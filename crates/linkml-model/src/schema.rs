@@ -2,11 +2,14 @@
 //! The LinkML subset as plain data (odata-linkml-mapping.md section 9): the
 //! metaslots the surfaces read, in the shape of LinkML's JSON serialisation.
 //! Every struct denies unknown fields, so a metaslot outside the subset fails
-//! the load instead of being dropped (threat LK4).
+//! the load instead of being dropped (threat LK4). [`normalize`] first drops the
+//! listed non-semantic metaslots a LinkML generator writes, so real `gen-linkml`
+//! output loads (T-5207, mapping-contract rule 2).
 
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
+use serde_json::{Map, Value};
 
 /// A schema: `id`, `name`, `version`, `prefixes`, `default_prefix`, and its
 /// classes, slots and enums keyed by name. The two declarations the subset
@@ -304,4 +307,196 @@ pub struct PermissibleValue {
     /// Tagged values, keyed by tag.
     #[serde(default)]
     pub annotations: BTreeMap<String, Annotation>,
+}
+
+/// Metaslots that change no meaning a surface reads: provenance, generator
+/// stamps, mappings to other vocabularies, examples and editorial text
+/// (T-5207). [`normalize`] drops them; every other unknown metaslot is refused.
+pub const NON_SEMANTIC: [&str; 31] = [
+    "@type",
+    "aliases",
+    "broad_mappings",
+    "close_mappings",
+    "comments",
+    "contributors",
+    "created_by",
+    "created_on",
+    "deprecated",
+    "domain_of",
+    "examples",
+    "exact_mappings",
+    "from_schema",
+    "generation_date",
+    "imported_from",
+    "in_subset",
+    "keywords",
+    "last_updated_on",
+    "metamodel_version",
+    "modified_by",
+    "narrow_mappings",
+    "notes",
+    "owner",
+    "rank",
+    "related_mappings",
+    "see_also",
+    "source_file",
+    "source_file_date",
+    "source_file_size",
+    "title",
+    "todos",
+];
+
+/// The built-in types of `linkml:types` with their URIs: a schema's `types`
+/// holding exactly these (or some of them) is the import a generator merged in.
+const MERGED_TYPES: [(&str, &str); 19] = [
+    ("string", "xsd:string"),
+    ("integer", "xsd:integer"),
+    ("boolean", "xsd:boolean"),
+    ("float", "xsd:float"),
+    ("double", "xsd:double"),
+    ("decimal", "xsd:decimal"),
+    ("time", "xsd:time"),
+    ("date", "xsd:date"),
+    ("datetime", "xsd:dateTime"),
+    ("date_or_datetime", "linkml:DateOrDatetime"),
+    ("uriorcurie", "xsd:anyURI"),
+    ("curie", "xsd:string"),
+    ("uri", "xsd:anyURI"),
+    ("ncname", "xsd:string"),
+    ("objectidentifier", "shex:iri"),
+    ("nodeidentifier", "shex:nonLiteral"),
+    ("jsonpointer", "xsd:string"),
+    ("jsonpath", "xsd:string"),
+    ("sparqlpath", "xsd:string"),
+];
+
+/// Brings generator output to the subset's shape before the strict parse
+/// (T-5207): drops [`NON_SEMANTIC`] metaslots where the element does not read
+/// them, the merged `linkml:types` copy, a class's `attributes` when each one
+/// repeats a slot the class or an ancestor lists (the generator's induced
+/// copy), and writes a
+/// scalar annotation (`odata_computed: true`, or the YAML shorthand) as a
+/// `{tag, value}` string. Anything else stays, so a meaning-changing metaslot
+/// (`any_of`, `mixins`, an own type) is still refused by name.
+///
+/// ```
+/// let mut v = serde_json::json!({"id": "https://e.org/s", "name": "s", "@type": "SchemaDefinition",
+///   "slots": {"n": {"from_schema": "x", "annotations": {"odata_computed": {"tag": "odata_computed", "value": true}}}}});
+/// linkml_model::normalize(&mut v);
+/// let s: linkml_model::Schema = serde_json::from_value(v).unwrap();
+/// assert_eq!(s.slots["n"].annotations["odata_computed"].value, "true");
+/// ```
+pub fn normalize(schema: &mut Value) {
+    let Some(top) = schema.as_object_mut() else {
+        return;
+    };
+    strip(top, &[]);
+    if top.get("types").is_some_and(merged_types) {
+        top.remove("types");
+    }
+    let listed = inherited_slots(top);
+    for (name, class) in members(top, "classes") {
+        strip(class, &[]);
+        annotations(class);
+        let own = listed.get(name.as_str());
+        let induced = class
+            .get("attributes")
+            .and_then(Value::as_object)
+            .is_some_and(|a| a.keys().all(|k| own.is_some_and(|l| l.contains(k))));
+        if induced {
+            class.remove("attributes");
+        }
+        for (_, usage) in members(class, "slot_usage") {
+            slot(usage);
+        }
+    }
+    for (_, s) in members(top, "slots") {
+        slot(s);
+    }
+    for (_, e) in members(top, "enums") {
+        strip(e, &[]);
+        for (_, pv) in members(e, "permissible_values") {
+            strip(pv, &[]);
+            annotations(pv);
+        }
+    }
+}
+
+/// Each class's slots with its ancestors' (by `is_a`, at most 64 deep), as the
+/// raw document lists them.
+fn inherited_slots(top: &Map<String, Value>) -> BTreeMap<String, Vec<String>> {
+    let classes = top.get("classes").and_then(Value::as_object);
+    let field = |c: &str, key: &str| {
+        classes
+            .and_then(|m| m.get(c))
+            .and_then(|c| c.get(key))
+            .cloned()
+    };
+    classes
+        .into_iter()
+        .flat_map(|m| m.keys())
+        .map(|name| {
+            let mut all = Vec::new();
+            let mut at = Some(name.clone());
+            for _ in 0..64 {
+                let Some(c) = at else { break };
+                if let Some(Value::Array(slots)) = field(&c, "slots") {
+                    all.extend(slots.iter().filter_map(|s| s.as_str().map(str::to_owned)));
+                }
+                at = field(&c, "is_a").and_then(|p| p.as_str().map(str::to_owned));
+            }
+            (name.clone(), all)
+        })
+        .collect()
+}
+
+fn slot(s: &mut Map<String, Value>) {
+    strip(s, &["rank", "title"]);
+    annotations(s);
+}
+
+fn members<'a>(
+    m: &'a mut Map<String, Value>,
+    key: &str,
+) -> impl Iterator<Item = (&'a String, &'a mut Map<String, Value>)> {
+    m.get_mut(key)
+        .and_then(Value::as_object_mut)
+        .into_iter()
+        .flat_map(|o| o.iter_mut())
+        .filter_map(|(k, v)| v.as_object_mut().map(|v| (k, v)))
+}
+
+fn strip(m: &mut Map<String, Value>, reads: &[&str]) {
+    m.retain(|k, _| !NON_SEMANTIC.contains(&k.as_str()) || reads.contains(&k.as_str()));
+}
+
+fn merged_types(types: &Value) -> bool {
+    types.as_object().is_some_and(|t| {
+        t.iter().all(|(name, def)| {
+            MERGED_TYPES
+                .iter()
+                .any(|(n, uri)| n == name && def.get("uri").and_then(Value::as_str) == Some(*uri))
+        })
+    })
+}
+
+fn annotations(m: &mut Map<String, Value>) {
+    for (tag, a) in m
+        .get_mut("annotations")
+        .and_then(Value::as_object_mut)
+        .into_iter()
+        .flat_map(|o| o.iter_mut())
+    {
+        if !a.is_object() {
+            *a = serde_json::json!({"tag": tag, "value": a.take()});
+        }
+        if let Some(o) = a.as_object_mut() {
+            o.remove("@type");
+            if let Some(v) = o.get_mut("value") {
+                if let Value::Bool(_) | Value::Number(_) = v {
+                    *v = Value::String(v.to_string());
+                }
+            }
+        }
+    }
 }

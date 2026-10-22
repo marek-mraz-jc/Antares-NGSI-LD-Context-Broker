@@ -18,8 +18,11 @@ take a date or an RFC 3339 date-time; a date `to` is inclusive. Any other
 parameter is `400`. The answer is `text/calendar; charset=utf-8`.
 
 Which attribute becomes which calendar field is the view's
-`representations.ical` member (`type`, `preset`, `mapping`, as the platform's
-Endpoint writes it); a view without one serves the SDM `Event` table. A view
+`representations.ical` member (`version`, `type`, `preset`, `mapping`, as the platform's
+Endpoint writes it); a view without one serves the SDM `Event` table. `version` is the
+contract version, `1` when absent (T-5207): a mapping of version 1 is read strictly, and
+one of a newer version (a Portal released before the broker) is served as its `type`
+over its `preset` with a log warning, never as a `500` for the whole feed. A view
 that shows no Entity of the mapped type, or does not allow `query_entities`,
 answers `404`. An Entity the mapping cannot render (no start or title, an
 unreadable date, an end before its start, a bad URL or point) is left out,

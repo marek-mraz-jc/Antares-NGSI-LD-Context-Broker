@@ -220,11 +220,18 @@ pub enum DateMode {
     Datetime,
 }
 
+/// The version of the `representations.ical` contract this broker reads (T-5207,
+/// mapping-contract rule 1): a member added or given a new meaning takes the next one.
+pub const MAPPING_VERSION: u64 = 1;
+
 /// The view's `representations.ical` member, as the Portal writes it from the Endpoint's
 /// `spec.representations.ical`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IcalMapping {
+    /// The contract version the Portal wrote; `1` when absent.
+    #[serde(default = "first_version")]
+    pub version: u64,
     /// The NGSI-LD type the feed maps, by its local name; default `Event`.
     #[serde(rename = "type", default = "event")]
     pub entity_type: String,
@@ -238,6 +245,49 @@ pub struct IcalMapping {
 
 fn event() -> String {
     "Event".to_owned()
+}
+
+fn first_version() -> u64 {
+    1
+}
+
+/// The plan of a written `representations.ical` member, and whether it is degraded: a
+/// mapping of a newer contract version than [`MAPPING_VERSION`] (the Portal released before
+/// the broker) is served as its `type` over its `preset` (else `sdm-event`), the members this
+/// broker reads alone, instead of failing the whole feed (T-5207, mapping-contract rule 1).
+/// A mapping of this version is read strictly: the Portal checked it when it was saved.
+///
+/// # Errors
+/// Why a mapping of this version does not compile.
+///
+/// ```
+/// let newer = serde_json::json!({"version": 9, "type": "Concert", "rrule": "eventSchedule"});
+/// let (plan, degraded) = antares_ical::mapping::plan_of(&newer).unwrap();
+/// assert!(degraded);
+/// assert_eq!(plan.entity_type(), "Concert");
+/// ```
+pub fn plan_of(written: &serde_json::Value) -> Result<(Plan, bool), String> {
+    let version = written.get("version").and_then(serde_json::Value::as_u64);
+    if version.is_some_and(|v| v > MAPPING_VERSION) {
+        let entity_type = written
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .filter(|t| is_name(t))
+            .map_or_else(event, str::to_owned);
+        let preset = written
+            .get("preset")
+            .and_then(|p| serde_json::from_value::<Preset>(p.clone()).ok());
+        let mapping = IcalMapping {
+            version: MAPPING_VERSION,
+            entity_type,
+            preset,
+            mapping: BTreeMap::new(),
+        };
+        return Plan::compile(&mapping).map(|p| (p, true));
+    }
+    let mapping: IcalMapping =
+        serde_json::from_value(written.clone()).map_err(|e| e.to_string())?;
+    Plan::compile(&mapping).map(|p| (p, false))
 }
 
 /// A field's source: an attribute path (`startDate`) or the object form.
@@ -430,6 +480,12 @@ impl Plan {
     /// # Errors
     /// The first reason the mapping cannot be rendered.
     pub fn compile(mapping: &IcalMapping) -> Result<Self, String> {
+        if mapping.version != MAPPING_VERSION {
+            return Err(format!(
+                "version {} is not one this broker reads ({MAPPING_VERSION})",
+                mapping.version
+            ));
+        }
         if !is_name(&mapping.entity_type) {
             return Err(format!(
                 "type {:?} is not an NGSI-LD type name",

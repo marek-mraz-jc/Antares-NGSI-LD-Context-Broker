@@ -122,7 +122,7 @@ pub(crate) fn no_properties(version: ODataVersion) -> ODataErrorResponse {
     .with_version(version)
 }
 
-/// Whether no option but `$select` (and `$format`, `$schemaversion=*`,
+/// Whether no option but `$select` (and `$format`, `$schemaversion`,
 /// read before) is asked.
 pub(crate) fn only_select(options: &QueryOptions) -> bool {
     options.filter.is_none()
@@ -139,14 +139,17 @@ pub(crate) fn only_select(options: &QueryOptions) -> bool {
 
 /// Why a parsed URL is answered `501` in this round: a form or an option a
 /// later round maps. `None` for what this round serves.
-pub(crate) fn later(uri: &ODataUri) -> Option<&'static str> {
+pub(crate) fn later(uri: &ODataUri, schema_version: &str) -> Option<&'static str> {
     let ODataUri::Resource { options, .. } = uri else {
         return Some("this resource is not served");
     };
     let refused = [
         (options.id.is_some(), "$id"),
         (
-            options.schemaversion.as_deref().is_some_and(|v| v != "*"),
+            options
+                .schemaversion
+                .as_deref()
+                .is_some_and(|v| v != "*" && v != schema_version),
             "$schemaversion",
         ),
     ];
@@ -1874,6 +1877,7 @@ mod tests {
             },
             namespace: "n".into(),
             sets: BTreeMap::new(),
+            schema_version: "0.m1".into(),
         };
         let item = |path: &[&str]| QueryOptions {
             expand: Some(vec![odata_url::ExpandItem {
@@ -2006,6 +2010,7 @@ mod tests {
             },
             namespace: "v".into(),
             sets: BTreeMap::from([("T".into(), set())]),
+            schema_version: "0.m1".into(),
         };
         let both = json!({"type": ["https://e.org/T", "https://e.org/Hidden"]});
         assert_eq!(visible_types(&edm, &both), vec!["T".to_owned()]);

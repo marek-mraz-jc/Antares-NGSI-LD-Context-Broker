@@ -176,10 +176,10 @@ fn malformed_documents_are_malformed() {
             Some(with("/classes/string", json!({}))),
         ),
         (
-            "unknown NGSI-LD kind",
+            "NGSI-LD kind that is no kind name",
             Some(with(
                 "/slots/size/annotations",
-                json!({"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "Thing"}}),
+                json!({"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "some thing"}}),
             )),
         ),
         (
@@ -729,4 +729,105 @@ fn as_shown_rebases_only_what_is_shown_by_its_short_name() {
     assert_eq!(v.slot_iri("colour"), "https://sdm.org/colour");
     let none = m.as_shown(&std::collections::BTreeMap::new(), expand);
     assert_eq!(none.class_iri("Car"), "https://sdm.org/Car");
+}
+
+/// T-5207: what `gen-linkml` 1.12 writes for `tests/fixtures/gen-linkml-source.yaml`, in its JSON
+/// form and its YAML form read as JSON (`dev/gen-linkml-fixtures.sh` regenerates both), loads with
+/// the classes, slots, kinds and flags the source states.
+#[test]
+fn real_gen_linkml_output_loads() {
+    for (name, text) in [
+        ("json", include_str!("fixtures/gen-linkml.json")),
+        ("yaml", include_str!("fixtures/gen-linkml-yaml.json")),
+    ] {
+        let m = Model::read(text.as_bytes(), &LIMITS).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        let s = m.schema();
+        assert_eq!(s.classes.len(), 3, "{name}");
+        assert_eq!(s.slots.len(), 7, "{name}");
+        assert_eq!(m.kind(&s.slots["organizer"]), "Relationship", "{name}");
+        assert_eq!(
+            s.slots["capacity"].annotations["odata_computed"].value, "true",
+            "{name}: a YAML bool is the string the flag reads"
+        );
+        assert_eq!(
+            s.slots["temperature"].title.as_deref(),
+            Some("Temperature"),
+            "{name}"
+        );
+        assert_eq!(s.slots["temperature"].rank, Some(3), "{name}");
+    }
+}
+
+/// T-5207: every listed non-semantic metaslot is dropped at every level; a meaning-changing one
+/// beside it is still refused by name.
+#[test]
+fn non_semantic_metaslots_are_ignored_and_semantic_ones_refused() {
+    let mut doc = base();
+    for pointer in [
+        "",
+        "/classes/Room",
+        "/slots/size",
+        "/enums/E",
+        "/enums/E/permissible_values/a",
+    ] {
+        for key in linkml_model::NON_SEMANTIC {
+            if pointer == "/slots/size" && matches!(key, "rank" | "title") {
+                continue;
+            }
+            if let Some(o) = doc.pointer_mut(pointer).and_then(Value::as_object_mut) {
+                o.insert(key.to_owned(), json!("x"));
+            }
+        }
+    }
+    assert_eq!(
+        load(&doc).unwrap().schema(),
+        load(&base()).unwrap().schema()
+    );
+    for (pointer, value) in [
+        ("/slots/size/any_of", json!([{"range": "string"}])),
+        (
+            "/classes/Room/attributes",
+            json!({"other": {"range": "string"}}),
+        ),
+        (
+            "/types",
+            json!({"string": {"uri": "xsd:string"}, "money": {"uri": "xsd:decimal"}}),
+        ),
+    ] {
+        let mut bad = doc.clone();
+        if let Some((parent, key)) = pointer.rsplit_once('/') {
+            if let Some(o) = bad.pointer_mut(parent).and_then(Value::as_object_mut) {
+                o.insert(key.to_owned(), value);
+            }
+        }
+        match load(&bad) {
+            Err(Error::NotImplemented(why)) => {
+                assert!(why.contains("unknown field"), "{pointer}: {why}")
+            }
+            other => panic!("{pointer}: {other:?}"),
+        }
+    }
+}
+
+/// T-5207: a kind a later NGSI-LD version adds loads; the slot states it and the model
+/// reports it as unmapped, so each surface degrades that slot alone.
+#[test]
+fn a_new_ngsi_ld_kind_loads_and_is_not_known() {
+    let doc = with(
+        "/slots/size/annotations",
+        json!({"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "TimeSeriesProperty"}}),
+    );
+    let m = load(&doc).unwrap();
+    let kind = m.kind(&m.schema().slots["size"]);
+    assert_eq!(kind, "TimeSeriesProperty");
+    assert!(!linkml_model::known_kind(kind));
+    let schema: Value = serde_json::from_str(&linkml_model::json_schema(&m)).unwrap();
+    let size = &schema["definitions"]["Room"]["properties"]["size"];
+    assert_eq!(size.get("type"), None, "any value: {size}");
+    assert_eq!(size["x-ngsi-ld-kind"], "TimeSeriesProperty");
+    let context: Value = serde_json::from_str(&linkml_model::context(&m)).unwrap();
+    assert!(
+        context["@context"]["size"].is_string(),
+        "no coercion: {context}"
+    );
 }

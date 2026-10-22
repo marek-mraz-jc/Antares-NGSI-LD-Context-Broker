@@ -18,6 +18,16 @@ use crate::names::mangle;
 /// The surface's own vocabulary (section 3.2): `Iri`, `Kind`, and the
 /// abstract base every EntityType derives from.
 pub const VOCABULARY: &str = "Antares.NgsiLd";
+
+/// The version of this surface's mapping (`docs/src/odata.md` section "Mapping version",
+/// T-5207): bumped by every change to how a slot shapes, types or reads (`shape`,
+/// `property`, the write and filter readers), so a client that caches `$metadata` sees it in
+/// `Core.SchemaVersion` and `$schemaversion` before a member changes type under it.
+pub const MAPPING_VERSION: u32 = 1;
+
+/// The version of the [`VOCABULARY`] terms, stated as its `Core.SchemaVersion`: a term
+/// removed or retyped takes a new namespace (`Antares.NgsiLd.V2`) beside this one.
+pub const VOCABULARY_VERSION: &str = "1";
 const VOCABULARY_ALIAS: &str = "NgsiLd";
 const BASE: &str = "NgsiLd.Entity";
 
@@ -188,6 +198,10 @@ pub struct Edm {
     pub namespace: String,
     /// The EntitySets by name.
     pub sets: BTreeMap<String, Set>,
+    /// `Core.SchemaVersion` of the view's schema: the LinkML schema's `version` (`0` without
+    /// one) then `.m` and [`MAPPING_VERSION`], `1.2.0.m1` (a character outside the URL's unreserved
+    /// set becomes `_`); `$schemaversion` takes it.
+    pub schema_version: String,
 }
 
 /// Builds the model of view `view` from `schema` and what the view shows.
@@ -295,6 +309,24 @@ pub fn build(
     let mut own = Schema::new(namespace.clone());
     own.entity_types = types;
     own.entity_container = Some(container);
+    // `$schemaversion` takes unreserved characters alone (OData URL ABNF).
+    let schema_version: String = format!(
+        "{}.m{MAPPING_VERSION}",
+        schema.schema().version.as_deref().unwrap_or("0")
+    )
+    .chars()
+    .map(|c| {
+        if c.is_ascii_alphanumeric() || "-._~".contains(c) {
+            c
+        } else {
+            '_'
+        }
+    })
+    .collect();
+    own.annotations.push(Annotation::new(
+        "Core.SchemaVersion",
+        Expr::String(schema_version.clone()),
+    ));
     Ok(Edm {
         csdl: Model {
             version,
@@ -303,6 +335,7 @@ pub fn build(
         },
         namespace,
         sets,
+        schema_version,
     })
 }
 
@@ -446,6 +479,9 @@ fn shape(
 ) -> Shape {
     let many = slot.multivalued == Some(true);
     match (schema.kind(slot), schema.range(slot)) {
+        // A kind this mapping does not know (a later NGSI-LD version's) is an untyped,
+        // unfiltered, read-only value of that slot alone (T-5207, mapping-contract rule 4).
+        (kind, _) if !linkml_model::known_kind(kind) => Shape::Json,
         // P2: an inlined class is a JSON object value, whatever kind is named.
         (_, Range::Class(_)) if slot.inlined == Some(true) => Shape::Json,
         ("Relationship" | "ListRelationship", Range::Class(c)) => {
@@ -594,10 +630,15 @@ fn description(text: &str) -> Annotation {
 }
 
 /// When a client may write the slot's member (T-3722); the model admits
-/// only `"true"` and `"false"` as the flags' values.
+/// only `"true"` and `"false"` as the flags' values. A slot of a kind the
+/// mapping does not know is never written (T-5207).
 fn written(slot: &linkml_model::Slot) -> Written {
     let set = |tag: &str| slot.annotations.get(tag).is_some_and(|a| a.value == "true");
-    if set("odata_computed") {
+    let unknown = slot
+        .annotations
+        .get(linkml_model::KIND_TAG)
+        .is_some_and(|a| !linkml_model::known_kind(&a.value));
+    if unknown || set("odata_computed") {
         Written::Never
     } else if set("odata_immutable") {
         Written::OnCreate
@@ -808,6 +849,10 @@ fn references() -> Vec<Reference> {
 fn vocabulary() -> Schema {
     let mut v = Schema::new(VOCABULARY);
     v.alias = Some(VOCABULARY_ALIAS.into());
+    v.annotations.push(Annotation::new(
+        "Core.SchemaVersion",
+        Expr::String(VOCABULARY_VERSION.into()),
+    ));
     v.terms = vec![
         Term::new("Iri", TypeRef::single("Edm.String")),
         Term::new("Kind", TypeRef::single("Edm.String")),
@@ -1273,5 +1318,47 @@ mod tests {
         assert!(Shape::Url { collection: false }.sortable());
         assert!(base_member("_types"));
         assert!(!base_member("speed"));
+    }
+
+    /// T-5207: a kind a later NGSI-LD version adds degrades its own slot to a read-only,
+    /// unfiltered `Edm.Untyped` with the kind stated; the other slots keep their types, and the
+    /// schema states its version with the mapping's.
+    #[test]
+    fn a_new_kind_degrades_its_slot_and_the_schema_version_is_stated() {
+        let json = br#"{"id": "https://e.org/s", "name": "s", "version": "2.1.0",
+          "classes": {"Car": {"slots": ["speed", "trace"]}},
+          "slots": {"speed": {"range": "float"},
+            "trace": {"range": "float", "annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "TimeSeriesProperty"}}}}}"#;
+        let limits = linkml_model::Limits {
+            max_bytes: 1 << 16,
+            max_depth: 16,
+            max_elements: 64,
+        };
+        let s = linkml_model::Model::read(json, &limits).unwrap();
+        let edm = build(
+            "v",
+            &s,
+            &shown(&s, &[("Car", &["speed", "trace"])]),
+            Writable::default(),
+            CsdlVersion::V4_01,
+        )
+        .unwrap();
+        let car = &edm.sets["Car"].members;
+        assert_eq!(car["trace"].shape, Shape::Json);
+        assert!(!car["trace"].shape.filterable());
+        assert_eq!(car["trace"].written, Written::Never);
+        assert_eq!(
+            car["speed"].shape,
+            Shape::Value {
+                edm: "Edm.Double",
+                collection: false
+            }
+        );
+        assert_eq!(edm.schema_version, format!("2.1.0.m{MAPPING_VERSION}"));
+        let own = &edm.csdl.schemas[1];
+        assert!(own
+            .annotations
+            .iter()
+            .any(|a| a.term == "Core.SchemaVersion"));
     }
 }
