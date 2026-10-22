@@ -135,6 +135,9 @@ pub struct View {
 /// The surfaces a view's `representations` may name.
 pub const REPRESENTATIONS: &[&str] = &["ical"];
 
+/// The most named outputs one representation lists (owner 2026-10-22T09:30Z).
+pub const MAX_OUTPUTS: usize = 20;
+
 /// One allowlist of a [`View`]: the Entities of `types` for which the
 /// condition holds show `attributes`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -309,10 +312,13 @@ impl View {
         };
         if let Some(named) = &self.representations {
             if let Some((name, _)) = named.iter().find(|(name, member)| {
-                !REPRESENTATIONS.contains(&name.as_str()) || !member.is_object()
+                !REPRESENTATIONS.contains(&name.as_str())
+                    || member
+                        .as_array()
+                        .is_none_or(|outputs| outputs.len() > MAX_OUTPUTS)
             }) {
                 return Err(format!(
-                    "representations: {name:?} is not one of {REPRESENTATIONS:?} with an object"
+                    "representations: {name:?} is not one of {REPRESENTATIONS:?} with a list of at most {MAX_OUTPUTS} outputs"
                 ));
             }
         }
@@ -1312,7 +1318,7 @@ mod tests {
 
     #[test]
     fn a_view_keeps_the_representations_it_names_and_refuses_another_name() {
-        let ical = json!({"ical": {"preset": "sdm-event"}});
+        let ical = json!({"ical": [{"name": "events", "sources": [{"preset": "sdm-event"}]}]});
         let loaded = load(&with("representations", ical.clone())).expect("loads");
         assert_eq!(
             loaded
@@ -1323,7 +1329,15 @@ mod tests {
             Some(ical)
         );
         assert!(load(&base()).is_ok_and(|l| l.representations.is_none()));
-        for bad in [json!({"vcard": {}}), json!({"ical": []}), json!([])] {
+        let many: Vec<Value> = (0..=MAX_OUTPUTS)
+            .map(|i| json!({"name": format!("o{i}")}))
+            .collect();
+        for bad in [
+            json!({"vcard": []}),
+            json!({"ical": {"preset": "sdm-event"}}),
+            json!({"ical": many}),
+            json!([]),
+        ] {
             assert!(
                 load(&with("representations", bad.clone())).is_err(),
                 "{bad}"

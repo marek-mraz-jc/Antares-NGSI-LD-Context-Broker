@@ -45,6 +45,9 @@ pub mod percent;
 mod scan;
 pub mod views;
 
+/// The one `GeoJSON` geometry rule of the broker (T-5208): the default instance, valid, RFC 7946
+/// winding, for every surface that writes `GeoJSON`.
+pub use antares_api::{geometry_of, rewound};
 /// The NGSI-LD primer a surface tells a model (T-4532), through `antares-ops` alone (rule M2).
 pub use antares_ql::PRIMER;
 /// The residual of a standard query (ADR-0028 rule 2), re-exported so a surface compiles into

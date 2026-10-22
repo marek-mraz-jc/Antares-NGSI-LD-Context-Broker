@@ -275,7 +275,7 @@ async fn every_attribute_kind_is_a_plain_property_and_no_location_a_null_geometr
     let point = |x: f64| json!({"type": "GeoProperty", "value": {"type": "Point", "coordinates": [x, 48.7]}, "datasetId": format!("urn:ngsi-ld:Dataset:{x}")});
     let stops = [
         json!({"id": "urn:ngsi-ld:Stop:1", "type": "Stop",
-               "location": [point(19.0), point(20.0)],
+               "location": [point(19.0), {"type": "GeoProperty", "value": {"type": "Point", "coordinates": [20.0, 48.7]}}],
                "servedBy": {"type": "Relationship", "object": "urn:ngsi-ld:Line:6"},
                "label": {"type": "LanguageProperty", "languageMap": {"sk": "Zastávka", "en": "Stop"}},
                "seats": [{"type": "Property", "value": 4, "datasetId": "urn:ngsi-ld:Dataset:a"},
@@ -292,7 +292,11 @@ async fn every_attribute_kind_is_a_plain_property_and_no_location_a_null_geometr
     let features = page["features"].as_array().expect("features");
     let stop = |id: &str| features.iter().find(|f| f["id"] == id).expect(id).clone();
     let one = stop("urn:ngsi-ld:Stop:1");
-    assert_eq!(one["geometry"]["type"], "Point");
+    // the default instance, as NGSI-LD geo+json picks it (TS 104 175 4.5.16.1), not the first
+    assert_eq!(
+        one["geometry"],
+        json!({"type": "Point", "coordinates": [20.0, 48.7]})
+    );
     let props = &one["properties"];
     assert_eq!(props["servedBy"], "urn:ngsi-ld:Line:6");
     assert_eq!(props["label"], json!({"sk": "Zastávka", "en": "Stop"}));

@@ -89,14 +89,15 @@ async fn fixture() -> (TestBroker, Router) {
     let broker = TestBroker::new().await.expect("broker");
     let app = broker.serve(antares_ical::Ical).expect("mounted");
     let reads = json!(["query_entities"]);
+    let ical = json!({"ical": [{"name": "events", "sources": [{}]}]});
     let views = [
-        json!({"id": "city", "tenant": "city", "selector": ["Event"], "operations": reads,
+        json!({"id": "city", "tenant": "city", "selector": ["Event"], "operations": reads, "representations": ical,
                "rules": [{"types": ["Event"], "attributes": ["name", "startDate", "endDate", "description", "address", "location", "url"]}]}),
         json!({"id": "places", "tenant": "city", "selector": ["Place"], "operations": reads,
                "rules": [{"types": ["Place"], "attributes": ["name"]}]}),
-        json!({"id": "every", "tenant": "city", "selector": ["*"], "operations": reads,
+        json!({"id": "every", "tenant": "city", "selector": ["*"], "operations": reads, "representations": ical,
                "rules": [{"types": ["*"], "attributes": ["*"]}]}),
-        json!({"id": "void", "tenant": "void", "selector": ["Event"], "operations": reads,
+        json!({"id": "void", "tenant": "void", "selector": ["Event"], "operations": reads, "representations": ical,
                "rules": [{"types": ["Event"], "attributes": ["name", "startDate"]}]}),
         json!({"id": "writes", "tenant": "city", "selector": ["Event"], "operations": ["create_entity"],
                "rules": [{"types": ["Event"], "attributes": ["name", "startDate"]}]}),
@@ -346,21 +347,34 @@ async fn a_feed_reads_every_page_and_refuses_past_its_bound() {
     assert_eq!(a.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", a.body);
 }
 
-/// `DTSTAMP` and `LAST-MODIFIED` hold the time the fixture wrote the Entities.
+/// `DTSTAMP` and `LAST-MODIFIED` hold the time the fixture wrote the Entities, and the
+/// `VTIMEZONE` spans the years around today: both out, the zone has its own tests.
 fn stamped(text: &str) -> String {
+    let mut inside = false;
     text.split_inclusive('\n')
-        .map(|line| match line.split_once(':') {
-            Some((name @ ("DTSTAMP" | "LAST-MODIFIED"), rest)) => {
-                format!("{name}:STAMP{}", &rest[16..])
+        .filter_map(|line| {
+            let was = inside;
+            inside = (inside || line.starts_with("BEGIN:VTIMEZONE"))
+                && !line.starts_with("END:VTIMEZONE");
+            if was || inside {
+                return line
+                    .starts_with("BEGIN:VTIMEZONE")
+                    .then(|| "VTIMEZONE\r\n".to_owned());
             }
-            _ => line.to_owned(),
+            Some(match line.split_once(':') {
+                Some((name @ ("DTSTAMP" | "LAST-MODIFIED"), rest)) => {
+                    format!("{name}:STAMP{}", &rest[16..])
+                }
+                _ => line.to_owned(),
+            })
         })
         .collect()
 }
 
 #[tokio::test]
-async fn a_view_without_a_mapping_serves_what_the_feed_served_before_mappings_byte_for_byte() {
-    // fixtures/sdm-event-default.txt: these three feeds as dev 53ab566e (T-4487) served them
+async fn the_preset_output_serves_the_events_of_t_4487_under_the_calendar_properties() {
+    // fixtures/sdm-event-default.txt: the VEVENTs as dev 53ab566e (T-4487) served them, under
+    // the T-5208 calendar properties and VTIMEZONE
     let (_broker, app) = fixture().await;
     let mut all = String::new();
     for uri in [

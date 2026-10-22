@@ -106,25 +106,41 @@ fn an_offset_is_written_in_utc_and_an_end_before_the_start_skips_the_event() {
 }
 
 #[test]
-fn a_utc_start_with_a_date_or_floating_end_ends_in_utc() {
+fn a_utc_start_with_a_date_or_floating_end_ends_in_utc_read_in_bratislava() {
     let start = ("startDate", prop(json!("2026-10-20T18:00:00Z")));
+    // the last day 21 October ends at its local midnight, 22:00Z in CEST
     let l = feed(&[start.clone(), ("endDate", prop(json!("2026-10-21")))]);
-    assert!(has(&l, "DTEND:20261022T000000Z"), "{l:?}");
-    let l = feed(&[start, ("endDate", prop(json!("2026-10-20T20:00:00")))]);
+    assert!(has(&l, "DTEND:20261021T220000Z"), "{l:?}");
+    let l = feed(&[start, ("endDate", prop(json!("2026-10-20T22:00:00")))]);
     assert!(has(&l, "DTEND:20261020T200000Z"), "{l:?}");
 }
 
 #[test]
-fn a_floating_start_stays_floating_and_its_end_takes_its_type() {
+fn a_time_without_offset_is_read_in_bratislava_and_never_left_floating() {
+    // RFC 5545 3.3.5: a floating 18:00 would be 18:00 in New York too
     let start = ("startDate", prop(json!("2026-10-20T18:00:00")));
     let l = feed(&[
         start.clone(),
         ("endDate", prop(json!("2026-10-20T20:00:00Z"))),
     ]);
-    assert!(has(&l, "DTSTART:20261020T180000"), "{l:?}");
-    assert!(has(&l, "DTEND:20261020T200000"), "{l:?}");
+    assert!(has(&l, "DTSTART:20261020T160000Z"), "{l:?}");
+    assert!(has(&l, "DTEND:20261020T200000Z"), "{l:?}");
+    // the reverse mix: an instant start, a local end two hours later
+    let l = feed(&[
+        ("startDate", prop(json!("2026-10-20T16:00:00Z"))),
+        ("endDate", prop(json!("2026-10-20T20:00:00"))),
+    ]);
+    assert!(has(&l, "DTEND:20261020T180000Z"), "{l:?}");
+    // winter time: CET is +01:00
+    let l = feed(&[("startDate", prop(json!("2026-12-01T18:00:00")))]);
+    assert!(has(&l, "DTSTART:20261201T170000Z"), "{l:?}");
     let l = feed(&[start, ("endDate", prop(json!("2026-10-20")))]);
-    assert!(has(&l, "DTEND:20261021T000000"), "{l:?}");
+    assert!(has(&l, "DTEND:20261020T220000Z"), "{l:?}");
+    assert!(
+        !l.iter()
+            .any(|x| x.starts_with("DT") && !x.ends_with('Z') && !x.contains("VALUE=DATE")),
+        "{l:?}"
+    );
 }
 
 #[test]
@@ -153,18 +169,25 @@ fn without_start_or_name_there_is_no_event() {
 
 #[test]
 fn the_window_keeps_what_overlaps_it_and_its_last_day_inclusive() {
-    let w = Window {
-        from: When::parse("2026-10-21").map(When::key),
-        to: When::parse("2026-10-21").map(When::past),
-    };
+    // the 21st in Bratislava (CEST): 2026-10-20T22:00Z to 2026-10-21T22:00Z
+    let day = When::parse("2026-10-21");
+    let w = Window::read(day, day, antares_ical::mapping::DEFAULT_ZONE);
     let multi = event(&[("endDate", prop(json!("2026-10-22")))]);
     assert!(matches!(vevent(&multi, &w, now()), Outcome::Event(_)));
     // one day, the 20th: over before the 21st
     assert_eq!(vevent(&event(&[]), &w, now()), Outcome::Outside);
-    let late = event(&[("startDate", prop(json!("2026-10-21T23:30:00Z")))]);
+    let late = event(&[("startDate", prop(json!("2026-10-21T21:30:00Z")))]);
     assert!(matches!(vevent(&late, &w, now()), Outcome::Event(_)));
-    let later = event(&[("startDate", prop(json!("2026-10-22T00:00:00Z")))]);
+    let later = event(&[("startDate", prop(json!("2026-10-21T22:00:00Z")))]);
     assert_eq!(vevent(&later, &w, now()), Outcome::Outside);
+    // a bound without offset is read in the zone too
+    let evening = Window::read(
+        When::parse("2026-10-21T20:00:00"),
+        None,
+        antares_ical::mapping::DEFAULT_ZONE,
+    );
+    let at_19 = event(&[("startDate", prop(json!("2026-10-21T17:00:00Z")))]);
+    assert_eq!(vevent(&at_19, &evening, now()), Outcome::Outside);
 }
 
 #[test]

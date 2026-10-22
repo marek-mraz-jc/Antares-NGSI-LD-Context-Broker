@@ -17,19 +17,19 @@
   "cases": {
     "default-preset": {
       "ical": {},
-      "lines": ["UID:urn:ngsi-ld:Event:1", "DTSTAMP:20261001T080000Z", "DTSTART:20261020T180000", "DTEND:20261020T200000",
+      "lines": ["UID:urn:ngsi-ld:Event:1", "DTSTAMP:20261001T080000Z", "DTSTART:20261020T160000Z", "DTEND:20261020T180000Z",
         "SUMMARY:Concert in the square", "DESCRIPTION:Hrá orchester", "LOCATION:Námestie SNP 1\\, 96001\\, Zvolen",
         "GEO:48.57;19.12", "URL:https://zvolen.sk/koncert", "LAST-MODIFIED:20261001T080000Z"]
     },
     "sdm-event-explicit": {
       "ical": {"preset": "sdm-event"},
-      "lines": ["UID:urn:ngsi-ld:Event:1", "DTSTAMP:20261001T080000Z", "DTSTART:20261020T180000", "DTEND:20261020T200000",
+      "lines": ["UID:urn:ngsi-ld:Event:1", "DTSTAMP:20261001T080000Z", "DTSTART:20261020T160000Z", "DTEND:20261020T180000Z",
         "SUMMARY:Concert in the square", "DESCRIPTION:Hrá orchester", "LOCATION:Námestie SNP 1\\, 96001\\, Zvolen",
         "GEO:48.57;19.12", "URL:https://zvolen.sk/koncert", "LAST-MODIFIED:20261001T080000Z"]
     },
     "schema-org-preset": {
       "ical": {"preset": "schema-org"},
-      "lines": ["UID:urn:ngsi-ld:Event:1", "DTSTAMP:20261001T080000Z", "DTSTART:20261020T180000", "DTEND:20261020T200000",
+      "lines": ["UID:urn:ngsi-ld:Event:1", "DTSTAMP:20261001T080000Z", "DTSTART:20261020T160000Z", "DTEND:20261020T180000Z",
         "SUMMARY:Concert in the square", "DESCRIPTION:Hrá orchester", "LOCATION:Námestie SNP 1\\, 96001\\, Zvolen",
         "GEO:48.57;19.12", "URL:https://zvolen.sk/koncert", "STATUS:CANCELLED", "LAST-MODIFIED:20261001T080000Z"]
     },
@@ -41,14 +41,14 @@
         "CATEGORIES": {"attribute": "category", "map": {"sport": "Šport", "music": "Hudba"}},
         "STATUS": {"attribute": "eventStatus", "map": {"EventScheduled": "CONFIRMED", "https://schema.org/EventCancelled": "CANCELLED"}, "default": "TENTATIVE"},
         "CLASS": {"constant": "PUBLIC"}}},
-      "lines": ["UID:urn:ngsi-ld:Event:1", "DTSTAMP:20261001T080000Z", "DTSTART:20261020T180000", "DTEND:20261023T000000",
+      "lines": ["UID:urn:ngsi-ld:Event:1", "DTSTAMP:20261001T080000Z", "DTSTART:20261020T160000Z", "DTEND:20261022T220000Z",
         "SUMMARY:Koncert", "DESCRIPTION:Hrá orchester", "LOCATION:Námestie SNP 1\\, Zvolen",
         "GEO:48.57;19.12", "URL:https://zvolen.sk/koncert", "CATEGORIES:Šport,Hudba", "STATUS:CANCELLED", "CLASS:PUBLIC",
         "LAST-MODIFIED:20261001T080000Z"]
     },
     "custom-firstof-ending-required": {
       "ical": {"mapping": {"DTSTART": "startDate", "SUMMARY": {"firstOf": ["headline", "title", "name"]}, "URL": "url"}},
-      "lines": ["UID:urn:ngsi-ld:Event:1", "DTSTAMP:20261001T080000Z", "DTSTART:20261020T180000", "SUMMARY:Koncert",
+      "lines": ["UID:urn:ngsi-ld:Event:1", "DTSTAMP:20261001T080000Z", "DTSTART:20261020T160000Z", "SUMMARY:Koncert",
         "URL:https://zvolen.sk/koncert", "LAST-MODIFIED:20261001T080000Z"]
     },
     "timezone-written-in-utc": {
@@ -58,9 +58,13 @@
         "SUMMARY:Concert in the square", "DESCRIPTION:Hrá orchester", "LOCATION:Námestie SNP 1\\, 96001\\, Zvolen",
         "GEO:48.57;19.12", "URL:https://zvolen.sk/koncert", "LAST-MODIFIED:20261001T080000Z"]
     },
-    "duration-takes-no-constant": {
-      "ical": {"mapping": {"DTSTART": {"attribute": "startDate", "date": "date"}, "SUMMARY": "title", "DURATION": {"constant": "P1D"}}},
-      "refused": "does not take `constant`"
+    "duration-constant-is-the-length-of-an-event-without-end": {
+      "ical": {"mapping": {"DTSTART": "startDate", "SUMMARY": "title", "DURATION": {"constant": "PT1H"}}},
+      "lines": ["UID:urn:ngsi-ld:Event:1", "DTSTAMP:20261001T080000Z", "DTSTART:20261020T160000Z", "DURATION:PT1H", "SUMMARY:Koncert", "LAST-MODIFIED:20261001T080000Z"]
+    },
+    "duration-constant-must-be-a-duration": {
+      "ical": {"mapping": {"DTSTART": "startDate", "SUMMARY": "title", "DURATION": {"constant": "an hour"}}},
+      "refused": "RFC 5545 duration"
     },
     "missing-summary-value": {
       "ical": {"mapping": {"DTSTART": "startDate", "SUMMARY": "headline"}},
@@ -81,7 +85,7 @@
     "unknown-field": {"ical": {"preset": "sdm-event", "mapping": {"ATTENDEE": "url"}}, "refused": "unknown variant"},
     "unknown-remap": {"ical": {"preset": "sdm-event", "mapping": {"SUMMARY": {"attribute": "name", "template": "x"}}}, "refused": "did not match"},
     "separator-too-long": {"ical": {"preset": "sdm-event", "mapping": {"LOCATION": {"join": ["address"], "separator": "------------"}}}, "refused": "too long"},
-    "language-not-a-code": {"ical": {"preset": "sdm-event", "mapping": {"SUMMARY": {"attribute": "name", "language": "english"}}}, "refused": "two-letter code"},
+    "language-not-a-code": {"ical": {"preset": "sdm-event", "mapping": {"SUMMARY": {"attribute": "name", "language": "english"}}}, "refused": "BCP 47 tag"},
     "truncate-zero": {"ical": {"preset": "sdm-event", "mapping": {"SUMMARY": {"attribute": "name", "truncate": 0}}}, "refused": "1 to 10000"},
     "join-on-status": {"ical": {"preset": "sdm-event", "mapping": {"STATUS": {"join": ["eventStatus"]}}}, "refused": "does not take `join`"},
     "path-too-deep": {"ical": {"preset": "sdm-event", "mapping": {"LOCATION": "address.a.b.c"}}, "refused": "is not an attribute path"},
@@ -93,7 +97,7 @@
     "status-default-only": {
       "ical": {"mapping": {"DTSTART": "startDate", "SUMMARY": {"attribute": "title", "language": "first"},
         "STATUS": {"attribute": "eventStatus", "default": "CONFIRMED"}}},
-      "lines": ["UID:urn:ngsi-ld:Event:1", "DTSTAMP:20261001T080000Z", "DTSTART:20261020T180000", "SUMMARY:Koncert",
+      "lines": ["UID:urn:ngsi-ld:Event:1", "DTSTAMP:20261001T080000Z", "DTSTART:20261020T160000Z", "SUMMARY:Koncert",
         "STATUS:CONFIRMED", "LAST-MODIFIED:20261001T080000Z"]
     },
     "join-on-geo": {"ical": {"preset": "sdm-event", "mapping": {"GEO": {"join": ["location"]}}}, "refused": "does not take `join`"},
