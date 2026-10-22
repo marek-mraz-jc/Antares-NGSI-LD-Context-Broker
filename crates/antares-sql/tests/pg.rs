@@ -69,7 +69,6 @@ async fn migrations_apply_and_indexes_exist() {
     // existence).
     for idx in [
         "i_entities_location",
-        "i_entities_jsonb",
         "i_entities_types",
         "i_entities_loc_ambiguous",
         "i_entities_first_type_id",
@@ -86,6 +85,15 @@ async fn migrations_apply_and_indexes_exist() {
         .get(0);
         assert_eq!(n, 1, "index {idx} missing on entities");
     }
+    // 0019 dropped the whole-document GIN: no jsonb operator is leakproof,
+    // so it never served the broker's role under RLS (T-5193).
+    let gin: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_indexes WHERE tablename = 'entities' AND indexname = 'i_entities_jsonb'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("pg_indexes");
+    assert_eq!(gin, 0, "i_entities_jsonb is back on entities");
 
     // Every schema table exists.
     for table in [

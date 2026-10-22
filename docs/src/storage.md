@@ -115,7 +115,7 @@ and on attribute instances of the same shape:
 
 | Where | Per entity | Per attribute instance |
 |---|---|---|
-| Postgres, plain | 3.1 KB, 938 B of it the whole-document GIN index | 1,387 B |
+| Postgres, plain | 3.1 KB, 938 B of it the whole-document GIN index (dropped by 0019) | 1,387 B |
 | TimescaleDB after columnstore compression | as plain | 120 B, read latency unchanged |
 | Process memory (`serde_json::Value`, all modes) | 37.6 KB resident | as the entity |
 
@@ -124,6 +124,102 @@ text, so memory-mode capacity is bounded by RAM, not by the file. And
 expanded JSON-LD costs 4.8 times the compact text but only 1.8 times on disk,
 because Postgres compression absorbs the repeated IRIs; storing the compact
 form would buy nothing.
+
+### The instanceId lives in its column
+
+An instance's `instanceId` is also the `instance_id` column of its history
+row. Since T-5131 a new row leaves it out of `data` (about 70 B of a
+245 B document for a bike count). Rows written before keep it there and read
+back as stored: a row whose `data` lacks `instanceId` is one written since.
+The reads aggregate each attribute's `instance_id` column beside its
+documents, in the same order, and the store puts the member back into each
+instance before the answer leaves it, so the API answers stay byte-identical.
+Building the member into each row in SQL instead cost Postgres 10-35 % more. Copies into `attr_versions` keep whole documents, as before.
+
+`createdAt`, `modifiedAt`, `observedAt` and `type` stay in `data`. Rebuilding
+the two broker stamps from `created_at` and `modified_at` would save another
+~75 B a row, but printing two timestamps per row cost Postgres 20-45 % more
+on a whole-history read of 240,000 rows, whatever the encoding (`to_char`,
+`timestamp`, epoch). The API echoes a client's `observedAt` spelling, and no
+column holds `type`.
+
+A rollback to a release older than T-5131 serves the rows written since then
+without `instanceId` in temporal answers (the column still holds it, nothing
+is lost); rolling forward again restores the answers.
+
+### Integer history keys: the design (T-5193)
+
+Not built yet. A history row keys on three texts: the Entity id (~60 B),
+the full expanded Attribute IRI (~70 B) and the broker's
+`urn:ngsi-ld:Instance:<uuid>` (57 B). Each is stored twice, in the heap and
+in `u_attr_instances_time`. The plan replaces them with an `entity_no
+bigint` and an `attr_no integer` from a per-Tenant dictionary of full
+expanded IRIs, and with an `instance_no uuid`.
+
+The columns cannot change type in place: `ALTER TYPE` rewrites every
+partition of dev's ~110 GB history under an exclusive lock, and the
+partitions of one parent must all have its columns. Two shapes were
+measured on one synthetic week (2,000,000 rows: 2,000 docking stations, 4
+Attributes, 250 instances each, identical `data` of 336 B, PostgreSQL 17,
+`VACUUM ANALYZE`d, bytes per row):
+
+| Shape | Heap | Index | Total |
+|---|---|---|---|
+| Today: text keys | 630 | 306 | 936 |
+| B: a second parent `attr_rows` with integer and uuid keys | 455 | 90 | 546 |
+| C: today's table, three nullable columns, the text keys NULL on new rows | 455 | 100 | 555 |
+
+Reads, warm, both alternated twice: every row of the week through one
+index scan per (Entity, Attribute), 4.5-5.9 s today, 4.4-5.1 s for B; the
+newest 10 per (Entity, Attribute), 355-389 ms today, 276-287 ms for B.
+
+Decided (worker-t5193, owner may override): shape B, because it needs no
+work on the existing partitions. C needs a unique index on the new columns
+of every existing partition, built one `CREATE INDEX CONCURRENTLY` a
+partition as 0017 does, which reads the whole 110 GB for an index that
+holds nothing there. C also turns the three text columns nullable on the
+partitions that keep them, and its `CHECK` that a row holds exactly one key
+shape would scan every partition too. B's new parent carries `NOT NULL`
+keys from its first row.
+
+The shape, as it is to be built:
+
+- `iri_ids` (`tenant_id`, `id bigint` identity, `iri`): primary key
+  (`tenant_id`, `id`), unique (`tenant_id`, `iri`), under the same
+  per-command RLS policies as `attr_instances` (0005). Every lookup and
+  every join carries the Tenant, so an id never names another Tenant's IRI.
+- `attr_rows`: the columns of `attr_instances` with `entity_no`, `attr_no`
+  and `instance_no` in place of the three texts, partitioned (or a
+  hypertable) the same way, with the unique key (`tenant_id`, `entity_no`,
+  `attr_no`, `observed_at`, `instance_no`).
+- The cut-over is the Monday after the migration, stored in a one-row
+  table the broker reads at boot. A row whose `observed_at` falls before
+  it goes to `attr_instances` in the text shape, a late write included,
+  so one instance has one conflict key. The partition job creates the weeks
+  from the cut-over in `attr_rows` only. Retention drops weeks of both
+  parents; once `attr_instances` holds no week, the store stops reading it.
+- `instance_no` is the uuid of the broker's own `urn:ngsi-ld:Instance:<uuid>`
+  in its canonical lowercase form. Any other id a temporal write brings
+  (5.6.11.4) gets its uuid v5 as the key and stays in `data` as
+  `instanceId`, which the read path since T-5131 already returns as stored.
+  A v5 collision could only merge two instances that one writer created on
+  one Attribute at one `observedAt`.
+- The store keeps the dictionary per Tenant in memory. A write looks an IRI
+  up and only on its first sight inserts it (`ON CONFLICT DO NOTHING`, then
+  a read for the id another pod won). A read knows the ids from the request
+  (the Entity ids of the page, the expanded Attribute names) and maps the
+  answer's ids back from the same map, so a warm process sends no extra
+  statement.
+- Each history statement reads both parents as `UNION ALL`, one arm per
+  parent, each arm through its own unique index; ordered reads merge the
+  two arms (`Merge Append`). Copies into `attr_versions` keep whole
+  documents, as now.
+- A release older than the change reads only `attr_instances` and would
+  miss every row since the cut-over, so the migration is `breaking_`
+  (`migrations.rollback.toml`).
+
+The keys save about 390 B a row. Getting a dev row under 300 B also needs
+the `data` side; today only TimescaleDB's columnstore gets there (120 B).
 
 ## Migrations
 
@@ -150,3 +246,4 @@ unless `ANTARES_MIGRATE=0` hands the job to an init container.
 | `0016_entity_type_statistics` | Extended statistics `entities_tenant_types` (MCV over `tenant_id`, `types[1]`, `cardinality(types)`), filled by ANALYZE (T-4852). The planner treated a Tenant and its types as independent and estimated a tenth or less of a Tenant's Entities of one type, so a type page sorted a bitmap of the whole type instead of reading `i_entities_first_type_id` in id order. Changes no access and no result. |
 | `0017_history_one_index` | One unique btree `u_attr_instances_time` (`tenant_id`, `entity_id`, `attr_id`, `observed_at`, `instance_id`) replaces `i_attr_instances_lookup` and `u_attr_instances` (T-5057): it serves the per-attribute read backwards and the upsert's conflict, and saves one index entry a history row (~150 B on a fresh build, 9 GB of a 30 GB week on dev). An empty history swaps in the migration; a plain-mode history with rows is moved by the maintenance job, one partition a pass with `CREATE INDEX CONCURRENTLY`, then one short transaction attaches them and drops the two old indexes. Until then each partition carries one more index on disk. A timescale hypertable with history keeps the two old indexes (timescale has no concurrent unique build). |
 | `0018_typed_location_paths` | Two btrees the broker's role reaches under RLS (T-5136): `i_entities_type_location_cell` (`tenant_id`, `types[1]`, `location_cell`) serves a geoquery of one type, whose cover over 0015's index read every type's rows in the cells (17 000-47 000 rows for a page of 20 on the distinct-1000 rig); `i_entities_type_unlocated` (`tenant_id`, `types[1]`, `id`) `WHERE location IS NULL` serves `!location` (an OGC `bbox` page's Features without a geometry), to which the store ANDs `location IS NULL`; the negated `@?` alone read the whole type for no row. Changes no access and no result. |
+| `0019_drop_entities_jsonb` | Drops `i_entities_jsonb`, the `jsonb_path_ops` GIN over the whole document (T-5193). No jsonb operator is leakproof (`@?`, `@>`, `?|`), so under forced RLS the broker's role never used it as an index condition: as `antares_app`, a q= page of 200,000 Entities read the primary key and filtered 199,998 rows with the GIN in place, while a superuser's plan read the GIN. Every Entity write still paid a GIN entry per path. 1,869 -> 1,754 B an Entity on that synthetic set; a deployment that bypasses RLS loses the GIN path its q= pages used. |

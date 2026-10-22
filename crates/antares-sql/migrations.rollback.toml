@@ -80,3 +80,7 @@ note = "index swap; an older release's ON CONFLICT infers u_attr_instances_time 
 [0018]
 rollback = "compatible"
 note = "two added btree indexes; an older release reads geo and !location pages slower"
+
+[0019]
+rollback = "compatible"
+note = "index drop; an older release names no index in its statements and plans its q= reads without it, as it already did under RLS"
