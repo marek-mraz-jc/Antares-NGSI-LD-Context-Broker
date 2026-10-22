@@ -480,11 +480,12 @@ async fn retain(
         .execute(&mut *tx)
         .await?;
     if !dry_run {
-        // One batch that outlasts the sweep's budget (15 s, antares-ops
+        // One batch past a third of the sweep's budget (15 s, antares-ops
         // retention) is cancelled rather than holding a connection and the
-        // database for minutes; the sweep logs it and the next minute retries
-        // (T-4084).
-        sqlx::query("SET LOCAL statement_timeout = '15s'")
+        // database for minutes (T-4084); the sweep logs it, goes on with the
+        // other steps and retries it the next minute, so one slow (Tenant,
+        // type) cannot spend the whole budget (T-5157).
+        sqlx::query("SET LOCAL statement_timeout = '5s'")
             .execute(&mut *tx)
             .await?;
     }
