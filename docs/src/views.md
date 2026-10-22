@@ -205,7 +205,10 @@ What changes for a client:
 - A slot whose source Attribute no rule of the view shows is never served,
   and the loader says so in the view's `notes` (`/q/health`, `/q/views`):
   this is what a model change that renames or removes a source Attribute
-  looks like. The mapping never widens what the rules show.
+  looks like. No `q`, `orderBy` or geo-query reads such a slot (400, the
+  slot is not filterable), the default `location` of a geo-query included,
+  so no answer depends on a hidden value. The mapping never widens what the
+  rules show.
 - A slot member the IR does not define for its kind (a misspelt `ofset`)
   refuses the view with the slot's index.
 

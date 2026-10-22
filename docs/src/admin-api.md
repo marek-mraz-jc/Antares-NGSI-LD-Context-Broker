@@ -307,7 +307,7 @@ A view of another model also carries `mapping`, the version 2 mapping IR
 another version, a slot member its kind does not define, a selector other
 than the IR's `sourceClass`, and any operation that is not a read. It loads
 the view with a note for each slot whose source Attribute no rule shows:
-such a slot is never served.
+such a slot is never served and no filter, sort or geo-query reads it.
 
 ### GET /q/views
 

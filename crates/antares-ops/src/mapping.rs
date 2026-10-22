@@ -271,6 +271,9 @@ pub struct Mapping {
     /// The core with the inner terms over it: what the broker's answer
     /// names mean.
     answer: Context,
+    /// The slots the view's rules never show ([`Self::hide`]): no filter,
+    /// geo-query or sort reads them, or it would answer by what is hidden.
+    hidden: BTreeSet<usize>,
 }
 
 /// A request inverted into the source model.
@@ -342,6 +345,31 @@ impl Mapping {
             .collect();
         hidden.sort();
         hidden
+    }
+
+    /// Records [`Self::hidden_slots`] for the view that loads this mapping,
+    /// so no filter reads them, and returns their names for the load note.
+    pub fn hide(&mut self, shown: &BTreeSet<String>) -> Vec<String> {
+        let hidden = self.hidden_slots(shown);
+        self.hidden = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| hidden.contains(&s.term))
+            .map(|(i, _)| i)
+            .collect();
+        hidden
+    }
+
+    /// A slot a filter, geo-query or sort may read: named, filterable and
+    /// shown by the view's rules.
+    fn filter_slot(&self, name: &str) -> Result<&Slot, &'static str> {
+        let (i, slot) = self.slot_named(name).ok_or(UNKNOWN)?;
+        if slot.filterable && !self.hidden.contains(&i) {
+            Ok(slot)
+        } else {
+            Err(NOT_FILTERABLE)
+        }
     }
 
     /// Read and compile one IR document. Names are expanded through `ctx`
@@ -419,6 +447,7 @@ impl Mapping {
             slots,
             inner: Value::Object(inner),
             answer,
+            hidden: BTreeSet::new(),
             ctx,
             served: served.map_or_else(
                 || Value::String(antares_jsonld::CORE_CONTEXT.to_owned()),
@@ -577,9 +606,9 @@ impl Mapping {
     /// `geoproperty`: a filterable renamed slot. A geometry has no unit and
     /// no value table, so no other kind compares the same in both models.
     fn geo_property(&self, name: &str) -> Result<String, &'static str> {
-        let (_, slot) = self.slot_named(name).ok_or(UNKNOWN)?;
+        let slot = self.filter_slot(name)?;
         match (&slot.derivation, &slot.source) {
-            (Derivation::Rename, Some(source)) if slot.filterable => Ok(source.term.clone()),
+            (Derivation::Rename, Some(source)) => Ok(source.term.clone()),
             _ => Err(NOT_FILTERABLE),
         }
     }
@@ -596,15 +625,12 @@ impl Mapping {
                 if member.contains(['.', '[']) {
                     return Err(DEEP_PATH);
                 }
-                let (_, slot) = self.slot_named(member).ok_or(UNKNOWN)?;
+                let slot = self.filter_slot(member)?;
                 let source = slot
                     .source
                     .as_ref()
                     .map(|s| s.term.as_str())
                     .ok_or(NOT_FILTERABLE)?;
-                if !slot.filterable {
-                    return Err(NOT_FILTERABLE);
-                }
                 let dir = match (&slot.derivation, dir) {
                     (Derivation::UnitConversion { factor, .. }, d) if *factor < 0.0 => {
                         match d.unwrap_or("asc") {
@@ -669,10 +695,7 @@ impl Mapping {
             return Err(DEEP_PATH);
         }
         let first = path.path.first_mut().ok_or(UNKNOWN)?;
-        let (_, slot) = self.slot_named(first).ok_or(UNKNOWN)?;
-        if !slot.filterable {
-            return Err(NOT_FILTERABLE);
-        }
+        let slot = self.filter_slot(first)?;
         first.clone_from(&slot.source.as_ref().ok_or(NOT_FILTERABLE)?.term);
         Ok((path, slot))
     }

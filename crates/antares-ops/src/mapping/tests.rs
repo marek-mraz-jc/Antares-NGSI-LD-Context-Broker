@@ -1556,6 +1556,35 @@ fn a_geoquery_without_geoproperty_filters_the_target_location() {
 }
 
 #[test]
+fn a_slot_the_rules_hide_is_read_by_no_filter() {
+    let mut m = slots(&json!([
+        { "target": "location", "source": "position", "kind": "rename", "filterable": true },
+        { "target": "t", "source": "s", "kind": "rename", "filterable": true }
+    ]));
+    let geo = [
+        ("georel", "near;maxDistance==500"),
+        ("geometry", "Point"),
+        ("coordinates", "[17.1,48.1]"),
+    ];
+    assert!(m.invert(&pairs(&geo)).is_ok(), "shown, the location filters");
+    let shown = BTreeSet::from([antares_jsonld::core_context().expand_key("s")]);
+    assert_eq!(m.hide(&shown), vec!["location".to_owned()]);
+    assert_eq!(
+        m.invert(&pairs(&geo)).err(),
+        Some(NOT_FILTERABLE),
+        "a default geo-query would filter the hidden source"
+    );
+    for asked in [
+        [("geoproperty", "location")],
+        [("q", "location==\"x\"")],
+        [("orderBy", "location")],
+    ] {
+        assert_eq!(m.invert(&pairs(&asked)).err(), Some(NOT_FILTERABLE), "{asked:?}");
+    }
+    assert!(m.invert(&pairs(&[("q", "t==1"), ("orderBy", "t")])).is_ok());
+}
+
+#[test]
 fn each_attribute_kind_is_translated_through_a_mapping() {
     let m = slots(&json!([
         { "target": "v", "source": "a", "kind": "valueMappings", "forward": { "x": "y", "urn:p": "urn:q" } },

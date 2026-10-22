@@ -20,6 +20,7 @@
 //! ```
 
 use crate::OperationId;
+use crate::mapping::Mapping;
 use antares_api::policy::Rule;
 use antares_api::views::{CompiledView, Schema, ViewEntry, SCHEMA_ID_PREFIX};
 use antares_api::AppState;
@@ -273,7 +274,7 @@ impl View {
             geo_q("geoQ", self.geo_q.as_ref())?,
         );
         let operations = operations(&self.operations)?;
-        let (view, notes, selector) = if self.is_every()? {
+        let (view, mut notes, selector) = if self.is_every()? {
             (
                 CompiledView::every(q, scope, geo),
                 Vec::new(),
@@ -299,13 +300,11 @@ impl View {
         };
         let mapping = match &self.mapping {
             None => None,
-            Some(ir) => Some(Arc::new(mapped(
-                ir,
-                &ctx,
-                self.context.as_ref(),
-                &selector,
-                &operations,
-            )?)),
+            Some(ir) => {
+                let mut mapping = mapped(ir, &ctx, self.context.as_ref(), &selector, &operations)?;
+                notes.extend(hidden_slots_note(&mut mapping, &view));
+                Some(Arc::new(mapping))
+            }
         };
         if let Some(named) = &self.representations {
             if let Some((name, _)) = named.iter().find(|(name, member)| {
@@ -326,7 +325,6 @@ impl View {
             context: self.context.clone().map(Arc::new),
             representations: self.representations.clone().map(Arc::new),
         };
-        loaded.notes.extend(hidden_slots_note(&loaded));
         if self.q.is_some()
             && loaded
                 .operations
@@ -346,18 +344,16 @@ impl View {
 }
 
 /// The note of a mapped view whose rules hide what some slots read: such a
-/// slot is never served (T-5210).
-fn hidden_slots_note(loaded: &Loaded) -> Option<String> {
-    let mapping = loaded.mapping.as_deref()?;
-    let shown: BTreeSet<String> = loaded
-        .view
+/// slot is never served nor read by a filter (T-5210).
+fn hidden_slots_note(mapping: &mut Mapping, view: &CompiledView) -> Option<String> {
+    let shown: BTreeSet<String> = view
         .narrowing()
         .rules
         .iter()
         .filter(|rule| rule.types.iter().any(|t| t == mapping.source_class()))
         .flat_map(|rule| rule.attributes.iter().cloned())
         .collect();
-    let hidden = mapping.hidden_slots(&shown);
+    let hidden = mapping.hide(&shown);
     (!hidden.is_empty()).then(|| {
         format!(
             "the mapping serves {} from source Attributes no rule of the view shows: they are \
@@ -1413,6 +1409,12 @@ mod tests {
                 .any(|n| n.contains("serves velocity from")),
             "{:?}",
             loaded.notes
+        );
+        let q = [("q".to_owned(), "velocity>1".to_owned())];
+        assert_eq!(
+            loaded.mapping.as_deref().map(|m| m.invert(&q).err()),
+            Some(Some(crate::mapping::NOT_FILTERABLE)),
+            "no filter reads a hidden slot"
         );
     }
 
