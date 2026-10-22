@@ -674,7 +674,7 @@ pub(crate) async fn page(
 
 /// Why the residual refused the filter: too large (400), a construct it does not read with the
 /// standard's meaning (501), or one no filter of this collection can be (400).
-fn refused(e: &residual::Error) -> Problem {
+pub(crate) fn refused(e: &residual::Error) -> Problem {
     match e {
         residual::Error::TooComplex => bad(antares_ops::TOO_COMPLEX),
         residual::Error::Unsupported(_) => Problem(
@@ -686,7 +686,7 @@ fn refused(e: &residual::Error) -> Problem {
 }
 
 /// The time a residual's `now()` reads.
-fn now() -> Option<residual::DateTime> {
+pub(crate) fn now() -> Option<residual::DateTime> {
     let micros = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?

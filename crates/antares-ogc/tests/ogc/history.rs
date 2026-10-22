@@ -3,7 +3,10 @@
 //! `validFrom`/`validTo`, the location valid then, `datetime`, `bbox`, `filter`, paging, the
 //! Feature by id, no write, and the view's rules and Policy narrowing the history.
 
-use crate::common::{fixture_with, get, href, ids, local, schemas_on, send, SlowOnly};
+use crate::common::{fixture_with, get, href, ids, local, schemas_on, send, SlowOnly, SCHEMA};
+use antares_ops::policy::{
+    Decision, DecisionFuture, NotifyDecision, Operation, PolicyEngine, Subject,
+};
 use antares_ops::test_kit::{q_filter, TestBroker};
 use axum::http::StatusCode;
 use serde_json::{json, Value};
@@ -40,15 +43,33 @@ async fn past(broker: TestBroker) -> Result<crate::common::Fixture, String> {
                   {"types": ["Stop"], "attributes": ["name"]}],
         "operations": ["query_entities", "temporal_query"]
     });
-    let a = send(&f.app, "PUT", "/q/views/past", &view.to_string(), &[]).await;
-    if a.status != StatusCode::CREATED {
-        return Err(format!("view past: {} {}", a.status, a.body));
+    let only = json!({
+        "id": "past-only", "tenant": "city", "selector": ["Car"],
+        "rules": [{"types": ["Car"], "attributes": ["speed", "location"]}],
+        "operations": ["temporal_query"]
+    });
+    let void = json!({
+        "id": "void", "tenant": "void", "selector": ["Car"],
+        "rules": [{"types": ["Car"], "attributes": ["speed", "location"]}],
+        "operations": ["query_entities", "temporal_query"]
+    });
+    for (path, body) in [
+        ("/q/views/past", view.to_string()),
+        ("/q/views/past-only", only.to_string()),
+        ("/q/views/void", void.to_string()),
+        ("/q/schemas/void", SCHEMA.to_owned()),
+    ] {
+        let a = send(&f.app, "PUT", path, &body, &[]).await;
+        if a.status != StatusCode::CREATED {
+            return Err(format!("{path}: {} {}", a.status, a.body));
+        }
     }
     let histories = [
         json!({"id": "urn:ngsi-ld:Car:1", "type": "Car",
                "speed": [at(&json!(10), T0), at(&json!(20), T2)],
                "location": [moved(17.1, 48.1, T0), moved(17.2, 48.2, T1)],
-               "secret": [at(&json!("hidden-in-history"), T0)]}),
+               "secret": [at(&json!("hidden-in-history"), T0)],
+               "at": [{"type": "Relationship", "object": "urn:ngsi-ld:Stop:1", "observedAt": T1}]}),
         json!({"id": "urn:ngsi-ld:Car:2", "type": "Car",
                "speed": [at(&json!(60), T1)], "location": [moved(179.5, 0.0, T1)]}),
         json!({"id": "urn:ngsi-ld:Car:4", "type": "Car", "speed": [at(&json!(70), T0)]}),
@@ -276,4 +297,151 @@ async fn the_policy_narrows_the_history_as_the_current_state() -> Result<(), Str
         ids(&a.body)
     );
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn properties_relationships_and_ngsild_q_shape_a_history() -> Result<(), String> {
+    let f = past(fresh().await?).await?;
+    let a = get(&f.app, &format!("{ITEMS}?properties=speed,at&limit=2")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let props: Vec<Value> = a
+        .body
+        .get("features")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|f| f.get("properties").cloned())
+        .collect();
+    assert_eq!(
+        props,
+        [
+            json!({"speed": 10}),
+            json!({"speed": 10, "at": "urn:ngsi-ld:Stop:1"})
+        ],
+        "properties keeps what it names; a Relationship is valid from its observedAt"
+    );
+    let q = get(&f.app, &format!("{ITEMS}?ngsild.q=speed%3E65")).await;
+    assert_eq!(q.status, StatusCode::OK, "{}", q.body);
+    assert_eq!(
+        ids(&q.body),
+        [car(4, T0)],
+        "ngsild.q reaches the Temporal Query"
+    );
+    let bad = get(&f.app, &format!("{ITEMS}?ngsild.q=(((")).await;
+    assert_eq!(bad.status, StatusCode::BAD_REQUEST, "{}", bad.body);
+    let feb = get(&f.app, &format!("{ITEMS}?datetime=2026-02-30T00:00:00Z")).await;
+    assert_eq!(feb.status, StatusCode::BAD_REQUEST, "{}", feb.body);
+    let no_at = get(&f.app, &format!("{ITEMS}/urn:ngsi-ld:Car:1")).await;
+    assert_eq!(no_at.status, StatusCode::NOT_FOUND);
+    let stops = get(&f.app, &format!("{PAST}/collections/Stop-history/items")).await;
+    assert_eq!(stops.status, StatusCode::OK, "{}", stops.body);
+    assert_eq!(
+        ids(&stops.body),
+        Vec::<String>::new(),
+        "a type without history is empty"
+    );
+    let void = get(
+        &f.app,
+        "/x/views/void/ogc/features/collections/Car-history/items",
+    )
+    .await;
+    assert_eq!(void.status, StatusCode::OK, "{}", void.body);
+    assert_eq!(
+        ids(&void.body),
+        Vec::<String>::new(),
+        "a Tenant holding nothing"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_place_needs_query_entities_and_falls_back_to_none() -> Result<(), String> {
+    let f = past(fresh().await?).await?;
+    let only = "/x/views/past-only/ogc/features/collections/Car-history/items";
+    let a = get(&f.app, only).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let four = states(&a.body)
+        .into_iter()
+        .find(|s| s.0 == car(4, T0))
+        .ok_or("Car 4's state")?;
+    assert_eq!(four.2, Value::Null, "no Query Entities, no current place");
+    let engine = Arc::new(DenyClause("5.7.2"));
+    let f = past(fresh().await?.with_policy(engine)).await?;
+    let a = get(&f.app, ITEMS).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let four = states(&a.body)
+        .into_iter()
+        .find(|s| s.0 == car(4, T0))
+        .ok_or("Car 4's state")?;
+    assert_eq!(
+        four.2,
+        Value::Null,
+        "a refused Query Entities gives no place"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_or_too_large_temporal_answer_is_refused() -> Result<(), String> {
+    let engine = Arc::new(DenyClause("5.7.4"));
+    let f = past(fresh().await?.with_policy(engine)).await?;
+    let a = get(&f.app, ITEMS).await;
+    assert_eq!(a.status, StatusCode::FORBIDDEN, "{}", a.body);
+    schemas_on();
+    let f = past(TestBroker::with_max_answer_bytes(600).await?).await?;
+    let a = get(&f.app, ITEMS).await;
+    assert_eq!(a.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", a.body);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_ends_short_after_its_reads_and_goes_on() -> Result<(), String> {
+    let f = past(fresh().await?).await?;
+    for n in 0..105 {
+        let h = json!({"id": format!("urn:ngsi-ld:Car:h{n:03}"), "type": "Car", "speed": [at(&json!(5), T0)]});
+        let a = send(
+            &f.app,
+            "POST",
+            "/ngsi-ld/v1/temporal/entities",
+            &h.to_string(),
+            &[("NGSILD-Tenant", "city")],
+        )
+        .await;
+        if !a.status.is_success() {
+            return Err(format!("{h}: {} {}", a.status, a.body));
+        }
+    }
+    let first = get(&f.app, &format!("{ITEMS}?filter=speed%3E1000")).await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    assert_eq!(ids(&first.body), Vec::<String>::new());
+    let next = href(&first.body, "next").ok_or("a short page links the rest")?;
+    let rest = get(&f.app, &local(&next)).await;
+    assert_eq!(rest.status, StatusCode::OK, "{}", rest.body);
+    assert_eq!(
+        href(&rest.body, "next"),
+        None,
+        "the last read ends the history"
+    );
+    Ok(())
+}
+
+/// An engine that denies one clause and allows the rest.
+struct DenyClause(&'static str);
+
+impl PolicyEngine for DenyClause {
+    fn name(&self) -> &'static str {
+        "deny-clause"
+    }
+
+    fn decide<'a>(&'a self, _: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
+        Box::pin(std::future::ready(if op.clause == self.0 {
+            Decision::Deny("denied".into())
+        } else {
+            Decision::Allow
+        }))
+    }
+
+    fn pre_notify(&self, _: &Subject, _: &Value, _: &mut Value) -> NotifyDecision {
+        NotifyDecision::Deliver
+    }
 }

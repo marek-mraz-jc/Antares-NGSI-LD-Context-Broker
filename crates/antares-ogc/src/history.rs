@@ -37,6 +37,12 @@ const BATCH: usize = 4;
 const MAX_READS: usize = 25;
 /// The start of every history read (`timerel=after`).
 const EPOCH: &str = "1970-01-01T00:00:00Z";
+/// The details of the refusals a read of the history answers.
+const REFUSED: &str = "the view refused the query";
+const NOT_NGSI_LD: &str =
+    "the query is not valid NGSI-LD; an ngsild. parameter takes NGSI-LD syntax";
+const NO_LIST: &str = "the temporal answer is no list of Entities";
+const NO_CLOCK: &str = "the clock reads no time";
 /// The `ngsild.` options a history takes: the Temporal Query reads them as Query Entities does.
 const OPTIONS: [&str; 2] = ["q", "scopeQ"];
 
@@ -229,22 +235,12 @@ fn program(c: &Collection, terms: &Terms, p: &Params) -> Result<Option<Program>,
             ))),
         ));
     }
-    let expr = match all.len() {
-        0 => return Ok(None),
-        1 => all.pop().unwrap_or(Expr::Lit(Lit::Bool(true))),
-        _ => Expr::And(all),
-    };
-    let now = DateTime::from_unix_micros(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|d| i64::try_from(d.as_micros()).ok())
-            .unwrap_or_default(),
-    )
-    .unwrap_or(DateTime::MIN);
-    residual::compile(&expr, now).map(Some).map_err(|_| {
-        bad("the filter is too large or names a construct a history does not evaluate")
-    })
+    if all.is_empty() {
+        return Ok(None);
+    }
+    let now = items::now().ok_or(Problem(StatusCode::INTERNAL_SERVER_ERROR, NO_CLOCK))?;
+    let compiled = residual::compile(&Expr::And(all), now);
+    compiled.map(Some).map_err(|e| items::refused(&e))
 }
 
 /// One Query Temporal Evolution of Entities through the view: [`BATCH`] Entities of the type
@@ -276,37 +272,20 @@ async fn read(
     for (name, value) in &p.ngsild {
         let _ = write!(path, "&{name}={}", items::encode(value));
     }
-    let mut req = OpsRequest::new(Method::GET, path);
-    if let Some(context) = terms.context() {
-        req = req.context(context);
-    }
-    let refused = |r: &antares_ops::Refusal| Problem(r.status(), "the view refused the query");
-    let answer = view
-        .run(OperationId::TemporalQuery, caller, req)
-        .await
-        .map_err(|r| refused(&r))?;
+    let req = OpsRequest::new(Method::GET, path);
+    let req = terms.context().into_iter().fold(req, OpsRequest::context);
+    let answer = view.run(OperationId::TemporalQuery, caller, req).await;
+    let answer = answer.map_err(|r| Problem(r.status(), REFUSED))?;
     match answer.status() {
         // A Tenant that holds nothing yet answers 404 (5.5.10): an empty history.
         StatusCode::NOT_FOUND => return Ok(Vec::new()),
-        StatusCode::BAD_REQUEST => {
-            return Err(bad(
-                "the query is not valid NGSI-LD; an ngsild. parameter takes NGSI-LD syntax",
-            ))
-        }
-        s if !s.is_success() => return Err(Problem(s, "the view refused the query")),
+        StatusCode::BAD_REQUEST => return Err(bad(NOT_NGSI_LD)),
+        s if !s.is_success() => return Err(Problem(s, REFUSED)),
         _ => {}
     }
-    let bytes = view
-        .read_answer(answer.into_body())
-        .await
-        .map_err(|r| refused(&r))?;
-    match serde_json::from_slice(&bytes) {
-        Ok(Value::Array(entities)) => Ok(entities),
-        _ => Err(Problem(
-            StatusCode::BAD_GATEWAY,
-            "the temporal answer is no list of Entities",
-        )),
-    }
+    let bytes = view.read_answer(answer.into_body()).await;
+    let bytes = bytes.map_err(|r| Problem(r.status(), REFUSED))?;
+    serde_json::from_slice(&bytes).map_err(|_| Problem(StatusCode::BAD_GATEWAY, NO_LIST))
 }
 
 /// The current geometry of each Entity of `batch` whose history holds no place, by id, read
@@ -468,20 +447,21 @@ fn states(
                 normalized.insert(term, json!({"type": "Property", "value": v}));
             }
         }
-        let kept = match program {
-            None => true,
-            Some(program) => {
-                program
-                    .eval(&Value::Object(normalized))
-                    .map_err(|_| bad(antares_ops::TOO_COMPLEX))?
-                    == Truth::True
-            }
-        };
-        if kept {
+        if keeps(program, &Value::Object(normalized))? {
             out.push(Value::Object(simple));
         }
     }
     Ok(out)
+}
+
+/// Whether `program` keeps a state; none keeps every state.
+fn keeps(program: Option<&Program>, state: &Value) -> Result<bool, Problem> {
+    let Some(program) = program else {
+        return Ok(true);
+    };
+    let truth = program.eval(state);
+    let truth = truth.map_err(|_| bad(antares_ops::TOO_COMPLEX))?;
+    Ok(truth == Truth::True)
 }
 
 /// A state as its Feature, its `properties` only those the request's `properties` keeps.
@@ -671,5 +651,12 @@ mod tests {
             .map(|(_, t, v)| (t, v))
             .collect();
         assert_eq!(got, [("2026-10-21T11:00:00+01:00".to_owned(), json!(3))]);
+        let one = json!({"speed": {"type": "Property", "value": 4, "observedAt": "2026-10-21T10:00:00Z"}});
+        assert_eq!(
+            instances(&one, "speed").len(),
+            1,
+            "one instance may come unlisted"
+        );
+        assert_eq!(instances(&one, "other").len(), 0);
     }
 }
