@@ -12,6 +12,7 @@
 //! travels as a bind).
 
 use antares_model::{NgsiError, TenantId};
+use antares_ql::QNode;
 use serde_json::Value;
 use sqlx::postgres::PgPool;
 use sqlx::Row;
@@ -256,6 +257,27 @@ fn arms(wheres: &[String], split: Option<&TypeSplit>) -> Vec<String> {
         s.named, s.selection
     ));
     arms
+}
+
+/// Does `q` require the Entity to have no `location`, by a top-level
+/// `!location` term? Then `location IS NULL` holds for every match: a stored
+/// geometry comes from an instance's `value` or `object` (`extract`), which
+/// `!location` resolves as present. The conjunct is leakproof, so
+/// it reaches `i_entities_type_unlocated` (0018) under RLS, where the negated
+/// `@?` read the whole type (T-5136); the `@?` stays and decides.
+fn unlocated(q: &QNode, expand: &dyn Fn(&str) -> String) -> bool {
+    match q {
+        QNode::Exists {
+            path,
+            negated: true,
+        } => {
+            path.links.is_empty()
+                && path.bracket.is_none()
+                && matches!(path.path.as_slice(), [term] if expand(term) == crate::compile::geo::LOCATION_IRI)
+        }
+        QNode::And(all) => all.iter().any(|n| unlocated(n, expand)),
+        _ => false,
+    }
 }
 
 /// The type selection's binds and SQL: `Ok(split)` for at most
@@ -865,6 +887,9 @@ impl PgEntityStore {
                     binds.extend(c.binds.into_iter().map(Bind::Path));
                 }
                 None => decided = false,
+            }
+            if unlocated(node, f.expand) {
+                wheres.push("location IS NULL".to_owned());
             }
         }
         if let Some(sq) = f.scope_q {
@@ -1702,6 +1727,31 @@ mod tests {
 
     fn wheres() -> Vec<String> {
         vec!["tenant_id = $1".to_owned()]
+    }
+
+    /// T-5136: only a `!location` every match must satisfy narrows to
+    /// `location IS NULL`; an alternative, a sub-path or another
+    /// geoproperty does not.
+    #[test]
+    fn only_a_required_missing_location_narrows_to_no_geometry() {
+        let expand = |t: &str| match t {
+            "location" => crate::compile::geo::LOCATION_IRI.to_owned(),
+            t => format!("https://x/{t}"),
+        };
+        let narrows = |q: &str| unlocated(&antares_ql::parse_q(q).expect("q parses"), &expand);
+        for q in ["!location", "a>1;!location", "(a==1;!location);b"] {
+            assert!(narrows(q), "{q}");
+        }
+        for q in [
+            "location",
+            "!location|a",
+            "!location.observedAt",
+            "!place",
+            "a;b",
+            "!location[x]",
+        ] {
+            assert!(!narrows(q), "{q}");
+        }
     }
 
     /// `location_ambiguous` is the single bit that keeps geoquery pushdown

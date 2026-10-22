@@ -506,4 +506,31 @@ proptest! {
         let (only_b, _) = query(db, &tenant, &EntityFilter { geo: &specs[1..], expand: &expand, ..Default::default() });
         prop_assert!(got.is_subset(&only_a) && got.is_subset(&only_b), "a={:?} b={:?}: the pair kept {:?}, more than one alone", a, b, got);
     }
+
+    /// T-5136: `!location` reads only the Entities with no stored geometry
+    /// (`location IS NULL`, a leakproof index path) and stays decided and
+    /// exact, also beside a location the store cannot extract (two
+    /// instances, `location_ambiguous`) and under another conjunct.
+    #[test]
+    fn a_missing_location_is_decided_exactly(docs in entities(), rest in prop::option::of(q_compilable())) {
+        let Some(db) = db() else { return Ok(()) };
+        let q = rest.map_or_else(|| "!location".to_owned(), |r| format!("!location;{r}"));
+        let ast = parse_q(&q).map_err(|e| TestCaseError::fail(format!("{q}: {e:?}")))?;
+        let mut docs = docs;
+        let geometry = json!({"type": "Point", "coordinates": [1.0, 1.0]});
+        docs.push(json!({"id": "urn:ngsi-ld:T:twice", "type": "T", "location": [
+            {"type": "GeoProperty", "value": geometry, "datasetId": "urn:ngsi-ld:Dataset:1"},
+            {"type": "GeoProperty", "value": geometry, "datasetId": "urn:ngsi-ld:Dataset:2"},
+        ]}));
+        let tenant = TenantId::new("pgparityunlocated").expect("tenant");
+        let stored = seed(db, &tenant, &docs);
+        let want: BTreeSet<String> = stored
+            .iter()
+            .filter(|doc| eval_q(&ast, doc, ctx(), &|_| None))
+            .filter_map(|doc| doc["id"].as_str().map(str::to_owned))
+            .collect();
+        let (got, decided) = query(db, &tenant, &EntityFilter { q: Some(&ast), expand: &expand, ..Default::default() });
+        prop_assert!(decided, "q={} is in the exact subset and was not decided", q);
+        prop_assert_eq!(&got, &want, "q={}", q);
+    }
 }
