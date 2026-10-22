@@ -90,6 +90,17 @@ version, and cached (at most 256 models). `$metadata` carries a strong
 `@odata.metadataEtag` (`@metadataEtag` in 4.01), right after the context
 URL, so a client knows when to fetch the model again.
 
+Mapping version (T-5207): the view's schema carries `Core.SchemaVersion`,
+the LinkML schema's `version` (`0` without one), `.m` and the mapping version
+`MAPPING_VERSION` of `antares-odata` (now `1`), such as `2.1.0.m1`; a character
+outside the URL's unreserved set becomes `_`. `$schemaversion` takes `*` or that
+value; another value stays `501` as matrix 7.1 lists it. Any change to how a slot
+shapes, types or reads bumps the mapping version in the same change. The
+`Antares.NgsiLd` vocabulary states its own `Core.SchemaVersion` (`1`); a term
+removed or retyped goes to a new namespace `Antares.NgsiLd.V2` beside it. A slot
+of a kind the mapping does not know is `Edm.Untyped`, `Core.Computed` and not
+filterable, with `NgsiLd.Kind` naming the kind.
+
 ## 2. Reads
 
 Each read is one NGSI-LD operation of the view, run through `antares-ops`,

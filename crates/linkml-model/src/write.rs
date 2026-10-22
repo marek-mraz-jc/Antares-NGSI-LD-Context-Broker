@@ -295,6 +295,8 @@ fn inlined(model: &Model, slot: &Slot) -> bool {
 fn slot_schema(model: &Model, slot: &Slot) -> Value {
     let kind = model.kind(slot);
     let base = match model.range(slot) {
+        // A kind no surface maps yet: any value (T-5207, mapping-contract rule 4).
+        _ if !crate::known_kind(model.kind(slot)) => Map::new(),
         _ if geo(model, slot) => typed("object", None),
         // keyValues: a LanguageProperty is its map of language to text (NGSI-LD 4.5.18).
         _ if kind == "LanguageProperty" => {
@@ -419,8 +421,12 @@ pub fn context(model: &Model) -> String {
             ("VocabProperty", _) => Some("@vocab".to_owned()),
             ("JsonProperty", _) => Some("@json".to_owned()),
             ("Relationship" | "ListRelationship", _) => Some("@id".to_owned()),
+            // A kind no surface maps yet stays untyped (T-5207, mapping-contract rule 4).
             (k, Range::Type(b))
-                if k != "LanguageProperty" && b != Builtin::String && !geo(model, slot) =>
+                if crate::known_kind(k)
+                    && k != "LanguageProperty"
+                    && b != Builtin::String
+                    && !geo(model, slot) =>
             {
                 Some(b.xsd().replacen("xsd:", XSD, 1))
             }

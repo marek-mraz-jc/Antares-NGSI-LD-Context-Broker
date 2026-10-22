@@ -105,6 +105,7 @@ version = "0.3.0"
 dependencies = [
  "antares-api",
  "antares-bus",
+ "antares-feed",
  "antares-geojson",
  "antares-ical",
  "antares-icsr",
@@ -171,6 +172,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "antares-feed"
+version = "0.3.0"
+dependencies = [
+ "antares-ops",
+ "axum",
+ "chrono",
+ "http-body-util",
+ "metrics",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "antares-geojson"
 version = "0.3.0"
 dependencies = [
@@ -197,6 +214,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower",
+ "tracing",
 ]
 
 [[package]]
