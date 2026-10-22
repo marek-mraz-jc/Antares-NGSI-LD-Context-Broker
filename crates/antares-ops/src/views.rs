@@ -19,8 +19,8 @@
 //! let everything = antares_ops::views::View::default();
 //! ```
 
-use crate::OperationId;
 use crate::mapping::Mapping;
+use crate::OperationId;
 use antares_api::policy::Rule;
 use antares_api::views::{CompiledView, Schema, ViewEntry, SCHEMA_ID_PREFIX};
 use antares_api::AppState;

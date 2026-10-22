@@ -1566,7 +1566,10 @@ fn a_slot_the_rules_hide_is_read_by_no_filter() {
         ("geometry", "Point"),
         ("coordinates", "[17.1,48.1]"),
     ];
-    assert!(m.invert(&pairs(&geo)).is_ok(), "shown, the location filters");
+    assert!(
+        m.invert(&pairs(&geo)).is_ok(),
+        "shown, the location filters"
+    );
     let shown = BTreeSet::from([antares_jsonld::core_context().expand_key("s")]);
     assert_eq!(m.hide(&shown), vec!["location".to_owned()]);
     assert_eq!(
@@ -1579,7 +1582,11 @@ fn a_slot_the_rules_hide_is_read_by_no_filter() {
         [("q", "location==\"x\"")],
         [("orderBy", "location")],
     ] {
-        assert_eq!(m.invert(&pairs(&asked)).err(), Some(NOT_FILTERABLE), "{asked:?}");
+        assert_eq!(
+            m.invert(&pairs(&asked)).err(),
+            Some(NOT_FILTERABLE),
+            "{asked:?}"
+        );
     }
     assert!(m.invert(&pairs(&[("q", "t==1"), ("orderBy", "t")])).is_ok());
 }
