@@ -1,0 +1,285 @@
+// SPDX-License-Identifier: EUPL-1.2
+//! Every history read covers both parents (T-5200, migration 0020): the
+//! answers are byte-identical whether a row sits in `attr_instances` in the
+//! text shape or in `attr_rows` keyed by dictionary ids and the instance uuid.
+//! Nothing writes `attr_rows` before the cut-over, so the test moves the newer
+//! half of one Entity's history across by hand, as the cut-over will place
+//! it, and compares each read before and after. Skips without
+//! ANTARES_TEST_DATABASE_URL (see tests/pg.rs recipe).
+
+#![cfg(feature = "postgres")]
+
+use antares_model::TenantId;
+use antares_sql::compile::temporal::InstanceRange;
+use antares_sql::store::filter::{Aggregate, Page, TemporalFilter};
+use antares_sql::store::pg;
+use antares_sql::store::pg::temporal::PgTemporalStore;
+use serde_json::{json, Value};
+
+const SPEED: &str = "https://uri.etsi.org/ngsi-ld/default-context/speed";
+const LEVEL: &str = "https://uri.etsi.org/ngsi-ld/default-context/level";
+const MOVED_FROM: &str = "2026-01-02T00:00:00Z";
+
+fn expand(term: &str) -> String {
+    match term {
+        "speed" => SPEED.to_owned(),
+        "level" => LEVEL.to_owned(),
+        t => t.to_owned(),
+    }
+}
+
+/// Instances on two days around [`MOVED_FROM`]: the broker's own uuid ids,
+/// one client id of another shape, a dataset, a correction (version 2).
+fn doc(id: &str) -> Value {
+    let at = |h: usize| format!("2026-01-{:02}T{:02}:00:00Z", 1 + h / 24, h % 24);
+    let speed: Vec<Value> = (0..48)
+        .map(|h| {
+            let iid = if h == 30 {
+                "urn:client:speed:thirty".to_owned()
+            } else {
+                format!("urn:ngsi-ld:Instance:00000000-0000-4000-8000-{h:012}")
+            };
+            json!({"type": "Property", "value": h * 3 % 17, "observedAt": at(h),
+                   "instanceId": iid})
+        })
+        .collect();
+    let level: Vec<Value> = (0..48)
+        .step_by(4)
+        .map(|h| {
+            json!({"type": "Property", "value": h, "observedAt": at(h),
+                   "datasetId": "urn:ngsi-ld:Dataset:tank",
+                   "instanceId": format!("urn:ngsi-ld:Instance:00000000-0000-4000-9000-{h:012}")})
+        })
+        .collect();
+    json!({"id": id, "type": "Tank",
+           "createdAt": "2026-01-01T00:00:00Z", "modifiedAt": "2026-01-01T00:00:00Z",
+           SPEED: speed, LEVEL: level})
+}
+
+/// Each read shape the store has, as one JSON value per shape.
+async fn reads(s: &PgTemporalStore, t: &TenantId, id: &str) -> Vec<(&'static str, Value)> {
+    let ids = [id];
+    let attrs = [SPEED.to_owned()];
+    let methods = ["avg".to_owned(), "max".to_owned(), "totalCount".to_owned()];
+    let q = antares_ql::parse_q("speed>10").expect("q");
+    let after = |at| {
+        Some(InstanceRange {
+            timerel: "after",
+            time_at: at,
+            end_time_at: None,
+            timeproperty: "observedAt",
+        })
+    };
+    let between = Some(InstanceRange {
+        timerel: "between",
+        time_at: "2026-01-01T20:00:00Z",
+        end_time_at: Some("2026-01-02T04:00:00Z"),
+        timeproperty: "observedAt",
+    });
+    let modified = Some(InstanceRange {
+        timerel: "before",
+        time_at: "2999-01-01T00:00:00Z",
+        end_time_at: None,
+        timeproperty: "modifiedAt",
+    });
+    let base = || TemporalFilter {
+        ids: Some(&ids),
+        expand: &expand,
+        ..TemporalFilter::default()
+    };
+    let filters: Vec<(&'static str, TemporalFilter<'_>)> = vec![
+        ("all", base()),
+        (
+            "lastN 5",
+            TemporalFilter {
+                last_n: Some(5),
+                ..base()
+            },
+        ),
+        (
+            "lastN 30 after",
+            TemporalFilter {
+                last_n: Some(30),
+                range: after("2026-01-01T12:00:00Z"),
+                ..base()
+            },
+        ),
+        (
+            "firstN 3",
+            TemporalFilter {
+                last_n: Some(3),
+                oldest_first: true,
+                ..base()
+            },
+        ),
+        (
+            "between",
+            TemporalFilter {
+                range: between,
+                ..base()
+            },
+        ),
+        (
+            "modifiedAt",
+            TemporalFilter {
+                range: modified,
+                timeproperty: "modifiedAt",
+                ..base()
+            },
+        ),
+        (
+            "attrs + page",
+            TemporalFilter {
+                attrs: Some(&attrs),
+                page: Some(Page {
+                    offset: 0,
+                    limit: 10,
+                    count: true,
+                }),
+                range: after("2026-01-01T00:00:00Z"),
+                ..base()
+            },
+        ),
+        (
+            "q",
+            TemporalFilter {
+                q: Some(&q),
+                range: after("2026-01-01T00:00:00Z"),
+                ..base()
+            },
+        ),
+        (
+            "aggregate",
+            TemporalFilter {
+                range: after("2026-01-01T00:00:00Z"),
+                aggregate: Some(Aggregate {
+                    methods: &methods,
+                    period_secs: Some(21_600),
+                    anchor: Some("2026-01-01T00:00:00Z"),
+                }),
+                ..base()
+            },
+        ),
+    ];
+    let mut out = Vec::new();
+    for (name, f) in &filters {
+        let o = s.query(t, f).await.expect(name);
+        out.push((
+            *name,
+            json!({"rows": o.rows, "total": o.total, "agg": o.aggregated}),
+        ));
+        let one = s.get_range(t, id, f).await.expect(name);
+        out.push((*name, json!({"one": one})));
+    }
+    out.push(("get", json!(s.get(t, id).await.expect("get"))));
+    out.push((
+        "versions",
+        json!(s.versions(t, id).await.expect("versions")),
+    ));
+    out
+}
+
+/// Moves the rows of `id` observed from [`MOVED_FROM`] on into `attr_rows`,
+/// as the cut-over places them: ids from the Tenant's dictionary, the broker's
+/// uuid as the key, a client's other id kept in `data` with a v5-like key.
+async fn move_newer_half(pool: &sqlx::PgPool, t: &TenantId, id: &str) -> u64 {
+    let mut tx = pool.begin().await.expect("tx");
+    pg::set_tenant(&mut tx, t).await.expect("tenant");
+    sqlx::query(
+        "INSERT INTO iri_ids (tenant_id, iri)
+         SELECT DISTINCT $1, unnest(ARRAY[entity_id, attr_id]) FROM attr_instances
+          WHERE tenant_id = $1 AND entity_id = $2
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(t.as_str())
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .expect("dictionary");
+    let moved = sqlx::query(
+        "WITH gone AS (DELETE FROM attr_instances
+                        WHERE tenant_id = $1 AND entity_id = $2 AND observed_at >= $3::timestamptz
+                        RETURNING *)
+         INSERT INTO attr_rows (tenant_id, entity_no, attr_no, instance_no, dataset_id,
+                                observed_at, created_at, modified_at, deleted_at, data,
+                                geo_value, version, provenance)
+         SELECT g.tenant_id, iri_no(g.tenant_id, g.entity_id), iri_no(g.tenant_id, g.attr_id),
+                CASE WHEN g.instance_id LIKE 'urn:ngsi-ld:Instance:%'
+                     THEN substr(g.instance_id, 22)::uuid ELSE md5(g.instance_id)::uuid END,
+                g.dataset_id, g.observed_at, g.created_at, g.modified_at, g.deleted_at,
+                CASE WHEN g.instance_id LIKE 'urn:ngsi-ld:Instance:%' THEN g.data
+                     ELSE g.data || jsonb_build_object('instanceId', g.instance_id) END,
+                g.geo_value, g.version, g.provenance
+           FROM gone g",
+    )
+    .bind(t.as_str())
+    .bind(id)
+    .bind(MOVED_FROM)
+    .execute(&mut *tx)
+    .await
+    .expect("move")
+    .rows_affected();
+    tx.commit().await.expect("commit");
+    moved
+}
+
+async fn keyed_rows(pool: &sqlx::PgPool, t: &TenantId) -> i64 {
+    let mut tx = pool.begin().await.expect("tx");
+    pg::set_tenant(&mut tx, t).await.expect("tenant");
+    sqlx::query_scalar("SELECT count(*) FROM attr_rows WHERE tenant_id = $1")
+        .bind(t.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .expect("count")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reads_over_both_parents_answer_byte_identically() {
+    let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
+        eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
+        return;
+    };
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let s = PgTemporalStore::new(pool.clone());
+    let t = TenantId::new("pgkeyed").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let id = "urn:ngsi-ld:Tank:keyed1";
+    let _ = s.delete(&t, id).await;
+    assert!(s.create(&t, id, &doc(id)).await.expect("create"));
+    // a correction keeps version 1 in attr_versions and makes the row version 2
+    let fix = json!({SPEED: [{"type": "Property", "value": 99,
+        "observedAt": "2026-01-02T06:00:00Z",
+        "instanceId": "urn:ngsi-ld:Instance:00000000-0000-4000-8000-000000000030"}]});
+    s.append(&t, id, &doc(id), &fix).await.expect("correct");
+    assert_eq!(
+        keyed_rows(&pool, &t).await,
+        0,
+        "nothing writes attr_rows before the cut-over"
+    );
+
+    let before = reads(&s, &t, id).await;
+    let moved = move_newer_half(&pool, &t, id).await;
+    assert!(moved >= 30, "moved {moved} rows");
+    let after = reads(&s, &t, id).await;
+    for ((name, b), (_, a)) in before.iter().zip(&after) {
+        assert_eq!(
+            serde_json::to_string(b).expect("json"),
+            serde_json::to_string(a).expect("json"),
+            "{name}: the answer changed once rows sit in attr_rows"
+        );
+    }
+
+    // deletes reach both parents: an erase of the older half, then the rest
+    let erased = s
+        .erase(
+            &t,
+            id,
+            Some(&[LEVEL.to_owned()]),
+            Some("2026-01-03T00:00:00Z"),
+        )
+        .await
+        .expect("erase");
+    assert_eq!(erased, 12, "every level row of both parents");
+    assert!(s.delete(&t, id).await.expect("delete"));
+    assert_eq!(keyed_rows(&pool, &t).await, 0, "the delete left keyed rows");
+}
