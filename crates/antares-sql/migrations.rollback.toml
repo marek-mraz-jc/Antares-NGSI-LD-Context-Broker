@@ -84,3 +84,7 @@ note = "two added btree indexes; an older release reads geo and !location pages 
 [0019]
 rollback = "compatible"
 note = "index drop; an older release names no index in its statements and plans its q= reads without it, as it already did under RLS"
+
+[0023]
+rollback = "compatible"
+note = "entity_attrs and its trigger stay; an older release never reads them and folds /attributes, while the trigger keeps the catalogue current for the roll-forward"

@@ -469,9 +469,10 @@ async fn purge_tenant_empties_every_tenant_table() {
             .await
             .expect("correction");
     }
-    const TABLES: [&str; 16] = [
+    const TABLES: [&str; 17] = [
         "entities",
         "entity_types",
+        "entity_attrs",
         "jsonld_contexts",
         "subscriptions",
         "csource_subscriptions",

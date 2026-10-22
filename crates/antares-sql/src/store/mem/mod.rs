@@ -557,6 +557,32 @@ impl Store {
         })
     }
 
+    /// The (type, member name) pairs the Tenant's live Entities carry,
+    /// sorted (T-4934): one pass over the held documents.
+    pub fn entity_attr_pairs(&self, tenant: &TenantId, now: &str) -> Vec<(String, String)> {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pairs = std::collections::BTreeSet::new();
+        if let Some(m) = Self::map(&inner, Kind::Entity).get(tenant.as_str()) {
+            for doc in m.values().filter(|d| !filter::expired_at(d, now)) {
+                let types: Vec<&str> = match &doc["type"] {
+                    Value::String(t) => vec![t.as_str()],
+                    Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+                    _ => Vec::new(),
+                };
+                for k in doc.as_object().into_iter().flat_map(|o| o.keys()) {
+                    pairs.extend(types.iter().map(|t| (*t, k.as_str())));
+                }
+            }
+        }
+        pairs
+            .into_iter()
+            .map(|(t, k)| (t.to_owned(), k.to_owned()))
+            .collect()
+    }
+
     fn entity_types_where(
         &self,
         tenant: &TenantId,
