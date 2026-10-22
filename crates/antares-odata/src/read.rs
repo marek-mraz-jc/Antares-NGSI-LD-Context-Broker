@@ -84,7 +84,7 @@ pub(crate) async fn dereference(
             .with_version(ctx.version)
         })?;
     let relative = id.strip_prefix(ctx.service_root).unwrap_or(&id);
-    let model = EdmModel(&reads.state.model);
+    let model = EdmModel(reads.state.url_model());
     let parsed = (!relative.starts_with('/') && !relative.contains("://"))
         .then(|| odata_url::parse(relative, &model, &reads.state.url_limits));
     match parsed {

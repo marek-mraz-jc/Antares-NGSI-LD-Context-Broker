@@ -17,6 +17,7 @@
 //! let model = Model { version: CsdlVersion::V4_01, references: vec![], schemas: vec![] };
 //! let state = ODataState {
 //!     model: Arc::new(model),
+//!     url_model: None,
 //!     service_root: "https://example.org/odata/".into(),
 //!     url_limits: odata_url::Limits::strict(),
 //!     csdl_limits: odata_csdl::Limits::strict(),
@@ -49,6 +50,7 @@ use odata_url::{EdmModel, Format, LimitKind, ODataUri, QueryOptions, UrlError, U
 /// # use odata_csdl::{CsdlVersion, Model};
 /// let state = odata_axum::ODataState {
 ///     model: Arc::new(Model { version: CsdlVersion::V4_01, references: vec![], schemas: vec![] }),
+///     url_model: None,
 ///     service_root: "https://example.org/odata/".into(),
 ///     url_limits: odata_url::Limits::strict(),
 ///     csdl_limits: odata_csdl::Limits::strict(),
@@ -60,8 +62,12 @@ use odata_url::{EdmModel, Format, LimitKind, ODataUri, QueryOptions, UrlError, U
 /// ```
 #[derive(Debug, Clone)]
 pub struct ODataState {
-    /// The model the URLs resolve against and `$metadata` describes.
+    /// The model `$metadata` describes, and the URLs resolve against unless `url_model` is set.
     pub model: Arc<odata_csdl::Model>,
+    /// The model the URLs resolve against when it names more than `model`: a 4.0 document
+    /// serves an `Edm.Untyped` property as a dynamic property of an open type (CSDL XML 3.4),
+    /// and only the 4.01 document names it, so an undeclared name stays unknown.
+    pub url_model: Option<Arc<odata_csdl::Model>>,
     /// The service root URL, ending in `/`: context URLs start with it.
     pub service_root: String,
     /// The URL parser's limits.
@@ -77,6 +83,13 @@ pub struct ODataState {
     /// resource path, by their exact name; a request naming any other one, or any one on the
     /// service document, `$metadata`, `$batch` or `$entity`, is 400.
     pub custom_options: Vec<String>,
+}
+
+impl ODataState {
+    /// The model the URLs resolve against: `url_model`, else `model`.
+    pub fn url_model(&self) -> &odata_csdl::Model {
+        self.url_model.as_deref().unwrap_or(&self.model)
+    }
 }
 
 /// A request's URL, parsed against the service's model, and the version its response is
@@ -95,6 +108,7 @@ pub struct ODataState {
 /// }
 /// # let state = ODataState {
 /// #     model: Arc::new(Model { version: CsdlVersion::V4_01, references: vec![], schemas: vec![] }),
+/// #     url_model: None,
 /// #     service_root: "https://example.org/odata/".into(),
 /// #     url_limits: odata_url::Limits::strict(),
 /// #     csdl_limits: odata_csdl::Limits::strict(),
@@ -141,7 +155,7 @@ impl ODataRequest {
             Some(query) => format!("{path}?{query}"),
             None => path.to_owned(),
         };
-        let uri = odata_url::parse(&relative, &EdmModel(&state.model), &state.url_limits)
+        let uri = odata_url::parse(&relative, &EdmModel(state.url_model()), &state.url_limits)
             .map_err(|error| url_error(&error, path.len()).with_version(version))?;
         let resource = matches!(uri, ODataUri::Resource { .. });
         let unknown = |options: &QueryOptions| {
@@ -310,6 +324,7 @@ pub fn url_error(error: &UrlError, path_len: usize) -> ODataErrorResponse {
 /// # use odata_csdl::{CsdlVersion, Model};
 /// # let state = odata_axum::ODataState {
 /// #     model: Arc::new(Model { version: CsdlVersion::V4_01, references: vec![], schemas: vec![] }),
+/// #     url_model: None,
 /// #     service_root: "https://example.org/odata/".into(),
 /// #     url_limits: odata_url::Limits::strict(),
 /// #     csdl_limits: odata_csdl::Limits::strict(),

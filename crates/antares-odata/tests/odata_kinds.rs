@@ -144,6 +144,17 @@ async fn a_4_0_client_reads_and_selects_an_untyped_member_as_dynamic() {
     let (status, picked) = get(&app, "Car?$select=address", &[]).await;
     assert_eq!(status, StatusCode::OK, "{picked}");
     assert!(picked.contains("Dolná 2"), "{picked}");
+    // The open type is how 4.0 serves the model's own untyped members, never any name: a name
+    // no model holds stays 400 in a query option and 404 in a path (8.1.6, 11.2.3; T-5206 bounce).
+    for (path, want) in [
+        ("Car?$select=width", StatusCode::BAD_REQUEST),
+        ("Car?$filter=width%20eq%201", StatusCode::BAD_REQUEST),
+        ("Car?$orderby=width", StatusCode::BAD_REQUEST),
+        ("Car('urn:ngsi-ld:Car:51')/width", StatusCode::NOT_FOUND),
+    ] {
+        let (status, body) = get(&app, path, &[]).await;
+        assert_eq!(status, want, "{path}: {body}");
+    }
 }
 
 /// Findings 7, 8 and 9: an array under a single-valued member and a stored instance of another

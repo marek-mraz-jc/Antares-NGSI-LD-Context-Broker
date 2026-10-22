@@ -93,11 +93,6 @@ impl Model for EdmModel<'_> {
             }
             Structured::Entity(entity) => entity,
         };
-        // URL 4.01 5.1.3: an open type also has every undeclared name, as a dynamic property
-        // (CSDL XML 3.4: how a 4.0 model serves an `Edm.Untyped` one, T-5206).
-        let dynamic = entity
-            .open
-            .then_some(Member::Primitive { collection: false });
         // A base-type cycle is a validation error of the model; the walk stops after as many
         // steps as there are entity types.
         let types: usize = self.0.schemas.iter().map(|s| s.entity_types.len()).sum();
@@ -111,12 +106,12 @@ impl Model for EdmModel<'_> {
                     collection: nav.ty.collection,
                 });
             }
-            match entity.base_type.as_deref().and_then(|b| self.structured(b)) {
-                Some(Structured::Entity(base)) => entity = base,
-                _ => return dynamic,
+            match self.structured(entity.base_type.as_deref()?)? {
+                Structured::Entity(base) => entity = base,
+                Structured::Complex(_) => return None,
             }
         }
-        dynamic
+        None
     }
 }
 
@@ -237,23 +232,6 @@ mod tests {
         ] {
             assert_eq!(edm.member(ty, name), None, "{ty} {name}");
         }
-    }
-
-    /// T-5206: an open type answers an undeclared name as a dynamic property (URL 5.1.3).
-    #[test]
-    fn an_open_type_has_dynamic_properties() {
-        let mut model = city();
-        for ty in model
-            .schemas
-            .iter_mut()
-            .flat_map(|s| s.entity_types.iter_mut())
-        {
-            ty.open = ty.name == "Tower";
-        }
-        let edm = EdmModel(&model);
-        let single = Member::Primitive { collection: false };
-        assert_eq!(edm.member("City.Tower", "width"), Some(single));
-        assert_eq!(edm.member("City.Person", "width"), None);
     }
 
     #[test]
