@@ -269,14 +269,14 @@ impl Named {
 
     /// The Entity `e` holding as measurements only the output's Datastreams.
     fn shaped(&self, mut e: Value) -> Value {
-        if let Some(members) = e.as_object_mut() {
+        e.as_object_mut().into_iter().for_each(|members| {
             members.retain(|name, member| {
                 self.streams(name)
                     || !mapping::instances(member)
                         .iter()
                         .any(|i| i.get("value").is_some_and(Value::is_number))
             });
-        }
+        });
         e
     }
 
@@ -999,4 +999,36 @@ fn find(items: Vec<Value>, key: &str) -> Option<Value> {
     items
         .into_iter()
         .find(|i| i.get("@iot.id").and_then(Value::as_str) == Some(key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn named(filter: &Value) -> Option<Named> {
+        let list = json!([{"name": "a", "filter": filter, "sources": [{"type": "Car"}]}]);
+        let (_, output) = outputs::listed(Some(&list), "sta").pop()?;
+        Some(Named {
+            output: output.ok()?,
+            types: vec!["Car".into()],
+        })
+    }
+
+    #[test]
+    fn a_query_under_an_output_keeps_its_filter_and_refuses_what_would_undo_it() {
+        let near =
+            json!({"georel": "near;maxDistance==9", "geometry": "Point", "coordinates": "[1,2]"});
+        let fixed = named(&near).map(|n| n.narrowed("type=Car&georel=within").map_err(|p| p.0));
+        assert_eq!(fixed, Some(Err(StatusCode::BAD_REQUEST)));
+        let q = named(&json!({"q": "speed<50"}));
+        let broken = q.as_ref().map(|n| n.narrowed("q=%zz").map_err(|p| p.0));
+        assert_eq!(broken, Some(Err(StatusCode::NOT_FOUND)));
+        let joined = q.map(|n| n.narrowed("type=Car&q=a%3D%3D1").ok());
+        assert_eq!(
+            joined,
+            Some(Some(
+                "q=%28speed%3C50%29%3B%28a%3D%3D1%29&type=Car".to_owned()
+            ))
+        );
+    }
 }

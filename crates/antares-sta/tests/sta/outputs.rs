@@ -25,9 +25,15 @@ async fn named() -> Result<Fixture, String> {
                   {"types": ["Stop", "Device"], "attributes": ["name", "location"]}],
         "operations": ["query_entities", "temporal_retrieve", "temporal_query"],
         "representations": {"sta": sta}});
-    let a = send(&f.app, "PUT", "/q/views/out", &view.to_string()).await;
-    if a.status != StatusCode::CREATED {
-        return Err(format!("view: {} {}", a.status, a.body));
+    let every = json!({"id": "all", "tenant": "city", "selector": ["*"],
+        "rules": [{"types": ["*"], "attributes": ["*"]}],
+        "operations": ["query_entities", "temporal_retrieve", "temporal_query"],
+        "representations": {"sta": [{"name": "cars", "sources": [{"type": "Car"}]}]}});
+    for (id, view) in [("out", view), ("all", every)] {
+        let a = send(&f.app, "PUT", &format!("/q/views/{id}"), &view.to_string()).await;
+        if a.status != StatusCode::CREATED {
+            return Err(format!("view {id}: {} {}", a.status, a.body));
+        }
     }
     Ok(f)
 }
@@ -59,6 +65,8 @@ async fn a_filtered_output_never_holds_an_entity_outside_its_filter_by_query_or_
         "/Datastreams('urn:ngsi-ld:Car:2%2Fspeed')/Observations",
         "/Things('urn:ngsi-ld:Car:2')/Datastreams",
         "/Things('urn:ngsi-ld:Car:2')/HistoricalLocations",
+        "/HistoricalLocations('urn:ngsi-ld:Car:2%2FhistoricalLocation%2F2026-01-01T00:00:00Z')",
+        "/HistoricalLocations('urn:ngsi-ld:Car:1%2FhistoricalLocation%2F2020-01-01T00:00:00Z')",
     ] {
         assert_eq!(
             get(&f, "slow", outside).await.0,
@@ -74,6 +82,7 @@ async fn a_filtered_output_never_holds_an_entity_outside_its_filter_by_query_or_
     for unnamed in [
         "/Datastreams('urn:ngsi-ld:Car:1%2FNO2')",
         "/Datastreams('urn:ngsi-ld:Car:1%2FNO2')/Observations",
+        "/Observations('urn:ngsi-ld:Car:1%2FNO2%2F2020-01-01T00:00:00Z')",
     ] {
         assert_eq!(
             get(&f, "slow", unnamed).await.0,
@@ -131,6 +140,12 @@ async fn an_output_without_a_role_serves_every_measurement_and_its_root_names_it
     // the view's own service is unchanged beside its outputs
     let own = send(&f.app, "GET", "/x/views/out/sta/v1.1/Things", "").await;
     assert_eq!(ids(&own.body).len(), 4);
+    // on a view of every type the output names its types as written
+    let every = send(&f.app, "GET", "/x/views/all/sta/cars/v1.1/Things", "").await;
+    assert_eq!(
+        ids(&every.body),
+        vec!["urn:ngsi-ld:Car:1", "urn:ngsi-ld:Car:2"]
+    );
     Ok(())
 }
 

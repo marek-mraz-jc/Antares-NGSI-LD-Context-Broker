@@ -1323,6 +1323,48 @@ mod tests {
     }
 
     #[test]
+    fn an_output_is_a_read_only_set_of_its_class_and_one_without_a_class_is_none() {
+        let s = schema();
+        let edm = build(
+            "city",
+            &s,
+            &shown(&s, &[("Car", CAR_ALL)]),
+            Writable::default(),
+            CsdlVersion::V4_01,
+        )
+        .unwrap();
+        let long = "a".repeat(129);
+        let list = serde_json::json!([
+            {"name": "fast-cars", "filter": {"q": "speed>2"}, "sources": [{"type": "Car"}]},
+            {"name": "people", "sources": [{"type": "Person"}]},
+            {"name": "long", "sources": [{"type": long}]}
+        ]);
+        let listed: Vec<_> = antares_ops::outputs::listed(Some(&list), "odata")
+            .into_iter()
+            .filter_map(|(_, o)| o.ok())
+            .collect();
+        assert_eq!(listed.len(), 3);
+        let named = outputs(edm.clone(), &listed);
+        assert_eq!(
+            named.sets.keys().collect::<Vec<_>>(),
+            vec!["Car", "fast_cars"]
+        );
+        let fast = &named.sets["fast_cars"];
+        assert_eq!(fast.writable, Writable::default());
+        assert_eq!(
+            fast.output.as_ref().and_then(|f| f.q.as_deref()),
+            Some("speed>2")
+        );
+        assert_eq!(fast.members, edm.sets["Car"].members);
+        // a model without a container takes no output
+        let mut bare = edm;
+        for schema in &mut bare.csdl.schemas {
+            schema.entity_container = None;
+        }
+        assert_eq!(outputs(bare.clone(), &listed), bare);
+    }
+
+    #[test]
     fn every_builtin_has_its_edm_type() {
         use linkml_model::Builtin as B;
         let all = [

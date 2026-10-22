@@ -22,7 +22,8 @@ async fn named() -> Result<axum::Router, String> {
         {"name": "fast", "title": {"en": "Fast cars"}, "filter": {"q": "speed>2"},
          "sources": [{"type": "Car"}]},
         {"name": "in-a", "filter": {"scopeQ": "/a"}, "sources": [{"type": "Car"}]},
-        {"name": "halls", "sources": [{"type": "Hall"}]}
+        {"name": "halls", "sources": [{"type": "Hall"}]},
+        {"name": "broken", "filter": {"q": "(("}, "sources": [{"type": "Car"}]}
     ]);
     let view = json!({"id": "named", "tenant": "city",
         "@context": {"city": CITY, "speed": format!("{CITY}speed")},
@@ -104,6 +105,19 @@ async fn a_filtered_output_never_holds_an_entity_outside_its_filter_by_key_or_by
     // the request's scopeQ joins the output's, never widens it
     let (_, elsewhere) = get(&app, "in_a?ngsild.scopeQ=/b").await;
     assert_eq!(ids(&elsewhere), Vec::<&str>::new(), "{elsewhere}");
+    // a filter or a scope that cannot be read is the request's 400, never the whole set
+    for refused in [
+        "broken",
+        "broken('urn:ngsi-ld:Car:3')",
+        "in_a?ngsild.scopeQ=%ff",
+        "in_a?ngsild.scopeQ=nowhere",
+    ] {
+        assert_eq!(
+            get(&app, refused).await.0,
+            StatusCode::BAD_REQUEST,
+            "{refused}"
+        );
+    }
     // the class's own set is unchanged beside its outputs
     let (_, cars) = get(&app, "Car").await;
     assert_eq!(ids(&cars).len(), 3, "{cars}");
