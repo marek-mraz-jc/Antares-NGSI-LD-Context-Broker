@@ -571,3 +571,65 @@ async fn a_feature_links_its_entity_and_its_schema() -> Result<(), String> {
     );
     Ok(())
 }
+
+/// T-5204: a time written with an offset is the instant it names, for `datetime` and for the
+/// CQL2 temporal functions alike (the live Events were written `+01:00`).
+#[tokio::test(flavor = "multi_thread")]
+async fn datetime_and_temporal_filters_read_offsets_as_instants() -> Result<(), String> {
+    let f = fixture().await?;
+    let car = json!({"type": "Feature", "geometry": null,
+                     "properties": {"speed": 5, "seen": "2026-01-01T01:00:00.000000001+01:00"}});
+    let made = send(
+        &f.app,
+        "POST",
+        "/x/views/fleet/ogc/features/collections/Car/items",
+        &car.to_string(),
+        &[("Content-Type", "application/geo+json")],
+    )
+    .await;
+    assert_eq!(made.status, StatusCode::CREATED, "{}", made.body);
+    let seen = |query: String| {
+        let app = f.app.clone();
+        async move {
+            let a = get(&app, &format!("{CARS}?{query}")).await;
+            assert_eq!(a.status, StatusCode::OK, "{query}: {}", a.body);
+            let mut got: Vec<u64> = a
+                .body
+                .get("features")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|f| f.pointer("/properties/seen").is_some())
+                .filter_map(|f| f.pointer("/properties/speed").and_then(Value::as_u64))
+                .collect();
+            got.sort_unstable();
+            got
+        }
+    };
+    let at = "2026-01-01T00:00:00Z";
+    assert_eq!(seen(format!("datetime={at}")).await, [5, 10]);
+    assert_eq!(
+        seen("datetime=2026-01-01T00:00:00.5Z/..".into()).await,
+        [60]
+    );
+    assert_eq!(
+        seen("datetime=../2025-12-31T23:59:59%2B00:00".into()).await,
+        Vec::<u64>::new()
+    );
+    for (filter, want) in [
+        (format!("T_EQUALS(seen, TIMESTAMP('{at}'))"), vec![5, 10]),
+        (format!("T_AFTER(seen, TIMESTAMP('{at}'))"), vec![60]),
+        (
+            "T_BEFORE(seen, TIMESTAMP('2026-01-01T00:00:00.1Z'))".into(),
+            vec![5, 10],
+        ),
+        (
+            "T_INTERSECTS(seen, INTERVAL('2025-12-31T23:00:00Z', '2026-01-01T00:00:00Z'))".into(),
+            vec![5, 10],
+        ),
+    ] {
+        let query = format!("filter={}", antares_ops::percent::encode(&filter));
+        assert_eq!(seen(query).await, want, "{filter}");
+    }
+    Ok(())
+}
