@@ -421,8 +421,8 @@ pub fn context(model: &Model) -> String {
             ("VocabProperty", _) => Some("@vocab".to_owned()),
             ("JsonProperty", _) => Some("@json".to_owned()),
             ("Relationship" | "ListRelationship", _) => Some("@id".to_owned()),
-            _ if inlined(model, slot) => None,
-            (_, Range::Class(_)) => Some("@id".to_owned()),
+            // any other kind over a class holds the object (`inlined`)
+            (_, Range::Class(_)) => None,
             (_, Range::Type(Builtin::String) | Range::Enum(_)) => None,
             (_, Range::Type(b)) => Some(b.xsd().replacen("xsd:", XSD, 1)),
         };

@@ -499,7 +499,7 @@ fn each_ngsi_ld_kind_shapes_the_context_and_the_json_schema() {
     let doc = serde_json::json!({
         "id": "https://e.org/s/", "name": "s",
         "classes": {"Room": {"slots": ["prop", "rel", "geo", "lang", "vocab", "list", "links",
-                                       "json", "address", "uri_rel"]},
+                                       "json", "address", "uri_rel", "place"]},
                     "PostalAddress": {}},
         "slots": {
             "prop": {"range": "integer"},
@@ -511,7 +511,8 @@ fn each_ngsi_ld_kind_shapes_the_context_and_the_json_schema() {
             "links": {"range": "Room", "annotations": kind("ListRelationship")},
             "json": {"annotations": kind("JsonProperty")},
             "address": {"range": "PostalAddress", "inlined": true, "annotations": kind("Property")},
-            "uri_rel": {"range": "uriorcurie", "annotations": kind("Relationship")}
+            "uri_rel": {"range": "uriorcurie", "annotations": kind("Relationship")},
+            "place": {"range": "PostalAddress", "inlined": true}
         }
     });
     let m = Model::read(doc.to_string().as_bytes(), &LIMITS).expect("loads");
@@ -552,4 +553,9 @@ fn each_ngsi_ld_kind_shapes_the_context_and_the_json_schema() {
     assert_eq!(p["json"].get("type"), None, "a JsonProperty holds any JSON");
     assert_eq!(p["address"]["type"], "object");
     assert_eq!(p["address"]["x-ngsi-ld-kind"], "Property");
+    assert_eq!(
+        p["place"]["x-ngsi-ld-kind"], "Property",
+        "an inlined class is no link"
+    );
+    assert_eq!(c["place"], "https://e.org/s/place");
 }
