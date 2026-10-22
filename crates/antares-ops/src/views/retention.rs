@@ -307,7 +307,7 @@ pub(super) fn history_off(rules: &Rules) -> antares_api::HistoryRules {
     out
 }
 
-/// Which writes keep [`antares_store::SHORT_HISTORY`] of history or less
+/// Which writes keep [`antares_api::SHORT_HISTORY`] of history or less
 /// (T-5249): a type rule or the Tenant's `*` rule with such a duration.
 /// `off` records nothing and `forever` keeps it all; both count as not short
 /// for a type, so its other types' short rules do not reach it.
