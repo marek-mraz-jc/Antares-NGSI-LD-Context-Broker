@@ -30,7 +30,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  FEATURES: full,jc-policy,linkml,parquet,tabular,ical
+  FEATURES: full,jc-policy,linkml,parquet,tabular,ical,feed
   # what the jc image must carry, by crate name in its auditable list
   CARRIES: antares-views antares-mcp antares-odata antares-ws antares-linkml joinedcontext-policy
 

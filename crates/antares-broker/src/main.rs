@@ -585,6 +585,8 @@ const SURFACE_SHELF: &[(&str, SurfaceCtor)] = &[
     ("ical", || antares_ops::mount(antares_ical::Ical)),
     #[cfg(feature = "geojson")]
     ("geojson", || antares_ops::mount(antares_geojson::GeoJson)),
+    #[cfg(feature = "feed")]
+    ("feed", || antares_ops::mount(antares_feed::Feed)),
     #[cfg(feature = "ws")]
     ("ws", || antares_ops::mount(antares_ws::Ws::process())),
     #[cfg(all(feature = "ws", feature = "views"))]
