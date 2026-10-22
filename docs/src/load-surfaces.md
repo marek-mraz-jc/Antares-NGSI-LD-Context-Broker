@@ -19,6 +19,7 @@ broker) load dev at night from joinedcontext-conformance `tests/k6/night.sh`.
 | run | commit | machine | note |
 |---|---|---|---|
 | local, 2026-10-20 22:00Z | `53ab566e` + the T-4889 branch | sandbox, 12 cores, PostGIS 17-3.5 in Docker | one pass, no repetition; the baseline in `ci/perf-baseline/surfaces.json` |
+| local, 2026-10-21 22:30Z | `3c43f323` (dev) | sandbox, 12 cores, PostGIS 17-3.5 in Docker | `SHAPES=ngsi-near,ngsi-within` only, after T-4852 (T-4918) |
 
 The first `load-surfaces` run on `ubuntu-latest` adds its run id here and its baseline replaces the
 sandbox one (`surfaces_gate.py baseline --machine github-ubuntu-latest`). The PostgreSQL column of
@@ -32,7 +33,7 @@ per process; the sampler now reads the container's cgroup (`docker stats`).
 | ngsi-id | 200 | 5.19 / 8.34 | 10.36 / 23.69 | 2.0x | 12.0 / 30.4 | 50 / 150 | ok |
 | ngsi-type | 100 | 7.31 / 8.76 | 19.54 / 41.36 | 2.7x | 10.5 / 30.8 | 50 / 150 | ok |
 | ngsi-q | 100 | 30.14 / 35.97 | 62.87 / 226.73 | 2.1x | 12.1 / 29.9 | 200 / 500 | ok |
-| ngsi-near | 50 | 132.91 / 232.31 | 562.99 / 939.71 | 4.2x | 5.2 / 29.6 | 200 / 500 | breach: p95_ms 562.99 > 200; p99_ms 939.71 > 500 |
+| ngsi-near | 50 | 10.09 / 25.85 | 23.46 / 93.68 | 2.3x | 4.9 / 53.6 | 200 / 500 | ok (2026-10-21 run; was 132.91 / 232.31 and 562.99 / 939.71, see section 5) |
 | ngsi-within | 50 | 8.97 / 95.69 | 28.19 / 94.53 | 3.1x | 4.8 / 29.4 | 200 / 500 | ok |
 | ngsi-attrs | 50 | 22.28 / 27.21 | 25.68 / 42.31 | 1.2x | 8.4 / 27.5 | 50 / 150 | ok |
 | temporal-lastn | 50 | 13.48 / 21.53 | 22.37 / 47.85 | 1.7x | 4.4 / 27.3 | 50 / 150 | ok |
@@ -64,7 +65,7 @@ every page (p95 10.8 ms, p99 34.3 ms at 50/s).
 
 ## 3. Breaches
 
-Each breach of this run is a task: `ngsi-near` on the platform build (4.2x vanilla, T-4918), `odata` p95 (T-4919, fixed: see the note under the table),
+Each breach of this run is a task: `ngsi-near` on the platform build (4.2x vanilla, T-4918, fixed: section 5), `odata` p95 (T-4919, fixed: see the note under the table),
 `ogc-items` (bbox with a CQL2 filter on 10 556 AirQualityObserved: 10 s timeouts at 354 % CPU, T-4920), and
 the WebSocket fan-out (20 % of 300 050 owed notifications delivered within the hold, 30 s behind,
 no `x-gap` sent, T-4921).
@@ -74,6 +75,21 @@ no `x-gap` sent, T-4921).
 `surfaces_gate.py --selftest` fails a planted slowdown, a planted error rate, half the rate and a
 shape that did not run, and passes the clean run. A throwaway branch that sleeps 60 ms in Query
 Entities breaks `ngsi-type` on the real binary (section 1 of T-4889).
+
+## 5. ngsi-near after T-4852
+
+The 2026-10-20 run measured `near` before T-4852 landed (`37215069`). Then the broker's role
+(`antares_app`) read every geoquery through the tables' row-level security, where no PostGIS
+operator is leakproof, so the GIST index on `location` never served as an index condition: each
+`near` query read every row of the Tenant and cast each one to `geography` for `ST_DWithin`. `within`
+pays the same scan but its per-row test is a plain planar check, which is why `near` alone breached.
+T-4852 ANDs every geoquery with a geohash cover over `entities.location_cell` (migration 0015,
+leakproof btree text comparisons); a 500 m radius becomes a few cells and `ST_DWithin` only checks
+the rows inside them. The 2026-10-21 rerun (section 1) gives `near` at 50/s p95 10.09 / p99 25.85 ms
+vanilla and 23.46 / 93.68 ms platform, `within` 10.86 / 25.99 and 24.45 / 81.87 ms. The platform build
+keeps its 2.3x over vanilla on both shapes alike, so nothing specific to `near` is left.
+`crates/antares-sql/tests/pg_explain.rs` (`every_query_shape_reads_an_index_under_rls`, case
+"geo near") holds the plan: a 500 m `near` as `antares_app` must read `i_entities_location_cell`.
 
 ## Related
 
