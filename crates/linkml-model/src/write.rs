@@ -286,6 +286,8 @@ fn geo(model: &Model, slot: &Slot) -> bool {
 
 fn slot_schema(model: &Model, slot: &Slot) -> Value {
     let base = match model.range(slot) {
+        // A kind no surface maps yet: any value (T-5207, mapping-contract rule 4).
+        _ if !crate::known_kind(model.kind(slot)) => Map::new(),
         _ if geo(model, slot) => typed("object", None),
         Range::Type(b) => builtin_schema(b),
         // A relationship holds the target entity's id.
@@ -398,7 +400,7 @@ pub fn context(model: &Model) -> String {
     for (name, slot) in &s.slots {
         let iri = model.slot_iri(name);
         let coerced = match model.range(slot) {
-            _ if geo(model, slot) => None,
+            _ if geo(model, slot) || !crate::known_kind(model.kind(slot)) => None,
             Range::Class(_) => Some("@id".to_owned()),
             Range::Type(Builtin::String) | Range::Enum(_) => None,
             Range::Type(b) => Some(b.xsd().replacen("xsd:", XSD, 1)),

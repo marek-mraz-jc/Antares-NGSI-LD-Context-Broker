@@ -246,9 +246,8 @@ fn plan(view: &ViewOps) -> Result<Plan, Problem> {
     let Some(written) = view.representation("ical") else {
         return Ok(Plan::default());
     };
-    serde_json::from_value::<IcalMapping>(written.clone())
-        .map_err(|e| e.to_string())
-        .and_then(|m| Plan::compile(&m))
+    mapping::plan_of(written)
+        .map(|(plan, _)| plan)
         .map_err(|_| {
             Problem::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
