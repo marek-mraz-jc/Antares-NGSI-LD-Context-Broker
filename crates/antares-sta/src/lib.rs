@@ -196,6 +196,18 @@ async fn respond(ops: &Ops, caller: &Caller, req: &Parts) -> Done {
             "value": SETS.iter().map(|s| json!({ "name": s, "url": format!("{}/{s}", cx.base) })).collect::<Vec<_>>(),
             "serverSettings": { "conformance": CONFORMANCE },
         })),
+        [Step { set, key: None }] if set != "Things" && cx.opts.top == 0 => {
+            // `$top=0` answers the count alone: here a resource is not an Entity, so the count is
+            // the one a full first page knows, absent where that page is not the whole set.
+            let mut cx = cx;
+            cx.opts.top = query::MAX_TOP;
+            let count = Box::pin(cx.set(set))
+                .await?
+                .get("@iot.count")
+                .and_then(Value::as_u64);
+            let count = count.and_then(|n| usize::try_from(n).ok());
+            Ok(query::collection(Vec::new(), &[], count, None))
+        }
         [Step { set, key: None }] => cx.set(set).await,
         [Step {
             set,
@@ -390,14 +402,14 @@ impl Cx<'_> {
             ));
         }
         if self.opts.top == 0 {
-            // The count alone (T-5205 finding 19): one Entity read for the operation's count.
+            // A Thing's count alone (T-5205 finding 19): one Entity read for the operation's count.
             let page = Page {
                 start: 0,
                 size: 1,
                 whole: self.opts.count,
             };
             let (_, _, count) = self.entities(&extra, page).await?;
-            let count = count.filter(|_| set == "Things" && ids.not.is_empty());
+            let count = count.filter(|_| ids.not.is_empty());
             return Ok(query::collection(Vec::new(), &[], count, None));
         }
         if let Some(key) = ids.is.first() {

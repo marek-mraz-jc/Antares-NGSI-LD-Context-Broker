@@ -239,8 +239,11 @@ async fn the_type_selector_and_the_count_alone_hold_at_their_edges() -> Result<(
     )
     .await;
     assert_eq!(count.body, json!({"value": []}));
+    // Another set's count alone is the count of its first page when that is the whole set.
     let streams = sta(&f.app, "/Datastreams?$top=0&$count=true").await;
-    assert_eq!(streams.body, json!({"value": []}));
+    assert_eq!(streams.body, json!({"@iot.count": 4, "value": []}));
+    let uncounted = sta(&f.app, "/Datastreams?$top=0").await;
+    assert_eq!(uncounted.body, json!({"value": []}));
     // An instant the broker refuses is its 400, never an empty series.
     let odd = sta(&f.app, "/Datastreams('urn:ngsi-ld:Car:1%2Fspeed')/Observations?$filter=phenomenonTime ge 2026-01-01T00:00:00%2B0100").await;
     assert_eq!(odd.status, StatusCode::BAD_REQUEST, "{}", odd.body);

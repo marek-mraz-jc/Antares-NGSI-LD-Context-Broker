@@ -69,7 +69,7 @@ JSON, not a SensorML or PDF document.
 
 | Option | Behaviour |
 |---|---|
-| `$top`, `$skip` | resources per page, at most 100 (default 100); `$top=0` answers `@iot.count` alone; `$skip` at most 10 000; on `Datastreams`, `Observations` and `ObservedProperties` a `$skip` reaching past the first 1 000 Entities is `400`: follow `@iot.nextLink`. A page of those sets reads past Entities that hold none of its resources, up to 1 000 Entities per request |
+| `$top`, `$skip` | resources per page, at most 100 (default 100); `$top=0` answers `@iot.count` alone (on a set other than `Things`, only when the first 100 resources are the whole set); `$skip` at most 10 000; on `Datastreams`, `Observations` and `ObservedProperties` a `$skip` reaching past the first 1 000 Entities is `400`: follow `@iot.nextLink`. A page of those sets reads past Entities that hold none of its resources, up to 1 000 Entities per request |
 | `$count=true` | `@iot.count`: the Query Entities count on `Things`, and on any other set only when the page is the whole answer |
 | `$filter` | see below; at most 4 096 bytes; anything else `400` naming it |
 | `$expand` | `Locations`, `Datastreams` and `Datastreams/Observations` on a Thing, `Observations` on a Datastream; an inlined `Observations` is the current Observation, so its nested options are not read; any other path is `400` naming it |
@@ -79,6 +79,9 @@ JSON, not a SensorML or PDF document.
 `$filter` takes comparisons (`eq`, `ne`, `gt`, `ge`, `lt`, `le`), `and`,
 `or`, parentheses and `substringof('text', property)`, its text matched
 literally. A text literal may hold spaces, parentheses and a doubled quote.
+An unquoted value is a number, `true`, `false` or an RFC 3339 instant
+(`2026-01-01T00:00:00Z`); any other unquoted value is `400`. A property
+name holds letters, digits and `_` only.
 The properties are SensorThings names, each read as the NGSI-LD Attribute
 of the Entity behind the resource:
 

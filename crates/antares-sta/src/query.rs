@@ -153,7 +153,7 @@ pub fn property(set: &str, path: &str) -> Result<String, Bad> {
         "name" | "description" => Some(p),
         _ => p
             .strip_prefix("properties/")
-            .filter(|a| !a.is_empty() && !a.contains('/') && *a != "type"),
+            .filter(|a| a.chars().all(name_char) && !a.is_empty() && *a != "type"),
     });
     attribute.map(str::to_owned).ok_or_else(|| {
         Bad(
@@ -161,6 +161,12 @@ pub fn property(set: &str, path: &str) -> Result<String, Bad> {
             format!("{path} is not a property {set} are filtered on"),
         )
     })
+}
+
+/// A character of an NGSI-LD `q` attribute name (CIM 009 4.9 nameChar): a letter, a digit or `_`.
+/// Every `q` operator lies outside it, so a path cannot carry one into the query.
+fn name_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 /// `$filter` as the NGSI-LD `q`: comparisons, `and`, `or`, parentheses and `substringof`, each
@@ -301,17 +307,41 @@ fn substring(rest: &mut &str, names: Names<'_>) -> Result<String, Bad> {
 const ID: [&str; 2] = ["id", "@iot.id"];
 
 /// An unquoted operand: a number, `true`, `false` or an instant as written, else a property path
-/// read through `names`. The id is refused: [`by_id`] reads its top-level comparisons.
+/// read through `names`. The id is refused: [`by_id`] reads its top-level comparisons. Any other
+/// token that starts like a value is refused, so none carries a `q` operator past [`property`].
 fn term(token: &str, names: Names<'_>) -> Result<String, Bad> {
     if ID.contains(&token) {
         return Err(bad("id takes eq or ne on the top-level and"));
     }
-    let value = token.starts_with(|c: char| c.is_ascii_digit() || c == '-')
-        || matches!(token, "true" | "false");
-    if value {
+    if is_value(token) {
         return Ok(token.to_owned());
     }
+    if token.starts_with(|c: char| c.is_ascii_digit() || c == '-') {
+        return Err(Bad(
+            "$filter",
+            format!("{token} is not a number, true, false or an instant such as 2026-01-01T00:00:00Z; quote a text"),
+        ));
+    }
     names(token)
+}
+
+/// Whether `token` is an unquoted value: `true`, `false`, a finite number or an RFC 3339 instant
+/// (`2026-01-01T00:00:00Z`, `2026-01-01T00:00:00.5+02:00`). Each is digits and fixed punctuation.
+fn is_value(token: &str) -> bool {
+    let shape: String = token
+        .chars()
+        .map(|c| if c.is_ascii_digit() { '9' } else { c })
+        .collect();
+    let number = shape.chars().all(|c| "9-+.eE".contains(c))
+        && token.parse::<f64>().is_ok_and(f64::is_finite);
+    let (clock, zone) = (shape.get(..19), shape.get(19..).unwrap_or_default());
+    let zone = match zone.strip_prefix('.') {
+        Some(fraction) if fraction.starts_with('9') => fraction.trim_start_matches('9'),
+        Some(_) => "",
+        None => zone,
+    };
+    let instant = clock == Some("9999-99-99T99:99:99") && matches!(zone, "Z" | "+99:99" | "-99:99");
+    matches!(token, "true" | "false") || number || instant
 }
 
 /// A set's `$filter` split (T-4928): the resource ids its top-level `and` compares with `eq`
@@ -815,6 +845,57 @@ mod tests {
             Err("startswith() is not supported".into())
         );
         assert!(filter_to_q("  ", &names).is_err());
+    }
+
+    /// The integrator's review of T-5205: an unquoted operand carries no `q` operator, as a
+    /// value or as a property path.
+    #[test]
+    fn an_unquoted_operand_is_a_value_or_a_name_and_never_a_query() {
+        let names = |p: &str| property("Things", p);
+        for value in [
+            "-2",
+            "1.5e3",
+            "true",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00.25Z",
+            "2026-01-01T00:00:00+02:00",
+            "2026-01-01T00:00:00.5-01:30",
+        ] {
+            let filter = format!("properties/x eq {value}");
+            assert_eq!(filter_to_q(&filter, &names), Ok(format!("x=={value}")));
+        }
+        for injected in [
+            "1|refDevice==\"x\"",
+            "1;refDevice==\"x\"",
+            "-1e999",
+            "1-2",
+            "2026-01-01",
+            "2026-01-01T00:00:00",
+            "2026-01-01T00:00:00.Z",
+            "2026-01-01T00:00:00.5",
+            "2026-01-01T00:00:00Z|a==1",
+        ] {
+            let filter = format!("properties/x eq {injected}");
+            assert_eq!(
+                filter_to_q(&filter, &names).map_err(|b| b.1),
+                Err(format!("{injected} is not a number, true, false or an instant such as 2026-01-01T00:00:00Z; quote a text"))
+            );
+        }
+        for path in [
+            "properties/a|b",
+            "properties/a==1",
+            "properties/a.observedAt",
+            "name;x",
+        ] {
+            assert_eq!(
+                filter_to_q(&format!("{path} eq 1"), &names).map_err(|b| b.1),
+                Err(format!("{path} is not a property Things are filtered on"))
+            );
+        }
+        assert_eq!(
+            filter_to_q("properties/x eq 1 or properties/größe lt 2", &names),
+            Ok("x==1|größe<2".into())
+        );
     }
 
     /// T-5205 finding 12: each operator's own edge.
