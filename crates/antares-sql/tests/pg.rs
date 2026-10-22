@@ -468,8 +468,22 @@ async fn purge_tenant_empties_every_tenant_table() {
             )
             .await
             .expect("correction");
+        // The keyed history parent (0020) is not written before the cut-over:
+        // seeded by hand, as the cut-over will fill it.
+        for stmt in [
+            "INSERT INTO iri_ids (tenant_id, iri) VALUES ($1, 'urn:x:1') ON CONFLICT DO NOTHING",
+            "INSERT INTO attr_rows (tenant_id, entity_no, attr_no, instance_no, observed_at,
+                                    created_at, modified_at, data)
+             VALUES ($1, iri_no($1, 'urn:x:1'), 1, gen_random_uuid(), now(), now(), now(), '{}')",
+        ] {
+            sqlx::query(stmt)
+                .bind(t.as_str())
+                .execute(&pool)
+                .await
+                .expect(stmt);
+        }
     }
-    const TABLES: [&str; 16] = [
+    const TABLES: [&str; 18] = [
         "entities",
         "entity_types",
         "jsonld_contexts",
@@ -486,6 +500,8 @@ async fn purge_tenant_empties_every_tenant_table() {
         "temporal_entities",
         "attr_instances",
         "attr_versions",
+        "iri_ids",
+        "attr_rows",
     ];
     let count = |table: &'static str, t: &TenantId| {
         let pool = pool.clone();

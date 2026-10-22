@@ -11,6 +11,8 @@
 //! Postgres store that selects, inserts into, updates or deletes from
 //! `attr_instances` either compares `tenant_id`, or is named below with the
 //! reason it does not. A new statement is neither until someone says which.
+//! `attr_rows` (migration 0020, T-5200), the second history parent, runs
+//! without a policy in timescale mode too and is held to the same rule.
 //!
 //! ponytail: a small lexer over `#[cfg(test)]`-free source, not a Rust
 //! parser. It reads plain and raw string literals and skips char literals
@@ -25,8 +27,8 @@ use std::path::{Path, PathBuf};
 const EXEMPT: &[(&str, &str)] = &[
     (
         "WHERE try_timestamptz(data->>'expiresAt') < now()",
-        "the 4.22 expired-instance reap: cross-tenant work under the service \
-         role, which is what lets it collect every tenant's expired rows in \
+        "the 4.22 expired-instance reap (both history parents): cross-tenant \
+         work under the service role, which is what lets it collect every tenant's expired rows in \
          one statement",
     ),
     (
@@ -39,6 +41,14 @@ const EXEMPT: &[(&str, &str)] = &[
         "partition adoption moves a whole week out of DEFAULT so the ATTACH \
          revalidates; a tenant predicate would strand the other tenants' rows \
          there and the ATTACH would fail",
+    ),
+    (
+        "DELETE FROM attr_rows_default\n         WHERE observed_at < now()",
+        "the retention purge of the second parent's DEFAULT partition",
+    ),
+    (
+        "WITH moved AS (DELETE FROM attr_rows_default",
+        "partition adoption for the second parent, as for attr_instances",
     ),
 ];
 
@@ -152,6 +162,9 @@ fn touches_rows(lit: &str) -> bool {
         "FROM attr_instances",
         "INTO attr_instances",
         "UPDATE attr_instances",
+        "FROM attr_rows",
+        "INTO attr_rows",
+        "UPDATE attr_rows",
     ]
     .iter()
     .any(|k| lit.contains(k))
@@ -181,10 +194,12 @@ fn names_its_tenant(lit: &str) -> bool {
 /// runtime. `used` marks the exemptions the file accounts for.
 fn findings(src: &str, used: &mut [bool]) -> (Vec<String>, bool) {
     let (lits, code) = lex(src);
-    let mut unread = code.contains("attr_instances");
+    let mut unread = code.contains("attr_instances") || code.contains("attr_rows");
     let mut naked = Vec::new();
     for lit in lits {
-        if lit.trim().starts_with("attr_instances") && !lit.trim().contains(' ') {
+        if (lit.trim().starts_with("attr_instances") || lit.trim().starts_with("attr_rows"))
+            && !lit.trim().contains(' ')
+        {
             unread = true;
         }
         if !touches_rows(&lit) {
