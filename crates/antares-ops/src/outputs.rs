@@ -166,7 +166,7 @@ pub struct Output {
     pub name: String,
     /// The contract version; a newer one is served from the members this broker reads (EP-153).
     #[serde(default)]
-    pub version: Option<u32>,
+    pub version: Option<u64>,
     /// The output's title per language tag.
     #[serde(default)]
     pub title: BTreeMap<String, String>,

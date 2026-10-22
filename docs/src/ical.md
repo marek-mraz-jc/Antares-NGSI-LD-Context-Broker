@@ -50,7 +50,11 @@ The calendar carries `NAME` and `DESCRIPTION` per title language,
 `If-None-Match` with it answers `304`. `DTSTAMP` is the mapped `LAST-MODIFIED`,
 else the newest `modifiedAt` of the mapped attributes, else the Entity's, so a
 re-ingest that rewrites the same values leaves the feed byte for byte when the
-source carries its own modification date. A view without the list, an unknown
+source carries its own modification date. An output's `version` is the
+contract version, `1` when absent (T-5207): an output of version 1 is read
+strictly, and one of a newer version (a Portal released before the broker) keeps
+its name, texts, filter and settings and serves each source's type over its
+preset with a log warning, never a `500`. A view without the list, an unknown
 output, or a view that shows none of the types or does not allow
 `query_entities`, answers `404`. An Entity the mapping cannot render (no start or title, an
 unreadable date, an end before its start, a bad URL or point) is left out,

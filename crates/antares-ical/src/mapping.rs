@@ -253,9 +253,9 @@ pub const MAPPING_VERSION: u64 = 1;
 pub struct Output {
     /// The slug the output is served at.
     pub name: String,
-    /// The contract version; 1, the default, is the only one.
+    /// The contract version the Portal wrote; [`MAPPING_VERSION`] when absent.
     #[serde(default)]
-    pub version: Option<u32>,
+    pub version: Option<u64>,
     /// The calendar's title per language tag: `NAME` (RFC 7986 5.1) and `X-WR-CALNAME`.
     #[serde(default)]
     pub title: BTreeMap<String, String>,
@@ -341,44 +341,73 @@ fn first_version() -> u64 {
     1
 }
 
-/// The plan of a written `representations.ical` member, and whether it is degraded: a
-/// mapping of a newer contract version than [`MAPPING_VERSION`] (the Portal released before
-/// the broker) is served as its `type` over its `preset` (else `sdm-event`), the members this
-/// broker reads alone, instead of failing the whole feed (T-5207, mapping-contract rule 1).
-/// A mapping of this version is read strictly: the Portal checked it when it was saved.
+/// A written output of the view's `representations.ical` list, and whether it is degraded:
+/// an output of a newer contract version than [`MAPPING_VERSION`] (the Portal released before
+/// the broker) keeps its name, texts, language, zone, sort, limit, filter and each source's
+/// type over its preset, and drops what this broker cannot read, instead of failing the
+/// calendar (T-5207, mapping-contract rule 1). Its filter still has to read, since serving
+/// the output without it would widen it. An output of this version is read strictly: the
+/// Portal checked it when it was saved.
 ///
 /// # Errors
-/// Why a mapping of this version does not compile.
+/// Why an output of this version does not read, or why a newer one's filter does not.
 ///
 /// ```
-/// let newer = serde_json::json!({"version": 9, "type": "CouncilMeeting", "rrule": "eventSchedule"});
-/// let (plan, degraded) = antares_ical::mapping::plan_of(&newer).unwrap();
+/// let newer = serde_json::json!({"name": "koncerty", "version": 9, "rrule": "x",
+///     "sources": [{"type": "OfficeHours", "preset": "schema-org", "rrule": "eventSchedule"}]});
+/// let (output, degraded) = antares_ical::mapping::output_of(&newer).unwrap();
 /// assert!(degraded);
-/// assert_eq!(plan.entity_type(), "CouncilMeeting");
+/// assert_eq!(output.sources[0].entity_type, "OfficeHours");
 /// ```
-pub fn plan_of(written: &serde_json::Value) -> Result<(Plan, bool), String> {
-    let version = written.get("version").and_then(serde_json::Value::as_u64);
-    if version.is_some_and(|v| v > MAPPING_VERSION) {
-        let entity_type = written
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .filter(|t| is_name(t))
-            .map_or_else(event, str::to_owned);
-        let preset = written
-            .get("preset")
-            .and_then(|p| serde_json::from_value::<Preset>(p.clone()).ok());
-        let mapping = IcalMapping {
-            version: MAPPING_VERSION,
-            entity_type,
-            preset,
-            mapping: BTreeMap::new(),
-        };
-        tracing::warn!(version, "newer calendar mapping: preset served");
-        return Plan::compile(&mapping).map(|p| (p, true));
+pub fn output_of(written: &Value) -> Result<(Output, bool), String> {
+    let version = written.get("version").and_then(Value::as_u64);
+    if version.is_none_or(|v| v <= MAPPING_VERSION) {
+        let output: Output = serde_json::from_value(written.clone()).map_err(|e| e.to_string())?;
+        return Ok((output, false));
     }
-    let mapping: IcalMapping =
-        serde_json::from_value(written.clone()).map_err(|e| e.to_string())?;
-    Plan::compile(&mapping).map(|p| (p, false))
+    let text = |name: &str| written.get(name).and_then(Value::as_str).map(str::to_owned);
+    let texts = |name: &str| {
+        written
+            .get(name)
+            .and_then(|t| serde_json::from_value(t.clone()).ok())
+            .unwrap_or_default()
+    };
+    let filter = match written.get("filter") {
+        Some(f) => serde_json::from_value(f.clone()).map_err(|e| format!("filter: {e}"))?,
+        None => Filter::default(),
+    };
+    let source = |s: &Value| IcalMapping {
+        version: MAPPING_VERSION,
+        entity_type: s
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|t| is_name(t))
+            .map_or_else(event, str::to_owned),
+        preset: s
+            .get("preset")
+            .and_then(|p| serde_json::from_value(p.clone()).ok()),
+        mapping: BTreeMap::new(),
+    };
+    let output = Output {
+        name: text("name").unwrap_or_default(),
+        version: None,
+        title: texts("title"),
+        description: texts("description"),
+        filter,
+        lang: text("lang"),
+        limit: written
+            .get("limit")
+            .and_then(|l| serde_json::from_value(l.clone()).ok()),
+        sort: text("sort").filter(|s| matches!(s.as_str(), "start" | "-start")),
+        timezone: text("timezone").filter(|z| z.parse::<Tz>().is_ok()),
+        sources: written
+            .get("sources")
+            .and_then(Value::as_array)
+            .map(|list| list.iter().map(source).collect())
+            .unwrap_or_default(),
+    };
+    tracing::warn!(version, name = %output.name, "newer calendar output: presets served");
+    Ok((output, true))
 }
 
 /// A field's source: an attribute path (`startDate`) or the object form.
@@ -664,8 +693,11 @@ impl CompiledOutput {
     /// The first reason the output cannot be served.
     pub fn compile(output: &Output) -> Result<Self, String> {
         let o = output;
-        if o.version.is_some_and(|v| v != 1) {
-            return Err(format!("{}: version {:?} is not 1", o.name, o.version));
+        if o.version.is_some_and(|v| v != MAPPING_VERSION) {
+            return Err(format!(
+                "{}: version {:?} is not {MAPPING_VERSION}",
+                o.name, o.version
+            ));
         }
         if !is_output_name(&o.name) {
             return Err(format!(

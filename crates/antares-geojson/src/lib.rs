@@ -365,6 +365,8 @@ async fn entities(
     asked: Vec<(String, String)>,
 ) -> Result<(Output, Vec<Value>, Option<usize>), Answer> {
     let (view, output) = target(ops, id, "geojson", name)?;
+    // the output's limit is the default page size; offset pages through the rest, so a
+    // caller's own limit (1 to MAX_LIMIT) widens nothing the view or the Policy bounds
     let size = output
         .limit
         .map_or(MAX_LIMIT, |n| usize::try_from(n).unwrap_or(MAX_LIMIT))

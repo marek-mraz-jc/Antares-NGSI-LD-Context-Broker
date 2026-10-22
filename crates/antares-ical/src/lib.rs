@@ -45,7 +45,7 @@ use axum::response::{IntoResponse as _, Response};
 use axum::routing::any;
 use axum::Router;
 use chrono::Utc;
-use mapping::{fold, local, CompiledOutput, IcalMapping, Outcome, Output, Plan, When, Window};
+use mapping::{fold, local, CompiledOutput, IcalMapping, Outcome, Plan, When, Window};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
@@ -296,16 +296,17 @@ fn output(view: &ViewOps, name: &str) -> Result<CompiledOutput, Problem> {
         )
     };
     // more than MAX_OUTPUTS is a list the gateway refuses at save: it serves nobody
-    let outputs: Vec<Output> = serde_json::from_value(written.clone())
-        .ok()
-        .filter(|all: &Vec<Output>| all.len() <= mapping::MAX_OUTPUTS)
+    let outputs = written
+        .as_array()
+        .filter(|all| all.len() <= mapping::MAX_OUTPUTS)
         .ok_or_else(broken)?;
     let chosen = outputs
         .iter()
-        .find(|o| o.name == name)
+        .find(|o| o.get("name").and_then(Value::as_str) == Some(name))
         .or_else(|| (name == "events").then(|| outputs.first()).flatten())
         .ok_or_else(not_found)?;
-    CompiledOutput::compile(chosen).map_err(|_| broken())
+    let (written, _) = mapping::output_of(chosen).map_err(|_| broken())?;
+    CompiledOutput::compile(&written).map_err(|_| broken())
 }
 
 /// What every Query Entities names: the view's types whose local name is a plan's, or for a
