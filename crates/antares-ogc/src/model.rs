@@ -67,6 +67,35 @@ pub(crate) enum Time {
     Interval(Option<String>, Option<String>),
 }
 
+/// The NGSI-LD Attribute kinds (TS 104 175 4.5) a Feature property reads and writes: a slot of
+/// any other kind is no property of the collection, so a write naming it is 400 and it is in
+/// neither `/schema` nor the queryables, never stored as a `Property`.
+pub(crate) const KINDS: [&str; 8] = [
+    "Property",
+    "Relationship",
+    "GeoProperty",
+    "JsonProperty",
+    "VocabProperty",
+    "LanguageProperty",
+    "ListProperty",
+    "ListRelationship",
+];
+
+/// Whether the `ogc_role` annotation `role` fits the slot `p` (Part 5 `core-roles-features`):
+/// the geometry a `GeoProperty`, a time a scalar text Property (a date, a date-time, or a
+/// string holding one, as Smart Data Models write `startDate`). Any other role is kept.
+fn fits(role: &str, p: &Prop) -> bool {
+    match role {
+        "primary-geometry" => p.kind == "GeoProperty",
+        "primary-instant" | "primary-interval-start" | "primary-interval-end" => {
+            p.kind == "Property"
+                && p.schema.get("type").and_then(Value::as_str) == Some("string")
+                && p.schema.get("enum").is_none()
+        }
+        _ => true,
+    }
+}
+
 /// A `collectionId` is a path segment as written: letters, digits, `_`, `-`, `.`.
 fn path_safe(name: &str) -> bool {
     !name.is_empty()
@@ -96,8 +125,13 @@ pub(crate) fn build(
             .class_slots(class_name)
             .into_iter()
             .map(|(name, slot)| prop(schema, name, &slot, |c| classes.contains_key(c)))
-            .filter(|p| attrs.contains(&p.iri))
+            .filter(|p| attrs.contains(&p.iri) && KINDS.contains(&p.kind.as_str()))
             .collect();
+        for p in &mut slots {
+            if p.role.as_deref().is_some_and(|r| !fits(r, p)) {
+                p.role = None;
+            }
+        }
         if let Some(guide) = antares_ops::guide::of(class_name) {
             guided(guide, &mut slots);
         }
@@ -503,5 +537,67 @@ mod tests {
         assert!(!path_safe("Car 2"));
         assert!(!path_safe(""));
         assert!(!path_safe("Car/2"));
+    }
+
+    /// T-5204: a type no code knows gets its place and time from its model's annotations
+    /// alone, and a role on a slot of the wrong kind is dropped. (A kind NGSI-LD does not define
+    /// is refused when the schema loads; [`KINDS`] keeps one out should that ever loosen.)
+    #[test]
+    fn roles_come_from_the_model_and_are_checked() {
+        let ann = |kind: &str, role: &str| {
+            format!(
+                r#"{{"ngsi_ld_kind": {{"tag": "ngsi_ld_kind", "value": "{kind}"}}, "ogc_role": {{"tag": "ogc_role", "value": "{role}"}}}}"#
+            )
+        };
+        let m = schema(&format!(
+            r#"{{"id": "https://e.org/s", "name": "s", "default_prefix": "s",
+                 "prefixes": {{"s": {{"prefix_prefix": "s", "prefix_reference": "https://e.org/s/"}}}},
+                 "classes": {{"Kiosk": {{"slots": ["spot", "opened", "rank"]}},
+                              "Booth": {{"slots": ["size", "count", "area"]}}}},
+                 "slots": {{"spot": {{"range": "string", "annotations": {}}},
+                            "opened": {{"range": "string", "annotations": {}}},
+                            "rank": {{"range": "integer", "annotations": {{"ogc_role": {{"tag": "ogc_role", "value": "label"}}}}}},
+                            "size": {{"range": "float", "annotations": {}}},
+                            "count": {{"range": "integer", "annotations": {}}},
+                            "area": {{"range": "string", "annotations": {}}}}}}}"#,
+            ann("GeoProperty", "primary-geometry"),
+            ann("Property", "primary-instant"),
+            ann("Property", "primary-geometry"),
+            ann("Property", "primary-instant"),
+            ann("GeoProperty", "primary-instant"),
+        ));
+        let all = |t: &str, slots: &[&str]| {
+            (
+                format!("https://e.org/s/{t}"),
+                slots
+                    .iter()
+                    .map(|s| format!("https://e.org/s/{s}"))
+                    .collect(),
+            )
+        };
+        let c = build(
+            &m,
+            &BTreeMap::from([
+                all("Kiosk", &["spot", "opened", "rank"]),
+                all("Booth", &["size", "count", "area"]),
+            ]),
+        );
+        let kiosk = c.get("Kiosk").unwrap_or_else(|| unreachable!());
+        assert_eq!(kiosk.geometry.as_deref(), Some("https://e.org/s/spot"));
+        assert_eq!(
+            kiosk.time,
+            Some(Time::Instant("https://e.org/s/opened".into()))
+        );
+        let names: Vec<&str> = kiosk.properties.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["opened", "rank"]);
+        let rank = kiosk.properties.iter().find(|p| p.name == "rank");
+        assert_eq!(
+            rank.and_then(|p| p.role.as_deref()),
+            Some("label"),
+            "a role of no place or time is kept"
+        );
+        let booth = c.get("Booth").unwrap_or_else(|| unreachable!());
+        assert_eq!(booth.geometry, None, "a float is no geometry");
+        assert_eq!(booth.time, None, "an integer and a GeoProperty are no time");
     }
 }

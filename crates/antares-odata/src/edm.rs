@@ -142,6 +142,9 @@ pub struct Member {
     /// The slot is a `ListProperty` or a `ListRelationship`: a write
     /// keeps the kind (`valueList`, `objectList`).
     pub list: bool,
+    /// The slot is a `JsonProperty`: a [`Shape::Json`] write keeps `json`. Any other
+    /// [`Shape::Json`] (an inlined object, P2) is a `Property` (T-5206 finding 4).
+    pub json: bool,
     /// When a client may write it (T-3722).
     pub written: Written,
 }
@@ -245,17 +248,16 @@ pub fn build(
             let slot_iri = schema.slot_iri(slot_name);
             let Some(member) = attrs
                 .contains(&slot_iri)
-                .then(|| mangle(slot_name))
+                .then(|| member_name(slot_name, &slot))
                 .flatten()
             else {
                 continue;
             };
             let shape = shape(schema, &slot, &visible);
-            if version == CsdlVersion::V4_0 && shape == Shape::Json {
-                // CSDL XML 3.4: a 4.0 client gets no Untyped property and an open type.
-                ty.open = true;
-                continue;
-            }
+            // CSDL XML 3.4: a 4.0 client gets no Untyped property and an open type; the
+            // member is served, selected and filtered as a dynamic property (T-5206 finding 5).
+            let dynamic = version == CsdlVersion::V4_0 && shape == Shape::Json;
+            ty.open |= dynamic;
             if let (Some(true), Shape::Value { edm, .. }) = (slot.identifier, &shape) {
                 identifier = Some(keyed(&mut ty, class, &member, edm));
             }
@@ -275,6 +277,7 @@ pub fn build(
                         target: target.clone(),
                     });
                 }
+                _ if dynamic => {}
                 other => {
                     let p = property(&member, &slot_iri, other, schema, &slot);
                     ty.properties
@@ -289,6 +292,7 @@ pub fn build(
                     iri: slot_iri,
                     shape,
                     list: schema.kind(&slot).starts_with("List"),
+                    json: schema.kind(&slot) == "JsonProperty",
                     written: written(&slot),
                 },
             );
@@ -441,6 +445,32 @@ fn key_property(p: Property, key: bool, shape: &Shape) -> Property {
         p.annotations.push(core("ComputedDefaultValue"));
     }
     p
+}
+
+/// The member a shown slot is, `None` for none. T-5206 finding 10: a slot named like a base
+/// member never declares it twice; an identifier slot `id` is the NGSI-LD `id` itself, any
+/// other is served escaped ([`unreserved`]).
+fn member_name(slot_name: &str, slot: &linkml_model::Slot) -> Option<String> {
+    let member = mangle(slot_name)?;
+    if slot.identifier == Some(true) && member == "id" {
+        return None;
+    }
+    unreserved(&member)
+}
+
+/// The members of `NgsiLd.Entity` a slot cannot be named as.
+const RESERVED: [&str; 5] = ["id", "_types", "scope", "createdAt", "modifiedAt"];
+
+/// `member`, or for a base member's name that name with its first character escaped
+/// (`_x0073_cope`, CSDL names.rs form); `None` when even that does not fit 128 characters.
+fn unreserved(member: &str) -> Option<String> {
+    if !RESERVED.contains(&member) {
+        return Some(member.to_owned());
+    }
+    let mut chars = member.chars();
+    let first = chars.next()?;
+    let escaped = format!("_x{:04X}_{}", u32::from(first), chars.as_str());
+    (escaped.len() <= 128).then_some(escaped)
 }
 
 /// E2a: `ty` declares the base members itself and is keyed by `member`.
@@ -865,6 +895,9 @@ fn vocabulary() -> Schema {
         Term::new("Kind", TypeRef::single("Edm.String")),
         Term::new("observedAt", TypeRef::single("Edm.DateTimeOffset")),
         Term::new("datasetId", TypeRef::single("Edm.String")),
+        // T-5206: the instance's UN/CEFACT unit code, and why a stored value reads null.
+        Term::new("unitCode", TypeRef::single("Edm.String")),
+        Term::new("Unserved", TypeRef::single("Edm.String")),
     ];
     let mut base = EntityType::new("Entity");
     base.is_abstract = true;
@@ -1222,7 +1255,7 @@ mod tests {
     }
 
     #[test]
-    fn a_4_0_model_has_no_untyped_property_and_an_open_type() {
+    fn a_4_0_model_has_no_untyped_property_and_an_open_type_serving_it_dynamically() {
         let s = schema();
         let edm = build(
             "v",
@@ -1232,9 +1265,40 @@ mod tests {
             CsdlVersion::V4_0,
         )
         .unwrap();
-        assert!(!edm.sets["Car"].members.contains_key("notes"));
+        assert!(
+            edm.sets["Car"].members.contains_key("notes"),
+            "a dynamic property (T-5206)"
+        );
         assert!(!xml(&edm).contains("Edm.Untyped"));
         assert!(xml(&edm).contains(r#"OpenType="true""#));
+    }
+
+    /// T-5206 finding 10: slots named like the base members give valid CSDL; an identifier
+    /// slot `id` is the NGSI-LD id, the others are served escaped.
+    #[test]
+    fn a_slot_named_like_a_base_member_is_escaped_never_declared_twice() {
+        let s = linkml_model::Model::read(
+            br#"{"id": "https://e.org/s/", "name": "s",
+                "classes": {"Car": {"slots": ["id", "scope", "createdAt", "speed"]}},
+                "slots": {"id": {"identifier": true, "range": "uriorcurie"}, "scope": {},
+                          "createdAt": {"range": "datetime"}, "speed": {"range": "float"}}}"#,
+            &linkml_model::Limits {
+                max_bytes: 4096,
+                max_depth: 8,
+                max_elements: 99,
+            },
+        )
+        .unwrap();
+        let shown = s.slot_iris_by_class();
+        let edm = build("v", &s, &shown, Writable::default(), CsdlVersion::V4_01).unwrap();
+        let members: Vec<&String> = edm.sets["Car"].members.keys().collect();
+        assert_eq!(members, ["_x0063_reatedAt", "_x0073_cope", "speed"]);
+        assert!(
+            edm.sets["Car"].identifier.is_none(),
+            "keyed by the NGSI-LD id"
+        );
+        assert!(odata_csdl::validate(&edm.csdl, &odata_csdl::Limits::strict()).is_ok());
+        assert!(xml(&edm).contains(r#"Name="_x0073_cope""#));
     }
 
     #[test]

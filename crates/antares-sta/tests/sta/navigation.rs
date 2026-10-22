@@ -120,7 +120,7 @@ async fn a_member_path_and_an_earlier_observation_read_by_id() -> Result<(), Str
         (StatusCode::OK, json!({"name": "Žltá"}))
     );
 
-    let earlier = "/Observations('urn:ngsi-ld:Car:1/speed/2025-12-30T00:00:00Z')";
+    let earlier = "/Observations('urn:ngsi-ld:Car:1/speed/2025-12-30T00:00:00.000Z')";
     let a = sta(&f.app, earlier).await;
     assert_eq!(
         (a.status, at(&a.body, "/result")),
@@ -128,14 +128,26 @@ async fn a_member_path_and_an_earlier_observation_read_by_id() -> Result<(), Str
     );
     let stream = sta(&f.app, &format!("{earlier}/Datastream")).await;
     assert_eq!(at(&stream.body, "/@iot.id"), "urn:ngsi-ld:Car:1/speed");
-    // Depot:1 measures `capacity` and names no Device: its Datastream has no Sensor.
+    // Depot:1 measures `capacity` and names no Device: its Datastream's Sensor is the unknown one
+    // (T-5205 finding 7), whose Datastreams are those of every Entity naming no Device.
     let no_device = "/x/views/every/sta/v1.1/Datastreams('urn:ngsi-ld:Depot:1/capacity')";
     assert_eq!(
         send(&f.app, "GET", no_device, "").await.status,
         StatusCode::OK
     );
     let sensor = send(&f.app, "GET", &format!("{no_device}/Sensor"), "").await;
-    assert_eq!(sensor.status, StatusCode::NOT_FOUND);
+    assert_eq!(at(&sensor.body, "/@iot.id"), "unknown");
+    let streams = send(
+        &f.app,
+        "GET",
+        "/x/views/every/sta/v1.1/Sensors('unknown')/Datastreams",
+        "",
+    )
+    .await;
+    assert!(ids(&streams.body).contains(&"urn:ngsi-ld:Depot:1/capacity".to_owned()));
+    assert!(!ids(&streams.body)
+        .iter()
+        .any(|i| i.starts_with("urn:ngsi-ld:Car:1/")));
     let unknown = sta(
         &f.app,
         "/Observations('urn:ngsi-ld:Car:1/speed/2001-01-01T00:00:00Z')",

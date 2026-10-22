@@ -559,6 +559,9 @@ async fn the_odata_column_is_served_as_the_matrix_states() {
         /// (5.7.1) and then the row's clause; under `restricted`, whose
         /// model has no navigation, 404 before the engine.
         Linked(&'static str),
+        /// A `PUT` of the Entity: under `all` the Entity read (5.7.1, its named instances
+        /// checked, T-5206) and then the row's clause; under `restricted` 405 before the engine.
+        Replaced(&'static str),
     }
     let sent: &[(&str, &str, String, Want)] = &[
         (
@@ -604,7 +607,7 @@ async fn the_odata_column_is_served_as_the_matrix_states() {
             "replace_entity",
             "PUT",
             KEY.into(),
-            Want::Write(r#"{"speed": 4}"#),
+            Want::Replaced(r#"{"speed": 4}"#),
         ),
         (
             "delete_entity",
@@ -662,7 +665,7 @@ async fn the_odata_column_is_served_as_the_matrix_states() {
                 continue;
             }
             let body = match want {
-                Want::Write(body) | Want::Linked(body) => body,
+                Want::Write(body) | Want::Linked(body) | Want::Replaced(body) => body,
                 _ if *method == "GET" || *method == "DELETE" => "",
                 _ => "{}",
             };
@@ -707,7 +710,7 @@ async fn the_odata_column_is_served_as_the_matrix_states() {
                         "{cell}: {status} {answer} after {seen:?}, the row's clause is {clause:?}"
                     ));
                 }
-                Want::Linked(_)
+                Want::Linked(_) | Want::Replaced(_)
                     if view == "all"
                         && (!status.is_success()
                             || seen.first() != Some(&"5.7.1")
@@ -723,7 +726,7 @@ async fn the_odata_column_is_served_as_the_matrix_states() {
                 {
                     wrong.push(format!("{cell}: answered {status} after {seen:?}"));
                 }
-                Want::Write(_)
+                Want::Write(_) | Want::Replaced(_)
                     if view == "restricted"
                         && (status != StatusCode::METHOD_NOT_ALLOWED || !seen.is_empty()) =>
                 {
@@ -737,7 +740,7 @@ async fn the_odata_column_is_served_as_the_matrix_states() {
                 wrong.push(format!("{cell}: the hidden Attribute is in {answer}"));
             }
             assert!(
-                read != matches!(want, Want::Write(_) | Want::Linked(_)),
+                read != matches!(want, Want::Write(_) | Want::Linked(_) | Want::Replaced(_)),
                 "{cell}: a read sent as a write or a write as a read"
             );
         }

@@ -48,9 +48,16 @@ ADR-0023 rule 5), never from the stored schema (LK1):
   slot of its types; a rule's condition is not read;
 - `is_a` stays only when the parent is kept and shows nothing the child
   does not;
-- a range to a hidden class becomes `uriorcurie`, with the slot's kind
-  stated as `ngsi_ld_kind: Relationship` (DM-69); `inverse` stays only
-  when both ends are kept;
+- a Relationship's range to a hidden class becomes `uriorcurie`, with the
+  slot's kind stated as `ngsi_ld_kind: Relationship` (DM-69); a slot that
+  holds the object (`inlined: true`, or any kind but Relationship and
+  ListRelationship) ranges over `Any` (`class_uri: linkml:Any`) instead and
+  keeps its kind, so its JSON Schema is an open object (T-5206); `inverse`
+  stays only when both ends are kept;
+- a class or slot the view shows only by its short name is stated under the
+  IRI the core @context gives that name, the IRI the Entities hold and the
+  OData surface states (`NgsiLd.Iri`), never the schema's own vocabulary IRI
+  (T-5206); a `*` view keeps the schema's IRIs;
 - only the enums a kept slot uses and the prefixes a kept element names
   are listed (LK6);
 - the narrowed schema's `id` is `<source id>/views/<view>`, so it never
@@ -76,6 +83,14 @@ refusal never tells that the name is there (LK1).
 | `schema/v{major}/model` | the formalism `Accept` names (Turtle is SHACL, `profile="owl"` OWL, YAML LinkML, Markdown, `ld+json` the context, else JSON Schema) | 5.7.6 |
 | `classes/{class}` | one class with its slots (JSON) | Retrieve Entity Type Information (5.7.7) |
 | `slots/{slot}` | one slot with its range, kind and the classes using it (JSON) | Retrieve Attribute Information (5.7.10) |
+
+The `@context` and the JSON Schema follow each slot's NGSI-LD kind before its
+range (TS 104 175 5.2.6.4.6 to 5.2.6.4.10, T-5206): a LanguageProperty is
+`@container: @language` and, in keyValues, an object of texts; a VocabProperty
+`@type: @vocab`; a ListProperty or ListRelationship `@container: @list` and an
+array; a JsonProperty `@type: @json` and any JSON value; a Relationship
+`@type: @id` whatever its range; an inlined object an untyped term and an
+object; a GeoProperty an untyped term and an object.
 
 `{major}` is the leading number of the schema's `version` (`1` when it has
 none). A hidden class or slot, an unknown major, the cube of a model whose

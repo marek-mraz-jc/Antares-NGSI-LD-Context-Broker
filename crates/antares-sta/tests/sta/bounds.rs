@@ -110,7 +110,7 @@ async fn a_filter_outside_ascii_answers_without_panicking() -> Result<(), String
 #[tokio::test]
 async fn a_filter_the_view_cannot_read_is_its_400() -> Result<(), String> {
     let f = fixture().await?;
-    let a = sta(&f.app, "/Things?$filter=speed eq").await;
+    let a = sta(&f.app, "/Things?$filter=properties/speed eq").await;
     assert_eq!(
         (a.status, at(&a.body, "/error/message")),
         (

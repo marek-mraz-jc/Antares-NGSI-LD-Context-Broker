@@ -325,6 +325,23 @@ alone ≤ vanilla + 10 MiB. The per-feature 2 MiB rule and its exceptions
 new surface and two red trains on 2026-10-11 for growth the owner accepts.
 The gate stays, so a surface that pulls in tens of MiB is still red.
 
+Decided (worker-t5234, owner may override; T-5234, 2026-10-22): fat LTO
+for the release profile, because dev 827c303 put `full` 3040 bytes under
+the 10 MiB ceiling and nothing short of it frees 512 KiB without a CPU
+cost. Measured on one host, stripped release binaries: thin LTO vanilla
+32 333 224, `full` 42 815 880 (+10.00 MiB); one codegen unit for the cold
+crates and `antares-ogc` brings `full` to 42 389 384 (+9.59 MiB); fat LTO
+on top gives vanilla 27 042 344 and `full` 35 820 040 (+8.37 MiB). Broker
+CPU per request (`/proc` utime+stime over a 10 s k6 run at c20, three
+rounds, `dev/perf/shapes.sh` setup) falls on every shape: `query` 267 to
+251 µs, `view` 346 to 334, `odata` 480 to 444, `mcp` 680 to 653, `ogc`
+493 to 450. A release link takes about 3 min longer (53 s to 231 s for
+`full`), so the `binary-size` job runs on six runners instead of three.
+Options: fat LTO (chosen); `opt-level = "s"` on `antares-ogc` (-227 KiB,
+but 7 % more CPU per OGC request, 488-492 to 520-531 µs); `opt-level =
+"s"` on `rmcp` (grows the binary by 10 KB); dropping a feature from `full`
+or raising the ceiling (both refused by the task).
+
 ### 7. Code rules for every new crate
 
 Adopted from the threat model section 10.1 without change: each new

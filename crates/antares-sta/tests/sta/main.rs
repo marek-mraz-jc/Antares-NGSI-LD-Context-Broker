@@ -5,6 +5,7 @@
 
 mod bounds;
 mod common;
+mod findings;
 mod navigation;
 mod paging;
 mod sets;
