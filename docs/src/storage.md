@@ -125,6 +125,27 @@ expanded JSON-LD costs 4.8 times the compact text but only 1.8 times on disk,
 because Postgres compression absorbs the repeated IRIs; storing the compact
 form would buy nothing.
 
+### The instanceId lives in its column
+
+An instance's `instanceId` is also the `instance_id` column of its history
+row. Since T-5131 a new row leaves it out of `data` (about 70 B of a
+245 B document for a bike count). Rows written before keep it there and read
+back as stored: a row whose `data` lacks `instanceId` is one written since.
+The reads return such a row as `[data, instance_id]`, and the store puts the
+member back before the answer leaves it, so the API answers stay
+byte-identical. Copies into `attr_versions` keep whole documents, as before.
+
+`createdAt`, `modifiedAt`, `observedAt` and `type` stay in `data`. Rebuilding
+the two broker stamps from `created_at` and `modified_at` would save another
+~75 B a row, but printing two timestamps per row cost Postgres 20-45 % more
+on a whole-history read of 240,000 rows, whatever the encoding (`to_char`,
+`timestamp`, epoch). The API echoes a client's `observedAt` spelling, and no
+column holds `type`.
+
+A rollback to a release older than T-5131 serves the rows written since then
+without `instanceId` in temporal answers (the column still holds it, nothing
+is lost); rolling forward again restores the answers.
+
 ## Migrations
 
 `crates/antares-sql/migrations/`, applied by the first process to start
