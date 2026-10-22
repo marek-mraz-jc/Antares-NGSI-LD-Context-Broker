@@ -27,18 +27,18 @@ pub struct Bad(pub &'static str, pub String);
 /// The query options of one request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
-    /// `$top`, 1 to [`MAX_TOP`].
+    /// `$top`, 0 to [`MAX_TOP`]; 0 answers the count alone.
     pub top: usize,
     /// `$skip`.
     pub skip: usize,
     /// `$count=true`.
     pub count: bool,
-    /// `$select`: the members each resource keeps; empty keeps every one.
+    /// `$select`: the members each resource keeps; empty keeps every one (`id` is `@iot.id`).
     pub select: Vec<String>,
-    /// The first segment of each `$expand` path.
+    /// Each `$expand` path, its nested options left out.
     pub expand: Vec<String>,
-    /// `$orderby` names `phenomenonTime desc`.
-    pub newest_first: bool,
+    /// `$orderby=phenomenonTime desc`, the one order served: a Datastream's Observations.
+    pub ordered: bool,
     /// `$filter`, as sent.
     pub filter: Option<String>,
     /// `$skiptoken` of a set whose Entity holds several resources, as its `@iot.nextLink` writes
@@ -49,7 +49,7 @@ pub struct Options {
 /// The query options of `pairs`.
 ///
 /// # Errors
-/// [`Bad`] naming the option that is no number, too deep or too large.
+/// [`Bad`] naming the option that is no number, too deep, too large or an order not served.
 pub fn options(pairs: &[(String, String)]) -> Result<Options, Bad> {
     let mut out = Options {
         top: MAX_TOP,
@@ -57,32 +57,43 @@ pub fn options(pairs: &[(String, String)]) -> Result<Options, Bad> {
         count: false,
         select: Vec::new(),
         expand: Vec::new(),
-        newest_first: false,
+        ordered: false,
         filter: None,
         resume: None,
     };
     for (name, value) in pairs {
         match name.as_str() {
-            "$top" => out.top = number("$top", value, usize::MAX)?.clamp(1, MAX_TOP),
+            "$top" => out.top = number("$top", value, usize::MAX)?.min(MAX_TOP),
             "$skip" => out.skip = number("$skip", value, MAX_SKIP)?,
             "$count" => out.count = value == "true",
-            "$select" => out.select = list(value).map(str::to_owned).collect(),
+            "$select" => {
+                out.select = list(value)
+                    .map(|s| if s == "id" { "@iot.id" } else { s }.to_owned())
+                    .collect();
+            }
             "$expand" => {
-                if list(value).any(|p| p.split('/').count() > MAX_EXPAND) {
+                // `Observations($top=1)`: the path before its nested options.
+                let paths: Vec<&str> = list(value).filter_map(|p| p.split('(').next()).collect();
+                if paths.iter().any(|p| p.split('/').count() > MAX_EXPAND) {
                     return Err(Bad(
                         "$expand",
                         format!("a path is at most {MAX_EXPAND} deep"),
                     ));
                 }
-                // `Observations($top=1)`: the set before its nested options.
-                out.expand = list(value)
-                    .filter_map(|p| p.split(['/', '(']).next())
-                    .map(str::to_owned)
-                    .collect();
+                out.expand = paths.into_iter().map(str::to_owned).collect();
             }
             "$orderby" => {
-                let lowered = value.to_ascii_lowercase();
-                out.newest_first = lowered.contains("phenomenontime") && lowered.contains("desc");
+                let words: Vec<String> = value
+                    .split_whitespace()
+                    .map(str::to_ascii_lowercase)
+                    .collect();
+                if words != ["phenomenontime", "desc"] {
+                    return Err(Bad(
+                        "$orderby",
+                        "only phenomenonTime desc is served, on a Datastream's Observations".into(),
+                    ));
+                }
+                out.ordered = true;
             }
             "$filter" if value.len() > MAX_FILTER => {
                 return Err(Bad("$filter", format!("at most {MAX_FILTER} bytes")));
@@ -116,13 +127,49 @@ fn number(name: &'static str, value: &str, max: usize) -> Result<usize, Bad> {
         .ok_or_else(|| Bad(name, format!("a whole number, at most {max}")))
 }
 
-/// `$filter` as the NGSI-LD `q`: comparisons over an Attribute, `and`, `or`, parentheses and
-/// `substringof`, the subset the gateway compiled; anything else refused by name, since a
-/// filter dropped silently answers rows the caller asked not to see.
+/// What a `$filter` property path of a set names: the NGSI-LD Attribute, or a refusal.
+pub type Names<'a> = &'a dyn Fn(&str) -> Result<String, Bad>;
+
+/// The path of a set's resource to its Thing: a Thing is its Entity, a Datastream's Thing and an
+/// Observation's Datastream's Thing are too.
+fn thing_path<'a>(set: &str, path: &'a str) -> Option<&'a str> {
+    match set {
+        "Things" => Some(path),
+        "Datastreams" => path.strip_prefix("Thing/"),
+        "Observations" => path.strip_prefix("Datastream/Thing/"),
+        _ => None,
+    }
+}
+
+/// The NGSI-LD Attribute an STA property path of `set` reads (T-5205 finding 8): a Thing's
+/// `name`, `description` and `properties/{attribute}`, reached from a Datastream through `Thing/`
+/// and from an Observation through `Datastream/Thing/`. Every other path is refused by name, so no
+/// filter silently reads an Attribute the client did not mean.
+///
+/// # Errors
+/// [`Bad`] naming the path.
+pub fn property(set: &str, path: &str) -> Result<String, Bad> {
+    let attribute = thing_path(set, path).and_then(|p| match p {
+        "name" | "description" => Some(p),
+        _ => p
+            .strip_prefix("properties/")
+            .filter(|a| !a.is_empty() && !a.contains('/') && *a != "type"),
+    });
+    attribute.map(str::to_owned).ok_or_else(|| {
+        Bad(
+            "$filter",
+            format!("{path} is not a property {set} are filtered on"),
+        )
+    })
+}
+
+/// `$filter` as the NGSI-LD `q`: comparisons, `and`, `or`, parentheses and `substringof`, each
+/// property read through `names`; anything else refused by name, since a filter dropped silently
+/// answers rows the caller asked not to see.
 ///
 /// # Errors
 /// [`Bad`] naming the construct.
-pub fn filter_to_q(filter: &str) -> Result<String, Bad> {
+pub fn filter_to_q(filter: &str, names: Names<'_>) -> Result<String, Bad> {
     let mut out = String::new();
     let mut rest = filter.trim();
     let mut operand = true;
@@ -137,6 +184,12 @@ pub fn filter_to_q(filter: &str) -> Result<String, Bad> {
             (rest, operand) = (tail.trim_start(), false);
             continue;
         }
+        if operand && rest.starts_with('\'') {
+            let text = literal(&mut rest)?;
+            out.push_str(&quoted(&text));
+            (rest, operand) = (rest.trim_start(), false);
+            continue;
+        }
         let (token, tail) = match rest.find([' ', '(', ')']) {
             Some(at) => rest.split_at(at),
             None => (rest, ""),
@@ -146,14 +199,16 @@ pub fn filter_to_q(filter: &str) -> Result<String, Bad> {
             out.push_str(connective(token)?);
             operand = true;
         } else if token.eq_ignore_ascii_case("substringof") {
-            out.push_str(&substring(&mut rest)?);
+            out.push_str(&substring(&mut rest, names)?);
             operand = false;
         } else if token.eq_ignore_ascii_case("not") {
             return Err(bad(
                 "not is not supported; write the negated comparison instead",
             ));
+        } else if tail.starts_with('(') {
+            return Err(Bad("$filter", format!("{token}() is not supported")));
         } else {
-            out.push_str(&term(token)?);
+            out.push_str(&term(token, names)?);
             operand = false;
         }
     }
@@ -183,51 +238,93 @@ fn connective(token: &str) -> Result<&'static str, Bad> {
     })
 }
 
-/// `substringof('text',attribute)` as a pattern match; `rest` starts at its parenthesis.
-fn substring(rest: &mut &str) -> Result<String, Bad> {
-    let usage = || bad("substringof takes ('text', attribute)");
-    let (inner, after) = rest
-        .strip_prefix('(')
-        .and_then(|open| open.split_once(')'))
-        .ok_or_else(usage)?;
-    let (needle, attribute) = inner.split_once(',').ok_or_else(usage)?;
-    let needle = needle.trim().trim_matches('\'');
-    let attribute = attribute.trim();
-    if ID.contains(&attribute) {
-        return Err(bad("id takes eq or ne on the top-level and"));
+/// The OData string literal `rest` starts with (`'…'`, a quote written twice), unquoted; `rest`
+/// moves past it.
+fn literal(rest: &mut &str) -> Result<String, Bad> {
+    let mut text = String::new();
+    let mut chars = rest.char_indices().skip(1).peekable();
+    while let Some((at, c)) = chars.next() {
+        if c != '\'' {
+            text.push(c);
+        } else if chars.next_if(|(_, n)| *n == '\'').is_some() {
+            text.push('\'');
+        } else {
+            *rest = rest.get(at.saturating_add(1)..).unwrap_or_default();
+            return Ok(text);
+        }
     }
-    if needle.is_empty() || attribute.is_empty() {
+    Err(bad("a text literal is not closed with '"))
+}
+
+/// A text as an NGSI-LD `quotedStr` (an RFC 8259 String: `"` and `\` escaped).
+fn quoted(text: &str) -> String {
+    Value::String(text.to_owned()).to_string()
+}
+
+/// `substringof('text',property)` as a pattern match, the text matched literally; `rest` starts
+/// at its parenthesis.
+fn substring(rest: &mut &str, names: Names<'_>) -> Result<String, Bad> {
+    let usage = || bad("substringof takes ('text', property)");
+    let mut inner = rest.strip_prefix('(').ok_or_else(usage)?.trim_start();
+    if !inner.starts_with('\'') {
         return Err(usage());
     }
+    let needle = literal(&mut inner)?;
+    let (property, after) = inner
+        .trim_start()
+        .strip_prefix(',')
+        .and_then(|p| p.split_once(')'))
+        .ok_or_else(usage)?;
+    let property = property.trim();
+    if ID.contains(&property) {
+        return Err(bad("id takes eq or ne on the top-level and"));
+    }
+    if needle.is_empty() || property.is_empty() {
+        return Err(usage());
+    }
+    // A pattern ends at its first `"` (NGSI-LD 4.9 RegExp), so one cannot be matched.
+    if needle.contains('"') {
+        return Err(bad("substringof cannot match a text holding \""));
+    }
+    let mut pattern = String::new();
+    for c in needle.chars() {
+        if r".^$*+?()[]{}|\".contains(c) {
+            pattern.push('\\');
+        }
+        pattern.push(c);
+    }
     *rest = after.trim_start();
-    Ok(format!("{attribute}~=\".*{needle}.*\""))
+    Ok(format!("{}~=\".*{pattern}.*\"", names(property)?))
 }
 
 /// The names a resource's id goes by: no Attribute, so never a `q` operand.
 const ID: [&str; 2] = ["id", "@iot.id"];
 
-/// An operand: a quoted literal in NGSI-LD's quotes, a path its last segment (NGSI-LD has one
-/// flat Attribute namespace). The id is refused: [`by_id`] reads its top-level comparisons.
-fn term(token: &str) -> Result<String, Bad> {
+/// An unquoted operand: a number, `true`, `false` or an instant as written, else a property path
+/// read through `names`. The id is refused: [`by_id`] reads its top-level comparisons.
+fn term(token: &str, names: Names<'_>) -> Result<String, Bad> {
     if ID.contains(&token) {
         return Err(bad("id takes eq or ne on the top-level and"));
     }
-    Ok(
-        match token.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
-            Some(text) => format!("\"{text}\""),
-            None => token.rsplit('/').next().unwrap_or(token).to_owned(),
-        },
-    )
+    let value = token.starts_with(|c: char| c.is_ascii_digit() || c == '-')
+        || matches!(token, "true" | "false");
+    if value {
+        return Ok(token.to_owned());
+    }
+    names(token)
 }
 
 /// A set's `$filter` split (T-4928): the resource ids its top-level `and` compares with `eq`
-/// and `ne`, which no `q` can name, and the `q` of the rest.
+/// and `ne`, which no `q` can name, the types `properties/type eq` names (the view's `type`
+/// selector), and the `q` of the rest.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ById {
     /// `id eq` literals: the resource is each of them.
     pub is: Vec<String>,
     /// `id ne` literals: the resource is none of them.
     pub not: Vec<String>,
+    /// `properties/type eq` literals: the Entity is of each of them.
+    pub types: Vec<String>,
     /// The NGSI-LD `q` of every other conjunct.
     pub q: Option<String>,
 }
@@ -241,18 +338,20 @@ impl ById {
     }
 }
 
-/// The `$filter` of an entity set as [`ById`].
+/// The `$filter` of the entity set `set` as [`ById`].
 ///
 /// # Errors
-/// [`Bad`] naming the construct: an id compared other than by `eq` or `ne` with a quoted literal,
-/// or anything [`filter_to_q`] refuses.
-pub fn by_id(filter: &str) -> Result<ById, Bad> {
+/// [`Bad`] naming the construct: an id or a type compared other than by `eq` (an id also `ne`)
+/// with a quoted literal, or anything [`filter_to_q`] refuses.
+pub fn by_id(filter: &str, set: &str) -> Result<ById, Bad> {
     let mut out = ById::default();
     let mut rest = Vec::new();
     for conjunct in conjuncts(filter) {
         let mut words = conjunct.splitn(3, ' ');
         let (first, operator, literal) = (words.next(), words.next(), words.next());
-        if !first.is_some_and(|f| ID.contains(&f)) {
+        let first = first.unwrap_or_default();
+        let kind = first == "properties/type" || thing_path(set, first) == Some("properties/type");
+        if !kind && !ID.contains(&first) {
             rest.push(conjunct);
             continue;
         }
@@ -260,38 +359,39 @@ pub fn by_id(filter: &str) -> Result<ById, Bad> {
             .map(str::trim)
             .and_then(|l| l.strip_prefix('\'')?.strip_suffix('\''))
             .filter(|l| !l.is_empty())
-            .ok_or_else(|| bad("id compares with a quoted literal"))?
+            .ok_or_else(|| bad("id and properties/type compare with a quoted literal"))?
             .replace("''", "'");
-        match operator.map(str::to_ascii_lowercase).as_deref() {
-            Some("eq") => out.is.push(literal),
-            Some("ne") => out.not.push(literal),
-            _ => return Err(bad("id takes eq or ne on the top-level and")),
+        match (kind, operator.map(str::to_ascii_lowercase).as_deref()) {
+            (true, Some("eq")) => out.types.push(literal),
+            (false, Some("eq")) => out.is.push(literal),
+            (false, Some("ne")) => out.not.push(literal),
+            _ => {
+                return Err(bad(
+                    "id takes eq or ne, properties/type takes eq, on the top-level and",
+                ))
+            }
         }
     }
     if !rest.is_empty() {
-        out.q = Some(filter_to_q(&rest.join(" and "))?);
+        let names = |p: &str| property(set, p);
+        out.q = Some(filter_to_q(&rest.join(" and "), &names)?);
     }
     Ok(out)
 }
 
-/// A series `$filter`: the temporal window from its `phenomenonTime` predicates and the `q` of
-/// the rest.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Series {
-    /// `timerel`, `timeAt` and `endTimeAt`.
-    pub window: Vec<(&'static str, String)>,
-    /// The NGSI-LD `q` of every other predicate.
-    pub q: Option<String>,
-}
-
-/// The `$filter` of a Datastream's Observations. `phenomenonTime` is an instance's instant, read
-/// by NGSI-LD as a window on the whole request, so a predicate on it stands on the top-level
-/// `and` alone; inside a parenthesis or an `or` it is refused. The broker checks the instants.
+/// The `$filter` of a Datastream's Observations as the temporal window (`timerel`, `timeAt`,
+/// `endTimeAt`) of its `phenomenonTime` predicates. Retrieve Temporal Evolution takes no `q`
+/// (NGSI-LD 6.19.3.1), so a predicate on anything else, `result` too, is refused by name
+/// (`docs/src/sta.md`, not served). `phenomenonTime` is an instance's instant, read by NGSI-LD as a window on the whole request,
+/// so a predicate on it stands on the top-level `and` alone; inside a parenthesis or an `or` it
+/// is refused. The window is exact: NGSI-LD's `after` holds its instant and `before` does not
+/// (4.11), so `gt` and `le` move it one millisecond on.
 ///
 /// # Errors
 /// [`Bad`] naming the predicate.
-pub fn series_filter(filter: &str) -> Result<Series, Bad> {
+pub fn series_filter(filter: &str) -> Result<Vec<(&'static str, String)>, Bad> {
     const TIME: &str = "phenomenontime";
+    let usage = || bad("phenomenonTime takes `phenomenonTime <op> <instant>` on the top-level and");
     let (mut start, mut end) = (None, None);
     let mut rest = Vec::new();
     for conjunct in conjuncts(filter) {
@@ -302,20 +402,23 @@ pub fn series_filter(filter: &str) -> Result<Series, Bad> {
         }
         let words: Vec<&str> = conjunct.split_whitespace().collect();
         let [first, operator, instant] = words.as_slice() else {
-            return Err(bad(
-                "phenomenonTime takes `phenomenonTime <op> <instant>` on the top-level and",
-            ));
+            return Err(usage());
         };
         if !first.eq_ignore_ascii_case(TIME) {
-            return Err(bad(
-                "phenomenonTime takes `phenomenonTime <op> <instant>` on the top-level and",
-            ));
+            return Err(usage());
         }
-        let instant = instant.trim_matches('\'').to_owned();
+        let at = crate::mapping::instant(instant.trim_matches('\''));
+        let after = || {
+            crate::mapping::next_milli(&at).ok_or_else(|| {
+                bad("phenomenonTime compares with a UTC instant such as 2026-01-01T00:00:00Z")
+            })
+        };
         match operator.to_ascii_lowercase().as_str() {
-            "gt" | "ge" => start = Some(instant),
-            "lt" | "le" => end = Some(instant),
-            "eq" => (start, end) = (Some(instant.clone()), Some(instant)),
+            "ge" => start = Some(at),
+            "gt" => start = Some(after()?),
+            "lt" => end = Some(at),
+            "le" => end = Some(after()?),
+            "eq" => (start, end) = (Some(at.clone()), Some(after()?)),
             other => {
                 return Err(Bad(
                     "$filter",
@@ -325,7 +428,7 @@ pub fn series_filter(filter: &str) -> Result<Series, Bad> {
         }
     }
     let window = match (start, end) {
-        (Some(s), Some(e)) if s > e => return Err(bad("the window ends before it starts")),
+        (Some(s), Some(e)) if s >= e => return Err(bad("the window ends before it starts")),
         (Some(s), Some(e)) => vec![
             ("timerel", "between".into()),
             ("timeAt", s),
@@ -335,24 +438,34 @@ pub fn series_filter(filter: &str) -> Result<Series, Bad> {
         (None, Some(e)) => vec![("timerel", "before".into()), ("timeAt", e)],
         (None, None) => Vec::new(),
     };
-    let q = if rest.is_empty() {
-        None
-    } else {
-        Some(filter_to_q(&rest.join(" and "))?)
-    };
-    Ok(Series { window, q })
+    if !rest.is_empty() {
+        let names = |p: &str| {
+            Err(Bad(
+                "$filter",
+                format!("{p}: a Datastream's Observations are filtered on phenomenonTime only"),
+            ))
+        };
+        filter_to_q(&rest.join(" and "), &names)?;
+        return Err(bad(
+            "a Datastream's Observations are filtered on phenomenonTime only",
+        ));
+    }
+    Ok(window)
 }
 
-/// The top-level ` and `-separated terms of a filter, what a parenthesis holds left whole; split
-/// on character boundaries only (T-4323).
+/// The top-level ` and `-separated terms of a filter, what a parenthesis or a text literal holds
+/// left whole; split on character boundaries only (T-4323).
 fn conjuncts(filter: &str) -> Vec<&str> {
     let mut terms = Vec::new();
-    let (mut depth, mut start, mut resume) = (0usize, 0usize, 0usize);
+    let (mut depth, mut start, mut resume, mut text) = (0usize, 0usize, 0usize, false);
     for (at, c) in filter.char_indices() {
         if at < resume {
             continue;
         }
         match c {
+            // A doubled quote inside a literal closes and reopens it: the same state after both.
+            '\'' => text = !text,
+            _ if text => {}
             '(' => depth = depth.saturating_add(1),
             ')' => depth = depth.saturating_sub(1),
             ' ' if depth == 0
@@ -494,8 +607,8 @@ mod tests {
             ("$top", "500"),
             ("$skip", "3"),
             ("$count", "true"),
-            ("$select", "@iot.id, name,"),
-            ("$expand", "Locations,Datastreams/Observations"),
+            ("$select", "id, name,"),
+            ("$expand", "Locations,Datastreams/Observations($top=1)"),
             ("$orderby", "phenomenonTime DESC"),
             ("$filter", "a eq 1"),
             ("other", "x"),
@@ -507,8 +620,8 @@ mod tests {
                 skip: 3,
                 count: true,
                 select: vec!["@iot.id".into(), "name".into()],
-                expand: vec!["Locations".into(), "Datastreams".into()],
-                newest_first: true,
+                expand: vec!["Locations".into(), "Datastreams/Observations".into()],
+                ordered: true,
                 filter: Some("a eq 1".into()),
                 resume: None,
             })
@@ -528,11 +641,19 @@ mod tests {
                 "{token}"
             );
         }
-        assert_eq!(options(&pairs(&[("$top", "0")])).map(|o| o.top), Ok(1));
-        assert_eq!(
-            options(&pairs(&[("$orderby", "name")])).map(|o| o.newest_first),
-            Ok(false)
-        );
+        // T-5205 finding 19: `$top=0` is the count alone; an order not served is refused.
+        assert_eq!(options(&pairs(&[("$top", "0")])).map(|o| o.top), Ok(0));
+        for order in [
+            "name",
+            "resultTime desc,phenomenonTime asc",
+            "phenomenonTime asc",
+        ] {
+            assert_eq!(
+                options(&pairs(&[("$orderby", order)])).map_err(|b| b.0),
+                Err("$orderby"),
+                "{order}"
+            );
+        }
         assert!(options(&pairs(&[("$top", "x")])).is_err());
         assert_eq!(
             options(&pairs(&[("$skip", "10001")])).map_err(|b| b.0),
@@ -553,100 +674,200 @@ mod tests {
     #[test]
     fn an_id_comparison_is_read_by_id_and_never_sent_as_q() {
         assert_eq!(
-            by_id("id eq 'urn:a/x/2026' and speed gt 3 and @iot.id ne 'it''s'"),
+            by_id(
+                "id eq 'urn:a/x/2026' and properties/speed gt 3 and @iot.id ne 'it''s'",
+                "Things"
+            ),
             Ok(ById {
                 is: vec!["urn:a/x/2026".into()],
                 not: vec!["it's".into()],
+                types: Vec::new(),
                 q: Some("speed>3".into()),
             })
         );
-        assert_eq!(by_id("speed gt 3").map(|b| b.q), Ok(Some("speed>3".into())));
+        assert_eq!(
+            by_id("properties/speed gt 3", "Things").map(|b| b.q),
+            Ok(Some("speed>3".into()))
+        );
         for refused in [
             "id gt 'a'",
             "id eq 3",
             "id eq ''",
             "(id eq 'a')",
-            "speed gt 3 or id eq 'a'",
+            "name gt 3 or id eq 'a'",
             "substringof('a', id)",
+            "properties/type ne 'Car'",
         ] {
-            assert_eq!(by_id(refused).map_err(|b| b.0), Err("$filter"), "{refused}");
+            assert_eq!(
+                by_id(refused, "Things").map_err(|b| b.0),
+                Err("$filter"),
+                "{refused}"
+            );
         }
-        let split = by_id("id eq 'a' and id ne 'b'").unwrap_or_default();
+        let split = by_id("id eq 'a' and id ne 'b'", "Things").unwrap_or_default();
         assert!(split.admits(Some("a")));
         assert!(!split.admits(Some("b")));
         assert!(!split.admits(None));
         assert!(ById::default().admits(None));
     }
 
+    /// T-5205 finding 9: the catalogue's link names its type, which narrows the read.
     #[test]
-    fn a_filter_compiles_to_q_or_names_what_it_refuses() {
+    fn a_type_comparison_is_the_views_type_selector() {
+        let f = "Thing/properties/type eq 'Accident' and Thing/properties/isPartOf eq 'bbsk-x'";
         assert_eq!(
-            filter_to_q("(name eq 'Žilina' or speed gt 5) and Datastreams/x le 2"),
-            Ok("(name==\"Žilina\"|speed>5);x<=2".into())
+            by_id(f, "Datastreams"),
+            Ok(ById {
+                types: vec!["Accident".into()],
+                q: Some("isPartOf==\"bbsk-x\"".into()),
+                ..ById::default()
+            })
         );
         assert_eq!(
-            filter_to_q("a ne 1 and b ge 2 and c lt 3"),
-            Ok("a!=1;b>=2;c<3".into())
+            by_id("properties/type eq 'Car'", "Things").map(|b| b.types),
+            Ok(vec!["Car".to_owned()])
         );
+    }
+
+    /// T-5205 finding 8: STA property names, never an Attribute of the same last segment.
+    #[test]
+    fn a_property_is_read_per_set_or_refused_by_name() {
+        for (set, path, want) in [
+            ("Things", "name", Some("name")),
+            ("Things", "properties/isPartOf", Some("isPartOf")),
+            ("Datastreams", "Thing/description", Some("description")),
+            ("Observations", "Datastream/Thing/properties/x", Some("x")),
+            ("Datastreams", "name", None),
+            ("Observations", "result", None),
+            ("Things", "properties/a/b", None),
+            ("Things", "properties/", None),
+            ("Things", "properties/type", None),
+            ("Sensors", "name", None),
+        ] {
+            assert_eq!(
+                property(set, path).ok(),
+                want.map(str::to_owned),
+                "{set} {path}"
+            );
+        }
         assert_eq!(
-            filter_to_q("substringof('Ži', name)"),
-            Ok("name~=\".*Ži.*\"".into())
+            property("Datastreams", "name").map_err(|b| b.1),
+            Err("name is not a property Datastreams are filtered on".into())
         );
-        assert!(filter_to_q("substringof name").is_err());
-        assert!(filter_to_q("substringof('x')").is_err());
-        assert!(filter_to_q("substringof('', name)").is_err());
-        assert!(filter_to_q("substringof('x', )").is_err());
-        assert!(filter_to_q("not a eq 1").is_err());
-        assert_eq!(
-            filter_to_q("a has 1").map_err(|b| b.1),
-            Err("has is not supported".into())
-        );
-        assert!(filter_to_q("  ").is_err());
     }
 
     #[test]
-    fn a_series_filter_splits_into_its_window_and_its_q() {
-        let s = series_filter("phenomenonTime ge '2026-01-01T00:00:00Z' and phenomenonTime lt 2026-02-01T00:00:00Z and result gt 3");
+    fn a_filter_compiles_to_q_or_names_what_it_refuses() {
+        let names = |p: &str| property("Things", p);
         assert_eq!(
-            s,
-            Ok(Series {
-                window: vec![
-                    ("timerel", "between".into()),
-                    ("timeAt", "2026-01-01T00:00:00Z".into()),
-                    ("endTimeAt", "2026-02-01T00:00:00Z".into())
-                ],
-                q: Some("result>3".into()),
-            })
-        );
-        let after = series_filter("phenomenonTime gt 2026-01-01T00:00:00Z");
-        assert_eq!(
-            after.map(|s| s.window.first().map(|w| w.1.clone())),
-            Ok(Some("after".into()))
-        );
-        let before = series_filter("phenomenonTime le 2026-01-01T00:00:00Z");
-        assert_eq!(
-            before.map(|s| s.window.first().map(|w| w.1.clone())),
-            Ok(Some("before".into()))
-        );
-        let at = series_filter("phenomenonTime eq 2026-01-01T00:00:00Z");
-        assert_eq!(at.map(|s| s.window.len()), Ok(3));
-        assert_eq!(
-            series_filter("(a eq 1 and b eq 2)").map(|s| s.q),
-            Ok(Some("(a==1;b==2)".into()))
+            filter_to_q(
+                "(name eq 'Žilina' or properties/speed gt 5) and properties/x le -2",
+                &names
+            ),
+            Ok("(name==\"Žilina\"|speed>5);x<=-2".into())
         );
         assert_eq!(
-            series_filter("Žilina eq 'x'").map(|s| s.window),
-            Ok(Vec::new())
+            filter_to_q(
+                "properties/a ne true and properties/b ge 2026-01-01T00:00:00Z and name lt 'b'",
+                &names
+            ),
+            Ok("a!=true;b>=2026-01-01T00:00:00Z;name<\"b\"".into())
         );
-        assert!(series_filter("a eq 1 or phenomenonTime gt 2026-01-01T00:00:00Z").is_err());
-        assert!(series_filter("phenomenonTime gt").is_err());
-        assert!(series_filter("a eq phenomenonTime").is_err());
-        assert!(series_filter("phenomenonTime ne 2026-01-01T00:00:00Z").is_err());
-        assert!(series_filter(
-            "phenomenonTime gt 2026-02-01T00:00:00Z and phenomenonTime lt 2026-01-01T00:00:00Z"
-        )
-        .is_err());
-        assert!(series_filter("x has 1").is_err());
+        assert_eq!(
+            filter_to_q("substringof('Ži', name)", &names),
+            Ok("name~=\".*Ži.*\"".into())
+        );
+        // T-5205 finding 10: a literal with a space, a parenthesis or a doubled quote.
+        assert_eq!(
+            filter_to_q("name eq 'Banská Bystrica (mesto) and ''okolie'''", &names),
+            Ok("name==\"Banská Bystrica (mesto) and 'okolie'\"".into())
+        );
+        // T-5205 finding 11: a quote ends no string, a dot matches only a dot.
+        assert_eq!(
+            filter_to_q(r#"name eq 'a"b\'"#, &names),
+            Ok(r#"name=="a\"b\\""#.into())
+        );
+        assert_eq!(
+            filter_to_q("substringof('a.b*(c)', name)", &names),
+            Ok(r#"name~=".*a\.b\*\(c\).*""#.into())
+        );
+        for refused in [
+            "substringof name",
+            "substringof('x')",
+            "substringof(x, name)",
+            "substringof('', name)",
+            "substringof('x', )",
+            "substringof('a\"', name)",
+            "substringof('x', Datastreams/x)",
+            "not name eq 1",
+            "name eq 'open",
+            "Datastreams/x le 2",
+        ] {
+            assert!(filter_to_q(refused, &names).is_err(), "{refused}");
+        }
+        assert_eq!(
+            filter_to_q("name has 1", &names).map_err(|b| b.1),
+            Err("has is not supported".into())
+        );
+        // T-5205 finding 23: a function is named.
+        assert_eq!(
+            filter_to_q("startswith(name,'B')", &names).map_err(|b| b.1),
+            Err("startswith() is not supported".into())
+        );
+        assert!(filter_to_q("  ", &names).is_err());
+    }
+
+    /// T-5205 finding 12: each operator's own edge.
+    #[test]
+    fn a_series_filter_is_its_exact_window() {
+        assert_eq!(
+            series_filter(
+                "phenomenonTime ge '2026-01-01T00:00:00Z' and phenomenonTime lt 2026-02-01T00:00:00Z"
+            ),
+            Ok(vec![
+                ("timerel", "between".into()),
+                ("timeAt", "2026-01-01T00:00:00.000Z".into()),
+                ("endTimeAt", "2026-02-01T00:00:00.000Z".into())
+            ])
+        );
+        assert_eq!(
+            series_filter("phenomenonTime gt 2026-01-01T00:00:00Z"),
+            Ok(vec![
+                ("timerel", "after".into()),
+                ("timeAt", "2026-01-01T00:00:00.001Z".into())
+            ])
+        );
+        assert_eq!(
+            series_filter("phenomenonTime le 2026-01-01T00:00:00Z"),
+            Ok(vec![
+                ("timerel", "before".into()),
+                ("timeAt", "2026-01-01T00:00:00.001Z".into())
+            ])
+        );
+        assert_eq!(
+            series_filter("phenomenonTime eq 2026-01-01T00:00:00Z"),
+            Ok(vec![
+                ("timerel", "between".into()),
+                ("timeAt", "2026-01-01T00:00:00.000Z".into()),
+                ("endTimeAt", "2026-01-01T00:00:00.001Z".into())
+            ])
+        );
+        assert_eq!(
+            series_filter("result gt 3").map_err(|b| b.1),
+            Err("result: a Datastream's Observations are filtered on phenomenonTime only".into())
+        );
+        for refused in [
+            "result eq 1 or phenomenonTime gt 2026-01-01T00:00:00Z",
+            "phenomenonTime gt",
+            "result eq phenomenonTime",
+            "phenomenonTime ne 2026-01-01T00:00:00Z",
+            "phenomenonTime gt yesterday",
+            "phenomenonTime gt 2026-02-01T00:00:00Z and phenomenonTime lt 2026-01-01T00:00:00Z",
+            "phenomenonTime ge 2026-01-01T00:00:00Z and phenomenonTime lt 2026-01-01T00:00:00Z",
+            "1 eq 1",
+        ] {
+            assert!(series_filter(refused).is_err(), "{refused}");
+        }
     }
 
     #[test]
