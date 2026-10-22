@@ -28,7 +28,8 @@ surface hides, and which CI job proves each surface's conformance.
 `items` as a Parquet file, [OGC](ogc.md#2-items)), `tabular` (CSV
 files and a ZIP of a CSV per collection) and `ical` (a view's Events as an
 iCalendar feed, [iCalendar](ical.md)) are named beside it,
-because `full` sits at its ADR-0027 size budget. `linkml` and
+because they were kept out of `full` under its ADR-0027 size budget of
+vanilla + 10 MiB (15 MiB since T-5246). `linkml` and
 `internal-csr` stay separate. A feature links a surface; only
 `ANTARES_API_SURFACES` mounts one ([Configuration](configuration.md)). A
 name the binary was not built with stops the broker at start.
