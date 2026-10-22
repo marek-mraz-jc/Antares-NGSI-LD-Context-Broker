@@ -13,6 +13,7 @@ here).
 | `ANTARES_STORE` | `memory` | Store mode: `memory`, `file`, `postgres`, `timescale`. Unknown value = fatal. |
 | `ANTARES_TEMPORAL` | follows `ANTARES_STORE` | Temporal driver: a store mode, or `none` — history off. Mix freely with `ANTARES_STORE`, e.g. `file` current state with `timescale` history; temporal reads answer `OperationNotSupported` (422, CIM 009 Table 6.3.2-1) and nothing is recorded. A backend different from the store builds a second store instance used only for history. |
 | `ANTARES_HTTP_PORT` | `9090` | HTTP listen port. |
+| `ANTARES_METRICS_PORT` | unset | A second listener that serves `GET /q/metrics` and answers every other path `404`; with it set, the API port answers `/q/metrics` `404`, so a NetworkPolicy can admit a scraper to this port without the API. Unset, `/q/metrics` stays on the API port. Port 0, the API port or a non-number is fatal at startup. `ANTARES_ADMIN_METRICS` applies on this port as on the API port. |
 | `ANTARES_ROLES` | `all` | Comma list of roles this process runs: `api`, `matcher`, `notifier`, `temporal`, `registry` — the role-split fleet shape. |
 | `ANTARES_BUS` | `local` | Change-event bus: `local` (in-process, single node) or `nats` (JetStream, multi-pod). Unknown value = fatal. |
 | `ANTARES_HOST_ALIAS` | `antares` | This broker's name in federation `Via` chains (CIM 009 6.3.18) — loop detection identity. Two LB'd replicas of one logical broker share one alias. |
