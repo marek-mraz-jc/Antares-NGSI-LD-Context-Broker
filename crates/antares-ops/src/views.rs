@@ -133,10 +133,9 @@ pub struct View {
 }
 
 /// The surfaces a view's `representations` may name.
-pub const REPRESENTATIONS: &[&str] = &["ical"];
+pub const REPRESENTATIONS: &[&str] = &["ical", "ogc", "geojson", "csv"];
 
-/// The most named outputs one representation lists (owner 2026-10-22T09:30Z).
-pub const MAX_OUTPUTS: usize = 20;
+pub use crate::outputs::MAX_OUTPUTS;
 
 /// One allowlist of a [`View`]: the Entities of `types` for which the
 /// condition holds show `attributes`.

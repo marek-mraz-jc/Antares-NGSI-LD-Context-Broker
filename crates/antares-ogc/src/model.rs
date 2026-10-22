@@ -30,6 +30,9 @@ pub(crate) struct Collection {
     pub properties: Vec<Prop>,
     /// A `{type}-history` collection (T-5100): read from the temporal history, never written.
     pub history: bool,
+    /// A named output of the view's `representations.ogc` (T-5216): read only, its filter a
+    /// conjunct of every read.
+    pub output: Option<antares_ops::outputs::Output>,
 }
 
 /// One Attribute of a collection besides its geometry.
@@ -65,6 +68,65 @@ pub(crate) enum Time {
     Instant(String),
     /// `primary-interval-start` / `primary-interval-end`, either may be undeclared.
     Interval(Option<String>, Option<String>),
+}
+
+/// The collection of a named output (docs API/11 EP-159, T-5216) over its one source's
+/// collection `base`: its geometry (the first `geometry` path), its time and its properties from
+/// the source's roles, read only, narrowed by its filter. `None` when a role names an Attribute
+/// the collection does not show, or a geometry that is no `GeoProperty`.
+pub(crate) fn output(base: &Collection, o: &antares_ops::outputs::Output) -> Option<Collection> {
+    let source = o.sources.first()?;
+    let attribute = |name: &str| base.properties.iter().find(|p| p.name == name);
+    let iri = |name: &str| attribute(name).map(|p| p.iri.clone());
+    let one = |role: &str| source.role(role).first().map(|name| iri(name).ok_or(()));
+    let geometry = match source.role("geometry").first() {
+        None => base.geometry.clone(),
+        Some(name) => Some(
+            base.geometry
+                .clone()
+                .filter(|g| g.rsplit(['/', '#']).next() == Some(*name))
+                .or_else(|| {
+                    attribute(name)
+                        .filter(|p| p.kind == "GeoProperty")
+                        .map(|p| p.iri.clone())
+                })?,
+        ),
+    };
+    let time = match (one("instant"), one("start"), one("end")) {
+        (None, None, None) => base.time.clone(),
+        (Some(at), _, _) => Some(Time::Instant(at.ok()?)),
+        (None, start, end) => Some(Time::Interval(
+            start.transpose().ok()?,
+            end.transpose().ok()?,
+        )),
+    };
+    let shown = source.role("properties");
+    if shown.iter().any(|name| attribute(name).is_none()) {
+        return None;
+    }
+    let timed: Vec<&String> = match &time {
+        Some(Time::Instant(at)) => vec![at],
+        Some(Time::Interval(start, end)) => start.iter().chain(end).collect(),
+        None => Vec::new(),
+    };
+    // a time Attribute stays a property: the `datetime` query names it by its term
+    let properties = base
+        .properties
+        .iter()
+        .filter(|p| Some(&p.iri) != geometry.as_ref())
+        .filter(|p| shown.is_empty() || shown.contains(&p.name.as_str()) || timed.contains(&&p.iri))
+        .cloned()
+        .collect();
+    Some(Collection {
+        id: o.name.clone(),
+        description: o.description_in("en").map(str::to_owned),
+        type_iri: base.type_iri.clone(),
+        geometry,
+        time,
+        properties,
+        history: false,
+        output: Some(o.clone()),
+    })
 }
 
 /// A `collectionId` is a path segment as written: letters, digits, `_`, `-`, `.`.
@@ -126,6 +188,7 @@ pub(crate) fn build(
             class_name.to_owned(),
             Collection {
                 history: false,
+                output: None,
                 id: class_name.to_owned(),
                 description: class.description.clone(),
                 type_iri,

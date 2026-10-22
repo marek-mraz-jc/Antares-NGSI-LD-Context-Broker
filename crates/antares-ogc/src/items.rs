@@ -195,6 +195,9 @@ pub(crate) fn params(c: &Collection, pairs: &[(String, String)]) -> Result<Param
             "ngsild.pick and ngsild.omit both select the properties; name one",
         ));
     }
+    if let Some(o) = &c.output {
+        o.filter.scope_with(p.option("scopeQ")).map_err(bad)?;
+    }
     p.filter = crate::filter::read(c, &raw)?;
     if p.properties.is_some() && p.option("pick").is_some() {
         return Err(bad(
@@ -361,12 +364,31 @@ fn shape(c: &Collection, terms: &Terms, p: &Params) -> String {
         format!("&pick={}", encode(&names.join(",")))
     });
     let omit = if pick.is_some() { None } else { Some("omit") };
-    let options = ["pick", "scopeQ"]
+    let options = ["pick"]
         .into_iter()
         .chain(omit)
-        .filter_map(|name| p.option(name).map(|v| format!("&{name}={}", encode(v))));
+        .filter_map(|name| p.option(name).map(|v| format!("&{name}={}", encode(v))))
+        .chain(scope_q(c, p).map(|v| format!("&scopeQ={}", encode(&v))));
     let lang = p.lang.iter().map(|l| format!("&lang={}", encode(l)));
     pick.into_iter().chain(options).chain(lang).collect()
+}
+
+/// The `q` of the collection's output filter (T-5216), a conjunct of every read of it.
+fn output_q(c: &Collection) -> Option<String> {
+    let q = c.output.as_ref()?.filter.q.as_ref()?;
+    Some(format!("({q})"))
+}
+
+/// The `scopeQ` of a read: the output filter's (T-5216) joined with the request's, which
+/// [`params`] has checked can be joined; the filter's alone otherwise, never wider.
+fn scope_q(c: &Collection, p: &Params) -> Option<String> {
+    match &c.output {
+        Some(o) => o
+            .filter
+            .scope_with(p.option("scopeQ"))
+            .unwrap_or(o.filter.scope_q.clone()),
+        None => p.option("scopeQ").map(str::to_owned),
+    }
 }
 
 /// One Query Entities an `items` request reads: the store's pushdown and the residual the
@@ -395,8 +417,8 @@ pub(crate) fn targets(c: &Collection, terms: &Terms, p: &Params, f: &Lowered) ->
     let bbox = p.bbox.zip(c.geometry.as_deref());
     let residual = !f.residual.is_empty() || (bbox.is_some() && p.ngsild_geo());
     let projection = if residual {
-        p.option("scopeQ")
-            .map(|v| format!("&scopeQ={}", encode(v)))
+        scope_q(c, p)
+            .map(|v| format!("&scopeQ={}", encode(&v)))
             .unwrap_or_default()
     } else {
         shape(c, terms, p)
@@ -438,6 +460,7 @@ pub(crate) fn targets(c: &Collection, terms: &Terms, p: &Params, f: &Lowered) ->
             .cloned()
             .chain(extra)
             .chain(theirs.clone())
+            .chain(output_q(c))
             .chain(f.q.iter().map(|q| format!("({q})")))
             .collect();
         if q.is_empty() {
@@ -883,10 +906,13 @@ pub(crate) async fn one(
     let terms = Terms::of(c);
     let pushdown = Pushdown {
         query: format!(
-            "id={}&type={}&format=simplified{}",
+            "id={}&type={}&format=simplified{}{}",
             encode(id),
             encode(&c.type_iri),
-            shape(c, &terms, p)
+            shape(c, &terms, p),
+            output_q(c)
+                .map(|q| format!("&q={}", encode(&q)))
+                .unwrap_or_default()
         ),
         context: terms.context(),
         ..Pushdown::default()
@@ -929,6 +955,7 @@ mod tests {
     fn car() -> Collection {
         Collection {
             history: false,
+            output: None,
             id: "Car".into(),
             description: None,
             type_iri: "https://e.org/Car".into(),
@@ -1179,6 +1206,7 @@ mod tests {
     fn core_attributes_keep_their_name_and_others_get_a_context_term() {
         let c = Collection {
             history: false,
+            output: None,
             id: "Car".into(),
             description: None,
             type_iri: "https://e.org/Car".into(),
@@ -1204,6 +1232,7 @@ mod tests {
         assert_eq!(t.context.len(), 4);
         let long = Terms::of(&Collection {
             history: false,
+            output: None,
             properties: vec![prop(&"x".repeat(257), false), prop("1st", false)],
             ..c.clone()
         });
@@ -1214,6 +1243,7 @@ mod tests {
         assert_eq!(long.term("https://e.org/1st"), "p1");
         let only_core = Terms::of(&Collection {
             history: false,
+            output: None,
             properties: Vec::new(),
             ..c
         });

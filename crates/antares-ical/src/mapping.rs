@@ -301,77 +301,11 @@ fn event() -> String {
 /// and `SUMMARY` itself.
 pub const PRESET_TYPES: [&str; 3] = ["Event", "CouncilMeeting", "OfficeHours"];
 
-/// The most outputs of one format an Endpoint has (owner 2026-10-22T09:30Z).
-pub const MAX_OUTPUTS: usize = 20;
-
-/// The NGSI-LD query an output adds to every read through the view (TS 104 175 6.4.3.2).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct Filter {
-    /// `q`, AND-ed with a caller's.
-    #[serde(default)]
-    pub q: Option<String>,
-    /// `scopeQ`, AND-ed with a caller's.
-    #[serde(default, rename = "scopeQ")]
-    pub scope_q: Option<String>,
-    /// `georel`; with it the output fixes the geo-query and a caller names none.
-    #[serde(default)]
-    pub georel: Option<String>,
-    /// `geometry`.
-    #[serde(default)]
-    pub geometry: Option<String>,
-    /// `coordinates`.
-    #[serde(default)]
-    pub coordinates: Option<String>,
-    /// `geoproperty`.
-    #[serde(default)]
-    pub geoproperty: Option<String>,
-}
-
-impl Filter {
-    /// The members set, by their query parameter names.
-    #[must_use]
-    pub fn params(&self) -> Vec<(&'static str, &str)> {
-        [
-            ("q", &self.q),
-            ("scopeQ", &self.scope_q),
-            ("georel", &self.georel),
-            ("geometry", &self.geometry),
-            ("coordinates", &self.coordinates),
-            ("geoproperty", &self.geoproperty),
-        ]
-        .into_iter()
-        .filter_map(|(k, v)| v.as_deref().map(|v| (k, v)))
-        .collect()
-    }
-}
+/// The output contract every format shares (docs API/11, T-5216).
+pub use antares_ops::outputs::{is_language_tag, is_output_name, Filter, MAX_OUTPUTS};
 
 /// The zone of an output that names none.
 pub const DEFAULT_ZONE: Tz = chrono_tz::Europe::Bratislava;
-
-/// An output name: `[a-z0-9-]`, 1 to 40, not `preview`.
-#[must_use]
-pub fn is_output_name(name: &str) -> bool {
-    (1..=40).contains(&name.len())
-        && name != "preview"
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-}
-
-/// A BCP 47 language tag by its shape (`sk`, `sk-SK`, `zh-Hant`), or `@none`.
-#[must_use]
-pub fn is_language_tag(tag: &str) -> bool {
-    let mut parts = tag.split('-');
-    tag == "@none"
-        || (tag.len() <= 35
-            && parts.next().is_some_and(|p| {
-                (2..=3).contains(&p.len()) && p.chars().all(|c| c.is_ascii_alphabetic())
-            })
-            && parts.all(|p| {
-                (1..=8).contains(&p.len()) && p.chars().all(|c| c.is_ascii_alphanumeric())
-            }))
-}
 
 /// The text of a `languageMap` for `want`: its exact tag, the same tag in another case, a tag
 /// of the same primary language (`sk` for `sk-SK` and back), then `@none`, then the first tag

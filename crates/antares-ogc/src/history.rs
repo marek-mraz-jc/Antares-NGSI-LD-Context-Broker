@@ -108,6 +108,7 @@ pub(crate) fn of(c: &Collection) -> Collection {
         )),
         properties: own.chain(added).collect(),
         history: true,
+        output: None,
     }
 }
 
@@ -511,6 +512,7 @@ mod tests {
         };
         Collection {
             history: false,
+            output: None,
             id: "Car".to_owned(),
             description: None,
             type_iri: "https://example.org/Car".to_owned(),
