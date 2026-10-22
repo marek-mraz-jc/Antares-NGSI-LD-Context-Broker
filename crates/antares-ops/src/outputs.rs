@@ -342,7 +342,8 @@ mod tests {
     fn checked(output: &Value, format: &str) -> Result<Output, String> {
         listed(Some(&json!([output])), format)
             .pop()
-            .map_or_else(|| Err("skipped".to_owned()), |(_, o)| o)
+            .map(|(_, o)| o)
+            .unwrap_or(Err("skipped".to_owned()))
     }
 
     #[test]
@@ -375,6 +376,7 @@ mod tests {
     #[test]
     fn an_output_names_the_member_that_does_not_hold() {
         let source = |s: Value| json!({"name": "a", "sources": [s]});
+        let long = "x".repeat(1001);
         let refused = [
             (
                 json!({"name": "A", "sources": [{"type": "E"}]}),
@@ -393,6 +395,11 @@ mod tests {
             ),
             (
                 json!({"name": "a", "description": {"sk": ""}, "sources": [{"type": "E"}]}),
+                "ogc",
+                "title or description",
+            ),
+            (
+                json!({"name": "a", "title": {"sk": long}, "sources": [{"type": "E"}]}),
                 "ogc",
                 "title or description",
             ),
@@ -520,7 +527,15 @@ mod tests {
         for tag in ["sk", "sk-SK", "zh-Hant", "@none"] {
             assert!(is_language_tag(tag), "{tag}");
         }
-        for tag in ["", "s", "slovak", "sk-", "sk-toolongpart", "1k"] {
+        for tag in [
+            "",
+            "s",
+            "slovak",
+            "sk-",
+            "sk-toolongpart",
+            "1k",
+            "sk-aaaaaaaa-bbbbbbbb-cccccccc-dddddddd",
+        ] {
             assert!(!is_language_tag(tag), "{tag}");
         }
     }

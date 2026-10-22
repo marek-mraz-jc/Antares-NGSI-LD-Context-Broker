@@ -326,6 +326,8 @@ async fn events() -> Router {
         {"name": "leak", "sources": [{"type": "Secret"}, {"type": "Event"}]},
         {"name": "hidden", "sources": [{"type": "Secret"}]},
         {"name": "broken", "sources": []},
+        {"name": "ends", "filter": {"scopeQ": "/bb"},
+         "sources": [{"type": "SportEvent", "mapping": {"end": "startDate"}}]},
         {"name": "near", "limit": 1, "sources": [{"type": "Event"}],
          "filter": {"georel": "near;maxDistance==1000", "geometry": "Point", "coordinates": "[19.146,48.736]"}},
     ]);
@@ -361,7 +363,7 @@ async fn events() -> Router {
         json!({"id": "urn:ngsi-ld:Event:e2", "type": "Event", "name": prop(json!("=Futbal")),
                "eventCategory": prop(json!("sport")), "startDate": prop(json!("2026-11-02T10:00:00Z")),
                "location": point(20.0, 49.0)}),
-        json!({"id": "urn:ngsi-ld:SportEvent:s1", "type": "SportEvent", "name": prop(json!("Beh")),
+        json!({"id": "urn:ngsi-ld:SportEvent:s1", "type": "SportEvent", "scope": "/bb", "name": prop(json!("Beh")),
                "eventCategory": prop(json!("sport")), "startDate": prop(json!("2026-11-03T09:00:00Z")),
                "location": point(19.2, 48.7)}),
     ];
@@ -442,6 +444,21 @@ async fn an_output_maps_geometry_time_and_properties_by_roles() {
         json!({"interval": ["2026-11-02T10:00:00Z", ".."]})
     );
     assert_eq!(e2["properties"]["address.addressLocality"], Value::Null);
+    // an interval open at its start; the output's scopeQ intersected with the caller's
+    let (_, body) = send(
+        &app,
+        "GET",
+        "/x/views/ev/geojson/v1/ends?scopeQ=/bb/%23",
+        "",
+    )
+    .await;
+    let ends = by_id(&body);
+    assert_eq!(
+        ends["urn:ngsi-ld:SportEvent:s1"]["time"],
+        json!({"interval": ["..", "2026-11-03T09:00:00Z"]})
+    );
+    let (status, _) = send(&app, "GET", "/x/views/ev/geojson/v1/ends?scopeQ=,", "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(!body.contains("hidden-note"), "{body}");
 }
 
@@ -492,7 +509,7 @@ async fn a_csv_output_is_one_type_or_a_union_with_a_type_column() {
     let mut lines = body.lines();
     assert_eq!(
         lines.next(),
-        Some("id,type,name,eventCategory,location,startDate")
+        Some("id,type,name,eventCategory,location,scope,startDate")
     );
     assert_eq!(lines.count(), 3, "{body}");
     assert!(

@@ -14,7 +14,8 @@ const SCHEMA: &str = r#"{
   "prefixes": {"dc": {"prefix_prefix": "dc", "prefix_reference": "https://uri.etsi.org/ngsi-ld/default-context/"},
                "ngsi": {"prefix_prefix": "ngsi", "prefix_reference": "https://uri.etsi.org/ngsi-ld/"}},
   "default_prefix": "dc",
-  "classes": {"Event": {"slots": ["name", "category", "location", "operationSpace", "startDate", "endDate"]}},
+  "classes": {"Event": {"slots": ["name", "category", "location", "operationSpace", "startDate", "endDate"]},
+              "Venue": {"slots": ["name", "location"]}},
   "slots": {
     "name": {"range": "string"},
     "category": {"range": "string"},
@@ -48,7 +49,8 @@ async fn fixture() -> Result<(TestBroker, Router), String> {
         {"name": "nobody", "sources": source(json!({"properties": ["nope"]}))},
         {"name": "untimed", "sources": source(json!({"instant": "nope"}))},
         {"name": "unended", "sources": source(json!({"end": "nope"}))},
-        {"name": "elsewhere", "sources": [{"type": "Venue"}]},
+        {"name": "elsewhere", "sources": [{"type": "Hall"}]},
+        {"name": "places", "sources": [{"type": "Venue"}]},
         {"name": "broken", "sources": []}
     ]);
     let shown = json!([
@@ -59,8 +61,9 @@ async fn fixture() -> Result<(TestBroker, Router), String> {
         "startDate",
         "endDate"
     ]);
-    let view = json!({"id": "ev", "tenant": "city", "selector": ["Event"], "q": "category!=\"hidden\"",
-        "operations": ["query_entities", "create_entity"], "rules": [{"types": ["Event"], "attributes": shown}],
+    let view = json!({"id": "ev", "tenant": "city", "selector": ["Event", "Venue"], "q": "category!=\"hidden\"",
+        "operations": ["query_entities", "create_entity"],
+        "rules": [{"types": ["Event"], "attributes": shown}, {"types": ["Venue"], "attributes": ["name", "location"]}],
         "representations": {"ogc": ogc}});
     let a = send(&app, "PUT", "/q/views/ev", &view.to_string(), &[]).await;
     if a.status != StatusCode::CREATED {
@@ -104,16 +107,35 @@ async fn each_output_is_a_collection_and_one_that_does_not_hold_is_none() -> Res
     let (_broker, app) = fixture().await?;
     let a = send(&app, "GET", ITEMS, "", &[("Accept-Language", "sk")]).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    let listed: Vec<&str> = a.body["collections"]
-        .as_array()
+    let listed: Vec<&str> = a
+        .body
+        .get("collections")
+        .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|c| c["id"].as_str())
+        .filter_map(|c| c.get("id").and_then(Value::as_str))
         .collect();
     assert_eq!(
         listed,
-        ["Event", "catchment", "loose", "scoped", "starts", "venues"]
+        [
+            "Event",
+            "Venue",
+            "catchment",
+            "loose",
+            "places",
+            "scoped",
+            "starts",
+            "venues"
+        ]
     );
+    // the API definition offers no write on an output
+    let a = get(&app, "/x/views/ev/ogc/features/api").await;
+    assert_eq!(a.status, StatusCode::OK);
+    let paths = a.body.get("paths");
+    let catchment = paths.and_then(|p| p.get("/collections/catchment/items"));
+    let event = paths.and_then(|p| p.get("/collections/Event/items"));
+    assert_eq!(catchment.and_then(|c| c.get("post")), None, "{catchment:?}");
+    assert!(event.and_then(|c| c.get("post")).is_some(), "{event:?}");
     let a = send(
         &app,
         "GET",
@@ -122,11 +144,19 @@ async fn each_output_is_a_collection_and_one_that_does_not_hold_is_none() -> Res
         &[("Accept-Language", "sk")],
     )
     .await;
-    assert_eq!(a.body["title"], "Miesta konania", "{}", a.body);
+    assert_eq!(
+        a.body.get("title"),
+        Some(&json!("Miesta konania")),
+        "{}",
+        a.body
+    );
     let a = get(&app, &format!("{ITEMS}/catchment")).await;
     assert_eq!(
-        (&a.body["title"], &a.body["description"]),
-        (&json!("catchment"), &json!("Where the sport events reach"))
+        (a.body.get("title"), a.body.get("description")),
+        (
+            Some(&json!("catchment")),
+            Some(&json!("Where the sport events reach"))
+        )
     );
     for gone in [
         "ghost",
@@ -154,8 +184,9 @@ async fn two_outputs_over_one_type_serve_different_geometries_and_times() -> Res
     assert_eq!(ids(&a.body), ["urn:ngsi-ld:Event:2"]);
     let feature = a.body.pointer("/features/0").cloned().unwrap_or_default();
     assert_eq!(feature.pointer("/geometry/type"), Some(&json!("Polygon")));
-    let names: Vec<&String> = feature["properties"]
-        .as_object()
+    let names: Vec<&String> = feature
+        .get("properties")
+        .and_then(Value::as_object)
         .into_iter()
         .flatten()
         .map(|(k, _)| k)
