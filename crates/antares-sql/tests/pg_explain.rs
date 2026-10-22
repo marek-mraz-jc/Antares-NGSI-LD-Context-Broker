@@ -1045,3 +1045,65 @@ async fn the_history_write_probes_read_only_the_weeks_that_can_hold_the_instance
         );
     }
 }
+
+/// T-5200: the `attr_rows` arm of each history read reads its unique btree
+/// under RLS, both ids bound as index conditions by `iri_no` (migration 0020):
+/// a join with `iri_ids` would sort every row of the Attribute instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_keyed_history_arms_read_their_unique_index_under_rls() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    const T: &str = "pgexplain-keyed";
+    for stmt in [
+        "DELETE FROM attr_rows WHERE tenant_id = 'pgexplain-keyed'",
+        "INSERT INTO iri_ids (tenant_id, iri)
+         SELECT 'pgexplain-keyed', i FROM (SELECT 'urn:k:' || g AS i FROM generate_series(1, 50) g
+                                           UNION ALL VALUES ('https://x/speed'), ('https://x/level')) v
+         ON CONFLICT DO NOTHING",
+        "INSERT INTO attr_rows (tenant_id, entity_no, attr_no, instance_no, observed_at,
+                                created_at, modified_at, data)
+         SELECT 'pgexplain-keyed', e.id, a.id, gen_random_uuid(), now() - make_interval(mins => g),
+                now(), now(), jsonb_build_object('type', 'Property', 'value', g)
+           FROM iri_ids e, iri_ids a, generate_series(1, 40) g
+          WHERE e.tenant_id = 'pgexplain-keyed' AND e.iri LIKE 'urn:k:%'
+            AND a.tenant_id = 'pgexplain-keyed' AND a.iri LIKE 'https://x/%'",
+        "ANALYZE iri_ids, attr_rows",
+    ] {
+        sqlx::query(stmt).execute(&pool).await.expect(stmt);
+    }
+    let shapes = [
+        (
+            "newest of an Attribute",
+            format!(
+                "SELECT u.data FROM ((SELECT x.data, x.observed_at FROM attr_instances x \
+                   WHERE x.tenant_id = '{T}' AND x.entity_id = 'urn:k:7' AND x.attr_id = 'https://x/speed' \
+                   ORDER BY x.observed_at DESC LIMIT 5) \
+                 UNION ALL (SELECT x.data, x.observed_at FROM attr_rows_at('{T}', 'urn:k:7', 'https://x/speed') x \
+                   ORDER BY x.observed_at DESC LIMIT 5)) u ORDER BY u.observed_at DESC LIMIT 5"
+            ),
+            "attr_no = iri_no('pgexplain-keyed'::text, 'https://x/speed'::text)",
+        ),
+        (
+            "an Entity's history",
+            format!("SELECT x.attr_id, count(*) FROM attr_rows_of('{T}', 'urn:k:7') x GROUP BY 1"),
+            "entity_no = iri_no('pgexplain-keyed'::text, 'urn:k:7'::text)",
+        ),
+    ];
+    let mut bad = Vec::new();
+    for (shape, sql, cond) in &shapes {
+        let plan = plan_of(&pool, T, sql).await;
+        let indexed = plan
+            .lines()
+            .any(|l| l.contains("Index Cond:") && l.contains(cond));
+        if !indexed || plan.contains("Seq Scan on attr_rows") {
+            bad.push(format!(
+                "{shape} (wants an index condition {cond}):\n{plan}"
+            ));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "keyed arms that walk:\n\n{}",
+        bad.join("\n\n")
+    );
+}

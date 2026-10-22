@@ -149,7 +149,10 @@ is lost); rolling forward again restores the answers.
 
 ### Integer history keys: the design (T-5193)
 
-Not built yet. A history row keys on three texts: the Entity id (~60 B),
+Slice 1 built (T-5200, migration 0020): the tables, the dictionary
+lookup, every read over both parents and the maintenance of both. The
+write routing and the cut-over (T-5243) and the dev measurement (T-5244)
+follow. A history row keys on three texts: the Entity id (~60 B),
 the full expanded Attribute IRI (~70 B) and the broker's
 `urn:ngsi-ld:Instance:<uuid>` (57 B). Each is stored twice, in the heap and
 in `u_attr_instances_time`. The plan replaces them with an `entity_no
@@ -211,12 +214,24 @@ The shape, as it is to be built:
   answer's ids back from the same map, so a warm process sends no extra
   statement.
 - Each history statement reads both parents as `UNION ALL`, one arm per
-  parent, each arm through its own unique index; ordered reads merge the
-  two arms (`Merge Append`). Copies into `attr_versions` keep whole
-  documents, as now.
+  parent, each arm through its own unique index. An ordered read with a
+  `LIMIT` (the newest instance a write compares with, lastN's N-th newest)
+  limits each arm itself: PostgreSQL merges two arms in index order only
+  then, because an arm's equality on (`tenant_id`, `entity_no`, `attr_no`)
+  does not make those leading index columns redundant in the parent's
+  ordering, and it sorts every row of the Attribute otherwise. Copies into
+  `attr_versions` keep whole documents, as now.
+- Until the store keeps the dictionary in memory (T-5243), an arm binds
+  its ids with `iri_no(tenant, iri)`, a STABLE invoker's-rights SQL
+  function the planner evaluates once per index scan. `attr_rows_of(tenant,
+  entity)` and `attr_rows_at(tenant, entity, attribute)` return `attr_rows`
+  in the row type of `attr_instances`; the planner inlines them, so the
+  caller's predicates reach the btree. An instance id is the broker's
+  `urn:ngsi-ld:Instance:<uuid>` unless `data` holds another `instanceId`.
 - A release older than the change reads only `attr_instances` and would
-  miss every row since the cut-over, so the migration is `breaking_`
-  (`migrations.rollback.toml`).
+  miss every row since the cut-over, so the migration that sets the
+  cut-over is `breaking_` (`migrations.rollback.toml`). 0020 leaves it NULL
+  and is `compatible`: until it is set every row goes to `attr_instances`.
 
 The keys save about 390 B a row. Getting a dev row under 300 B also needs
 the `data` side; today only TimescaleDB's columnstore gets there (120 B).
@@ -247,4 +262,5 @@ unless `ANTARES_MIGRATE=0` hands the job to an init container.
 | `0017_history_one_index` | One unique btree `u_attr_instances_time` (`tenant_id`, `entity_id`, `attr_id`, `observed_at`, `instance_id`) replaces `i_attr_instances_lookup` and `u_attr_instances` (T-5057): it serves the per-attribute read backwards and the upsert's conflict, and saves one index entry a history row (~150 B on a fresh build, 9 GB of a 30 GB week on dev). An empty history swaps in the migration; a plain-mode history with rows is moved by the maintenance job, one partition a pass with `CREATE INDEX CONCURRENTLY`, then one short transaction attaches them and drops the two old indexes. Until then each partition carries one more index on disk. A timescale hypertable with history keeps the two old indexes (timescale has no concurrent unique build). |
 | `0018_typed_location_paths` | Two btrees the broker's role reaches under RLS (T-5136): `i_entities_type_location_cell` (`tenant_id`, `types[1]`, `location_cell`) serves a geoquery of one type, whose cover over 0015's index read every type's rows in the cells (17 000-47 000 rows for a page of 20 on the distinct-1000 rig); `i_entities_type_unlocated` (`tenant_id`, `types[1]`, `id`) `WHERE location IS NULL` serves `!location` (an OGC `bbox` page's Features without a geometry), to which the store ANDs `location IS NULL`; the negated `@?` alone read the whole type for no row. Changes no access and no result. |
 | `0019_drop_entities_jsonb` | Drops `i_entities_jsonb`, the `jsonb_path_ops` GIN over the whole document (T-5193). No jsonb operator is leakproof (`@?`, `@>`, `?|`), so under forced RLS the broker's role never used it as an index condition: as `antares_app`, a q= page of 200,000 Entities read the primary key and filtered 199,998 rows with the GIN in place, while a superuser's plan read the GIN. Every Entity write still paid a GIN entry per path. 1,869 -> 1,754 B an Entity on that synthetic set; a deployment that bypasses RLS loses the GIN path its q= pages used. |
-| `0020_name_key` | A leakproof key for `name=="…"` (T-5349): `entities.name_key` (generated, `text COLLATE "C"`) holds the core-@context `name` (`https://uri.etsi.org/ngsi-ld/default-context/name`) of one instance whose `value` is a string up to 1,024 bytes, `''` without a `name`, NULL for every other shape; btree `i_entities_name_key` (`tenant_id`, `name_key`). The store ANDs `(name_key = $n OR name_key IS NULL)` to a top-level `name=="…"`, so a name filter without a type (STA `Things?$filter=name eq '…'`) reads the matching rows instead of the whole Tenant; the `@?` stays and decides. Rewrites `entities` once on upgrade. Changes no access and no result. |
+| `0020_history_integer_keys` | The second history parent of the integer keys (T-5200, "Integer history keys" above): `iri_ids` (per-Tenant dictionary of full expanded IRIs, 0005's per-command RLS, no UPDATE policy), `attr_rows` (partitioned or a hypertable as `attr_instances`, unique key (`tenant_id`, `entity_no`, `attr_no`, `observed_at`, `instance_no`), its RLS and compression as 0001 gives `attr_instances`), the one-row `history_cutover` holding NULL, and the functions `iri_no`, `attr_rows_of` and `attr_rows_at`. Every history read and delete covers both parents; nothing writes `attr_rows` while the cut-over is NULL. |
+| `0021_name_key` | A leakproof key for `name=="…"` (T-5349): `entities.name_key` (generated, `text COLLATE "C"`) holds the core-@context `name` (`https://uri.etsi.org/ngsi-ld/default-context/name`) of one instance whose `value` is a string up to 1,024 bytes, `''` without a `name`, NULL for every other shape; btree `i_entities_name_key` (`tenant_id`, `name_key`). The store ANDs `(name_key = $n OR name_key IS NULL)` to a top-level `name=="…"`, so a name filter without a type (STA `Things?$filter=name eq '…'`) reads the matching rows instead of the whole Tenant; the `@?` stays and decides. Rewrites `entities` once on upgrade. Changes no access and no result. |
