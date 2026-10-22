@@ -60,7 +60,7 @@ jobs:
         run: |
           python3 dev/perf/gate.py selftest
           mkdir -p results/bench-surfaces
-          BENCH_JSON=results/bench-surfaces/bench-core.json \
+          BENCH_JSON="$PWD"/results/bench-surfaces/bench-core.json \
             cargo bench --locked -q -p antares-sql --bench core_paths
           python3 dev/perf/gate.py bench results/bench-surfaces/bench-core.json \
             ci/perf-baseline/bench-core.json | tee results/bench-surfaces/bench-core.md

@@ -343,6 +343,31 @@ async fn every_query_shape_reads_an_index_under_rls() {
             "i_entities_location_cell",
         ),
         (
+            // T-5136: the type is in the cell key, so the cover reads one
+            // type's rows, not every type's in the cells
+            "geo near of a type",
+            format!(
+                "SELECT entity FROM entities WHERE {w} AND types[1] = '{t1}' AND {} \
+                 ORDER BY id LIMIT 10000",
+                geo_where(Rel::Near { max: Some(500.0), min: None }, "Point", &point)
+            ),
+            "i_entities_type_location_cell",
+        ),
+        (
+            // T-5136: `!location`, the OGC bbox page's Features without a
+            // geometry, with the store's leakproof `location IS NULL`
+            "no location of a type",
+            type_page(
+                &format!(
+                    "{w} AND location IS NULL AND NOT (entity @? \
+                     '$.\"https://uri.etsi.org/ngsi-ld/location\"[*].\"value\"'::jsonpath)"
+                ),
+                &[&[&t1]],
+                21,
+            ),
+            "i_entities_type_unlocated",
+        ),
+        (
             // a rare type (1 %): for a common one an id-ordered read of the
             // primary key stops after a page's worth of rows, which is the
             // right plan and no walk
@@ -387,6 +412,34 @@ async fn every_query_shape_reads_an_index_under_rls() {
         bad.is_empty(),
         "shapes that walk the Tenant under RLS:\n\n{}",
         bad.join("\n\n")
+    );
+}
+
+/// T-5136: a pooled session plans no parallel workers. A `q` page of a type
+/// (its `@?` a filter under RLS, estimated selective) planned a Gather of two
+/// workers, two processes started for a page of 21 rows: 2.5 ms became
+/// 106 ms a statement at 1 000 req/s on 2 cores.
+#[tokio::test]
+async fn a_pooled_session_starts_no_parallel_workers() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    seed_rls(&pool).await;
+    let workers: String = sqlx::query_scalar("SHOW max_parallel_workers_per_gather")
+        .fetch_one(&pool)
+        .await
+        .expect("show");
+    assert_eq!(workers, "0");
+    let w = format!("tenant_id = '{RLS_A}' AND (expires_at IS NULL OR expires_at > now())");
+    let q = r#"entity @? '$."https://x/speed"[*]."value" ? (@ == 42)'::jsonpath"#;
+    let plan = plan_of(
+        &pool,
+        RLS_A,
+        &type_page(&format!("{w} AND {q}"), &[&["https://x/T1"]], 21),
+    )
+    .await;
+    assert!(
+        !plan.contains("Gather"),
+        "a page plans parallel workers:\n{plan}"
     );
 }
 

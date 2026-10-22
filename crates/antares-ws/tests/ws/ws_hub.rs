@@ -368,3 +368,94 @@ async fn ws_the_notification_cap_holds_to_the_byte() -> Result<(), String> {
     );
     Ok(())
 }
+
+/// T-4921: a notification the broker dropped before the queue (a full
+/// delivery lane) takes its seq and reaches the consumer as an `x-gap` in
+/// order; losses in a row share one, and the socket stays open.
+#[tokio::test]
+async fn ws_a_loss_before_the_queue_is_a_gap_in_order() -> Result<(), String> {
+    let b = broker_alone(Limits::default()).await?;
+    let mut c = connect(b.addr, ROOT, &[]).await?;
+    let (sub, _) = two(&mut c).await?;
+    let sink = Sink::new(b.hub.clone());
+    let endpoint = format!("{ENDPOINT_PREFIX}{}", c.connection);
+    let out = outbound(Some(&sub), None);
+    assert!(sink.deliver(&endpoint, &out, TIMEOUT).await.is_ok());
+    sink.lost(&endpoint, "default", &sub);
+    sink.lost(&endpoint, "default", &sub);
+    // another Tenant's loss and an unknown Subscription's are not this one's
+    assert_eq!(b.hub.lose(&c.connection, "other", &sub), Answer::Unknown);
+    assert_eq!(
+        b.hub.lose(&c.connection, "default", "urn:x"),
+        Answer::Unknown
+    );
+    assert!(sink.deliver(&endpoint, &out, TIMEOUT).await.is_ok());
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        let m = c.next().await.map_err(|e| format!("{e} after {seen:?}"))?;
+        seen.push((
+            text(&m, "/metadata/x-op"),
+            m.pointer("/metadata/x-seq").cloned(),
+            m.pointer("/metadata/x-from").cloned(),
+            m.pointer("/metadata/x-to").cloned(),
+        ));
+    }
+    assert_eq!(
+        seen,
+        vec![
+            ("x-notification".to_owned(), Some(json!(1)), None, None),
+            ("x-gap".to_owned(), None, Some(json!(2)), Some(json!(3))),
+            ("x-notification".to_owned(), Some(json!(4)), None, None),
+        ]
+    );
+    assert_eq!(b.hub.overflows(), 0);
+    assert_eq!(b.hub.attached(), 1, "the socket stays open");
+    Ok(())
+}
+
+/// T-4921: a loss into a full queue is an overflow like any other, and a
+/// full queue that holds a gap reports the gap's whole range as lost.
+#[tokio::test]
+async fn ws_a_loss_into_a_full_queue_overflows() -> Result<(), String> {
+    for gap_first in [false, true] {
+        let b = broker_alone(Limits {
+            queue: 1,
+            ..Limits::default()
+        })
+        .await?;
+        let mut c = connect(b.addr, ROOT, &[]).await?;
+        let (sub, _) = two(&mut c).await?;
+        let sink = Sink::new(b.hub.clone());
+        let endpoint = format!("{ENDPOINT_PREFIX}{}", c.connection);
+        let mut out = outbound(Some(&sub), None);
+        if let Some(data) = out.body.get_mut("data").and_then(Value::as_array_mut) {
+            data.push(json!({"id": "urn:ngsi-ld:Car:s", "type": "Car"}));
+        }
+        // a binding's URI that names no connection is not this hub's
+        sink.lost("urn:other", "default", &sub);
+        assert_eq!(b.hub.lose("nobody", "default", &sub), Answer::Unknown);
+        if gap_first {
+            assert_eq!(b.hub.lose(&c.connection, "default", &sub), Answer::Queued);
+            assert!(sink.deliver(&endpoint, &out, TIMEOUT).await.is_err());
+        } else {
+            assert!(sink.deliver(&endpoint, &out, TIMEOUT).await.is_ok());
+            assert_eq!(b.hub.lose(&c.connection, "default", &sub), Answer::Overflow);
+        }
+        assert_eq!(b.hub.overflows(), 1);
+        let (code, seen) = c.closed().await?;
+        assert_eq!(code, 1013, "{seen:?}");
+        let gap = seen
+            .iter()
+            .find(|m| m.pointer("/metadata/x-op") == Some(&json!("x-gap")))
+            .ok_or(format!("no x-gap in {seen:?}"))?;
+        assert_eq!(
+            (
+                gap.pointer("/metadata/x-from"),
+                gap.pointer("/metadata/x-to")
+            ),
+            (Some(&json!(1)), Some(&json!(2))),
+            "{gap}"
+        );
+    }
+    Ok(())
+}
