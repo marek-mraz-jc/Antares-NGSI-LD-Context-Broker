@@ -188,7 +188,7 @@ pub(crate) async fn change(
 /// A `PUT` replaces the whole Entity, and the surface serves only the default instance of an
 /// Attribute (S3): an Entity that holds an instance with a `datasetId` is `409`, never replaced,
 /// so no instance the caller cannot read here is deleted (T-5206 finding 8). The Entity is read
-/// under the view first; an absent one goes on to the replace's own `404`.
+/// under the view first; an absent or hidden one is `404`, as the replace would answer.
 async fn named_instances_kept(
     reads: &Reads,
     caller: &Caller,
@@ -197,7 +197,8 @@ async fn named_instances_kept(
     version: ODataVersion,
 ) -> Result<(), ODataErrorResponse> {
     let target = typed(&format!("/ngsi-ld/v1/entities/{}", encode(id)), set);
-    let docs = match run(
+    // an absent or hidden Entity is the `404` the replace would answer
+    let (docs, _) = run(
         reads,
         caller,
         OperationId::RetrieveEntity,
@@ -205,12 +206,7 @@ async fn named_instances_kept(
         &Translated::default(),
         version,
     )
-    .await
-    {
-        Ok((docs, _)) => docs,
-        Err(e) if e.status == StatusCode::NOT_FOUND => return Ok(()),
-        Err(e) => return Err(e),
-    };
+    .await?;
     let named = |v: &Value| v.get("datasetId").is_some();
     let held = docs
         .iter()

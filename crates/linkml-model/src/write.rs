@@ -416,15 +416,17 @@ pub fn context(model: &Model) -> String {
         // The kind first, then the range (TS 104 175 5.2.6.4.6 to 5.2.6.4.10, T-5206 finding 3).
         let kind = model.kind(slot);
         let coerced = match (kind, model.range(slot)) {
-            _ if geo(model, slot) => None,
-            ("LanguageProperty", _) => None,
             ("VocabProperty", _) => Some("@vocab".to_owned()),
             ("JsonProperty", _) => Some("@json".to_owned()),
             ("Relationship" | "ListRelationship", _) => Some("@id".to_owned()),
-            // any other kind over a class holds the object (`inlined`)
-            (_, Range::Class(_)) => None,
-            (_, Range::Type(Builtin::String) | Range::Enum(_)) => None,
-            (_, Range::Type(b)) => Some(b.xsd().replacen("xsd:", XSD, 1)),
+            (k, Range::Type(b))
+                if k != "LanguageProperty" && b != Builtin::String && !geo(model, slot) =>
+            {
+                Some(b.xsd().replacen("xsd:", XSD, 1))
+            }
+            // a GeoProperty, a LanguageProperty, any other kind over a class (it holds the
+            // object, `inlined`), a string and an enum stay untyped
+            _ => None,
         };
         let container = match kind {
             "LanguageProperty" => Some("@language"),

@@ -575,4 +575,23 @@ mod tests {
         assert_eq!(c["@context"]["address"], "https://e.org/city/address");
         assert_eq!(c["@context"]["venue"]["@type"], "@id");
     }
+
+    /// A visible class the schema itself names `Any` keeps its name: the stub is `LinkmlAny`.
+    #[test]
+    fn a_visible_class_named_any_keeps_its_name() {
+        let source = model(
+            r#"{"id": "https://e.org/city/", "name": "city",
+              "classes": {"Event": {"slots": ["address"]}, "Any": {}, "PostalAddress": {}},
+              "slots": {"address": {"range": "PostalAddress", "inlined": true}}}"#,
+        );
+        let (m, _) =
+            narrow(&source, &visible(&["Event", "Any"], &["address"]), "events").expect("narrowed");
+        let s = m.schema();
+        assert_eq!(s.slots["address"].range.as_deref(), Some("LinkmlAny"));
+        assert_eq!(m.class_iri("LinkmlAny"), "https://w3id.org/linkml/Any");
+        assert!(
+            s.classes["Any"].class_uri.is_none(),
+            "the schema's own class"
+        );
+    }
 }

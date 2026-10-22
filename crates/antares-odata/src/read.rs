@@ -2074,6 +2074,41 @@ mod tests {
             );
         }
         assert_eq!(member_value(&value(false), None), Value::Null);
+        assert_eq!(
+            served(&Shape::Language, None),
+            (Value::Null, None),
+            "absent, no note"
+        );
+    }
+
+    #[test]
+    fn ngsild_lang_is_one_language_tag() {
+        let with = |v: &str| QueryOptions {
+            custom: vec![("ngsild.lang".to_owned(), Some(v.to_owned()))],
+            ..QueryOptions::default()
+        };
+        assert_eq!(lang_of(&QueryOptions::default()), Ok(None));
+        assert_eq!(lang_of(&with("en-GB")), Ok(Some("en-GB")));
+        for bad in ["", "1a", "s;k", &"a".repeat(36)] {
+            assert_eq!(lang_of(&with(bad)), Err(()), "{bad}");
+        }
+    }
+
+    #[test]
+    fn include_annotations_names_the_vocabulary_or_everything() {
+        let prefer = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("Prefer", v.parse().expect("header"));
+            annotated(&h)
+        };
+        assert!(prefer(r#"odata.include-annotations="*""#));
+        assert!(prefer("return=minimal, include-annotations=NgsiLd.*"));
+        assert!(prefer(
+            r#"odata.include-annotations="Antares.NgsiLd.observedAt""#
+        ));
+        assert!(!prefer(r#"odata.include-annotations="Core.*""#));
+        assert!(!prefer("odata.maxpagesize=5"));
+        assert!(!annotated(&HeaderMap::new()));
     }
 
     #[test]
