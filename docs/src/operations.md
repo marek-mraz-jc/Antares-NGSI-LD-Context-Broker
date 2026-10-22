@@ -329,8 +329,8 @@ The script, step by step:
 
 1. `\copy` the file into an `UNLOGGED` staging table; the `jsonb` cast is
    the only parser the payload meets.
-2. Drop the eight secondary indexes (`i_entities_location`,
-   `i_entities_jsonb`, `i_entities_types`, `i_entities_loc_ambiguous`,
+2. Drop the seven secondary indexes (`i_entities_location`,
+   `i_entities_types`, `i_entities_loc_ambiguous`,
    `i_entities_expires`, `i_entities_first_type_id`,
    `i_entities_multi_type_id`, `i_entities_types_multi`);
    the primary key stays because the insert needs it.

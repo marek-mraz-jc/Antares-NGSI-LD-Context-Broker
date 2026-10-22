@@ -1290,10 +1290,11 @@ async fn an_unchanged_append_records_no_new_instance() {
         (got[1].0.as_str(), &got[1].2["value"]),
         (kept.as_str(), &json!(11))
     );
+    // the kept id is the column (checked above); data does not repeat it (T-5131)
     assert_eq!(
-        got[1].2["instanceId"],
-        json!(kept),
-        "the instance keeps its id"
+        got[1].2.get("instanceId"),
+        None,
+        "the instance keeps its id in its column"
     );
 
     // Without observedAt: compared with the newest stored value.
