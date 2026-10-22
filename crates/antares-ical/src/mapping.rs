@@ -283,10 +283,7 @@ pub fn plan_of(written: &serde_json::Value) -> Result<(Plan, bool), String> {
             preset,
             mapping: BTreeMap::new(),
         };
-        tracing::warn!(
-            version,
-            "a calendar mapping of a newer version than this broker reads: its preset is served"
-        );
+        tracing::warn!(version, "newer calendar mapping: preset served");
         return Plan::compile(&mapping).map(|p| (p, true));
     }
     let mapping: IcalMapping =
