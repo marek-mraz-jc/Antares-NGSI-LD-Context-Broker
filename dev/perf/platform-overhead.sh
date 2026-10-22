@@ -2,7 +2,7 @@
 # What the platform build costs over vanilla Antares on the same request
 # shapes (T-4853, docs/src/performance.md "Vanilla against the platform
 # build"): dev/perf/shapes.sh with the vanilla binary, with the platform
-# image binary (`full,jc-policy,linkml,parquet,tabular,ical`) as vanilla
+# image binary (`full,jc-policy,linkml,parquet,tabular,ical,feed`) as vanilla
 # runs it, and with that binary under ANTARES_POLICY=joinedcontext, a
 # policy document of 20 permissions and 12 Endpoint views loaded, every
 # request carrying the subject the gateway would name. The runs share the

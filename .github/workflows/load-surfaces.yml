@@ -60,7 +60,7 @@ jobs:
           mkdir -p bin
           cargo build --locked --release -p antares-broker
           cp target/release/antares bin/antares-vanilla
-          cargo build --locked --release -p antares-broker --features full,jc-policy,linkml,parquet,tabular,ical
+          cargo build --locked --release -p antares-broker --features full,jc-policy,linkml,parquet,tabular,ical,feed
           cp target/release/antares bin/antares-platform
       - name: Load every surface
         env:

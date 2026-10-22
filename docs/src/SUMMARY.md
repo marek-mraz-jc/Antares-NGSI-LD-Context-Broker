@@ -21,6 +21,7 @@
 - [SensorThings API endpoint of a view](sta.md)
 - [iCalendar feed of a view](ical.md)
 - [GeoJSON of a view](geojson.md)
+- [Feeds of a view](feed.md)
 - [WebSocket notifications](websocket.md)
 - [Federation](federation.md)
 - [Internal context sources](internal-context-sources.md)

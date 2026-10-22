@@ -105,6 +105,7 @@ version = "0.3.0"
 dependencies = [
  "antares-api",
  "antares-bus",
+ "antares-feed",
  "antares-geojson",
  "antares-ical",
  "antares-icsr",
@@ -168,6 +169,22 @@ dependencies = [
  "parquet",
  "serde_json",
  "zip",
+]
+
+[[package]]
+name = "antares-feed"
+version = "0.3.0"
+dependencies = [
+ "antares-ops",
+ "axum",
+ "chrono",
+ "http-body-util",
+ "metrics",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]

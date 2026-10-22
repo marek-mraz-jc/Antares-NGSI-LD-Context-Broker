@@ -130,7 +130,7 @@ extensions are Cargo features, and the default build carries none of them.
 image (signed with cosign, SPDX and CycloneDX SBOMs on every release) serve
 NGSI-LD (ETSI GS CIM 009 V1.9.1) and the `/q` admin surface, nothing else.
 The platform builds `antares-broker-jc` with
-`--features full,jc-policy,linkml,parquet,tabular,ical`.
+`--features full,jc-policy,linkml,parquet,tabular,ical,feed`.
 
 ```bash
 docker compose -f compose-files/docker-compose-postgres.yml up   # broker + PostGIS only

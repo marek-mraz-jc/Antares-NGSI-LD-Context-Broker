@@ -20,7 +20,7 @@ cd "$(dirname "$0")/.."
 # crates this repository knows about, so a rename that dodges the path rule
 # is still caught.
 # The surfaces epic adds its ops, surface and protocol crates (surfaces-threat-model 9.5, rule M3).
-FORBIDDEN='examples/|addons/|joinedcontext-|antares-plugin-|antares-policy-|antares-facade-|antares-sensorthings|antares-ogcapi|antares-sta|antares-ical|antares-wfs|antares-odata|antares-geojson|antares-ops|antares-views|antares-mcp|antares-linkml|antares-ws|antares-icsr|odata-|linkml-model|rmcp|tungstenite'
+FORBIDDEN='examples/|addons/|joinedcontext-|antares-plugin-|antares-policy-|antares-facade-|antares-sensorthings|antares-ogcapi|antares-sta|antares-ical|antares-wfs|antares-odata|antares-geojson|antares-feed|antares-ops|antares-views|antares-mcp|antares-linkml|antares-ws|antares-icsr|odata-|linkml-model|rmcp|tungstenite'
 
 tree() { cargo tree -p antares-broker -e normal --locked "$@"; }
 
