@@ -33,7 +33,7 @@ use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::any;
 use axum::Router;
-use mapping::{local, self_link, urn_of};
+use mapping::{local, self_link, unpart, urn_of};
 use query::{ById, Options, Step};
 use serde_json::{json, Value};
 
@@ -173,8 +173,15 @@ async fn respond(ops: &Ops, caller: &Caller, req: &Parts) -> Done {
     let pairs = Query::<Vec<(String, String)>>::try_from_uri(uri)
         .map(|Query(p)| p)
         .unwrap_or_default();
+    let options = query::options(&pairs)?;
+    let steps = query::steps(&rest);
+    let ids = match (&options.filter, steps.as_slice()) {
+        (Some(f), [Step { set, key: None }]) => query::by_id(f, set)?,
+        _ => ById::default(),
+    };
+    expandable(&steps, &options.expand)?;
     let cx = Cx {
-        opts: query::options(&pairs)?,
+        opts: options,
         base: format!(
             "{}{PREFIX}/{id}/sta/v1.1",
             antares_ops::public_base(&req.headers)
@@ -182,8 +189,9 @@ async fn respond(ops: &Ops, caller: &Caller, req: &Parts) -> Done {
         view: &view,
         caller,
         pairs,
+        ids,
     };
-    match query::steps(&rest).as_slice() {
+    match steps.as_slice() {
         [] => Ok(json!({
             "value": SETS.iter().map(|s| json!({ "name": s, "url": format!("{}/{s}", cx.base) })).collect::<Vec<_>>(),
             "serverSettings": { "conformance": CONFORMANCE },
@@ -192,7 +200,11 @@ async fn respond(ops: &Ops, caller: &Caller, req: &Parts) -> Done {
         [Step {
             set,
             key: Some(key),
-        }] => cx.one(set, key).await?.ok_or_else(not_found),
+        }] => cx
+            .one(set, key)
+            .await?
+            .map(|v| query::selected(v, &cx.opts.select))
+            .ok_or_else(not_found),
         [Step {
             set: from,
             key: Some(key),
@@ -204,47 +216,68 @@ async fn respond(ops: &Ops, caller: &Caller, req: &Parts) -> Done {
     }
 }
 
-/// One request's view, caller, base and options.
+/// The `$expand` paths each set renders (T-5205 finding 18); any other is refused by name.
+fn expandable(steps: &[Step], expand: &[String]) -> Result<(), Problem> {
+    let target = match steps {
+        [.., Step { set, .. }] => set.as_str(),
+        [] => "",
+    };
+    let served: &[&str] = match target {
+        "Things" | "Thing" => &["Locations", "Datastreams", "Datastreams/Observations"],
+        "Datastreams" | "Datastream" => &["Observations"],
+        _ => &[],
+    };
+    match expand.iter().find(|p| !served.contains(&p.as_str())) {
+        Some(p) => Err(Problem(
+            StatusCode::BAD_REQUEST,
+            format!("$expand: {p} is not served on {target}"),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// One request's view, caller, base, options and the id and type comparisons of its `$filter`.
 struct Cx<'a> {
     view: &'a ViewOps,
     caller: &'a Caller,
     base: String,
     opts: Options,
     pairs: Vec<(String, String)>,
+    ids: ById,
 }
 
 impl Cx<'_> {
     /// What every Query Entities names: the types the view shows (NGSI-LD 5.7.2 takes no query
     /// without one), or for a view of every type the local store.
-    fn selector(&self) -> String {
-        if self.view.shows_every_name() {
-            return "local=true".into();
-        }
-        let (types, _) = self.view.shown_names();
-        let types: Vec<String> = types.iter().map(|t| encode(t)).collect();
-        format!("type={}", types.join(","))
-    }
-
-    /// The name the view answers an Attribute under, from the local name an id carries.
-    fn attribute(&self, name: &str) -> String {
-        let (_, attrs) = self.view.shown_names();
-        attrs
-            .into_iter()
-            .find(|a| local(a) == name)
-            .unwrap_or_else(|| name.to_owned())
-    }
-
-    /// `$filter` of an entity set: its id comparisons and the `&q=` of the rest, empty without.
-    fn filter(&self) -> Result<(ById, String), Problem> {
-        let ids = match &self.opts.filter {
-            Some(f) => query::by_id(f)?,
-            None => ById::default(),
+    /// `properties/type eq` narrows it to those types the view shows (T-5205 finding 9): `None`
+    /// when it shows none of them.
+    fn selector(&self) -> Option<String> {
+        let wanted = &self.ids.types;
+        let types: Vec<String> = if self.view.shows_every_name() {
+            if wanted.is_empty() {
+                return Some("local=true".into());
+            }
+            wanted.clone()
+        } else {
+            let (shown, _) = self.view.shown_names();
+            shown
+                .into_iter()
+                .filter(|t| wanted.is_empty() || wanted.iter().any(|w| w == t || w == local(t)))
+                .collect()
         };
-        let q = ids
+        if types.is_empty() {
+            return None;
+        }
+        let types: Vec<String> = types.iter().map(|t| encode(t)).collect();
+        Some(format!("type={}", types.join(",")))
+    }
+
+    /// The `&q=` of an entity set's `$filter`, empty without.
+    fn filter(&self) -> String {
+        self.ids
             .q
             .as_ref()
-            .map_or_else(String::new, |q| format!("&q={}", encode(q)));
-        Ok((ids, q))
+            .map_or_else(String::new, |q| format!("&q={}", encode(q)))
     }
 
     /// One Query Entities through the view: the Entities, whether more remain past them, and
@@ -254,9 +287,12 @@ impl Cx<'_> {
         extra: &str,
         page: Page,
     ) -> Result<(Vec<Value>, bool, Option<usize>), Problem> {
+        let Some(selector) = self.selector() else {
+            return Ok((Vec::new(), false, Some(0)));
+        };
         // `modifiedAt` is the time of a value no sensor observed (STA 1.1 phenomenonTime).
         let pushdown = Pushdown {
-            query: format!("{}{extra}", self.selector()),
+            query: format!("{selector}{extra}"),
             sys_attrs: true,
             ..Pushdown::default()
         };
@@ -333,7 +369,7 @@ impl Cx<'_> {
         extra: &str,
     ) -> Result<Option<Value>, Problem> {
         let path = format!(
-            "/ngsi-ld/v1/temporal/entities/{}?attrs={}&lastN={last}{extra}",
+            "/ngsi-ld/v1/temporal/entities/{}?attrs={}&lastN={last}&options=sysAttrs{extra}",
             encode(urn),
             encode(attribute)
         );
@@ -345,8 +381,25 @@ impl Cx<'_> {
         if !SETS.contains(&set) {
             return Err(not_found());
         }
-        let (ids, extra) = self.filter()?;
+        let (ids, extra) = (&self.ids, self.filter());
         let path = format!("{}/{set}", self.base);
+        if self.opts.ordered {
+            return Err(Problem(
+                StatusCode::BAD_REQUEST,
+                "$orderby: served on a Datastream's Observations only".into(),
+            ));
+        }
+        if self.opts.top == 0 {
+            // The count alone (T-5205 finding 19): one Entity read for the operation's count.
+            let page = Page {
+                start: 0,
+                size: 1,
+                whole: self.opts.count,
+            };
+            let (_, _, count) = self.entities(&extra, page).await?;
+            let count = count.filter(|_| set == "Things" && ids.not.is_empty());
+            return Ok(query::collection(Vec::new(), &[], count, None));
+        }
         if let Some(key) = ids.is.first() {
             if ids.q.is_some() {
                 return Err(Problem(
@@ -355,13 +408,13 @@ impl Cx<'_> {
                 ));
             }
             let items = self.one(set, key).await?.into_iter().collect();
-            return Ok(self.listed(&path, items, true, &ids));
+            return Ok(self.listed(&path, items, true, ids));
         }
         if set == "HistoricalLocations" {
-            return self.moves(&extra, &path, &ids).await;
+            return self.moves(&extra, &path, ids).await;
         }
         if matches!(set, "Datastreams" | "Observations" | "ObservedProperties") {
-            return self.resources(set, &extra, &path, &ids).await;
+            return self.resources(set, &extra, &path, ids).await;
         }
         let page = Page {
             start: self.opts.skip,
@@ -372,14 +425,17 @@ impl Cx<'_> {
         let groups = match set {
             "Sensors" => {
                 let devices = self.referenced(&entities, "refDevice").await?;
-                entities
-                    .iter()
-                    .map(|e| {
+                // The Sensor of the Datastreams whose Entity names no Device, once, first.
+                let unknown =
+                    (self.opts.skip == 0).then(|| vec![mapping::unknown_sensor(&self.base)]);
+                unknown
+                    .into_iter()
+                    .chain(entities.iter().map(|e| {
                         target(&devices, mapping::object(e, "refDevice"))
                             .and_then(|d| mapping::sensor(&self.base, d))
                             .into_iter()
                             .collect()
-                    })
+                    }))
                     .collect()
             }
             "FeaturesOfInterest" => {
@@ -394,34 +450,43 @@ impl Cx<'_> {
         // Only a Thing is one Entity, so only its count is the operation's, and only while no
         // id is left out of the page after the read.
         let count = count.filter(|_| set == "Things" && ids.not.is_empty());
-        Ok(self.page(&path, groups, more, count, &ids))
+        Ok(self.page(&path, groups, more, count, ids))
     }
 
     /// A page of a set an Entity holds several resources of: `$top` resources from the start
     /// [`Cx::resume`] finds, `@iot.nextLink` resuming after the last one served.
     async fn resources(&self, set: &str, extra: &str, path: &str, ids: &ById) -> Done {
-        let (first, skipped) = self.resume(set, extra).await?;
-        let page = Page {
-            start: first,
-            size: self.opts.top,
-            whole: false,
-        };
-        let (entities, more, _) = self.entities(extra, page).await?;
-        // One group per resource, and where the next page resumes after each.
+        let start = self.resume(set, extra).await?;
+        let (mut at, mut skipped) = start;
+        // One group per resource, and where the next page resumes after each. Entities that hold
+        // none are read past, a page of Entities at a time, until the page is full or [`WALK`]
+        // Entities were read (T-5205 finding 15: 830 empty pages before the first Datastream).
         let (mut groups, mut after) = (Vec::new(), Vec::new());
-        for (n, e) in entities.iter().enumerate() {
-            let at = first.saturating_add(n);
-            let items = self.items(set, e);
-            let held = items.len();
-            let from = if n == 0 { skipped } else { 0 };
-            for (i, item) in items.into_iter().enumerate().skip(from) {
-                let done = i.saturating_add(1);
-                after.push(if done == held {
-                    (at.saturating_add(1), 0)
-                } else {
-                    (at, done)
-                });
-                groups.push(vec![item]);
+        let mut more = true;
+        for _ in 0..WALK / query::MAX_TOP {
+            if groups.len() >= self.opts.top || !more {
+                break;
+            }
+            let page = Page {
+                start: at,
+                size: self.opts.top,
+                whole: false,
+            };
+            let (entities, left, _) = self.entities(extra, page).await?;
+            more = left;
+            for e in &entities {
+                let items = self.items(set, e);
+                let held = items.len();
+                for (i, item) in items.into_iter().enumerate().skip(skipped) {
+                    let done = i.saturating_add(1);
+                    after.push(if done == held {
+                        (at.saturating_add(1), 0)
+                    } else {
+                        (at, done)
+                    });
+                    groups.push(vec![item]);
+                }
+                (at, skipped) = (at.saturating_add(1), 0);
             }
         }
         let read = groups.len();
@@ -430,10 +495,10 @@ impl Cx<'_> {
         let resume = if served < read {
             after.get(served.saturating_sub(1)).copied()
         } else {
-            more.then_some((first.saturating_add(entities.len()), 0))
+            more.then_some((at, 0))
         };
         let next = resume.map(|(e, i)| self.link(path, "$skiptoken", &format!("{e}.{i}")));
-        Ok(self.finish(items, next, None, (first, skipped) == (0, 0), ids))
+        Ok(self.finish(items, next, None, start == (0, 0), ids))
     }
 
     /// Where a page of [`Cx::resources`] starts, as an Entity offset and the resources of that
@@ -513,21 +578,25 @@ impl Cx<'_> {
     /// it, else its own location when it points at none.
     fn feature_of(&self, e: &Value, pois: &[Value]) -> Option<Value> {
         if let Some(poi) = mapping::object(e, "refPointOfInterest") {
-            return target(pois, Some(poi)).and_then(|t| mapping::feature(&self.base, t, poi));
+            return target(pois, Some(poi))
+                .and_then(|t| mapping::feature(&self.base, t, &mapping::part(poi)));
         }
         let urn = e.get("id").and_then(Value::as_str).unwrap_or_default();
-        mapping::feature(&self.base, e, &format!("{urn}/location"))
+        mapping::feature(&self.base, e, &format!("{}/location", mapping::part(urn)))
     }
 
     /// A page of HistoricalLocations: one Query Temporal Evolution of the `location` history of
     /// `$top` Entities from `$skip`.
     async fn moves(&self, extra: &str, path: &str, ids: &ById) -> Done {
         let (top, skip) = (self.opts.top, self.opts.skip);
+        let Some(selector) = self.selector() else {
+            return Ok(self.page(path, Vec::new(), false, None, ids));
+        };
         // ponytail: the last MAX_TOP moves of each Entity; a window per Entity when a client
         // pages a long history through this set rather than through its Thing.
         let query = format!(
             "/ngsi-ld/v1/temporal/entities?{}{extra}&attrs=location&timerel=after&timeAt={EPOCH}&lastN={}&limit={top}&offset={skip}",
-            self.selector(),
+            selector,
             query::MAX_TOP,
         );
         let answer = self.get(OperationId::TemporalQuery, query).await?;
@@ -551,12 +620,27 @@ impl Cx<'_> {
     async fn one(&self, set: &str, key: &str) -> Result<Option<Value>, Problem> {
         let base = self.base.as_str();
         let found = match set {
-            "Things" | "Locations" | "Datastreams" => self
-                .entity(urn_of(key))
+            "Things" => self
+                .entity(Some(key))
+                .await?
+                .and_then(|e| find(self.items(set, &e), key)),
+            // `{E}/location/{T}`: where the Entity was at T (T-5205 finding 13).
+            "Locations" if key.matches('/').count() == 2 => match urn_of(key) {
+                Some(urn) => {
+                    let time = key.rsplit('/').next().unwrap_or_default();
+                    self.history(&urn, "location", query::MAX_SKIP, "")
+                        .await?
+                        .and_then(|e| mapping::location_at(base, &e, time))
+                        .filter(|l| l.get("@iot.id").and_then(Value::as_str) == Some(key))
+                }
+                None => None,
+            },
+            "Locations" | "Datastreams" => self
+                .entity(urn_of(key).as_deref())
                 .await?
                 .and_then(|e| find(self.items(set, &e), key)),
             // The current Observation, else an earlier one of its Datastream's history.
-            "Observations" => match self.entity(urn_of(key)).await? {
+            "Observations" => match self.entity(urn_of(key).as_deref()).await? {
                 None => None,
                 Some(e) => match find(self.items(set, &e), key) {
                     Some(o) => Some(o),
@@ -575,23 +659,26 @@ impl Cx<'_> {
                     .first()
                     .and_then(|e| find(mapping::observed_properties(base, e), key))
             }
+            "Sensors" if key == mapping::UNKNOWN_SENSOR => Some(mapping::unknown_sensor(base)),
             "Sensors" => self
                 .entity(Some(key))
                 .await?
                 .and_then(|d| mapping::sensor(base, &d)),
+            // `{E}/location`, an Entity's own; else a point of interest's id, as a part.
             "FeaturesOfInterest" => match key.strip_suffix("/location") {
-                Some(urn) => self
-                    .entity(Some(urn))
+                Some(_) => self
+                    .entity(urn_of(key).as_deref())
                     .await?
+                    .filter(|e| mapping::object(e, "refPointOfInterest").is_none())
                     .and_then(|e| self.feature_of(&e, &[])),
                 None => self
-                    .entity(Some(key))
+                    .entity(unpart(key).as_deref())
                     .await?
                     .and_then(|t| mapping::feature(base, &t, key)),
             },
             "HistoricalLocations" => match urn_of(key) {
                 Some(urn) => self
-                    .history(urn, "location", query::MAX_SKIP, "")
+                    .history(&urn, "location", query::MAX_SKIP, "")
                     .await?
                     .and_then(|e| find(mapping::historical_locations(base, &e), key)),
                 None => None,
@@ -607,28 +694,38 @@ impl Cx<'_> {
     async fn related(&self, from: &str, key: &str, member: &str) -> Done {
         let path = format!("{}/{member}", self_link(&self.base, from, key));
         let source = self.one(from, key).await?.ok_or_else(not_found)?;
-        let urn = urn_of(key).unwrap_or(key);
+        let owner = match from {
+            "Things" | "Sensors" => Some(key.to_owned()),
+            "FeaturesOfInterest" if !key.ends_with("/location") => unpart(key),
+            _ => urn_of(key),
+        };
+        let urn = owner.as_deref().unwrap_or(key);
         let single = match (from, member) {
             ("Things", "Locations" | "Datastreams" | "HistoricalLocations") => {
                 return self.of_thing(&path, urn, member).await
             }
             ("Locations", "HistoricalLocations") => return self.of_thing(&path, urn, member).await,
             ("Datastreams", "Observations") => return self.series(key).await,
-            ("Locations", "Things") | ("HistoricalLocations", "Locations") => {
-                let set = if member == "Things" {
-                    "Things"
-                } else {
-                    "Locations"
-                };
+            ("Locations", "Things") => {
                 let e = self.entity(Some(urn)).await?.ok_or_else(not_found)?;
-                return Ok(self.listed(&path, self.items(set, &e), true, &ById::default()));
+                return Ok(self.listed(&path, self.items(member, &e), true, &ById::default()));
+            }
+            // Where the Thing was at the HistoricalLocation's time (T-5205 finding 13).
+            ("HistoricalLocations", "Locations") => {
+                let time = key.rsplit('/').next().unwrap_or_default();
+                let lid = format!("{}/location/{time}", mapping::part(urn));
+                let items = self.one("Locations", &lid).await?.into_iter().collect();
+                return Ok(self.listed(&path, items, true, &ById::default()));
             }
             ("Sensors", "Datastreams") => {
+                let q = if key == mapping::UNKNOWN_SENSOR {
+                    "!refDevice".to_owned()
+                } else {
+                    format!("refDevice=={}", Value::String(key.to_owned()))
+                };
                 return self
-                    .where_(&path, "refDevice", key, |b, e| {
-                        mapping::datastreams(b, e, &[])
-                    })
-                    .await
+                    .where_(&path, &q, |b, e| mapping::datastreams(b, e, &[]))
+                    .await;
             }
             ("FeaturesOfInterest", "Observations") if key.ends_with("/location") => {
                 let e = self.entity(Some(urn)).await?.ok_or_else(not_found)?;
@@ -640,21 +737,20 @@ impl Cx<'_> {
                 ));
             }
             ("FeaturesOfInterest", "Observations") => {
-                return self
-                    .where_(&path, "refPointOfInterest", key, mapping::observations)
-                    .await
+                let q = format!("refPointOfInterest=={}", Value::String(urn.to_owned()));
+                return self.where_(&path, &q, mapping::observations).await;
             }
             ("ObservedProperties", "Datastreams") => return self.measuring(&path, key).await,
             ("Datastreams" | "HistoricalLocations", "Thing") => self.one("Things", urn).await?,
             ("Datastreams", "Sensor") => {
                 let e = self.entity(Some(urn)).await?.ok_or_else(not_found)?;
-                let device = mapping::object(&e, "refDevice").ok_or_else(not_found)?;
+                let device = mapping::object(&e, "refDevice").unwrap_or(mapping::UNKNOWN_SENSOR);
                 self.one("Sensors", device).await?
             }
             ("Datastreams", "ObservedProperty") => {
                 let (_, name, _) = mapping::split_stream(key).ok_or_else(not_found)?;
-                let iri = antares_ops::core_iri(&self.attribute(name));
-                self.one("ObservedProperties", &iri).await?
+                self.one("ObservedProperties", &antares_ops::core_iri(&name))
+                    .await?
             }
             // `one` found the Observation, so its id names a Datastream.
             ("Observations", "Datastream") => {
@@ -671,22 +767,15 @@ impl Cx<'_> {
             }
             _ => None,
         };
-        single.ok_or_else(not_found)
+        single
+            .map(|v| query::selected(v, &self.opts.select))
+            .ok_or_else(not_found)
     }
 
-    /// A page of the resources `make` builds from each Entity whose `relationship` points at
-    /// `target`: a Sensor's Datastreams, a point of interest's Observations.
-    async fn where_(
-        &self,
-        path: &str,
-        relationship: &str,
-        target: &str,
-        make: fn(&str, &Value) -> Vec<Value>,
-    ) -> Done {
-        // `target` is the id of an Entity `one` found: a URI the broker validated at its creation
-        // (antares_model::EntityId::new), so it holds no `"` or `\` to end the q string.
-        let q = format!("{relationship}==\"{target}\"");
-        let extra = format!("&q={}", encode(&q));
+    /// A page of the resources `make` builds from each Entity `q` keeps: a Sensor's Datastreams,
+    /// a point of interest's Observations.
+    async fn where_(&self, path: &str, q: &str, make: fn(&str, &Value) -> Vec<Value>) -> Done {
+        let extra = format!("&q={}", encode(q));
         let (entities, more, _) = self.entities(&extra, self.paged()).await?;
         let groups = entities.iter().map(|e| make(&self.base, e)).collect();
         Ok(self.page(path, groups, more, None, &ById::default()))
@@ -706,7 +795,7 @@ impl Cx<'_> {
                         mapping::split_stream(
                             d.get("@iot.id").and_then(Value::as_str).unwrap_or_default(),
                         )
-                        .is_some_and(|(_, name, _)| antares_ops::core_iri(name) == iri)
+                        .is_some_and(|(_, name, _)| antares_ops::core_iri(&name) == iri)
                     })
                     .collect()
             })
@@ -725,17 +814,14 @@ impl Cx<'_> {
 
     /// An earlier Observation by id, found in its Datastream's history.
     async fn earlier(&self, key: &str) -> Result<Option<Value>, Problem> {
-        let Some(stream) = mapping::stream_of(key) else {
+        let parts = mapping::stream_of(key).and_then(|s| Some((s, mapping::split_stream(s)?)));
+        let Some((stream, (urn, name, _))) = parts else {
             return Ok(None);
         };
-        let Some((urn, name, _)) = mapping::split_stream(stream) else {
-            return Ok(None);
-        };
-        let attribute = self.attribute(name);
         Ok(self
-            .history(urn, &attribute, query::MAX_SKIP, "")
+            .history(&urn, &name, query::MAX_SKIP, "")
             .await?
-            .and_then(|e| find(mapping::series(&self.base, &e, &attribute, stream), key)))
+            .and_then(|e| find(mapping::series(&self.base, &e, &name, stream), key)))
     }
 
     /// The Locations, Datastreams or HistoricalLocations of one Thing, listed under `path`.
@@ -761,31 +847,43 @@ impl Cx<'_> {
         Ok(self.listed(path, items, whole, &ById::default()))
     }
 
-    /// The Observations of one Datastream: the history of its Attribute, `$skip` and `$top`
-    /// bounding what the view is asked for (one more, to know whether more remain).
+    /// The Observations of one Datastream, newest first: the current instance and the history of
+    /// its Attribute read with its system times (T-5205 findings 1-3), `$skip` and `$top` bounding
+    /// what the view is asked for (the newest `$skip + $top + 1`, to know whether more remain).
     async fn series(&self, key: &str) -> Done {
         let (urn, name, _) = mapping::split_stream(key).ok_or_else(not_found)?;
-        let attribute = self.attribute(name);
         let ceiling = self.opts.skip.saturating_add(self.opts.top);
         let mut extra = String::new();
         if let Some(f) = &self.opts.filter {
-            let series = query::series_filter(f)?;
-            for (k, v) in series.window {
+            for (k, v) in query::series_filter(f)? {
                 let _ = write!(extra, "&{k}={}", encode(&v));
             }
-            if let Some(q) = series.q {
-                let _ = write!(extra, "&q={}", encode(&q));
-            }
         }
-        let e = self
-            .history(urn, &attribute, ceiling.saturating_add(1), &extra)
-            .await?
-            .ok_or_else(not_found)?;
-        let mut items = mapping::series(&self.base, &e, &attribute, key);
-        if self.opts.newest_first {
-            items.sort_by(|a, b| time(b).cmp(&time(a)));
+        // `related` found the Datastream: an Entity without a temporal record has its current
+        // Observation alone.
+        let history = self
+            .history(&urn, &name, ceiling.saturating_add(1), &extra)
+            .await?;
+        let mut items = history
+            .map(|e| mapping::series(&self.base, &e, &name, key))
+            .unwrap_or_default();
+        let read = items.len();
+        if self.opts.filter.is_none() {
+            let e = self.entity(Some(&urn)).await?;
+            items.extend(
+                e.iter()
+                    .flat_map(|e| mapping::observations(&self.base, e))
+                    .filter(|o| {
+                        o.get("@iot.id")
+                            .and_then(Value::as_str)
+                            .and_then(mapping::stream_of)
+                            == Some(key)
+                    }),
+            );
         }
-        let whole = items.len() <= ceiling;
+        items.sort_by(|a, b| time(b).cmp(&time(a)));
+        items.dedup_by(|a, b| a.get("@iot.id") == b.get("@iot.id"));
+        let whole = read <= ceiling;
         let path = format!("{}/Observations", self_link(&self.base, "Datastreams", key));
         Ok(self.listed(&path, items, whole, &ById::default()))
     }
@@ -839,6 +937,7 @@ impl Cx<'_> {
             let id = i.get("@iot.id");
             ids.admits(id.and_then(Value::as_str)) && seen.insert(id.map(Value::to_string))
         });
+        let next = next.filter(|_| self.opts.top > 0);
         let derived = (next.is_none() && first).then_some(items.len());
         let count = self.opts.count.then(|| known.or(derived)).flatten();
         query::collection(items, &self.opts.select, count, next)
