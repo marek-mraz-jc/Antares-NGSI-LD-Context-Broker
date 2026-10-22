@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! T-4919: an ordered read the store decides sorts on what its `orderBy`
 //! keys read and reads the page whole by id afterwards. Only Postgres
 //! decides and projects, so every page it serves is held against the memory
