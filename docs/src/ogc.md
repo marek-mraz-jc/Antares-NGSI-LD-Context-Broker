@@ -28,9 +28,16 @@ Mount it with `ANTARES_API_SURFACES=admin,views,ogc`. The design is
 ADR-0029 and `docs/analysis/ogc-features-mapping.md`; this page is what
 the build serves today (T-3744, T-3754, T-3746, T-3745): Part 1 Core,
 `geojson` and `oas30`, Part 2 CRS84 and CRS84h, Part 3 filtering with every
-CQL2 conformance class (section 4), from the Part 4 draft (OGC
+CQL2 conformance class but `functions` (section 4; no custom function is
+defined, so it is not declared), from the Part 4 draft (OGC
 20-002r1) create, replace, update and delete, and from the Part 5 draft
 (OGC 23-058r1) schemas, core roles, sortables and feature references.
+The Part 4 and Part 5 classes are declared under the drafts' `1.0/conf`
+ids, which can change when OGC publishes them: re-check them against the
+published standard and ETS 1.9 then (watch row in `ogc-compliance.md`).
+`sortby` and `properties` follow the Part 8 (sorting) and Part 6 (property
+selection) drafts; their classes are not declared until those drafts have
+stable ids, so a client finds them in the OpenAPI document only.
 `HEAD` answers like `GET` without the body.
 
 ## 1. Collections
@@ -47,6 +54,52 @@ The collections are the view's Tenant's LinkML schema
 - a slot annotated `ogc_role: primary-instant`, or
   `primary-interval-start` / `primary-interval-end`, is the time
   `datetime` filters on.
+
+Roles come from the model. A slot's `ogc_role` annotation wins; where the
+schema annotates no time or no place, the type's query guide
+(`antares-ops/src/guide.rs`, keyed by class name: the Smart Data Models
+types such as `Event` with `startDate`/`endDate`) gives the default.
+A type no guide names gets its time and place from annotations alone, with
+no code change. A role must fit its slot: `primary-geometry` only on a
+`GeoProperty`, the time roles only on a scalar text Property (a `date`,
+`datetime` or `string` range); a role on any other slot is ignored. Of two
+slots with one role, the first in the class's slot order wins. A tenant
+class that happens to share a guided class name inherits its defaults:
+annotate the class to override them. The per-Endpoint role mapping of
+named outputs is T-5207's contract.
+
+A Feature carries each value in the shape `/schema` declares, so a GET
+then a PUT stores it unchanged:
+
+- an Attribute with several instances (`datasetId`) is served as its
+  default instance (the one without a `datasetId`, as the broker's own
+  GeoJSON picks), `null` when it has none; the other instances are not
+  served on this surface (read them through NGSI-LD);
+- a `VocabProperty` is its term, a `JsonProperty` its JSON, a
+  `LanguageProperty` its language map (every language: the NGSI-LD `lang`
+  filter is not mapped);
+- a reference written back in the `rel-as-uri` or `rel-as-link` form is
+  read back to its URN (§3).
+
+A slot of a kind NGSI-LD does not define is refused when the schema loads
+(`linkml-model`); the collection build keeps only the eight kinds, so such
+a slot could never be written as a `Property`.
+
+Not served, by design or not yet:
+
+- per-instance `observedAt`/`unitCode` and the Entity's
+  `createdAt`/`modifiedAt` are not Feature members, and `datetime` reads
+  only the time role; the unit is the slot's `x-ogc-unit`;
+- `scope` is reachable only as `ngsild.scopeQ`;
+- a GeoProperty other than the geometry (`observationSpace`,
+  `operationSpace`) is a property (`format: geometry-any`); a spatial CQL2
+  predicate on it runs in the residual, within its 10 000-Entity budget, and
+  a type with no `location` and no `primary-geometry` role has
+  `geometry: null`;
+- a type with data but no LinkML class, or a class name that is no path
+  segment, has no collection, without a log line;
+- history is served only as `{type}-history` for views that offer
+  `temporal_query` (§7).
 
 A view without a schema, or with one the build cannot read, has no
 endpoint (`404`). The collections carry no `extent`, and the
@@ -68,15 +121,26 @@ while the page and its `next` link are still served.
 |---|---|
 | `limit` | 1 to 10 000, default 10; a page holds up to `limit` Features, read from the store in pages of its `max_limit` |
 | `bbox` | `minx,miny,maxx,maxy` or the 6-number form, CRS84; a box with `minx > maxx` crosses the antimeridian. A `geoQ` `intersects` on the geometry; Features without a geometry are kept (Part 1 Req 24 C), served after the ones inside |
-| `datetime` | an RFC 3339 instant or `start/end`, `..` or empty for an open end; both ends open is `400`. Features without a time are kept |
+| `datetime` | an RFC 3339 instant or `start/end`, `..` or empty for an open end; both ends open is `400`. Features without a time are kept. Times compare as instants: a stored value with an offset (`2026-11-11T08:00:00+01:00`) is the instant it names, a date-only value (`2026-10-31`) is the whole UTC day, fractions past the microsecond are dropped. The store's `q` reads text, so it is sent 48 h wider and the residual decides; `numberMatched` is then counted within the scan budget |
 | `next` | the token of a `next` link; it is bound to the view, the collection and the query, any other use is `400` |
-| `sortby` | `[+\|-]name` by commas, names from `/sortables`; an NGSI-LD `orderBy`. With `bbox`, the Features without a geometry follow the sorted ones |
+| `sortby` | `[+\|-]name` by commas, names from `/sortables`; an NGSI-LD `orderBy`. With `bbox`, the Features without a geometry follow the sorted ones. A time stored as text with mixed offsets sorts by its text, not its instant |
 | `properties` | property names by commas, empty for none; an NGSI-LD `pick` that keeps `id`, `type` and the geometry |
 | `profile` | `rel-as-key` (default), `rel-as-uri` or `rel-as-link`, below |
 | `crs`, `bbox-crs` | CRS84 or CRS84h (the URI or `[OGC:CRS84]`); any other is `400` naming both. The answer carries `Content-Crs` |
 | `ngsild.q`, `ngsild.scopeQ` | an NGSI-LD `q` (joined to the request's own with `;`) or `scopeQ`; a broken one is `400` |
 | `ngsild.georel`, `ngsild.geometry`, `ngsild.coordinates`, `ngsild.geoproperty` | the request's one NGSI-LD `geoQ`; a `bbox` beside it is evaluated on what the store answers |
 | `ngsild.pick`, `ngsild.omit` | an NGSI-LD `pick` (not beside `properties`, `400`) or `omit` (beside `properties`, it removes from the selection) |
+
+Every coordinate, in `bbox` and in a CQL2 literal, is longitude then
+latitude (CRS84). A box written lat,lon is valid and usually holds no
+located Feature, so the answer is only the Features without a geometry:
+check the axis order before reading an empty map as no data.
+
+`f=json` (and `f=geojson` on `/items`) asks for the JSON this surface
+writes, whatever `Accept` says; any other `f` than the file encodings below
+is `400`. A `HEAD` answers the `Content-Length` of its `GET` here; through
+the platform gateway it has read `0` (the gateway half is tracked outside
+this repository).
 
 Any other parameter, a repeated one, or a parameter on a resource that
 takes none is `400`; a property the view hides is refused like a
@@ -175,7 +239,8 @@ end) and goes where NGSI-LD can say it exactly:
 | `=`, `<>`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN` of a scalar property and literals; `AND`/`OR` of such | `q` |
 | `IS NULL`, `IS NOT NULL` of a property | `q` (`!p`, `p`) |
 | `LIKE`, `CASEI(p) = CASEI('x')`, `CASEI(p) LIKE CASEI('x%')` | `q` `~=` with an anchored pattern, `(?i)` for `CASEI` |
-| `T_AFTER`, `T_BEFORE`, `T_EQUALS`, `T_DURING`, `T_INTERSECTS` of a time property and literals | `q` comparisons |
+| `T_AFTER`, `T_BEFORE`, `T_DURING`, `T_INTERSECTS` and ordering comparisons of a time property and a `DATE`/`TIMESTAMP` literal | a `q` bound 48 h wider, decided by the residual: `q` compares text, the residual instants (an offset as written, a `DATE` the whole UTC day, a date-only value against a timestamp by its day) |
+| `T_EQUALS`, `=`, `<>` and `IN` of a time property and such literals | the residual (two spellings of one instant are no text equality) |
 | `A_OVERLAPS` of a `ListProperty` and literals | `q` `==a,b` |
 | one `S_INTERSECTS`, `S_WITHIN`, `S_CONTAINS`, `S_EQUALS`, `S_DISJOINT`, `S_OVERLAPS` of `geometry` and a literal, when neither `bbox` nor an `ngsild.geo*` option holds the request's one `geoQ` | `geoQ` |
 | everything else: `NOT`, `ACCENTI`, `S_TOUCHES`, `S_CROSSES`, a second spatial predicate, the other temporal and array functions, property-property comparisons, arithmetic (`+ - * / % div ^`) | the residual over the view's answer (ADR-0028) |
