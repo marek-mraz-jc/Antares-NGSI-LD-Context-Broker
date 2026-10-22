@@ -979,10 +979,9 @@ impl PgEntityStore {
         // plus `$n` placeholders — no caller-supplied text reaches it.
         // The audit lives here, next to the builder.
         // Unprepared: a prepared statement goes to a generic plan after five
-        // runs on a connection, and that plan cannot tell a selective `@?`
-        // from one `jsonb_path_ops` cannot narrow. It ORs one GIN scan per
-        // `q` alternative over the whole type: 1.6 s instead of 1.5 ms at
-        // 100 000 entities (T-3735). The text varies with every q, geo and
+        // runs on a connection, and that plan cannot see a selective value:
+        // 1.6 s instead of 1.5 ms at 100 000 entities when a GIN still
+        // existed (T-3735). The text varies with every q, geo and
         // projection shape, so the statement cache saved little anyway.
         let mut qy = sqlx::query(sqlx::AssertSqlSafe(sql.clone())).persistent(false);
         for b in &binds {
