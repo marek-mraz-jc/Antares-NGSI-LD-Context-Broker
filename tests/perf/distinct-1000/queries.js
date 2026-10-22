@@ -42,7 +42,8 @@ export function shapeOf(u) {
 const tag = (base, u) => (Math.floor(base) + (u % SPAN) / SPAN).toFixed(6);
 const enc = encodeURIComponent;
 
-// options: { entities, events, historyEntities, view } as the seed was run
+// options: { entities, events, historyEntities, view, endpoint } as the seed was run; `endpoint` (a slug)
+// asks every surface through the Context Gateway's /api/endpoint/{slug}/… instead of the broker
 export function request(u, o) {
   const shape = shapeOf(u);
   const type = TYPES[Math.floor(hash(u, 1) * (TYPES.length - 1))]; // not Event: its count is small
@@ -53,8 +54,8 @@ export function request(u, o) {
   const lat = 48.5 + hash(u, 2) * Math.min(0.45, Math.ceil(per / 1000) / 1000);
   const lo = Math.floor(hash(u, 3) * 80);
   const cat = `c${Math.floor(hash(u, 4) * 8)}`;
-  const base = "/ngsi-ld/v1";
-  const view = `/x/views/${o.view}`;
+  const view = o.endpoint ? `/api/endpoint/${o.endpoint}` : `/x/views/${o.view}`;
+  const base = o.endpoint ? `${view}/ngsi-ld/v1` : "/ngsi-ld/v1";
   switch (shape) {
     case "retrieve": {
       // u walks every entity once (type by u, number by u / 9); the next walk asks another
@@ -129,6 +130,12 @@ function selfTest() {
     if (seen.has(key)) throw new Error(`request ${u} repeats: ${key}`);
     seen.add(key);
     counts[r.shape] = (counts[r.shape] || 0) + 1;
+  }
+  // through the gateway every surface sits under the Endpoint and the request is the same otherwise
+  for (let u = 0; u < 1000; u++) {
+    const direct = request(u, o), gw = request(u, { ...o, endpoint: "bench" });
+    const want = direct.path.replace(/^\/x\/views\/load/, "/api/endpoint/bench").replace(/^\/ngsi-ld\/v1/, "/api/endpoint/bench/ngsi-ld/v1");
+    if (gw.path !== want || gw.body !== direct.body) throw new Error(`request ${u} through the gateway: ${gw.path}, want ${want}`);
   }
   for (const [shape, w] of MIX) {
     const got = counts[shape] / N * 100;
