@@ -104,13 +104,15 @@ pub struct Page {
 
 /// What `query` produced. `decided` = SQL applied every present predicate
 /// exactly, so re-evaluation cannot drop a row; `paged` = LIMIT/OFFSET
-/// happened in SQL (implies `decided`), `total` = the pre-LIMIT match count.
+/// happened in SQL (implies `decided`, except from `query_candidates`),
+/// `total` = the pre-LIMIT match count.
 pub struct QueryOutcome {
     /// Matching entity documents.
     pub rows: Vec<Value>,
     /// Every present predicate was applied exactly; no re-check needed.
     pub decided: bool,
-    /// LIMIT/OFFSET already applied (implies `decided`).
+    /// LIMIT/OFFSET already applied (implies `decided`, except from
+    /// `Store::query_candidates`).
     pub paged: bool,
     /// Pre-LIMIT match count, when the backend computed it.
     pub total: Option<i64>,

@@ -314,7 +314,7 @@ fn count_sql(wheres: &[String], split: Option<&TypeSplit>) -> String {
 
 /// The statement, split out of `query` so its pagination shape is
 /// assertable without a database. Either LIMIT/OFFSET over an exactly
-/// decided set (`true`; one row past the page answers "is there a next
+/// decided set or a `query_candidates` walk (`true`; one row past the page answers "is there a next
 /// page", the total is `count_sql`'s) or the flat `MAX_UNDECIDED_ROWS`
 /// safety LIMIT — never no LIMIT. A split reads each arm in id order up to
 /// what the page can need and merges them.
@@ -778,6 +778,28 @@ impl PgEntityStore {
         tenant: &TenantId,
         f: &EntityFilter<'_>,
     ) -> Result<QueryOutcome, sqlx::Error> {
+        self.query_in(tenant, f, false).await
+    }
+
+    /// `query` for a caller that re-decides every row and walks the match
+    /// set in id-ordered pages: `f.page` is pushed over the candidates even
+    /// when SQL cannot decide them (`paged` without `decided`), so a page of
+    /// a geoquery reads that page's candidates, not up to
+    /// `MAX_UNDECIDED_ROWS` (T-5088).
+    pub async fn query_candidates(
+        &self,
+        tenant: &TenantId,
+        f: &EntityFilter<'_>,
+    ) -> Result<QueryOutcome, sqlx::Error> {
+        self.query_in(tenant, f, true).await
+    }
+
+    async fn query_in(
+        &self,
+        tenant: &TenantId,
+        f: &EntityFilter<'_>,
+        candidates: bool,
+    ) -> Result<QueryOutcome, sqlx::Error> {
         let mut binds: Vec<Bind> = vec![Bind::Text(tenant.as_str().to_owned())];
         let mut wheres = vec![
             "tenant_id = $1".to_owned(),
@@ -922,7 +944,7 @@ impl PgEntityStore {
             &wheres,
             split.as_ref(),
             f.page.as_ref(),
-            decided,
+            decided || candidates,
             &mut binds,
         );
         let mut tx = super::begin(&self.pool).await?;
@@ -950,7 +972,8 @@ impl PgEntityStore {
         // drop the PgRow — the full row set never sits in memory twice.
         let mut docs: Vec<Value> = Vec::new();
         let mut total: Option<i64> = None;
-        let counted = paged && f.page.as_ref().is_some_and(|p| p.count);
+        // candidates are no match set to count
+        let counted = paged && decided && f.page.as_ref().is_some_and(|p| p.count);
         {
             use futures_util::TryStreamExt;
             let mut stream = qy.fetch(&mut *tx);
@@ -966,7 +989,7 @@ impl PgEntityStore {
         if let Some(p) = f.page.as_ref().filter(|_| paged) {
             let more = docs.len() as i64 > p.limit;
             docs.truncate(p.limit as usize);
-            total = page_total(p, docs.len(), more);
+            total = page_total(p, docs.len(), more).filter(|_| decided);
         }
         // count=true with more rows past the page, or an off-the-end page:
         // count the match set under the same WHERE, binds and transaction

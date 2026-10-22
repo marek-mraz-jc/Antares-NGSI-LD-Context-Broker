@@ -57,6 +57,69 @@ pub fn is_schema_mismatch(e: &sqlx::Error) -> bool {
     }
 }
 
+/// What the boot path does with the migrations a newer release applied
+/// (`newer`: version and description of each applied version above `newest`,
+/// this binary's own newest). A rollback starts the previous image on the
+/// schema the release it rolls back already migrated, and sqlx refuses every
+/// applied version it does not ship, so without this the previous image could
+/// never boot (T-5105, docs/src/operations.md "Rollback"). A migration whose file name
+/// starts with `breaking_` is one this release cannot serve: the way back is
+/// the pre-release backup, so the boot stops with that version. `Ok(true)`
+/// means newer, compatible migrations are applied and tolerated.
+fn tolerate_newer(
+    newest: i64,
+    newer: &[(i64, String)],
+) -> Result<bool, sqlx::migrate::MigrateError> {
+    match newer.iter().find(|(_, d)| d.starts_with("breaking ")) {
+        Some((v, _)) => Err(sqlx::migrate::MigrateError::VersionTooNew(*v, newest)),
+        None => Ok(!newer.is_empty()),
+    }
+}
+
+/// Version and description of each applied migration above `newest`.
+async fn newer_migrations(
+    conn: &mut sqlx::PgConnection,
+    newest: i64,
+) -> Result<Vec<(i64, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT version, description FROM _sqlx_migrations WHERE version > $1 ORDER BY version",
+    )
+    .bind(newest)
+    .fetch_all(conn)
+    .await
+    .or_else(|e| match &e {
+        // a database never migrated has no history table yet
+        sqlx::Error::Database(d) if d.code().as_deref() == Some("42P01") => Ok(Vec::new()),
+        _ => Err(e),
+    })
+}
+
+/// Run [`MIGRATOR`], tolerating compatible migrations of a newer release
+/// ([`tolerate_newer`]). An unknown applied version at or below this binary's
+/// newest is still a history from another release and refused as before.
+async fn migrate(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
+    let newest = MIGRATOR.iter().map(|m| m.version).max().unwrap_or(0);
+    let newer = newer_migrations(conn, newest).await?;
+    let tolerate = tolerate_newer(newest, &newer).map_err(|e| {
+        tracing::error!(
+            "the database holds a breaking migration of a newer release ({newer:?}): this \
+             release cannot serve it; restore the backup taken before that release"
+        );
+        sqlx::Error::Migrate(Box::new(e))
+    })?;
+    if !tolerate {
+        return MIGRATOR.run(conn).await.map_err(Into::into);
+    }
+    tracing::warn!(
+        "the database holds migrations {newer:?} of a newer release, all marked compatible: \
+         serving it as a rollback; roll forward again or restore the pre-release backup \
+         before applying another schema change"
+    );
+    let mut lenient = sqlx::migrate::Migrator::with_migrations(MIGRATOR.iter().cloned().collect());
+    lenient.set_ignore_missing(true);
+    lenient.run(conn).await.map_err(Into::into)
+}
+
 /// The `ANTARES_MIGRATE` switch: off only for an explicit `0`/`false`.
 fn migrate_enabled(v: Option<&str>) -> bool {
     !matches!(v, Some("0" | "false"))
@@ -142,7 +205,7 @@ pub async fn connect_with(
         migrate_conn
             .execute(sqlx::raw_sql("SET statement_timeout = 0"))
             .await?;
-        MIGRATOR.run(&mut migrate_conn).await?;
+        migrate(&mut migrate_conn).await?;
         migrate_conn.close().await?;
     }
     Ok(pool)
@@ -320,7 +383,7 @@ pub async fn ensure_tenant(pool: &PgPool, tenant: &TenantId) -> Result<(), sqlx:
 
 #[cfg(test)]
 mod tests {
-    use super::{bypasses, is_schema_mismatch, migrate_enabled};
+    use super::{bypasses, is_schema_mismatch, migrate_enabled, tolerate_newer};
 
     /// The RLS probe answers a security gate: a probe that errors must read as
     /// "unsafe", never as "the role does not bypass RLS".
@@ -368,6 +431,27 @@ mod tests {
             )))),
             "a migration that failed to execute may be a lock the next attempt gets"
         );
+    }
+
+    /// A rollback boots on a newer release's compatible migrations and stops
+    /// on a breaking one, naming its version (T-5105).
+    #[test]
+    fn a_rollback_tolerates_compatible_migrations_and_stops_on_a_breaking_one() {
+        use sqlx::migrate::MigrateError;
+        assert_eq!(tolerate_newer(16, &[]).ok(), Some(false));
+        let compatible = [(17, "type counts".to_owned())];
+        assert_eq!(tolerate_newer(16, &compatible).ok(), Some(true));
+        let breaking = [
+            (17, "type counts".to_owned()),
+            (18, "breaking drop names".to_owned()),
+        ];
+        let refused = tolerate_newer(16, &breaking).err().map(|e| e.to_string());
+        assert_eq!(
+            refused,
+            Some(MigrateError::VersionTooNew(18, 16).to_string())
+        );
+        let named = [(17, "not breaking yet".to_owned())];
+        assert_eq!(tolerate_newer(16, &named).ok(), Some(true));
     }
 
     /// Migrations stay on unless a deployment explicitly turns them off.
