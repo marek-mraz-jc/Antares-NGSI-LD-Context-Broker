@@ -342,8 +342,7 @@ mod tests {
     fn checked(output: &Value, format: &str) -> Result<Output, String> {
         listed(Some(&json!([output])), format)
             .pop()
-            .map(|(_, o)| o)
-            .unwrap_or(Err("skipped".to_owned()))
+            .map_or(Err("skipped".to_owned()), |(_, o)| o)
     }
 
     #[test]

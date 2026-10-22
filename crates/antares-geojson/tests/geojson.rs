@@ -313,7 +313,7 @@ async fn every_attribute_kind_is_a_plain_property_and_no_location_a_null_geometr
     assert_eq!(stop("urn:ngsi-ld:Stop:2")["geometry"], Value::Null);
 }
 
-/// The view `ev` shows `Event` and `SportEvent` and lists GeoJSON and CSV outputs (docs API/11
+/// The view `ev` shows `Event` and `SportEvent` and lists `GeoJSON` and CSV outputs (docs API/11
 /// EP-159, T-5216); `Secret` stays hidden from it, and `secretNote` from every Event.
 async fn events() -> Router {
     let app = fixture().await;
