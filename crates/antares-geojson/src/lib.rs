@@ -113,21 +113,14 @@ fn feature(entity: &Value) -> Value {
     for (name, member) in entity.as_object().into_iter().flatten() {
         match name.as_str() {
             "id" | "@context" => {}
-            "location" => geometry = plain(first(member)),
+            // the broker's one geometry rule: the default instance, valid, wound (T-5208)
+            "location" => geometry = antares_ops::geometry_of(entity, None),
             _ => {
                 properties.insert(name.clone(), plain(member));
             }
         }
     }
     json!({ "type": "Feature", "id": entity.get("id"), "geometry": geometry, "properties": properties })
-}
-
-/// The first instance of an Attribute that has several (TS 104 175 4.5.5).
-fn first(attribute: &Value) -> &Value {
-    match attribute {
-        Value::Array(instances) => instances.first().unwrap_or(&Value::Null),
-        one => one,
-    }
 }
 
 /// An Attribute's plain value, each instance in turn when it has several; a member that is no

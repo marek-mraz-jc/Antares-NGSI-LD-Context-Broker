@@ -95,6 +95,8 @@ pub mod policy;
 pub mod provenance;
 pub(crate) mod registry;
 pub(crate) mod repr;
+/// The one GeoJSON geometry rule (T-5208), for the surfaces that write GeoJSON.
+pub use repr::{geometry_of, rewound};
 pub mod secret;
 pub(crate) mod snapshots;
 pub(crate) mod stamp;

@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! The Events of one view as an iCalendar feed (RFC 5545):
-//! `/x/views/{view}/ical/v1/events.ics?from=…&to=…&q=…` (T-4487, T-4901,
+//! The Events of one view as iCalendar feeds (RFC 5545, RFC 7986):
+//! `/x/views/{view}/ical/v1/{output}.ics?from=…&to=…&q=…` (T-4487, T-4901, T-5208,
 //! `docs/analysis/ical-mapping.md`).
 //!
-//! The feed renders the view's `representations.ical` field mapping (none: the `sdm-event`
-//! preset over `Event`) over one NGSI-LD Query Entities of the mapping's type through the view:
-//! `q`, `scopeQ`, `georel`, `geometry`, `coordinates`, `geoproperty`, `id`, `idPattern`, `lang`
-//! and `attrs` pass through as Query Entities reads them, so a type or an Attribute the view
-//! hides is absent and the Policy decides as for NGSI-LD. Any other parameter is `400`. A view
-//! that shows no Entity of the type, or does not allow Query Entities, has no feed (the 404 an
-//! unknown view answers). An Entity the mapping cannot render is left out and counted in
+//! A view serves a calendar only when its `representations.ical` lists named outputs (owner
+//! 2026-10-22T09:25Z and 09:30Z): none is the 404 an unknown view answers. `events.ics` is the
+//! output named `events`, else the first (deprecated alias of the single feed of T-4487). An
+//! output renders its sources' field mappings over one NGSI-LD Query Entities of their types
+//! through the view, narrowed by the output's `filter` (its `q` and `scopeQ` AND-ed with a
+//! caller's, its geo-query fixed): `q`, `scopeQ`, `georel`, `geometry`, `coordinates`,
+//! `geoproperty`, `id`, `idPattern`, `lang` and `attrs` pass through as Query Entities reads
+//! them, so a type or an Attribute the view hides is absent and the Policy decides as for
+//! NGSI-LD. Any other parameter is `400`. A view that shows no Entity of the types, or does not
+//! allow Query Entities, has no feed. The calendar carries `NAME` per title language,
+//! `REFRESH-INTERVAL`, the output zone's `VTIMEZONE`, and a strong `ETag` (`If-None-Match`:
+//! 304). An Entity the mapping cannot render is left out and counted in
 //! `antares_surface_records_skipped_total{surface="ical",reason}` (EP-126), never served as an
 //! invalid `VEVENT`.
 //!
@@ -27,21 +32,23 @@
 #![forbid(unsafe_code)]
 
 pub mod mapping;
+pub mod zone;
 
 use antares_ops::percent::{decoded, encode};
 use antares_ops::{
     Caller, OperationId, Ops, Page, Pushdown, Refusal, Scanned, Surface, ViewOps, RESIDUAL_SCAN,
 };
 use axum::extract::{Query, Request};
-use axum::http::header::CONTENT_TYPE;
-use axum::http::{HeaderName, Method, StatusCode};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::any;
 use axum::Router;
 use chrono::Utc;
-use mapping::{fold, local, IcalMapping, Outcome, Plan, When, Window};
+use mapping::{fold, local, CompiledOutput, IcalMapping, Outcome, Output, Plan, When, Window};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -100,7 +107,7 @@ impl Surface for Ical {
         let preview_ops = ops.clone();
         Router::new()
             .route(
-                "/{view}/ical/v1/events.ics",
+                "/{view}/ical/v1/{file}",
                 any(move |caller: Caller, req: Request| {
                     let ops = ops.clone();
                     async move { serve(&ops, &caller, req).await }
@@ -157,20 +164,53 @@ async fn serve(ops: &Ops, caller: &Caller, req: Request) -> Response {
     let refused =
         || Problem::new(StatusCode::METHOD_NOT_ALLOWED, "this surface is read only").reply();
     antares_ops::read_only(&parts.method, refused, async {
-        match feed(ops, caller, view_segment(&parts.uri), &parts.uri).await {
-            Ok((body, skipped)) => (
-                StatusCode::OK,
-                [
-                    (CONTENT_TYPE, "text/calendar; charset=utf-8".to_owned()),
-                    (HeaderName::from_static(SKIPPED_HEADER), skipped.to_string()),
-                ],
-                body,
-            )
-                .into_response(),
+        let Some(name) = file_segment(&parts.uri).strip_suffix(".ics") else {
+            return not_found().reply();
+        };
+        match feed(ops, caller, view_segment(&parts.uri), name, &parts.uri).await {
+            Ok((body, skipped)) => tagged(&parts.headers, body, skipped),
             Err(problem) => problem.reply(),
         }
     })
     .await
+}
+
+/// The feed with a strong `ETag` of its bytes, or 304 when `If-None-Match` names it.
+fn tagged(headers: &HeaderMap, body: String, skipped: usize) -> Response {
+    let digest = Sha256::digest(body.as_bytes());
+    let mut etag = String::from("\"");
+    for b in digest {
+        let _ = write!(etag, "{b:02x}");
+    }
+    etag.push('"');
+    let matched = headers
+        .get_all(IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|t| t.trim().trim_start_matches("W/"))
+        .any(|t| t == "*" || t == etag);
+    let mut reply = if matched {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        (
+            StatusCode::OK,
+            [
+                (CONTENT_TYPE, "text/calendar; charset=utf-8".to_owned()),
+                (HeaderName::from_static(SKIPPED_HEADER), skipped.to_string()),
+            ],
+            body,
+        )
+            .into_response()
+    };
+    let h = reply.headers_mut();
+    // a quoted hex digest is always a header value; the fallback is never sent
+    h.insert(
+        ETAG,
+        HeaderValue::from_str(&etag).unwrap_or(HeaderValue::from_static("\"\"")),
+    );
+    h.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    reply
 }
 
 /// `/{view}/ical/v1/…`: a view id is `[a-z0-9-]`, so its raw segment is its id.
@@ -178,12 +218,18 @@ fn view_segment(uri: &axum::http::Uri) -> &str {
     uri.path().split('/').nth(1).unwrap_or_default()
 }
 
+/// `/{view}/ical/v1/{file}`: the last segment.
+fn file_segment(uri: &axum::http::Uri) -> &str {
+    uri.path().rsplit('/').next().unwrap_or_default()
+}
+
 /// A feed's query string read: the window, what passes through to Query Entities, the `type`
 /// a caller named and the `attrs` it selects.
 #[derive(Debug, Default)]
 struct Asked {
-    window: Window,
-    passed: String,
+    from: Option<When>,
+    to: Option<When>,
+    passed: BTreeMap<String, String>,
     types: Vec<String>,
     attrs: Option<Vec<String>>,
 }
@@ -209,14 +255,12 @@ fn asked(uri: &axum::http::Uri) -> Result<Asked, Problem> {
             .transpose()
     };
     let mut out = Asked {
-        window: Window {
-            from: date("from")?.map(When::key),
-            to: date("to")?.map(When::past),
-        },
+        from: date("from")?,
+        to: date("to")?,
         ..Asked::default()
     };
-    if let (Some(from), Some(to)) = (out.window.from, out.window.to) {
-        if from >= to {
+    if let (Some(from), Some(to)) = (out.from, out.to) {
+        if from.utc_key(chrono_tz::UTC) >= to.utc_past(chrono_tz::UTC) {
             return Err(bad("from is after to".to_owned()));
         }
     }
@@ -227,7 +271,7 @@ fn asked(uri: &axum::http::Uri) -> Result<Asked, Problem> {
             "type" => out.types = list(value),
             "attrs" => out.attrs = Some(list(value)),
             k if PASSED.contains(&k) => {
-                let _ = write!(out.passed, "&{k}={}", encode(value));
+                out.passed.insert(k.to_owned(), value.to_owned());
             }
             other => {
                 return Err(bad(format!(
@@ -240,32 +284,34 @@ fn asked(uri: &axum::http::Uri) -> Result<Asked, Problem> {
     Ok(out)
 }
 
-/// The view's mapping compiled; a mapping that does not compile serves nobody, and the
-/// reason is the preview's to tell (the Portal checks it at propose).
-fn plan(view: &ViewOps) -> Result<Plan, Problem> {
-    let Some(written) = view.representation("ical") else {
-        return Ok(Plan::default());
+/// The view's output `name` compiled (`events`: that one, else the first); a view without a
+/// list has no calendar. An output that does not compile serves nobody, and the reason is the
+/// preview's to tell (the Portal checks it at propose).
+fn output(view: &ViewOps, name: &str) -> Result<CompiledOutput, Problem> {
+    let written = view.representation("ical").ok_or_else(not_found)?;
+    let broken = || {
+        Problem::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the view's calendar outputs do not hold; its Endpoint must be published again",
+        )
     };
-    serde_json::from_value::<IcalMapping>(written.clone())
-        .map_err(|e| e.to_string())
-        .and_then(|m| Plan::compile(&m))
-        .map_err(|_| {
-            Problem::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "the view's calendar mapping does not hold; its Endpoint must be published again",
-            )
-        })
+    let outputs: Vec<Output> = serde_json::from_value(written.clone()).map_err(|_| broken())?;
+    let chosen = outputs
+        .iter()
+        .find(|o| o.name == name)
+        .or_else(|| (name == "events").then(|| outputs.first()).flatten())
+        .ok_or_else(not_found)?;
+    CompiledOutput::compile(chosen).map_err(|_| broken())
 }
 
-/// What every Query Entities names: the view's types whose local name is the mapping's, or
-/// for a view of every type the local store, narrowed by type after the read. A caller's
-/// `type` may only name that type.
-fn selector(view: &ViewOps, plan: &Plan, types: &[String]) -> Result<String, Problem> {
-    let wanted = plan.entity_type();
-    if types.iter().any(|t| local(t) != wanted) {
+/// What every Query Entities names: the view's types whose local name is a plan's, or for a
+/// view of every type the local store, narrowed by type after the read. A caller's `type`
+/// may only name those types.
+fn selector(view: &ViewOps, wanted: &[&str], types: &[String]) -> Result<String, Problem> {
+    if types.iter().any(|t| !wanted.contains(&local(t))) {
         return Err(Problem::new(
             StatusCode::BAD_REQUEST,
-            format!("this calendar maps the type {wanted} alone"),
+            format!("this calendar maps the types {} alone", wanted.join(", ")),
         ));
     }
     if view.shows_every_name() {
@@ -274,7 +320,7 @@ fn selector(view: &ViewOps, plan: &Plan, types: &[String]) -> Result<String, Pro
     let (shown, _) = view.shown_names();
     let matching: Vec<String> = shown
         .iter()
-        .filter(|t| local(t) == wanted)
+        .filter(|t| wanted.contains(&local(t)))
         .map(|t| encode(t))
         .collect();
     if matching.is_empty() {
@@ -283,38 +329,68 @@ fn selector(view: &ViewOps, plan: &Plan, types: &[String]) -> Result<String, Pro
     Ok(format!("type={}", matching.join(",")))
 }
 
-/// The view, its plan and the pushdown of a feed or a preview request.
-fn query(
-    ops: &Ops,
-    id: &str,
-    asked: &Asked,
-    mapping: Option<Plan>,
-) -> Result<(ViewOps, Plan, Pushdown), Problem> {
+/// The caller's query parameters under the output's filter: `q` and `scopeQ` AND-ed, a fixed
+/// geo-query never replaced, so the output only narrows what the view shows.
+fn narrowed(filter: &mapping::Filter, asked: &Asked) -> Result<String, Problem> {
+    let mut params = asked.passed.clone();
+    let geo = ["georel", "geometry", "coordinates", "geoproperty"];
+    let fixed = filter.georel.is_some();
+    if fixed && geo.iter().any(|k| params.contains_key(*k)) {
+        return Err(Problem::new(
+            StatusCode::BAD_REQUEST,
+            "this calendar fixes its geo-query: georel, geometry, coordinates and geoproperty are its own",
+        ));
+    }
+    for (key, value) in filter.params() {
+        // a caller's geo-query beside a fixed one was refused above
+        let merged = match (key, params.get(key)) {
+            ("q" | "scopeQ", Some(theirs)) => format!("({value});({theirs})"),
+            _ => value.to_owned(),
+        };
+        params.insert(key.to_owned(), merged);
+    }
+    let mut out = String::new();
+    for (k, v) in params {
+        let _ = write!(out, "&{k}={}", encode(&v));
+    }
+    Ok(out)
+}
+
+/// The view of `id` when it allows Query Entities; a view that does not has no feed, as an
+/// unknown one.
+fn view_of(ops: &Ops, id: &str) -> Result<ViewOps, Problem> {
     let id = decoded(id).ok_or_else(not_found)?;
-    // a view that does not allow Query Entities has no feed, as an unknown one
-    let view = ops
-        .view(&id)
+    ops.view(&id)
         .filter(|v| v.allows(OperationId::QueryEntities))
-        .ok_or_else(not_found)?;
-    let plan = match mapping {
-        Some(plan) => plan,
-        None => plan(&view)?,
-    };
-    let pushdown = Pushdown {
-        query: format!("{}{}", selector(&view, &plan, &asked.types)?, asked.passed),
+        .ok_or_else(not_found)
+}
+
+/// The pushdown of a feed or a preview over `plans`.
+fn pushdown(
+    view: &ViewOps,
+    plans: &[&Plan],
+    filter: &mapping::Filter,
+    asked: &Asked,
+) -> Result<Pushdown, Problem> {
+    let wanted: Vec<&str> = plans.iter().map(|p| p.entity_type()).collect();
+    Ok(Pushdown {
+        query: format!(
+            "{}{}",
+            selector(view, &wanted, &asked.types)?,
+            narrowed(filter, asked)?
+        ),
         attrs: asked.attrs.clone(),
         sys_attrs: true,
         ..Pushdown::default()
-    };
-    Ok((view, plan, pushdown))
+    })
 }
 
-/// One upstream page: its Entities of the plan's type and the next offset.
+/// One upstream page: its Entities of the plans' types and the next offset.
 async fn page(
     view: &ViewOps,
     caller: &Caller,
     pushdown: &Pushdown,
-    plan: &Plan,
+    plans: &[&Plan],
     page: Page,
 ) -> Result<(Vec<Value>, Option<usize>), Problem> {
     let (entities, next) = match view.scan(caller, pushdown, None, page).await {
@@ -324,38 +400,74 @@ async fn page(
         Ok(Scanned::Answer(a)) => return Err(Problem::Answer(Box::new(a))),
         Err(refusal) => return Err(Problem::Refused(refusal)),
     };
-    let wanted = plan.entity_type();
     let typed = entities
         .into_iter()
-        .filter(|e| local(e.get("type").and_then(Value::as_str).unwrap_or_default()) == wanted)
+        .filter(|e| {
+            let ty = local(e.get("type").and_then(Value::as_str).unwrap_or_default());
+            plans.iter().any(|p| p.entity_type() == ty)
+        })
         .collect();
     Ok((typed, next))
 }
 
-/// The feed of view `id` and how many Events it left out.
-async fn feed(
-    ops: &Ops,
-    caller: &Caller,
-    id: &str,
-    uri: &axum::http::Uri,
-) -> Result<(String, usize), Problem> {
-    let asked = asked(uri)?;
-    let (view, plan, pushdown) = query(ops, id, &asked, None)?;
-    let now = Utc::now();
-    let mut out = String::new();
+/// The calendar's own properties: RFC 7986 `NAME` and `DESCRIPTION` per language,
+/// `REFRESH-INTERVAL`, and the zone (`X-WR-*` for the clients that read only those).
+fn header(out: &CompiledOutput, view: &str, mut push: impl FnMut(&str)) {
     for line in [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
         "PRODID:-//Antares//antares-ical//EN",
         "CALSCALE:GREGORIAN",
     ] {
-        fold(line, &mut out);
+        push(line);
     }
-    let name = decoded(id).unwrap_or_default();
-    fold(
-        &format!("X-WR-CALNAME:{}", mapping::escape(&name)),
-        &mut out,
-    );
+    let o = &out.output;
+    let preferred = |texts: &BTreeMap<String, String>| {
+        o.lang
+            .as_ref()
+            .and_then(|l| texts.get(l))
+            .or_else(|| texts.values().next())
+            .cloned()
+    };
+    for (tag, title) in &o.title {
+        push(&format!("NAME;LANGUAGE={tag}:{}", mapping::escape(title)));
+    }
+    for (tag, text) in &o.description {
+        push(&format!(
+            "DESCRIPTION;LANGUAGE={tag}:{}",
+            mapping::escape(text)
+        ));
+    }
+    let name = preferred(&o.title).unwrap_or_else(|| view.to_owned());
+    push(&format!("X-WR-CALNAME:{}", mapping::escape(&name)));
+    push("REFRESH-INTERVAL;VALUE=DURATION:PT6H");
+    push("X-PUBLISHED-TTL:PT6H");
+    push(&format!("X-WR-TIMEZONE:{}", out.zone.name()));
+}
+
+/// The feed of output `name` of view `id` and how many Events it left out.
+async fn feed(
+    ops: &Ops,
+    caller: &Caller,
+    id: &str,
+    name: &str,
+    uri: &axum::http::Uri,
+) -> Result<(String, usize), Problem> {
+    let asked = asked(uri)?;
+    let view = view_of(ops, id)?;
+    let output = output(&view, name)?;
+    let plans: Vec<&Plan> = output.plans.iter().collect();
+    let pushdown = pushdown(&view, &plans, &output.output.filter, &asked)?;
+    let window = Window::read(asked.from, asked.to, output.zone);
+    let now = Utc::now();
+    let mut out = String::new();
+    header(&output, &decoded(id).unwrap_or_default(), |l| {
+        fold(l, &mut out);
+    });
+    for line in zone::vtimezone(output.zone, zone::year(now)) {
+        fold(&line, &mut out);
+    }
+    let mut events: Vec<(Option<chrono::NaiveDateTime>, String)> = Vec::new();
     let (mut start, mut skipped) = (0usize, 0usize);
     // ponytail: the window is applied after the read, so a feed reads every Event the query
     // selects up to RESIDUAL_SCAN; a caller narrows with q (startDate>=…) past that.
@@ -365,10 +477,14 @@ async fn feed(
             size: PAGE,
             whole: false,
         };
-        let (entities, next) = page(&view, caller, &pushdown, &plan, at).await?;
-        for entity in &entities {
-            match plan.vevent(entity, &asked.window, now) {
-                Outcome::Event(text) => out.push_str(&text),
+        let (entities, next) = page(&view, caller, &pushdown, &plans, at).await?;
+        // `page` keeps the Entities of the plans' types alone
+        let planned = entities
+            .iter()
+            .filter_map(|e| output.plan(e).map(|p| (p, e)));
+        for (plan, entity) in planned {
+            match plan.vevent(entity, &window, now) {
+                Outcome::Event(text) => events.push((plan.start(entity), text)),
                 Outcome::Outside => {}
                 Outcome::Skipped(reason) => {
                     skipped = skipped.saturating_add(1);
@@ -387,6 +503,23 @@ async fn feed(
             Some(n) => start = n,
             None => break,
         }
+    }
+    let o = &output.output;
+    if o.sort.is_some() || o.limit.is_some() {
+        // stable: Events that start together keep the view's order
+        events.sort_by(|a, b| {
+            if output.descending {
+                b.0.cmp(&a.0)
+            } else {
+                a.0.cmp(&b.0)
+            }
+        });
+    }
+    let keep = o
+        .limit
+        .map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(usize::MAX));
+    for (_, text) in events.into_iter().take(keep) {
+        out.push_str(&text);
     }
     fold("END:VCALENDAR", &mut out);
     Ok((out, skipped))
@@ -445,19 +578,22 @@ async fn previewed(
         .and_then(|m| Plan::compile(&m))
         .map_err(|why| bad(format!("the mapping does not hold: {why}")))?;
     let asked = asked(uri)?;
-    let (view, plan, pushdown) = query(ops, id, &asked, Some(candidate))?;
+    let view = view_of(ops, id)?;
+    let plan = &candidate;
+    let pushdown = pushdown(&view, &[plan], &mapping::Filter::default(), &asked)?;
+    let window = Window::read(asked.from, asked.to, plan.zone());
     let first = Page {
         start: 0,
         size: limit,
         whole: false,
     };
-    let (entities, _) = page(&view, caller, &pushdown, &plan, first).await?;
+    let (entities, _) = page(&view, caller, &pushdown, &[plan], first).await?;
     let now = Utc::now();
     let (mut valid, mut outside) = (0usize, 0usize);
     let mut skipped: BTreeMap<&str, usize> = BTreeMap::new();
     let mut events = Vec::new();
     for entity in &entities {
-        match plan.vevent(entity, &asked.window, now) {
+        match plan.vevent(entity, &window, now) {
             Outcome::Event(text) => {
                 valid = valid.saturating_add(1);
                 if events.len() < PREVIEW_EVENTS {

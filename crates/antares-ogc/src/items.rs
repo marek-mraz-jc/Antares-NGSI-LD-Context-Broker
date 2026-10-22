@@ -40,6 +40,8 @@ pub(crate) struct Params {
     pub ngsild: Vec<(&'static str, String)>,
     /// `filter` and the queryables named as parameters (F1, F2), names checked.
     pub filter: Option<ogc_cql2::Expr>,
+    /// The NGSI-LD `lang` a `LanguageProperty` is read in: the caller's `Accept-Language`.
+    pub lang: Option<String>,
 }
 
 /// The `ngsild.` options a collection's `items` declares (ADR-0028 rule 6): each narrows.
@@ -363,7 +365,8 @@ fn shape(c: &Collection, terms: &Terms, p: &Params) -> String {
         .into_iter()
         .chain(omit)
         .filter_map(|name| p.option(name).map(|v| format!("&{name}={}", encode(v))));
-    pick.into_iter().chain(options).collect()
+    let lang = p.lang.iter().map(|l| format!("&lang={}", encode(l)));
+    pick.into_iter().chain(options).chain(lang).collect()
 }
 
 /// One Query Entities an `items` request reads: the store's pushdown and the residual the
@@ -779,7 +782,7 @@ pub(crate) fn feature(
         .as_ref()
         .and_then(|g| doc.get(terms.term(g)))
         .cloned()
-        .unwrap_or(Value::Null);
+        .map_or(Value::Null, antares_ops::rewound);
     let properties: Map<String, Value> = c
         .properties
         .iter()
