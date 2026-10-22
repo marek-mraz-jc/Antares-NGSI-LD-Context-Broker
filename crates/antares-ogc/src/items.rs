@@ -436,7 +436,7 @@ pub(crate) fn targets(c: &Collection, terms: &Terms, p: &Params, f: &Lowered) ->
     } else {
         shape(c, terms, p)
     };
-    let mut base = format!("type={}{projection}", encode(&c.type_iri));
+    let mut base = format!("type={}{}{projection}", encode(&c.type_iri), f.id_param());
     if p.ngsild_geo() {
         for name in ["georel", "geometry", "coordinates", "geoproperty"] {
             if let Some(value) = p.option(name) {
@@ -618,6 +618,14 @@ pub(crate) async fn page(
         Some(f) => crate::filter::lower(c, &terms, f, geo_free)?,
         None => Lowered::default(),
     };
+    if lowered.ids.as_ref().is_some_and(Vec::is_empty) {
+        // `id` conjuncts no Entity id meets: nothing to ask the store.
+        return Ok(Page {
+            features: Vec::new(),
+            matched: Some(0),
+            next: None,
+        });
+    }
     let parts = targets(c, &terms, p, &lowered);
     let (start, offset) = match &p.next {
         None => (0, 0),

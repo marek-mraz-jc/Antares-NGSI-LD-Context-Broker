@@ -11,7 +11,7 @@ use std::fmt::Write as _;
 const CARS: &str = "/x/views/city/ogc/features/collections/Car/items";
 
 /// Percent-encodes a filter for a query string.
-fn enc(text: &str) -> String {
+pub(crate) fn enc(text: &str) -> String {
     let mut out = String::new();
     for b in text.bytes() {
         if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
