@@ -478,10 +478,11 @@ pub async fn until(hub: &Hub, what: impl Fn(&Hub) -> bool) -> Result<(), String>
     .await;
     waited.map_err(|_| {
         format!(
-            "not within the wait: {} connections, {} attached, {} overflows",
+            "not within the wait: {} connections, {} attached, {} overflows, {} queued",
             hub.connections(),
             hub.attached(),
-            hub.overflows()
+            hub.overflows(),
+            hub.queued()
         )
     })
 }

@@ -217,31 +217,25 @@ pub(super) async fn shown_now(
     }
     let mut wanted = std::collections::BTreeSet::new();
     ids(data, &mut wanted);
-    // one read for every Entity of the notification: one by one, a folded
-    // notification of 256 Entities was 256 round trips under a delivery
-    // slot (T-4921). One failed read now hides every Entity of the
-    // notification, where a failed get hid only its own: both fail together
-    // when the store is down, and the failure is logged, not silent.
-    let ids: Vec<&str> = wanted.iter().copied().collect();
-    let mut stored_now = st
-        .store
-        .get_entities(tenant, &ids)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!("notification path: reading the notified Entities failed: {e}");
-            HashMap::new()
-        });
+    // one read for every Entity of the notification, shared with every
+    // other delivery of the tenant waiting for a read (T-5159): one by one, a
+    // folded notification of 256 Entities was 256 round trips under a
+    // delivery slot (T-4921), and a fan-out to 1 000 subscriptions of one
+    // view read the same Entities 1 000 times. One failed read hides every
+    // Entity of the notification; the failure is logged, not silent.
+    let ids: Vec<String> = wanted.iter().map(|id| (*id).to_owned()).collect();
+    let stored_now = super::coalesce::read_entities(st, tenant, ids).await;
     let mut out = HashMap::new();
     for id in wanted {
-        let mut stored = stored_now.remove(id);
-        if let (Some(d), Some(_)) = (&stored, reach) {
+        let mut stored = stored_now.as_ref().and_then(|m| m.get(id));
+        if let (Some(d), Some(_)) = (stored, reach) {
             let ctx = crate::repr::policy_context();
             if !crate::repr::policy_admits(st, tenant, ctx, reach, d).await {
                 stored = None;
             }
         }
         let shown = stored
-            .and_then(|d| crate::repr::shown(rules, &d))
+            .and_then(|d| crate::repr::shown(rules, d))
             .map(|s| s.map_names(|n| ctx.compact_iri(n)));
         out.insert(id.to_owned(), shown);
     }
@@ -530,6 +524,9 @@ pub(super) async fn matches_for(
         .unwrap_or_default();
     let changed_keys: Vec<&str> = changes.iter().map(|(k, _)| k.as_str()).collect();
     let subs = subs_for(st, &tenant, &types, &changed_keys, queued).await;
+    // one instant for the change, so equal shapes render one payload
+    let now = now_iso();
+    let mut built: HashMap<String, Vec<Value>> = HashMap::new();
     for sub in subs {
         if !is_active(&sub) || sub.get("timeInterval").is_some() {
             continue;
@@ -609,19 +606,26 @@ pub(super) async fn matches_for(
             Vec::new()
         };
         let entity_deleted_fired = after.is_none() && triggers.contains(&"entityDeleted");
-        let now = now_iso();
-        let data = build_data(
-            st,
-            &tenant,
-            &sub,
-            &ctx,
-            before.as_ref(),
-            after.as_ref(),
-            &deleted,
-            entity_deleted_fired,
-            &now,
-        )
-        .await;
+        let key = payload_key(&sub, &ctx, &deleted, entity_deleted_fired);
+        let data = match built.get(&key) {
+            Some(data) => data.clone(),
+            None => {
+                let data = build_data(
+                    st,
+                    &tenant,
+                    &sub,
+                    &ctx,
+                    before.as_ref(),
+                    after.as_ref(),
+                    &deleted,
+                    entity_deleted_fired,
+                    &now,
+                )
+                .await;
+                built.insert(key, data.clone());
+                data
+            }
+        };
         out.push(Matched {
             tenant: tenant.clone(),
             sub,

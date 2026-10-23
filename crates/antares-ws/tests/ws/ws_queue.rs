@@ -15,6 +15,17 @@ use std::time::Duration;
 
 const ROOT: &str = "/x/ws/ngsi-ld/v1";
 
+/// Limits whose `resume_grace` outlasts a test that writes five changes
+/// while detached, each waited for up to [`crate::common::SETTLE`]: under
+/// CI load the default 30 s passed and the connection, its queue
+/// included, was gone before the resume (T-5245).
+fn away() -> Limits {
+    Limits {
+        resume_grace: Duration::from_secs(600),
+        ..Limits::default()
+    }
+}
+
 /// A Subscription to `Car:c`'s `speed`, `showChanges` as given.
 fn one_car(show_changes: bool) -> Value {
     json!({"type": "Subscription", "entities": [{"type": "Car", "id": "urn:ngsi-ld:Car:c"}],
@@ -93,7 +104,7 @@ async fn ws_a_slow_consumer_is_disconnected_not_buffered() -> Result<(), String>
 /// resumed socket as one notification carrying the last value.
 #[tokio::test(flavor = "multi_thread")]
 async fn ws_coalescing_keeps_the_latest_single_entity_notification() -> Result<(), String> {
-    let b = broker(Limits::default()).await?;
+    let b = broker(away()).await?;
     b.http.car(None, "urn:ngsi-ld:Car:c", 0).await?;
     let mut c = connect(b.addr, ROOT, &[]).await?;
     assert_eq!(status(&c.subscribe(one_car(false)).await?), 201);
@@ -161,7 +172,7 @@ async fn ws_a_consumer_that_keeps_up_gets_every_change() -> Result<(), String> {
 /// a `previousValue` the next one needs.
 #[tokio::test(flavor = "multi_thread")]
 async fn ws_show_changes_is_never_coalesced() -> Result<(), String> {
-    let b = broker(Limits::default()).await?;
+    let b = broker(away()).await?;
     b.http.car(None, "urn:ngsi-ld:Car:c", 0).await?;
     let mut c = connect(b.addr, ROOT, &[]).await?;
     let sub = with(

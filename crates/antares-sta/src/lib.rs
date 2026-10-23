@@ -122,17 +122,38 @@ fn not_found() -> Problem {
     Problem(StatusCode::NOT_FOUND, "no such resource".into())
 }
 
-/// The view's refusal, by its status.
+/// The view's refusal, by its status; a count or sort over too many Entities is a 400 the
+/// client fixes by narrowing, not an invalid filter.
 fn refused(refusal: &Refusal) -> Problem {
-    upstream(refusal.status())
+    match refusal {
+        Refusal::TooManyResults { .. } => Problem(
+            StatusCode::BAD_REQUEST,
+            "the query selects more Entities than one read may count or sort; narrow $filter"
+                .into(),
+        ),
+        _ => upstream(refusal.status()),
+    }
 }
 
-/// A view answer that is no success.
+/// A view answer that is no success, named by what it was (T-5349: a timeout or an inner
+/// failure reached the client as "refused").
 fn upstream(status: StatusCode) -> Problem {
-    match status {
-        StatusCode::BAD_REQUEST => Problem(status, "the filter is not valid NGSI-LD".into()),
-        _ => Problem(status, "the view refused the read".into()),
-    }
+    let message = match status {
+        StatusCode::BAD_REQUEST => "the filter is not valid NGSI-LD",
+        StatusCode::UNAUTHORIZED
+        | StatusCode::FORBIDDEN
+        | StatusCode::METHOD_NOT_ALLOWED
+        | StatusCode::UNPROCESSABLE_ENTITY => "the view refused the read",
+        StatusCode::REQUEST_TIMEOUT | StatusCode::GATEWAY_TIMEOUT => {
+            "the read took too long; narrow $filter or send it again"
+        }
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
+            "the broker is busy; send the read again shortly"
+        }
+        s if s.is_server_error() => "the read failed inside the broker",
+        _ => "the view could not answer the read",
+    };
+    Problem(status, message.into())
 }
 
 type Done = Result<Value, Problem>;
@@ -985,4 +1006,71 @@ fn find(items: Vec<Value>, key: &str) -> Option<Value> {
     items
         .into_iter()
         .find(|i| i.get("@iot.id").and_then(Value::as_str) == Some(key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T-5349: only a refusal reads as one; a timeout, a busy broker or an inner failure keeps
+    /// its status and says what it was.
+    #[test]
+    fn a_view_status_is_named_by_what_it_was() {
+        let message = |s: StatusCode| upstream(s).1;
+        for (status, says) in [
+            (StatusCode::BAD_REQUEST, "the filter is not valid NGSI-LD"),
+            (StatusCode::UNAUTHORIZED, "the view refused the read"),
+            (StatusCode::FORBIDDEN, "the view refused the read"),
+            (StatusCode::METHOD_NOT_ALLOWED, "the view refused the read"),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "the view refused the read",
+            ),
+            (
+                StatusCode::REQUEST_TIMEOUT,
+                "the read took too long; narrow $filter or send it again",
+            ),
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                "the read took too long; narrow $filter or send it again",
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "the broker is busy; send the read again shortly",
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the broker is busy; send the read again shortly",
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the read failed inside the broker",
+            ),
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "the view could not answer the read",
+            ),
+        ] {
+            assert_eq!(upstream(status).0, status);
+            assert_eq!(message(status), says);
+        }
+    }
+
+    #[test]
+    fn a_count_over_too_many_entities_asks_for_a_narrower_filter() {
+        let too_many = refused(&Refusal::TooManyResults {
+            budget: 10,
+            size: 11,
+        });
+        assert_eq!(too_many.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            too_many.1,
+            "the query selects more Entities than one read may count or sort; narrow $filter"
+        );
+        let inner = refused(&Refusal::Inner {
+            request_id: "ops-1".into(),
+        });
+        assert_eq!(inner.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(inner.1, "the read failed inside the broker");
+    }
 }

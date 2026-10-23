@@ -120,6 +120,18 @@ pub(crate) fn provenance(operation: &str) -> Value {
     out
 }
 
+/// Whether the request in flight came through an Endpoint that audits its
+/// changes (ADR-N-054 2.8, DM-136): each change is then kept as a version
+/// whatever the type's history rule says.
+fn audited() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    return PROVENANCE
+        .try_with(crate::provenance::audited)
+        .unwrap_or(false);
+    #[cfg(target_arch = "wasm32")]
+    false
+}
+
 /// Buffer one entity change for the request in flight so the matcher
 /// receives the whole request at once. Handed back when no request is in
 /// flight — the caller then gives it to the matcher on the spot.
@@ -175,9 +187,15 @@ const GATES: &[fn(&AppState, &TemporalEvent) -> bool] = &[observed_gate];
 /// metadata-shaped writes leave no history; `none` admits nothing.
 fn observed_gate(st: &AppState, ev: &TemporalEvent) -> bool {
     use crate::state::TemporalRecord::*;
+    // An audited write (DM-136) is kept without `observedAt` too.
+    let audited = || {
+        ev.instance
+            .get(antares_store::PROVENANCE_KEY)
+            .is_some_and(crate::provenance::audited)
+    };
     match st.temporal_record {
         All | Ruled => true,
-        Observed => ev.instance.get("observedAt").is_some(),
+        Observed => ev.instance.get("observedAt").is_some() || audited(),
         None => false,
     }
 }
@@ -227,6 +245,9 @@ pub fn retention_of(own: &Value) -> Result<OwnRetention, String> {
 /// Tenant's `*` rule. Below them all, `ANTARES_TEMPORAL_RECORD=ruled`
 /// records nothing (T-5056: history is opt-in), any other mode everything.
 pub(crate) fn records_history(st: &AppState, tenant: &TenantId, doc: &Value) -> bool {
+    if audited() {
+        return true;
+    }
     match own_retention(doc) {
         Some(Ok(OwnRetention::Off)) => return false,
         Some(Ok(OwnRetention::Keep(_))) => return true,
@@ -352,6 +373,11 @@ pub(crate) fn admits_change(
     before: Option<&Value>,
     instance: &Value,
 ) -> bool {
+    // An audited write keeps every change (DM-136); gate 1 already dropped
+    // an exact repeat.
+    if audited() {
+        return true;
+    }
     let default = if st.temporal_record == crate::state::TemporalRecord::Ruled {
         RecordMode::Observed
     } else {
