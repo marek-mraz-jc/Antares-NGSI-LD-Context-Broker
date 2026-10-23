@@ -312,14 +312,15 @@ impl View {
         };
         if let Some(named) = &self.representations {
             if let Some((name, _)) = named.iter().find(|(name, member)| {
-                // each is a list of named outputs: `feed` (T-5202), `ical` (T-5208)
+                // each is a list of named outputs: `feed` (T-5202) checks its list when
+                // it serves, `ical` (T-5208) refuses more than MAX_OUTPUTS here
                 !REPRESENTATIONS.contains(&name.as_str())
                     || member
                         .as_array()
-                        .is_none_or(|outputs| outputs.len() > MAX_OUTPUTS)
+                        .is_none_or(|outputs| *name == "ical" && outputs.len() > MAX_OUTPUTS)
             }) {
                 return Err(format!(
-                    "representations: {name:?} is not one of {REPRESENTATIONS:?} with a list of at most {MAX_OUTPUTS} outputs"
+                    "representations: {name:?} is not one of {REPRESENTATIONS:?} with a list of outputs (ical: at most {MAX_OUTPUTS})"
                 ));
             }
         }
@@ -1334,6 +1335,7 @@ mod tests {
         let many: Vec<Value> = (0..=MAX_OUTPUTS)
             .map(|i| json!({"name": format!("o{i}")}))
             .collect();
+        assert!(load(&with("representations", json!({"feed": many.clone()}))).is_ok());
         for bad in [
             json!({"vcard": []}),
             json!({"ical": {"preset": "sdm-event"}}),
