@@ -1,4 +1,4 @@
-# OGC API - Features compliance
+# OGC API - Features and Tiles compliance
 
 The [OGC API - Features endpoint](ogc.md) runs against the OGC CITE
 executable test suite, [ets-ogcapi-features10](https://github.com/opengeospatial/ets-ogcapi-features10),
@@ -146,6 +146,47 @@ kinds, one cell per Part and kind. A cell holds, or the write cell of a view
 without writes asserts its 405 with `Allow`. In every column no feature,
 queryable or schema shows an attribute the view hides, and a filter on one
 is the same 400 as an unknown name.
+
+## 8. OGC API - Tiles
+
+Job `ogc-tiles-external` runs the OGC CITE suite
+[ets-ogcapi-tiles10](https://github.com/opengeospatial/ets-ogcapi-tiles10) 1.2,
+the last release, on TEAM Engine 6.0.0-RC2 from the image
+`ogccite/ets-ogcapi-tiles10:1.2-teamengine-6.0.0-RC2`, pinned by digest
+(`sha256:af8e8ab4…c002ffc`), beside `ogc-compliance-external` and with the same
+broker, rig and gate (T-5121, T-5195):
+
+1. The broker of the `build` job serves view `ogc-public` of `ci/views/ogc`.
+2. The suite `ogcapi-tiles-1.0` runs against the landing page
+   `http://localhost:9090/x/views/ogc-public/ogc/features` with tile matrix
+   set `http://www.opengis.net/def/tilematrixset/OGC/1.0/WebMercatorQuad`, the
+   URL template of collection `AirQualityObserved`
+   (`.../collections/AirQualityObserved/tiles/WebMercatorQuad/{tileMatrix}/{tileRow}/{tileCol}`)
+   and tile matrix 0, rows and columns 0 to 0: the one tile that holds every
+   seeded Entity.
+3. `dev/ogc-compliance/baseline.py check` gates the run against
+   `ci/ogc-tiles-compliance-baseline.json`.
+
+The baseline, measured 2026-10-23 on a `full,linkml` debug broker: 16 tests,
+15 passed, 0 failed, 1 skipped. The skipped test,
+`Dataset Tilesets :: LandingPage.landingPageRetrieval`, needs dataset
+tilesets on the landing page; the broker serves tilesets per collection only.
+The OpenAPI class passes because each tile operation's `operationId` ends in
+the name Table 11 of OGC 20-057 gives it (`getTileSetsList`, `getTileSet`,
+`getTile`).
+
+To run it locally, after the steps of section 1 that start the broker and
+load the views:
+
+```sh
+docker run -d --network host ogccite/ets-ogcapi-tiles10:1.2-teamengine-6.0.0-RC2
+enc() { jq -rn --arg u "$1" '$u|@uri'; }
+iut=http://localhost:9090/x/views/ogc-public/ogc/features
+tpl="$iut/collections/AirQualityObserved/tiles/WebMercatorQuad/{tileMatrix}/{tileRow}/{tileCol}"
+curl -u ogctest:ogctest -H 'Accept: application/xml' -o testng-results.xml \
+  "localhost:8080/teamengine/rest/suites/ogcapi-tiles-1.0/run?iut=$(enc "$iut")&tilematrixsetdefinitionuri=$(enc http://www.opengis.net/def/tilematrixset/OGC/1.0/WebMercatorQuad)&urltemplatefortiles=$(enc "$tpl")&tilematrix=0&mintilerow=0&maxtilerow=0&mintilecol=0&maxtilecol=0"
+dev/ogc-compliance/baseline.py check testng-results.xml ci/ogc-tiles-compliance-baseline.json
+```
 
 ## Related
 

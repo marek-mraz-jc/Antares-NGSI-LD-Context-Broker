@@ -35,7 +35,7 @@
 - [Storage drivers](storage.md)
 - [Conformance](conformance.md)
 - [OData compliance](odata-compliance.md)
-- [OGC API - Features compliance](ogc-compliance.md)
+- [OGC API - Features and Tiles compliance](ogc-compliance.md)
 - [SensorThings API compliance](sta-compliance.md)
 - [Performance](performance.md)
 - [Performance baseline](perf-baseline.md)
