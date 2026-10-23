@@ -170,6 +170,40 @@ pub(crate) fn notif_shape(sub: &Value, ctx: &Context) -> NotifShape {
     }
 }
 
+/// Everything [`build_data`] reads of one Subscription for one change, as a
+/// memo key: the members [`notif_shape`] reads, the deleted Attributes its
+/// triggers name and the `@context` it compacts with. Subscriptions with
+/// equal keys get equal payloads, so 1 000 subscriptions of one view render
+/// one (T-5159). The `@context` counts by identity: the drain's memo hands
+/// every Subscription naming one URL the same `Arc`, and a key holds an
+/// address only while its `Arc` lives in a matched group, so no other
+/// `@context` can take that address in the meantime.
+pub(super) fn payload_key(
+    sub: &Value,
+    ctx: &Arc<Context>,
+    deleted: &[String],
+    entity_deleted: bool,
+) -> String {
+    let n = sub.get("notification");
+    let member = |k: &str| n.and_then(|n| n.get(k));
+    json!([
+        Arc::as_ptr(ctx).addr(),
+        member("format"),
+        member("sysAttrs"),
+        member("attributes"),
+        member("pick"),
+        member("omit"),
+        member("showChanges"),
+        member("join"),
+        member("joinLevel"),
+        sub.get("lang"),
+        sub.get("datasetId"),
+        deleted,
+        entity_deleted,
+    ])
+    .to_string()
+}
+
 /// Build the notification `data` array for one change and one subscription.
 #[allow(clippy::too_many_arguments)] // one param per 5.8.6 payload input
 pub(super) async fn build_data(

@@ -149,7 +149,9 @@ async fn seed_rls(pool: &sqlx::PgPool) {
                     jsonb_build_object(
                       'https://x/tenant', $1,
                       'https://x/speed', jsonb_build_array(jsonb_build_object('type', 'Property', 'value', g % 100)),
-                      'https://x/brand', jsonb_build_array(jsonb_build_object('type', 'Property', 'value', 'b' || (g % 50)))),
+                      'https://x/brand', jsonb_build_array(jsonb_build_object('type', 'Property', 'value', 'b' || (g % 50))),
+                      'https://uri.etsi.org/ngsi-ld/default-context/name',
+                        jsonb_build_array(jsonb_build_object('type', 'Property', 'value', 'n' || g))),
                     CASE WHEN g % 100 = 0 THEN ARRAY['https://x/T' || (g % 10), 'https://x/M']
                          ELSE ARRAY['https://x/T' || (g % 10)] END,
                     ST_SetSRID(ST_MakePoint(10 + (g % 1000) / 100.0, 45 + ((g / 1000) % 100) / 100.0), 4326),
@@ -366,6 +368,17 @@ async fn every_query_shape_reads_an_index_under_rls() {
                 21,
             ),
             "i_entities_type_unlocated",
+        ),
+        (
+            // T-5349: a name filter without a type (STA `Things?$filter=name eq`),
+            // with the store's leakproof `name_key` narrowing
+            "q name, no type",
+            format!(
+                "SELECT entity FROM entities WHERE {w} AND (name_key = 'n4242' OR name_key IS NULL) \
+                 AND entity @? '$.\"https://uri.etsi.org/ngsi-ld/default-context/name\"[*].\"value\" \
+                 ? (@ == \"n4242\")'::jsonpath ORDER BY id LIMIT 101"
+            ),
+            "i_entities_name_key",
         ),
         (
             // a rare type (1 %): for a common one an id-ordered read of the
@@ -1082,8 +1095,8 @@ async fn the_keyed_history_arms_read_their_unique_index_under_rls() {
         let indexed = plan
             .lines()
             .any(|l| l.contains("Index Cond:") && l.contains(cond));
-        // Since 0021 sets the cut-over, maintenance creates the weeks from it on
-        // in attr_rows; an empty week is read by a free Seq Scan, the right plan.
+        // Once a cut-over is set, maintenance creates the weeks from it on in
+        // attr_rows; an empty week is read by a free Seq Scan, the right plan.
         let walks = plan
             .lines()
             .any(|l| l.contains("Seq Scan on attr_rows") && !l.contains("(cost=0.00..0.00 "));

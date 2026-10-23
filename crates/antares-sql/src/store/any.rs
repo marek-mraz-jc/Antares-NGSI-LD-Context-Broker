@@ -1664,6 +1664,41 @@ impl antares_store::CurrentStateDriver for AnyStore {
         }
         antares_store::record_delivery_via_mutate(self, tenant, kind, id, now).await
     }
+    /// The Postgres arm books every attempt in ONE statement (see
+    /// `pg::doc::record_deliveries`); every other arm books them one by one.
+    async fn record_deliveries(
+        &self,
+        tenant: &TenantId,
+        kind: Kind,
+        attempts: &[(&str, &str)],
+    ) -> Result<Vec<Option<antares_store::Delivery>>, NgsiError> {
+        #[cfg(feature = "postgres")]
+        {
+            if let (AnyStore::Pg(p), Ok(dk)) = (self, doc_kind(kind)) {
+                let mut found = p
+                    .docs
+                    .record_deliveries(tenant, dk, attempts)
+                    .await
+                    .map_err(db)?;
+                return Ok(attempts
+                    .iter()
+                    .map(|(id, _)| {
+                        found
+                            .remove(*id)
+                            .map(|(doc, prev_success)| antares_store::Delivery {
+                                doc,
+                                prev_success,
+                            })
+                    })
+                    .collect());
+            }
+        }
+        let mut out = Vec::with_capacity(attempts.len());
+        for (id, now) in attempts {
+            out.push(antares_store::record_delivery_via_mutate(self, tenant, kind, id, now).await?);
+        }
+        Ok(out)
+    }
     async fn sweep_expired(&self) -> usize {
         AnyStore::sweep_expired(self)
     }

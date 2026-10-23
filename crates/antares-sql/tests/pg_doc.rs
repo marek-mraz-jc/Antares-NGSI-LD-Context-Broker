@@ -966,3 +966,52 @@ async fn list_digests_move_only_with_the_body() {
     assert_eq!(next[0], first[0]);
     assert_ne!(next[1].1, first[1].1);
 }
+
+/// T-5159: `record_deliveries` books several subscriptions in one statement,
+/// each with its own stamp and its own pre-image; a subscription that is gone
+/// has no entry.
+#[tokio::test(flavor = "multi_thread")]
+async fn record_deliveries_books_each_subscription_once() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let s = PgDocStore::new(pool.clone());
+    let t = TenantId::new("pgbatchbook").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let (a, b) = (
+        "urn:ngsi-ld:Subscription:batch-a",
+        "urn:ngsi-ld:Subscription:batch-b",
+    );
+    let t0 = "2026-01-01T00:00:00.000Z";
+    for (id, last) in [(a, Some(t0)), (b, None)] {
+        let mut n = json!({"endpoint": {"uri": "urn:antares:ws:c"}, "timesSent": 4});
+        if let Some(last) = last {
+            n["lastSuccess"] = json!(last);
+        }
+        s.upsert(
+            &t,
+            DocKind::Subscription,
+            id,
+            &json!({"id": id, "type": "Subscription", "notification": n}),
+        )
+        .await
+        .expect("seed");
+    }
+    let (ta, tb) = ("2026-01-01T00:00:01.000Z", "2026-01-01T00:00:02.000Z");
+    let found = s
+        .record_deliveries(
+            &t,
+            DocKind::Subscription,
+            &[(b, tb), ("urn:ngsi-ld:Subscription:gone", ta), (a, ta)],
+        )
+        .await
+        .expect("book");
+    assert_eq!(found.len(), 2, "the gone subscription books nothing");
+    let (doc_a, prev_a) = found.get(a).expect("a booked");
+    assert_eq!(prev_a, &Some(json!(t0)));
+    assert_eq!(doc_a["notification"]["timesSent"], json!(5));
+    assert_eq!(doc_a["notification"]["lastNotification"], json!(ta));
+    let (doc_b, prev_b) = found.get(b).expect("b booked");
+    assert_eq!(prev_b, &None);
+    assert_eq!(doc_b["notification"]["lastSuccess"], json!(tb));
+    assert_eq!(doc_b["notification"]["status"], json!("ok"));
+}

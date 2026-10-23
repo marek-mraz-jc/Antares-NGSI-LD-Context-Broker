@@ -180,11 +180,21 @@ pub(super) async fn process_queued(
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) async fn deliver_group(st: &AppState, g: Matched) {
     let id = g.sub.get("id").and_then(Value::as_str).unwrap_or_default();
-    let Ok(_permits) = tokio::time::timeout(STEP_DEADLINE, delivery_permits(&g.tenant)).await
-    else {
-        note_stall("permits", g.tenant.as_str(), id);
-        tell_lost(st, &g);
-        return;
+    // The slots bound how many deliveries can wait on a peer. An in-process
+    // sink has no peer to wait on, and its store calls join its tenant's
+    // shared statements (T-5159), so a fan-out to 1 000 sockets no longer
+    // queues behind 8 slots for work that never leaves the process.
+    let _permits = if in_process_sink(st, &g.sub) {
+        None
+    } else {
+        match tokio::time::timeout(STEP_DEADLINE, delivery_permits(&g.tenant)).await {
+            Ok(permits) => Some(permits),
+            Err(_) => {
+                note_stall("permits", g.tenant.as_str(), id);
+                tell_lost(st, &g);
+                return;
+            }
+        }
     };
     let delivered = deliver(st, &g.tenant, &g.sub, g.data, &g.ctx);
     if tokio::time::timeout(STEP_DEADLINE, delivered)
@@ -549,6 +559,16 @@ pub(super) fn tenant_slots(tenant: &TenantId) -> Arc<tokio::sync::Semaphore> {
 pub(super) async fn delivery_permits(tenant: &TenantId) -> impl Sized {
     let share = tenant_slots(tenant).acquire_owned().await;
     (share, DELIVERY_SLOTS.acquire().await)
+}
+
+/// Whether the Subscription's notifications stay in this process: its
+/// binding opens no socket (a WebSocket) or the forward transport takes them
+/// (ADR-0025 rule 7). The same test `deliver_as` polices egress by.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn in_process_sink(st: &AppState, sub: &Value) -> bool {
+    endpoint_uri(sub).is_some_and(|uri| {
+        in_process(st, uri).is_some() || st.sinks.sink_for_uri(uri).is_some_and(|s| !s.network())
+    })
 }
 
 /// `notification.endpoint.uri` of a Subscription.
