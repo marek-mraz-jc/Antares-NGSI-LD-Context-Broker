@@ -2060,7 +2060,12 @@ mod api_surface_tests {
     /// surface feature the shelf is the admin surface alone, and a path of
     /// every surface prefix (ADR-0023 to ADR-0027) is unrouted. A surface
     /// that lands without its feature gate turns this red.
-    #[cfg(not(any(feature = "plugin-example", feature = "views", feature = "ws")))]
+    #[cfg(not(any(
+        feature = "plugin-example",
+        feature = "views",
+        feature = "ws",
+        feature = "channels"
+    )))]
     #[tokio::test]
     async fn the_vanilla_shelf_is_admin_alone() {
         use tower::ServiceExt;
