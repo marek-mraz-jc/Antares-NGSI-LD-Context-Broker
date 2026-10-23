@@ -359,6 +359,12 @@ pub struct Shared {
     /// The mesh identity of the gateway whose provenance headers the broker
     /// believes (ANTARES_PROVENANCE_FROM, T-4665); `None` believes nobody.
     pub provenance_from: Option<String>,
+    /// A request to the NGSI-LD API that carries no subject header is served
+    /// only with the admin bearer token (T-5032,
+    /// [`crate::admin_auth::subject_or_admin`]). `false` (the default)
+    /// serves it as before; the platform build sets it when the deployment
+    /// names subject headers.
+    pub subject_required: bool,
     /// History gate 3 (T-4275): the (Tenant, expanded type) pairs whose
     /// retention rule says `history: "off"`. The views reload replaces the
     /// set; an Entity with any of these types records no attribute instance.
@@ -648,6 +654,7 @@ impl AppState {
                 nats: false,
                 temporal_record: TemporalRecord::All,
                 provenance_from: None,
+                subject_required: false,
                 history_off: HistoryOff::default(),
                 public_url,
                 snapshot_cap: 1024,
