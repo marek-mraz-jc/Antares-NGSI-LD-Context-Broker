@@ -115,6 +115,7 @@ fn health(hub: &Hub, endpoint: &str) -> serde_json::Value {
         "limits": hub.limits.health(),
         "connections": hub.connections(),
         "overflows": hub.overflows(),
+        "queued": hub.queued(),
     })
 }
 

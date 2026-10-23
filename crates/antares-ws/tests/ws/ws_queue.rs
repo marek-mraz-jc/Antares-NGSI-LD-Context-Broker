@@ -100,8 +100,13 @@ async fn ws_coalescing_keeps_the_latest_single_entity_notification() -> Result<(
     let (connection, token) = (c.connection.clone(), c.token.clone());
     c.close().await;
     until(&b.hub, |h| h.attached() == 0).await?;
-    for v in 1..=5 {
-        b.http.speed(None, "urn:ngsi-ld:Car:c", v).await?;
+    // each change reaches the detached queue before the next is written: a
+    // notifier lane that falls behind folds waiting changes into one
+    // notification, and one still on its way at the resume meets the new
+    // socket (T-5245)
+    for v in 1..=5u8 {
+        b.http.speed(None, "urn:ngsi-ld:Car:c", v.into()).await?;
+        until(&b.hub, |h| h.queued() == u64::from(v)).await?;
     }
     let mut again = connect(b.addr, ROOT, &[]).await?;
     assert_eq!(status(&again.resume(&connection, &token, 0).await?), 200);
@@ -168,8 +173,13 @@ async fn ws_show_changes_is_never_coalesced() -> Result<(), String> {
     let (connection, token) = (c.connection.clone(), c.token.clone());
     c.close().await;
     until(&b.hub, |h| h.attached() == 0).await?;
-    for v in 1..=5 {
-        b.http.speed(None, "urn:ngsi-ld:Car:c", v).await?;
+    // each change reaches the detached queue before the next is written: a
+    // notifier lane that falls behind folds waiting changes into one
+    // notification, and one still on its way at the resume meets the new
+    // socket (T-5245)
+    for v in 1..=5u8 {
+        b.http.speed(None, "urn:ngsi-ld:Car:c", v.into()).await?;
+        until(&b.hub, |h| h.queued() == u64::from(v)).await?;
     }
     let mut again = connect(b.addr, ROOT, &[]).await?;
     assert_eq!(status(&again.resume(&connection, &token, 0).await?), 200);

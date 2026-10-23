@@ -37,7 +37,8 @@ async fn ws_a_malformed_subscription_is_answered_and_forgotten() -> Result<(), S
     let b = broker(Limits::default()).await?;
     let mut c = connect(b.addr, ROOT, &[]).await?;
     let own = format!("{ENDPOINT_PREFIX}{}", c.connection);
-    let context = "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context.jsonld";
+    // a pinned core context: it resolves without the network (T-5245)
+    let context = "https://uri.etsi.org/ngsi-ld/v1/ngsi-ld-core-context-v1.9.jsonld";
     let cases = [
         (with(cars(), &["@context"], json!(context)), 201),
         (

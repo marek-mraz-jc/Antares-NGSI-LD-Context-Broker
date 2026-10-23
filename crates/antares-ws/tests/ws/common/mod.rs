@@ -22,6 +22,10 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 /// How long a test waits for a message it expects.
 pub const WAIT: Duration = Duration::from_secs(10);
 
+/// How long [`until`] waits for the hub to reach a state: the notifier
+/// runs beside the test, so under CI load it gets far more than [`WAIT`].
+pub const SETTLE: Duration = Duration::from_secs(60);
+
 /// Tests take a shared turn; one that pushes megabytes through a debug
 /// broker takes it alone, so the others' waits do not depend on its load.
 static TURN: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
@@ -464,9 +468,9 @@ pub fn with(mut v: Value, path: &[&str], x: Value) -> Value {
     v
 }
 
-/// Wait until `what` of the hub holds, within [`WAIT`].
+/// Wait until `what` of the hub holds, within [`SETTLE`].
 pub async fn until(hub: &Hub, what: impl Fn(&Hub) -> bool) -> Result<(), String> {
-    let waited = tokio::time::timeout(WAIT, async {
+    let waited = tokio::time::timeout(SETTLE, async {
         while !what(hub) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
