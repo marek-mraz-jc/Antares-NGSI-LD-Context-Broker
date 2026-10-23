@@ -606,6 +606,24 @@ pub trait CurrentStateDriver: Send + Sync {
     ) -> Result<Option<Delivery>, NgsiError> {
         record_delivery_via_mutate(self, tenant, kind, id, now).await
     }
+    /// [`Self::record_delivery`] for several attempts at once, one answer per
+    /// attempt in input order. The ids are distinct: an attempt books exactly
+    /// one notification and its pre-image is the value it overwrote. The
+    /// default books them one by one; a backend that can should write them
+    /// as one statement, which is what keeps a fan-out of thousands of
+    /// in-process deliveries at one round trip per batch (T-5159).
+    async fn record_deliveries(
+        &self,
+        tenant: &TenantId,
+        kind: Kind,
+        attempts: &[(&str, &str)],
+    ) -> Result<Vec<Option<Delivery>>, NgsiError> {
+        let mut out = Vec::with_capacity(attempts.len());
+        for (id, now) in attempts {
+            out.push(self.record_delivery(tenant, kind, id, now).await?);
+        }
+        Ok(out)
+    }
     /// Reap expired docs/instances (backends with their own maintenance job
     /// return 0).
     async fn sweep_expired(&self) -> usize {
