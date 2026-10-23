@@ -99,6 +99,10 @@ fn decompose(doc: &Value) -> Vec<Value> {
                 // Provenance is a column, never data (T-4665).
                 let mut data = i.clone();
                 let provenance = antares_store::take_provenance(&mut data);
+                // the `instance_id` column holds it (T-5131): ~70 B a row
+                if let Some(o) = data.as_object_mut() {
+                    o.remove("instanceId");
+                }
                 rows.push(serde_json::json!({
                     "attr_id": attr,
                     "instance_id": instance_id,
@@ -114,6 +118,66 @@ fn decompose(doc: &Value) -> Vec<Value> {
         }
     }
     rows
+}
+
+/// One attribute's instances of history rows `alias`, as the reads group
+/// them (T-5131): a row stores its instanceId in the `instance_id` column
+/// only, so an attribute comes back as `[instances, instance ids]` in one
+/// order, which [`unpack`] zips into the instances. A row written before
+/// T-5131 still holds `instanceId` in `data`, equal to the column. Building
+/// each row in SQL instead (`jsonb_build_array` or `||` per row) cost
+/// Postgres 10-35 % more than reading the old documents (240k rows).
+fn insts_and_ids(alias: &str) -> String {
+    let key = format!("{alias}.created_at, {alias}.observed_at, {alias}.instance_id");
+    format!(
+        "jsonb_build_array(jsonb_agg({alias}.data ORDER BY {key}), \
+         to_jsonb(array_agg({alias}.instance_id ORDER BY {key})))"
+    )
+}
+
+/// The whole instance document of row `alias`, built in SQL, where a row is
+/// copied (attr_versions keeps whole documents) or read rarely. The column
+/// equals `data`'s own instanceId on a row written before T-5131.
+fn restamp(alias: &str) -> String {
+    format!("({alias}.data || jsonb_build_object('instanceId', {alias}.instance_id))")
+}
+
+/// The history rows of one Entity over both parents (T-5200, docs/src/storage.md
+/// "Integer history keys"): `attr_instances` and, in its row type, `attr_rows`
+/// (`attr_rows_of`, migration 0020), which stays empty until the cut-over. The
+/// caller's predicates reach each arm's btree; an ordered read with a LIMIT
+/// writes its arms out instead, each limited itself.
+fn history(tenant: &str, entity: &str) -> String {
+    format!(
+        "(SELECT * FROM attr_instances WHERE tenant_id = {tenant} AND entity_id = {entity} \
+         UNION ALL SELECT * FROM attr_rows_of({tenant}, {entity}))"
+    )
+}
+
+/// Turns each attribute's `[instances, instance ids]` that
+/// [`insts_and_ids`] returned back into its instances.
+fn unpack(doc: &mut Value) {
+    let Some(o) = doc.as_object_mut() else {
+        return;
+    };
+    for attr in o.values_mut() {
+        let Some([insts, ids]) = attr.as_array_mut().map(Vec::as_mut_slice) else {
+            continue;
+        };
+        let (Some(list), Some(ids)) = (insts.as_array_mut(), ids.as_array_mut()) else {
+            continue;
+        };
+        if list.len() != ids.len() || !ids.iter().all(Value::is_string) {
+            continue;
+        }
+        for (inst, id) in list.iter_mut().zip(ids.iter_mut()) {
+            if let Some(i) = inst.as_object_mut() {
+                i.insert("instanceId".to_owned(), id.take());
+            }
+        }
+        let list = insts.take();
+        *attr = list;
+    }
 }
 
 /// `ANTARES_TEMPORAL_DEDUP=off` records a row per write again; anything else,
@@ -144,21 +208,34 @@ const GEO_VALUE: &str = "CASE WHEN jsonb_typeof(e->'data'->'value') = 'object'
 /// a merge over every weekly partition, one cold index descent each. A row
 /// found there is the newest of all; only an attribute silent for longer
 /// reads the whole history, and COALESCE runs that probe for it alone.
+/// Each parent (T-5200) is its own ordered arm with its own LIMIT: Postgres
+/// merges UNION ALL arms in index order only when each arm is limited itself.
 const NEWEST_REPEATS: &str = "COALESCE((
              SELECT x.instance_id <> e->>'instance_id'
                     AND x.data - ARRAY['instanceId','createdAt','modifiedAt']
                         = (e->'data') - ARRAY['instanceId','createdAt','modifiedAt']
-             FROM attr_instances x
-             WHERE x.tenant_id = $1 AND x.entity_id = $2 AND x.attr_id = e->>'attr_id'
-               AND x.dataset_id IS NOT DISTINCT FROM e->>'dataset_id'
-               AND x.observed_at >= date_trunc('week', now()) - interval '1 week'
+             FROM ((SELECT x.instance_id, x.data, x.observed_at FROM attr_instances x
+                    WHERE x.tenant_id = $1 AND x.entity_id = $2 AND x.attr_id = e->>'attr_id'
+                      AND x.dataset_id IS NOT DISTINCT FROM e->>'dataset_id'
+                      AND x.observed_at >= date_trunc('week', now()) - interval '1 week'
+                    ORDER BY x.observed_at DESC LIMIT 1)
+                   UNION ALL
+                   (SELECT x.instance_id, x.data, x.observed_at FROM attr_rows_at($1, $2, e->>'attr_id') x
+                    WHERE x.dataset_id IS NOT DISTINCT FROM e->>'dataset_id'
+                      AND x.observed_at >= date_trunc('week', now()) - interval '1 week'
+                    ORDER BY x.observed_at DESC LIMIT 1)) x
              ORDER BY x.observed_at DESC LIMIT 1), (
              SELECT x.instance_id <> e->>'instance_id'
                     AND x.data - ARRAY['instanceId','createdAt','modifiedAt']
                         = (e->'data') - ARRAY['instanceId','createdAt','modifiedAt']
-             FROM attr_instances x
-             WHERE x.tenant_id = $1 AND x.entity_id = $2 AND x.attr_id = e->>'attr_id'
-               AND x.dataset_id IS NOT DISTINCT FROM e->>'dataset_id'
+             FROM ((SELECT x.instance_id, x.data, x.observed_at FROM attr_instances x
+                    WHERE x.tenant_id = $1 AND x.entity_id = $2 AND x.attr_id = e->>'attr_id'
+                      AND x.dataset_id IS NOT DISTINCT FROM e->>'dataset_id'
+                    ORDER BY x.observed_at DESC LIMIT 1)
+                   UNION ALL
+                   (SELECT x.instance_id, x.data, x.observed_at FROM attr_rows_at($1, $2, e->>'attr_id') x
+                    WHERE x.dataset_id IS NOT DISTINCT FROM e->>'dataset_id'
+                    ORDER BY x.observed_at DESC LIMIT 1)) x
              ORDER BY x.observed_at DESC LIMIT 1), false)";
 
 /// The earliest and latest `observed_at` of `rows`, bound beside every probe
@@ -266,7 +343,7 @@ async fn insert_rows(
         "INSERT INTO attr_versions
            (tenant_id, entity_id, attr_id, instance_id, dataset_id, observed_at, version, data, provenance)
          SELECT x.tenant_id, x.entity_id, x.attr_id, x.instance_id, x.dataset_id, x.observed_at,
-                x.version, x.data, x.provenance
+                x.version, {x_data}, x.provenance
          FROM jsonb_array_elements($3::jsonb) AS e
          JOIN attr_instances x ON x.tenant_id = $1 AND x.entity_id = $2
            AND x.attr_id = e->>'attr_id' AND x.observed_at = (e->>'observed_at')::timestamptz
@@ -275,7 +352,8 @@ async fn insert_rows(
                 OR ($4 AND e->'data' ? 'observedAt'
                     AND x.dataset_id IS NOT DISTINCT FROM e->>'dataset_id'))
            AND x.data - {STAMPS} IS DISTINCT FROM (e->'data') - {STAMPS}
-         ON CONFLICT DO NOTHING"
+         ON CONFLICT DO NOTHING",
+        x_data = restamp("x")
     )))
     .bind(tenant.as_str())
     .bind(entity_id)
@@ -289,7 +367,7 @@ async fn insert_rows(
         // Same observedAt, another value: that observation was corrected.
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE attr_instances x
-             SET data = jsonb_set(e->'data', '{{instanceId}}', to_jsonb(x.instance_id)),
+             SET data = (e->'data') - 'instanceId',
                  version = x.version + 1, provenance = {CORRECTED},
                  modified_at = (e->>'modified_at')::timestamptz,
                  deleted_at = (e->>'deleted_at')::timestamptz, geo_value = {GEO_VALUE}
@@ -376,6 +454,11 @@ async fn wipe_instances(
         .bind(id)
         .execute(&mut *tx)
         .await?;
+    sqlx::query("DELETE FROM attr_rows WHERE tenant_id = $1 AND entity_no = iri_no($1, $2)")
+        .bind(tenant.as_str())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM attr_versions WHERE tenant_id = $1 AND entity_id = $2")
         .bind(tenant.as_str())
         .bind(id)
@@ -413,17 +496,16 @@ fn attr_object_expr(f: &TemporalFilter<'_>, first_bind: usize) -> Option<(String
             } else {
                 "DESC NULLS LAST"
             };
-            let rows = newest_rows(f, first_bind, n_bind).unwrap_or_else(|| {
-                "attr_instances ai WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id"
-                    .to_owned()
-            });
+            let rows = newest_rows(f, first_bind, n_bind)
+                .unwrap_or_else(|| format!("{} ai WHERE true", history("m.tenant_id", "m.id")));
             format!(
                 "COALESCE((SELECT jsonb_object_agg(g.attr_id, g.insts) FROM (\
-                   SELECT s.attr_id, jsonb_agg(s.data ORDER BY s.created_at, s.observed_at, s.instance_id) AS insts \
+                   SELECT s.attr_id, {s_insts} AS insts \
                    FROM (SELECT ai.*, rank() OVER (PARTITION BY ai.attr_id, ai.data ->> 'datasetId' \
                              ORDER BY {order_key} {dir}) AS rk \
                          FROM {rows}{range_and}) s \
-                   WHERE s.rk <= ${n_bind}::bigint GROUP BY s.attr_id) g), '{{}}'::jsonb)"
+                   WHERE s.rk <= ${n_bind}::bigint GROUP BY s.attr_id) g), '{{}}'::jsonb)",
+                s_insts = insts_and_ids("s")
             )
         }
         None => {
@@ -437,15 +519,62 @@ fn attr_object_expr(f: &TemporalFilter<'_>, first_bind: usize) -> Option<(String
             }
             format!(
                 "COALESCE((SELECT jsonb_object_agg(g.attr_id, g.insts) FROM (\
-                   SELECT ai.attr_id, jsonb_agg(ai.data ORDER BY ai.created_at, ai.observed_at, ai.instance_id) AS insts \
-                   FROM attr_instances ai \
-                   WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id{range_and} \
-                   GROUP BY ai.attr_id) g), '{{}}'::jsonb)"
+                   SELECT ai.attr_id, {ai_insts} AS insts \
+                   FROM {rows} ai \
+                   WHERE true{range_and} \
+                   GROUP BY ai.attr_id) g), '{{}}'::jsonb)",
+                ai_insts = insts_and_ids("ai"),
+                rows = history("m.tenant_id", "m.id")
             )
         }
     };
     Some((expr, binds))
 }
+
+/// [`newest_rows`]' statement: `{window}` is its range bound on `t`, `${n}`
+/// the bind of N.
+///
+/// Distinct Attributes by a skip scan of the same btree, in each parent
+/// (T-5200); `OFFSET 0` keeps the instance read a parameterised index
+/// range per Attribute, which a hash join over the whole Entity would
+/// otherwise replace. The N-th newest takes the newest N of each parent,
+/// each arm limited itself so both read their btree backwards.
+const NEWEST_ROWS: &str = "(WITH RECURSIVE a(attr) AS (\
+            SELECT min(x.attr_id) FROM attr_instances x \
+            WHERE x.tenant_id = m.tenant_id AND x.entity_id = m.id \
+          UNION ALL \
+            SELECT (SELECT min(x.attr_id) FROM attr_instances x \
+                    WHERE x.tenant_id = m.tenant_id AND x.entity_id = m.id AND x.attr_id > a.attr) \
+            FROM a WHERE a.attr IS NOT NULL), \
+          b(no) AS (\
+            SELECT min(r.attr_no) FROM attr_rows r \
+            WHERE r.tenant_id = m.tenant_id AND r.entity_no = iri_no(m.tenant_id, m.id) \
+          UNION ALL \
+            SELECT (SELECT min(r.attr_no) FROM attr_rows r \
+                    WHERE r.tenant_id = m.tenant_id AND r.entity_no = iri_no(m.tenant_id, m.id) \
+                      AND r.attr_no > b.no) \
+            FROM b WHERE b.no IS NOT NULL), \
+          n(attr) AS (\
+            SELECT a.attr FROM a WHERE a.attr IS NOT NULL \
+          UNION \
+            SELECT i.iri FROM b JOIN iri_ids i ON i.tenant_id = m.tenant_id AND i.id = b.no) \
+          SELECT ai.* FROM n a \
+          CROSS JOIN LATERAL (SELECT CASE WHEN a.attr = ANY(m.dataset_attrs) THEN '-infinity'::timestamptz \
+              ELSE COALESCE((SELECT t.observed_at FROM (\
+                (SELECT t.observed_at FROM attr_instances t \
+                  WHERE t.tenant_id = m.tenant_id AND t.entity_id = m.id AND t.attr_id = a.attr{window} \
+                  ORDER BY t.observed_at DESC LIMIT greatest(${n}::bigint, 1)) \
+                UNION ALL \
+                (SELECT t.observed_at FROM attr_rows_at(m.tenant_id, m.id, a.attr) t \
+                  WHERE true{window} \
+                  ORDER BY t.observed_at DESC LIMIT greatest(${n}::bigint, 1))) t \
+                ORDER BY t.observed_at DESC OFFSET greatest(${n}::bigint - 1, 0) LIMIT 1), \
+                '-infinity'::timestamptz) - interval '28 hours' END AS th) c \
+          CROSS JOIN LATERAL (SELECT * FROM attr_instances ai \
+            WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id AND ai.attr_id = a.attr \
+            AND ai.observed_at >= c.th \
+            UNION ALL SELECT * FROM attr_rows_at(m.tenant_id, m.id, a.attr) ai \
+            WHERE ai.observed_at >= c.th OFFSET 0) ai) ai WHERE true";
 
 /// lastN's candidate rows, read through the (tenant, entity, attr,
 /// observed_at DESC) btree instead of ranking every instance of the window:
@@ -479,28 +608,11 @@ fn newest_rows(f: &TemporalFilter<'_>, first_bind: usize, n_bind: usize) -> Opti
         ),
         Some(_) => return None,
     };
-    // Distinct Attributes by a skip scan of the same btree; `OFFSET 0` keeps
-    // the instance read a parameterised index range per Attribute, which a
-    // hash join over the whole Entity would otherwise replace.
-    Some(format!(
-        "(WITH RECURSIVE a(attr) AS (\
-            SELECT min(x.attr_id) FROM attr_instances x \
-            WHERE x.tenant_id = m.tenant_id AND x.entity_id = m.id \
-          UNION ALL \
-            SELECT (SELECT min(x.attr_id) FROM attr_instances x \
-                    WHERE x.tenant_id = m.tenant_id AND x.entity_id = m.id AND x.attr_id > a.attr) \
-            FROM a WHERE a.attr IS NOT NULL) \
-          SELECT ai.* FROM a \
-          CROSS JOIN LATERAL (SELECT CASE WHEN a.attr = ANY(m.dataset_attrs) THEN '-infinity'::timestamptz \
-              ELSE COALESCE((SELECT t.observed_at FROM attr_instances t \
-                WHERE t.tenant_id = m.tenant_id AND t.entity_id = m.id AND t.attr_id = a.attr{window} \
-                ORDER BY t.observed_at DESC OFFSET greatest(${n_bind}::bigint - 1, 0) LIMIT 1), \
-                '-infinity'::timestamptz) - interval '28 hours' END AS th) c \
-          CROSS JOIN LATERAL (SELECT * FROM attr_instances ai \
-            WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id AND ai.attr_id = a.attr \
-            AND ai.observed_at >= c.th OFFSET 0) ai \
-          WHERE a.attr IS NOT NULL) ai WHERE true"
-    ))
+    Some(
+        NEWEST_ROWS
+            .replace("{window}", &window)
+            .replace("{n}", &n_bind.to_string()),
+    )
 }
 
 /// The 4.11 window over the instance rows `ai` of the meta row `m`: the
@@ -634,6 +746,7 @@ fn aggregate_expr(
         ));
         pairs.push_str(&format!(", '{name}', b.r{i}"));
     }
+    let hist = history("m.tenant_id", "m.id");
     let expr = format!(
         "(SELECT jsonb_build_object('bad', bool_or(b.bad), 'attrs', \
             jsonb_object_agg(b.attr_id, jsonb_build_object('type', 'Property'{pairs}))) \
@@ -650,9 +763,8 @@ fn aggregate_expr(
                                    ai.{col} AS ts, {anchor} AS anchor, \
                                    min(ai.{col}) OVER (PARTITION BY ai.attr_id) AS first_ts, \
                                    max(ai.{col}) OVER (PARTITION BY ai.attr_id) AS last \
-                                  FROM attr_instances ai \
-                                  WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id \
-                                    AND jsonb_typeof(ai.data -> ${tp}) = 'string'{range_and}) s0) s \
+                                  FROM {hist} ai \
+                                  WHERE jsonb_typeof(ai.data -> ${tp}) = 'string'{range_and}) s0) s \
                       GROUP BY s.attr_id, s.bs, s.be) g \
                 GROUP BY g.attr_id) b)"
     );
@@ -873,6 +985,10 @@ impl PgTemporalStore {
             "DELETE FROM attr_instances WHERE tenant_id = $1 AND entity_id = $2 \
              AND ($3::text[] IS NULL OR attr_id = ANY($3)) \
              AND ($4::timestamptz IS NULL OR observed_at <= $4::timestamptz)",
+            "DELETE FROM attr_rows WHERE tenant_id = $1 AND entity_no = iri_no($1, $2) \
+             AND ($3::text[] IS NULL OR attr_no IN \
+                  (SELECT i.id FROM iri_ids i WHERE i.tenant_id = $1 AND i.iri = ANY($3))) \
+             AND ($4::timestamptz IS NULL OR observed_at <= $4::timestamptz)",
             "DELETE FROM attr_versions WHERE tenant_id = $1 AND entity_id = $2 \
              AND ($3::text[] IS NULL OR attr_id = ANY($3)) \
              AND ($4::timestamptz IS NULL OR observed_at <= $4::timestamptz)",
@@ -891,7 +1007,9 @@ impl PgTemporalStore {
             sqlx::query(
                 "DELETE FROM temporal_entities t WHERE t.tenant_id = $1 AND t.id = $2 \
                  AND NOT EXISTS (SELECT 1 FROM attr_instances a \
-                                 WHERE a.tenant_id = t.tenant_id AND a.entity_id = t.id)",
+                                 WHERE a.tenant_id = t.tenant_id AND a.entity_id = t.id) \
+                 AND NOT EXISTS (SELECT 1 FROM attr_rows r WHERE r.tenant_id = t.tenant_id \
+                                 AND r.entity_no = iri_no(t.tenant_id, t.id))",
             )
             .bind(tenant.as_str())
             .bind(id)
@@ -912,17 +1030,19 @@ impl PgTemporalStore {
     ) -> Result<serde_json::Map<String, Value>, sqlx::Error> {
         let mut tx = super::begin(&self.pool).await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
-        let rows: Vec<(String, Value)> = sqlx::query_as(
+        let rows: Vec<(String, Value)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT attr_id, data || jsonb_build_object('version', version) || jsonb_strip_nulls( \
                  jsonb_build_object('provenance', provenance, 'supersededAt', \
                    to_char(superseded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'))) \
              FROM (SELECT attr_id, observed_at, dataset_id, version, data, provenance, superseded_at \
                      FROM attr_versions WHERE tenant_id = $1 AND entity_id = $2 \
                    UNION ALL \
-                   SELECT attr_id, observed_at, dataset_id, version, data, provenance, NULL \
-                     FROM attr_instances WHERE tenant_id = $1 AND entity_id = $2) v \
+                   SELECT ai.attr_id, ai.observed_at, ai.dataset_id, ai.version, {}, ai.provenance, NULL \
+                     FROM {} ai) v \
              ORDER BY attr_id, observed_at, dataset_id NULLS FIRST, version",
-        )
+            restamp("ai"),
+            history("$1", "$2")
+        )))
         .bind(tenant.as_str())
         .bind(id)
         .fetch_all(&mut *tx)
@@ -992,9 +1112,12 @@ impl PgTemporalStore {
         if let Some(attrs) = f.attrs {
             binds.push(B::Arr(super::storable(attrs)));
             wheres.push(format!(
-                "EXISTS (SELECT 1 FROM attr_instances x WHERE x.tenant_id = m.tenant_id \
-                 AND x.entity_id = m.id AND x.attr_id = ANY(${}))",
-                binds.len()
+                "(EXISTS (SELECT 1 FROM attr_instances x WHERE x.tenant_id = m.tenant_id \
+                 AND x.entity_id = m.id AND x.attr_id = ANY(${n})) \
+                 OR EXISTS (SELECT 1 FROM attr_rows r WHERE r.tenant_id = m.tenant_id \
+                 AND r.entity_no = iri_no(m.tenant_id, m.id) AND r.attr_no IN \
+                   (SELECT i.id FROM iri_ids i WHERE i.tenant_id = m.tenant_id AND i.iri = ANY(${n}))))",
+                n = binds.len()
             ));
         }
         // page pushdown: only when the caller passed one AND the range (if
@@ -1014,9 +1137,10 @@ impl PgTemporalStore {
         });
         let mut paged = false;
         if f.page.is_some() && !matches!(compiled_range, Some(None)) {
-            let mut qual = "EXISTS (SELECT 1 FROM attr_instances ai WHERE \
-                            ai.tenant_id = m.tenant_id AND ai.entity_id = m.id"
-                .to_owned();
+            let mut qual = format!(
+                "EXISTS (SELECT 1 FROM {} ai WHERE true",
+                history("m.tenant_id", "m.id")
+            );
             if let (Some(r), Some(Some(c))) = (&f.range, compiled_range) {
                 let n = binds.len().saturating_add(1);
                 for b in c.binds {
@@ -1097,9 +1221,10 @@ impl PgTemporalStore {
                     binds.push(B::Float(n));
                 }
                 wheres.push(format!(
-                    "EXISTS (SELECT 1 FROM attr_instances gi \
-                     WHERE gi.tenant_id = m.tenant_id AND gi.entity_id = m.id \
-                     AND gi.attr_id = ${attr_bind}{window} AND {})",
+                    "EXISTS (SELECT 1 FROM (SELECT * FROM attr_instances \
+                     WHERE tenant_id = m.tenant_id AND entity_id = m.id AND attr_id = ${attr_bind} \
+                     UNION ALL SELECT * FROM attr_rows_at(m.tenant_id, m.id, ${attr_bind})) gi \
+                     WHERE true{window} AND {})",
                     c.sql
                 ));
             }
@@ -1190,6 +1315,7 @@ impl PgTemporalStore {
             tx.commit().await?;
             super::entity::check_ceiling(paged, rows.len(), super::entity::MAX_UNDECIDED_ROWS)?;
             let mut docs: Vec<Value> = rows.into_iter().map(|r| r.get::<Value, _>(0)).collect();
+            docs.iter_mut().for_each(unpack);
             if aggregated {
                 for d in &mut docs {
                     let Some(o) = d.as_object_mut() else { continue };
@@ -1255,7 +1381,11 @@ impl PgTemporalStore {
         }
         let row = qy.fetch_optional(&mut *tx).await?;
         tx.commit().await?;
-        Ok(row.map(|r| r.get::<Value, _>(0)))
+        Ok(row.map(|r| {
+            let mut doc = r.get::<Value, _>(0);
+            unpack(&mut doc);
+            doc
+        }))
     }
 
     pub async fn list(&self, tenant: &TenantId) -> Result<Vec<Value>, sqlx::Error> {
@@ -1292,19 +1422,21 @@ impl PgTemporalStore {
         };
         let meta: Value = row.get(0);
         // reconstruct the full doc inside the same transaction
-        let attrs_row = sqlx::query(
+        let attrs_row = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT COALESCE((SELECT jsonb_object_agg(g.attr_id, g.insts) FROM (
                 SELECT ai.attr_id,
-                       jsonb_agg(ai.data ORDER BY ai.created_at, ai.observed_at, ai.instance_id) AS insts
-                FROM attr_instances ai
-                WHERE ai.tenant_id = $1 AND ai.entity_id = $2
-                GROUP BY ai.attr_id) g), '{}'::jsonb)",
-        )
+                       {} AS insts
+                FROM {} ai
+                GROUP BY ai.attr_id) g), '{{}}'::jsonb)",
+            insts_and_ids("ai"),
+            history("$1", "$2")
+        )))
         .bind(tenant.as_str())
         .bind(id)
         .fetch_one(&mut *tx)
         .await?;
-        let attrs: Value = attrs_row.get(0);
+        let mut attrs: Value = attrs_row.get(0);
+        unpack(&mut attrs);
         let mut doc = meta;
         if let (Some(d), Some(a)) = (doc.as_object_mut(), attrs.as_object()) {
             for (k, v) in a {
@@ -1346,33 +1478,42 @@ impl PgTemporalStore {
                 if !deletes.is_empty() {
                     // 5.6.15 deletes an instance: its last version is kept,
                     // so a deletion is never without a record (T-4665).
-                    sqlx::query(
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
                         "INSERT INTO attr_versions
                            (tenant_id, entity_id, attr_id, instance_id, dataset_id, observed_at,
                             version, data, provenance)
                          SELECT t.tenant_id, t.entity_id, t.attr_id, t.instance_id, t.dataset_id,
-                                t.observed_at, t.version, t.data, t.provenance
-                         FROM attr_instances t JOIN jsonb_array_elements($3::jsonb) AS e
+                                t.observed_at, t.version, {}, t.provenance
+                         FROM {} t JOIN jsonb_array_elements($3::jsonb) AS e
                            ON t.attr_id = e->>'a' AND t.instance_id = e->>'i'
-                         WHERE t.tenant_id = $1 AND t.entity_id = $2
                          ON CONFLICT DO NOTHING",
-                    )
+                        restamp("t"),
+                        history("$1", "$2")
+                    )))
                     .bind(tenant.as_str())
                     .bind(id)
                     .bind(Value::Array(deletes.clone()))
                     .execute(&mut *tx)
                     .await?;
-                    sqlx::query(
+                    for sql in [
                         "DELETE FROM attr_instances t
                          USING jsonb_array_elements($3::jsonb) AS e
                          WHERE t.tenant_id = $1 AND t.entity_id = $2
                            AND t.attr_id = e->>'a' AND t.instance_id = e->>'i'",
-                    )
-                    .bind(tenant.as_str())
-                    .bind(id)
-                    .bind(Value::Array(deletes))
-                    .execute(&mut *tx)
-                    .await?;
+                        "DELETE FROM attr_rows t
+                         USING jsonb_array_elements($3::jsonb) AS e
+                         WHERE t.tenant_id = $1 AND t.entity_no = iri_no($1, $2)
+                           AND t.attr_no = iri_no($1, e->>'a')
+                           AND COALESCE(t.data->>'instanceId',
+                                        'urn:ngsi-ld:Instance:' || t.instance_no::text) = e->>'i'",
+                    ] {
+                        sqlx::query(sql)
+                            .bind(tenant.as_str())
+                            .bind(id)
+                            .bind(Value::Array(deletes.clone()))
+                            .execute(&mut *tx)
+                            .await?;
+                    }
                 }
                 insert_rows(&mut tx, tenant, id, upserts, false).await?;
                 sqlx::query(
@@ -1403,6 +1544,42 @@ impl PgTemporalStore {
 mod tests {
     use super::*;
     use crate::compile::temporal::InstanceRange;
+
+    /// T-5131: a row's instanceId lives in its column; `unpack` puts it back
+    /// and leaves stored instances and meta members alone.
+    #[test]
+    fn instance_id_leaves_data_and_unpack_puts_it_back() {
+        let speed = "https://uri.etsi.org/ngsi-ld/default-context/speed";
+        let inst = serde_json::json!({"type": "Property", "value": 1,
+                                      "instanceId": "urn:ngsi-ld:Instance:1"});
+        let rows = decompose(&serde_json::json!({"id": "urn:ngsi-ld:V:1", speed: [inst.clone()]}));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]["data"],
+            serde_json::json!({"type": "Property", "value": 1})
+        );
+        assert_eq!(rows[0]["instance_id"], "urn:ngsi-ld:Instance:1");
+        // a row written before T-5131 keeps its instanceId in data
+        let stored = serde_json::json!({"type": "Property", "value": 2, "instanceId": "urn:ngsi-ld:Instance:2"});
+        let mut doc = serde_json::json!({
+            "id": "urn:ngsi-ld:V:1", "type": "V", "scope": ["/a", "/b"],
+            speed: [[rows[0]["data"].clone(), stored.clone()],
+                    ["urn:ngsi-ld:Instance:1", "urn:ngsi-ld:Instance:2"]],
+            "short": [[{"value": 1}], ["x", "y"]],
+            "numbers": [[{"value": 1}], [1]]
+        });
+        unpack(&mut doc);
+        assert_eq!(
+            doc,
+            serde_json::json!({"id": "urn:ngsi-ld:V:1", "type": "V", "scope": ["/a", "/b"],
+                               speed: [inst, stored],
+                               "short": [[{"value": 1}], ["x", "y"]],
+                               "numbers": [[{"value": 1}], [1]]})
+        );
+        let mut scalar = serde_json::json!(1);
+        unpack(&mut scalar);
+        assert_eq!(scalar, serde_json::json!(1));
+    }
 
     /// T-4669: the dedup of an instance without observedAt reads the newest
     /// stored row through the index and nothing older. A correlated max()

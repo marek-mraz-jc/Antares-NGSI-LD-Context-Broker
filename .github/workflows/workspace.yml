@@ -503,11 +503,15 @@ jobs:
           # ADR-0027 section 6 (T-3493): the stripped release binary per
           # surface feature against vanilla; not a crate, so no clippy or
           # test step runs for it. Eleven release builds in a row reached the
-          # 30 min limit (trains 0217-1, 0307-1): three runners, each with its
-          # own vanilla build (T-4680).
-          - { package: binary-size, partition: 1/3 }
-          - { package: binary-size, partition: 2/3 }
-          - { package: binary-size, partition: 3/3 }
+          # 30 min limit (trains 0217-1, 0307-1): a runner per two features,
+          # each with its own vanilla build (T-4680); fat LTO links a release
+          # build about 3 min longer than thin did (T-5234).
+          - { package: binary-size, partition: 1/6 }
+          - { package: binary-size, partition: 2/6 }
+          - { package: binary-size, partition: 3/6 }
+          - { package: binary-size, partition: 4/6 }
+          - { package: binary-size, partition: 5/6 }
+          - { package: binary-size, partition: 6/6 }
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -531,7 +535,7 @@ jobs:
         if: matrix.package != 'workspace' && matrix.package != 'binary-size'
         run: cargo hack test --locked --each-feature --exclude-features console ${{ matrix.partition && format('--partition {0}', matrix.partition) || '' }} -p ${{ matrix.package }}
       # The budget is ADR-0027 section 6's "binary size" row, read from the
-      # ADR (`full` and each feature alone <= vanilla + 10 MiB, T-3775); the table goes to the step summary.
+      # ADR (`full` and each feature alone <= vanilla + 15 MiB, T-5246); the table goes to the step summary.
       - name: Binary size per surface feature
         if: matrix.package == 'binary-size'
         run: |

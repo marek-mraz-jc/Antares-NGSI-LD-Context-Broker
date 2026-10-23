@@ -43,6 +43,7 @@ fn model() -> Model {
 fn state() -> ODataState {
     ODataState {
         model: Arc::new(model()),
+        url_model: None,
         service_root: ROOT.into(),
         url_limits: odata_url::Limits::strict(),
         csdl_limits: odata_csdl::Limits::strict(),
@@ -356,6 +357,46 @@ async fn unknown_system_and_custom_query_options_are_400_and_not_echoed() -> Res
         assert!(!answer.body.contains("foo"), "{}", answer.body);
         assert!(!answer.body.contains("innererror"), "{}", answer.body);
     }
+    Ok(())
+}
+
+/// A 4.0 document leaves an `Edm.Untyped` property out (CSDL XML 3.4); the URLs resolve
+/// against `url_model`, which names it, so it is selectable and an unknown name stays 400.
+#[tokio::test]
+async fn urls_resolve_against_the_url_model_when_one_is_set() -> Result<(), String> {
+    let mut named = model();
+    if let Some(building) = named
+        .schemas
+        .iter_mut()
+        .flat_map(|s| s.entity_types.iter_mut())
+        .next()
+    {
+        building
+            .properties
+            .push(Property::new("notes", TypeRef::single("Edm.Untyped")));
+    }
+    let wide = ODataState {
+        url_model: Some(Arc::new(named)),
+        ..state()
+    };
+    let routes = Router::new()
+        .route("/{*rest}", routing::get(echo))
+        .with_state(Arc::new(wide));
+    let app = || Router::new().nest("/odata", routes.clone());
+    let answer = get_with(app(), "/odata/Buildings?$select=notes", &[]).await?;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    let answer = get_with(app(), "/odata/Buildings?$select=width", &[]).await?;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
+    let plain = Router::new()
+        .route("/{*rest}", routing::get(echo))
+        .with_state(Arc::new(state()));
+    let answer = get_with(
+        Router::new().nest("/odata", plain),
+        "/odata/Buildings?$select=notes",
+        &[],
+    )
+    .await?;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
     Ok(())
 }
 

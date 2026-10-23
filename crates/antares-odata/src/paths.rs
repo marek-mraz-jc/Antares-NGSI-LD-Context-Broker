@@ -303,6 +303,8 @@ mod tests {
             iri: "https://e.org/m".into(),
             shape,
             list: false,
+            json: false,
+            untyped: false,
             written: crate::edm::Written::Always,
         };
         let set = Set {

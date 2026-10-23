@@ -11,8 +11,9 @@
 //! read in the field's `timezone`, else the output's (default `Europe/Bratislava`), and written
 //! in UTC: no floating time leaves the feed. No mapping is the `sdm-event` preset: `startDate`,
 //! `endDate` (the last day, so a date `DTEND` is the day after it), `name`, `description`,
-//! `address`, `location` and `url`. An Entity with no value for `DTSTART` or `SUMMARY`, a date
-//! it cannot read, a `DTEND` not after `DTSTART`, a `GEO` off the globe or a `URL` that is not
+//! `address`, `location`, `url` and `organizer` (`{name, url}` as `ORGANIZER;CN=`). An Entity
+//! with no value for `DTSTART` or `SUMMARY`, a date it cannot read, a `DTEND` not after
+//! `DTSTART`, a `GEO` off the globe or a `URL` that is not
 //! http(s) is no `VEVENT` at all, and its reason is counted (EP-126).
 
 use chrono::{DateTime, Days, NaiveDate, NaiveDateTime, NaiveTime, TimeZone as _, Utc};
@@ -575,6 +576,7 @@ fn preset(preset: Preset) -> BTreeMap<Field, Remap> {
         (Field::Location, "address"),
         (Field::Geo, "location"),
         (Field::Url, "url"),
+        (Field::Organizer, "organizer"),
     ]
     .into_iter()
     .map(|(field, name)| (field, attribute(name)))
@@ -987,6 +989,41 @@ fn text(value: &Value) -> Option<String> {
     }
 }
 
+/// A CAL-ADDRESS: a `mailto:` or http(s) URI as given, an e-mail address as `mailto:`, else none.
+fn cal_address(value: String) -> Option<String> {
+    if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
+    if ["mailto:", "https://", "http://"]
+        .iter()
+        .any(|s| value.starts_with(s))
+    {
+        Some(value)
+    } else if value.contains('@') && !value.contains(':') {
+        Some(format!("mailto:{value}"))
+    } else {
+        None
+    }
+}
+
+/// RFC 5545 3.2 param-value, always quoted so `,` `;` `:` stay literal; a `"`, a `^` and a
+/// newline are RFC 6868 caret escapes, the other control characters are dropped.
+fn param(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().saturating_add(2));
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '^' => out.push_str("^^"),
+            '"' => out.push_str("^'"),
+            '\n' => out.push_str("^n"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// A structured postal address as one line: street, postal code, locality and country.
 fn address(value: &Value) -> Option<String> {
     let parts: Vec<String> = [
@@ -1237,48 +1274,34 @@ impl Plan {
             .then(|| format!("STATUS:{value}"))
     }
 
-    /// `ORGANIZER`, a CAL-ADDRESS: a `mailto:` or http(s) URI, or an e-mail address; from an
-    /// object (schema.org `Organization`) its `email` or `url`, its `name` as `CN` (RFC 5545
-    /// 3.2.2), a quoted parameter value without `"` or control characters.
+    /// `ORGANIZER`, a CAL-ADDRESS: the first source holding a `mailto:` or http(s) URI or an
+    /// e-mail address, or an organizer object (schema.org `Organization`) whose `email`, else
+    /// `url`, is the address and whose `name` becomes `CN`. An object without a usable address
+    /// writes nothing: RFC 5545 requires the address, and the event's own `URL` is no organizer's.
     fn organizer(&self, entity: &Value) -> Option<String> {
         let c = self.field(Field::Organizer)?;
-        let found = c
-            .remap
+        let language = c.remap.language.as_deref().or(self.lang.as_deref());
+        c.remap
             .attribute
             .iter()
             .chain(&c.remap.first_of)
-            .find_map(|p| at(entity, p, self.lang.as_deref()))?;
-        let (value, name) = if found.is_object() {
-            let member = |k: &str| {
-                found
-                    .get(k)
-                    .and_then(|v| value_of(v, self.lang.as_deref()).and_then(text))
-            };
-            (member("email").or_else(|| member("url"))?, member("name"))
-        } else {
-            (text(found)?, None)
-        };
-        if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
-            return None;
-        }
-        let cn = name
-            .map(|n| {
-                n.chars()
-                    .filter(|c| *c != '"' && !c.is_control())
-                    .collect::<String>()
+            .filter_map(|path| at(entity, path, language))
+            .find_map(|value| match value {
+                Value::Object(o) => {
+                    let member =
+                        |k: &str| o.get(k).and_then(|v| value_of(v, language)).and_then(text);
+                    let address = member("email")
+                        .and_then(cal_address)
+                        .or_else(|| member("url").and_then(cal_address))?;
+                    Some(match member("name") {
+                        Some(name) => format!("ORGANIZER;CN={}:{address}", param(&name)),
+                        None => format!("ORGANIZER:{address}"),
+                    })
+                }
+                _ => text(value)
+                    .and_then(cal_address)
+                    .map(|a| format!("ORGANIZER:{a}")),
             })
-            .filter(|n| !n.trim().is_empty())
-            .map_or_else(String::new, |n| format!(";CN=\"{}\"", n.trim()));
-        let uri = ["mailto:", "https://", "http://"]
-            .iter()
-            .any(|s| value.starts_with(s));
-        if uri {
-            Some(format!("ORGANIZER{cn}:{value}"))
-        } else if value.contains('@') && !value.contains(':') {
-            Some(format!("ORGANIZER{cn}:mailto:{value}"))
-        } else {
-            None
-        }
     }
 
     /// The latest `modifiedAt` of the attributes the mapping reads, every instance counted.

@@ -150,13 +150,29 @@ pub(crate) struct GeoQ {
     pub geometry: Value,
 }
 
-/// A filter lowered for one collection: `q` conjuncts, at most one `geoQ`, and the conjuncts
-/// the residual evaluates. Their conjunction is the filter.
+/// A filter lowered for one collection: the `id` list, `q` conjuncts, at most one `geoQ`, and
+/// the conjuncts the residual evaluates. Their conjunction is the filter.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Lowered {
+    /// The ids `id = '…'` and `id IN (…)` conjuncts allow, intersected (T-5169); empty when
+    /// no Entity can match.
+    pub ids: Option<Vec<String>>,
     pub q: Vec<String>,
     pub geo: Option<GeoQ>,
     pub residual: Vec<Expr>,
+}
+
+impl Lowered {
+    /// The NGSI-LD `id` parameter of [`Self::ids`], empty without one.
+    pub(crate) fn id_param(&self) -> String {
+        self.ids.as_ref().map_or_else(String::new, |ids| {
+            let ids: Vec<String> = ids
+                .iter()
+                .map(|id| antares_ops::percent::encode(id))
+                .collect();
+            format!("&id={}", ids.join(","))
+        })
+    }
 }
 
 /// Lowers `filter` for `c` under `terms`; `geo_free` when the request has no other geo query.
@@ -174,6 +190,13 @@ pub(crate) fn lower(
     for conjunct in conjuncts {
         let e = fold(l.expr(conjunct)?);
         if e == Expr::Lit(Lit::Bool(true)) {
+            continue;
+        }
+        if let Some(ids) = by_id(&e) {
+            out.ids = Some(match out.ids.take() {
+                None => ids,
+                Some(kept) => kept.into_iter().filter(|id| ids.contains(id)).collect(),
+            });
             continue;
         }
         if let Some(q) = l.q(&e) {
@@ -196,6 +219,38 @@ pub(crate) fn lower(
         out.residual.push(e);
     }
     Ok(out)
+}
+
+/// The ids `e` allows when it is `id = '…'` or `id IN (…)` of strings, in the order written and
+/// without the strings no Entity id can be (no URI). `None` when a string holds a `,`, which
+/// the NGSI-LD `id` list cannot carry, or the list passes the broker's `q` bound: the residual
+/// decides those.
+fn by_id(e: &Expr) -> Option<Vec<String>> {
+    let lits: &[Lit] = match e {
+        Expr::Cmp(Cmp::Eq, left, right) => match (left.as_ref(), right.as_ref()) {
+            (Expr::Path(Path::Id), Expr::Lit(lit)) | (Expr::Lit(lit), Expr::Path(Path::Id)) => {
+                std::slice::from_ref(lit)
+            }
+            _ => return None,
+        },
+        Expr::In(value, lits) if **value == Expr::Path(Path::Id) => lits,
+        _ => return None,
+    };
+    let mut ids: Vec<String> = Vec::new();
+    for lit in lits {
+        let Lit::Str(id) = lit else { return None };
+        if id.contains(',') {
+            return None;
+        }
+        if antares_ops::EntityId::new(id).is_ok() && !ids.contains(id) {
+            ids.push(id.clone());
+        }
+    }
+    let bytes = ids
+        .iter()
+        .map(|id| id.len().saturating_add(1))
+        .sum::<usize>();
+    (bytes <= MAX_Q_BYTES).then_some(ids)
 }
 
 /// Lowers `filter` for `c` under `terms` to residual conjuncts alone, for a collection the
@@ -1132,6 +1187,42 @@ mod tests {
     }
 
     #[test]
+    fn id_conjuncts_are_the_id_list() {
+        let ids = |filter: &str| lowered(filter).map(|l| (l.ids, l.q.len(), l.residual.len()));
+        let list = |ids: &[&str]| Some(ids.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>());
+        assert_eq!(ids("id = 'urn:a'"), Ok((list(&["urn:a"]), 0, 0)));
+        assert_eq!(ids("'urn:a' = id"), Ok((list(&["urn:a"]), 0, 0)));
+        assert_eq!(
+            ids("id IN ('urn:a', 'urn:b', 'urn:a')"),
+            Ok((list(&["urn:a", "urn:b"]), 0, 0))
+        );
+        // ANDed lists intersect; beside another conjunct the id list still holds.
+        assert_eq!(
+            ids("id IN ('urn:a', 'urn:b') AND id = 'urn:b'"),
+            Ok((list(&["urn:b"]), 0, 0))
+        );
+        assert_eq!(ids("id = 'urn:a' AND id = 'urn:b'"), Ok((list(&[]), 0, 0)));
+        assert_eq!(
+            ids("id = 'urn:a' AND pm10 > 3"),
+            Ok((list(&["urn:a"]), 1, 0))
+        );
+        // A string no Entity id can be matches nothing.
+        assert_eq!(ids("id = 'not an id'"), Ok((list(&[]), 0, 0)));
+        assert_eq!(ids("id IN ('urn:a', 'x y')"), Ok((list(&["urn:a"]), 0, 0)));
+        // What the id list cannot say stays the residual's.
+        assert_eq!(ids("id = 'urn:a,b'"), Ok((None, 0, 1)));
+        assert_eq!(ids("id IN ('urn:a', 3)"), Ok((None, 0, 1)));
+        assert_eq!(ids("id <> 'urn:a'"), Ok((None, 0, 1)));
+        assert_eq!(ids("id = 'urn:a' OR pm10 > 3"), Ok((None, 0, 1)));
+        assert_eq!(ids("NOT id IN ('urn:a')"), Ok((None, 0, 1)));
+        let long = (0..600)
+            .map(|i| format!("'urn:x:{i}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(ids(&format!("id IN ({long})")), Ok((None, 0, 1)));
+    }
+
+    #[test]
     fn not_is_residual() {
         assert!(residual("NOT pm10 > 50"));
         assert!(residual("NOT (pm10 > 50 OR pm25 < 1)"));
@@ -1144,7 +1235,7 @@ mod tests {
     #[test]
     fn non_scalar_and_relationship_comparisons_are_residual() {
         assert!(residual("labels = 'x'"));
-        assert!(residual("id = 'urn:ngsi-ld:AirQualityObserved:1'"));
+        assert!(residual("id <> 'urn:ngsi-ld:AirQualityObserved:1'"));
         assert!(residual("pm10 = pm25"));
         assert!(residual("pm10 + 1 > 5"));
     }

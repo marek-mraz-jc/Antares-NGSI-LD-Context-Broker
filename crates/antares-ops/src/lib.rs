@@ -80,7 +80,7 @@ pub mod policy {
 /// delivers notifications (WebSocket).
 pub use antares_api::{build_message, DeliveryError, DeliveryFuture, NotificationSink, Outbound};
 /// The error a sink's endpoint check answers with.
-pub use antares_model::{NgsiError, TenantId};
+pub use antares_model::{EntityId, NgsiError, TenantId};
 
 /// The request bounds a surface applies to what it parses itself (a
 /// WebSocket message never passes the HTTP bounds layer).

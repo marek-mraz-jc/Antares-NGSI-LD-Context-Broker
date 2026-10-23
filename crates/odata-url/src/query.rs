@@ -64,7 +64,7 @@ const NAMES: [(&str, bool, Name); 17] = [
     ("$compute", true, Name::Compute),
     ("$index", true, Name::Index),
     ("$deltatoken", false, Name::Deltatoken),
-    ("$apply", false, Name::Apply),
+    ("$apply", true, Name::Apply),
     ("$levels", true, Name::Levels),
 ];
 

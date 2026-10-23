@@ -199,7 +199,7 @@ instance type):
 | LinkML document | ≤ 5 ms p99 for a 100-class schema, cached per view revision | computed once per view revision |
 | WebSocket notification | delivery latency p99 ≤ 1.10× HTTP sink p99 to a local receiver (T-3626); ≤ 32 KiB resident per idle connection plus its queue | no socket opened per notification; one queue hop per connection |
 | internal CSR forward | p99 ≤ 0.5× the HTTP forward to the same broker | no socket, no TLS, no second JSON parse of the request line |
-| binary size | `full` release binary ≤ vanilla + 10 MiB; each feature alone ≤ vanilla + 10 MiB (owner 2026-10-11: under 10 MiB of growth is fine, T-3775) | measured with `ls -l` of the stripped release binary per feature in the feature-matrix job |
+| binary size | `full` release binary ≤ vanilla + 15 MiB; each feature alone ≤ vanilla + 15 MiB (owner 2026-10-22, T-5246; 10 MiB from 2026-10-11, T-3775) | measured with `ls -l` of the stripped release binary per feature in the feature-matrix job |
 | vanilla | unchanged within the noise band of T-3467 | GOAL point 1 |
 
 A benchmark per row: criterion benches in each surface crate for the
@@ -324,6 +324,29 @@ alone ≤ vanilla + 10 MiB. The per-feature 2 MiB rule and its exceptions
 (`mcp` 4.5, `odata` 3.5, `full` 6 then 7 MiB) cost a budget fight on every
 new surface and two red trains on 2026-10-11 for growth the owner accepts.
 The gate stays, so a surface that pulls in tens of MiB is still red.
+
+Decided (worker-t5234, owner may override; T-5234, 2026-10-22): fat LTO
+for the release profile, because dev 827c303 put `full` 3040 bytes under
+the 10 MiB ceiling and nothing short of it frees 512 KiB without a CPU
+cost. Measured on one host, stripped release binaries: thin LTO vanilla
+32 333 224, `full` 42 815 880 (+10.00 MiB); one codegen unit for the cold
+crates and `antares-ogc` brings `full` to 42 389 384 (+9.59 MiB); fat LTO
+on top gives vanilla 27 042 344 and `full` 35 820 040 (+8.37 MiB). Broker
+CPU per request (`/proc` utime+stime over a 10 s k6 run at c20, three
+rounds, `dev/perf/shapes.sh` setup) falls on every shape: `query` 267 to
+251 µs, `view` 346 to 334, `odata` 480 to 444, `mcp` 680 to 653, `ogc`
+493 to 450. A release link takes about 3 min longer (53 s to 231 s for
+`full`), so the `binary-size` job runs on six runners instead of three.
+Options: fat LTO (chosen); `opt-level = "s"` on `antares-ogc` (-227 KiB,
+but 7 % more CPU per OGC request, 488-492 to 520-531 µs); `opt-level =
+"s"` on `rmcp` (grows the binary by 10 KB); dropping a feature from `full`
+or raising the ceiling (both refused by the task).
+
+Decided (owner, 2026-10-22 17:15Z, T-5246): the ceiling rises to vanilla
++ 15 MiB for `full` and for each feature alone, because the 10 MiB one
+held every Antares train for about 3 hours on T-5234. The 2026-10-11
+ceiling of 10 MiB (T-3775) stays in the history above; the gate still
+turns red on a surface that pulls in tens of MiB.
 
 ### 7. Code rules for every new crate
 

@@ -1921,7 +1921,8 @@ impl antares_store::TemporalDriver for AnyStore {
                 async {
                     let mut tx = tenant_tx(p, tenant).await?;
                     let n: i64 = sqlx::query_scalar(
-                        "SELECT count(*) FROM attr_instances WHERE tenant_id = $1",
+                        "SELECT (SELECT count(*) FROM attr_instances WHERE tenant_id = $1)
+                              + (SELECT count(*) FROM attr_rows WHERE tenant_id = $1)",
                     )
                     .bind(tenant.as_str())
                     .fetch_one(&mut *tx)
@@ -1945,8 +1946,10 @@ impl antares_store::TemporalDriver for AnyStore {
                         .await
                         .map_err(db)?;
                     let n: i64 = sqlx::query_scalar(
-                        "SELECT coalesce(sum(pg_column_size(a.*)), 0)::bigint
-                           FROM attr_instances a WHERE tenant_id = $1",
+                        "SELECT (SELECT coalesce(sum(pg_column_size(a.*)), 0)
+                                   FROM attr_instances a WHERE tenant_id = $1)::bigint
+                              + (SELECT coalesce(sum(pg_column_size(r.*)), 0)
+                                   FROM attr_rows r WHERE tenant_id = $1)::bigint",
                     )
                     .bind(tenant.as_str())
                     .fetch_one(&mut *tx)
@@ -1972,6 +1975,8 @@ impl antares_store::TemporalDriver for AnyStore {
                     // attr_instances tenant-predicate check reads literals
                     for sql in [
                         "DELETE FROM attr_instances WHERE tenant_id = $1",
+                        "DELETE FROM attr_rows WHERE tenant_id = $1",
+                        "DELETE FROM iri_ids WHERE tenant_id = $1",
                         "DELETE FROM attr_versions WHERE tenant_id = $1",
                         "DELETE FROM temporal_entities WHERE tenant_id = $1",
                     ] {

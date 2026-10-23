@@ -16,6 +16,12 @@ use tower::ServiceExt;
 const GATEWAY: &str = "context-gateway.dev.serviceaccount.identity.linkerd.cluster.local";
 
 async fn pg_state() -> Option<(AppState, String)> {
+    pg_state_as(None).await
+}
+
+/// [`pg_state`] recording as `record` says; set before `wire`, which hands
+/// the write path the state it records through.
+async fn pg_state_as(record: Option<antares_api::TemporalRecord>) -> Option<(AppState, String)> {
     let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
         eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
         return None;
@@ -26,6 +32,9 @@ async fn pg_state() -> Option<(AppState, String)> {
     let store =
         antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(pool));
     let mut st = AppState::with_store("me".into(), std::sync::Arc::new(store), "postgres");
+    if let Some(record) = record {
+        st.temporal_record = record;
+    }
     antares_api::wire(&mut st).await;
     st.provenance_from = Some(GATEWAY.into());
     let tenant = format!("ver{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
@@ -154,6 +163,14 @@ async fn a_correction_shows_its_chain_only_to_a_caller_granted_read_versions() {
         "{all}"
     );
     assert_eq!(rows[0]["provenance"]["channel"], "api", "{all}");
+    // The broker stamps when it stored each version (ADR-N-054 2.3, T-5361).
+    for row in &rows {
+        let at = row["provenance"]["writtenAt"].as_str().unwrap_or_default();
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(at).is_ok(),
+            "writtenAt {at:?}: {all}"
+        );
+    }
 
     // lastN counts measurements: the latest one, with every version it has.
     let (s, last) = send(
@@ -172,4 +189,190 @@ async fn a_correction_shows_its_chain_only_to_a_caller_granted_read_versions() {
     };
     assert_eq!(last.len(), 1, "{last:?}");
     assert_eq!(last[0]["value"], 50.0);
+}
+
+/// One write per channel (Done when of T-5361): what each row stores is
+/// what the gateway said when the gateway's mesh identity sent it, and
+/// `channel: api` with no actor for a write that reached the broker's port
+/// another way, whatever headers it carried.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_channel_is_stored_as_the_gateway_named_it() {
+    let Some((st, t)) = pg_state().await else {
+        return;
+    };
+    let id = "urn:ngsi-ld:Vehicle:ver2";
+    let mut doc = speed(1.0, "2026-10-18T06:00:00Z");
+    doc["id"] = json!(id);
+    doc["type"] = json!("Vehicle");
+    let (s, b) = send(&st, &t, "POST", "/ngsi-ld/v1/entities", &[], Some(doc)).await;
+    assert_eq!(s, 201, "{b}");
+    let request_id = "6f1c2b9e-0d4a-4c3e-9a07-5b1d2e3f4a5b";
+    let writes = [
+        (
+            2.0,
+            "2026-10-18T07:00:00Z",
+            vec![
+                ("l5d-client-id", GATEWAY),
+                ("jc-provenance-channel", "pipeline"),
+                ("jc-provenance-actor", "serviceAccount%3Apl-parking"),
+                ("x-request-id", request_id),
+            ],
+        ),
+        (
+            3.0,
+            "2026-10-18T08:00:00Z",
+            vec![
+                ("l5d-client-id", GATEWAY),
+                ("jc-provenance-channel", "ui"),
+                ("jc-provenance-actor", "3b0f5c1e-steward"),
+                ("jc-reason", "Counted%20on%20site"),
+            ],
+        ),
+        (
+            4.0,
+            "2026-10-18T09:00:00Z",
+            vec![
+                ("jc-provenance-channel", "pipeline"),
+                ("jc-provenance-actor", "serviceAccount%3Apl-forged"),
+            ],
+        ),
+        (
+            5.0,
+            "2026-10-18T10:00:00Z",
+            vec![
+                (
+                    "l5d-client-id",
+                    "intruder.dev.serviceaccount.identity.linkerd.cluster.local",
+                ),
+                ("jc-provenance-channel", "ui"),
+                ("jc-provenance-actor", "admin"),
+            ],
+        ),
+    ];
+    let attrs = format!("/ngsi-ld/v1/entities/{id}/attrs");
+    for (value, at, headers) in &writes {
+        let (s, b) = send(&st, &t, "PATCH", &attrs, headers, Some(speed(*value, at))).await;
+        assert_eq!(s, 204, "{b}");
+    }
+    let granted = [("l5d-client-id", GATEWAY), ("jc-read-versions", "true")];
+    let uri = format!("/ngsi-ld/v1/temporal/entities/{id}?attrs=speed&versions=all");
+    let (s, all) = send(&st, &t, "GET", &uri, &granted, None).await;
+    assert_eq!(s, 200, "{all}");
+    let rows = all["speed"].as_array().expect("rows").clone();
+    let stored: Vec<(Value, Value, Value, Value, Value)> = rows
+        .iter()
+        .map(|r| {
+            let p = &r["provenance"];
+            (
+                r["value"].clone(),
+                p["channel"].clone(),
+                p["actor"].clone(),
+                p["requestId"].clone(),
+                p["reason"].clone(),
+            )
+        })
+        .collect();
+    let null = Value::Null;
+    assert_eq!(
+        stored,
+        [
+            (
+                json!(1.0),
+                json!("api"),
+                null.clone(),
+                null.clone(),
+                null.clone()
+            ),
+            (
+                json!(2.0),
+                json!("pipeline"),
+                json!("serviceAccount:pl-parking"),
+                json!(request_id),
+                null.clone()
+            ),
+            (
+                json!(3.0),
+                json!("ui"),
+                json!("3b0f5c1e-steward"),
+                null.clone(),
+                json!("Counted on site")
+            ),
+            (
+                json!(4.0),
+                json!("api"),
+                null.clone(),
+                null.clone(),
+                null.clone()
+            ),
+            (json!(5.0), json!("api"), null.clone(), null.clone(), null),
+        ],
+        "{all}"
+    );
+    for row in &rows {
+        let at = row["provenance"]["writtenAt"].as_str().unwrap_or_default();
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(at).is_ok(),
+            "writtenAt {at:?}: {all}"
+        );
+    }
+}
+
+/// Audit mode (platform ADR-N-054 2.8, DM-136): where the type keeps no
+/// history (`ruled` with no rule), a write through an audited Endpoint is
+/// kept as a version with the writer's Organization and kind, an exact
+/// repeat adds nothing, and the same writes without the gateway's audit mark,
+/// or with a forged one, add nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_audited_endpoint_keeps_every_change_where_history_is_off() {
+    let Some((st, t)) = pg_state_as(Some(antares_api::TemporalRecord::Ruled)).await else {
+        return;
+    };
+    let audited = [
+        ("l5d-client-id", GATEWAY),
+        ("jc-provenance-channel", "api"),
+        ("jc-provenance-actor", "serviceAccount%3Ahel-traffic"),
+        ("jc-provenance-organization", "hel"),
+        ("jc-provenance-actor-kind", "serviceAccount"),
+        ("jc-provenance-audit", "changes"),
+    ];
+    let plain = &audited[..5];
+    let forged = [("jc-provenance-audit", "changes")];
+    let granted = [("l5d-client-id", GATEWAY), ("jc-read-versions", "true")];
+    let mut values = Vec::new();
+    for (id, headers) in [
+        ("urn:ngsi-ld:Vehicle:audit-on", &audited[..]),
+        ("urn:ngsi-ld:Vehicle:audit-off", plain),
+        ("urn:ngsi-ld:Vehicle:audit-forged", &forged[..]),
+    ] {
+        let mut doc = speed(1.0, "2026-10-18T06:00:00Z");
+        doc["id"] = json!(id);
+        doc["type"] = json!("Vehicle");
+        let (s, b) = send(&st, &t, "POST", "/ngsi-ld/v1/entities", headers, Some(doc)).await;
+        assert_eq!(s, 201, "{b}");
+        let attrs = format!("/ngsi-ld/v1/entities/{id}/attrs");
+        for (value, at) in [
+            (2.0, "2026-10-18T07:00:00Z"),
+            (2.0, "2026-10-18T07:00:00Z"),
+            (3.0, "2026-10-18T08:00:00Z"),
+        ] {
+            let (s, b) = send(&st, &t, "PATCH", &attrs, headers, Some(speed(value, at))).await;
+            assert_eq!(s, 204, "{b}");
+        }
+        let uri = format!("/ngsi-ld/v1/temporal/entities/{id}?attrs=speed&versions=all");
+        let (_, all) = send(&st, &t, "GET", &uri, &granted, None).await;
+        let rows = all["speed"].as_array().cloned().unwrap_or_default();
+        values.push(rows.iter().map(|r| r["value"].clone()).collect::<Vec<_>>());
+        if id.ends_with("audit-on") {
+            for row in &rows {
+                let p = &row["provenance"];
+                assert_eq!(p["organization"], json!("hel"), "{row}");
+                assert_eq!(p["actorKind"], json!("serviceAccount"), "{row}");
+                assert_eq!(p["audit"], json!(true), "{row}");
+            }
+        }
+    }
+    assert_eq!(
+        values,
+        [vec![json!(1.0), json!(2.0), json!(3.0)], vec![], vec![]]
+    );
 }
