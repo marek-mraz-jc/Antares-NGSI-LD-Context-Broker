@@ -133,7 +133,7 @@ pub struct View {
 }
 
 /// The surfaces a view's `representations` may name.
-pub const REPRESENTATIONS: &[&str] = &["ical", "feed"];
+pub const REPRESENTATIONS: &[&str] = &["ical", "feed", "gbfs"];
 
 /// The most named outputs one representation lists (owner 2026-10-22T09:30Z).
 pub const MAX_OUTPUTS: usize = 20;

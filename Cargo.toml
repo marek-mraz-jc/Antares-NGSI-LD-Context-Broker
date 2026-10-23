@@ -33,6 +33,9 @@ members = [
     "crates/antares-icsr",
     "crates/antares-geojson",
     "crates/antares-feed",
+    "crates/antares-gbfs",
+    "crates/antares-gtfsrt",
+    "crates/antares-jsonstat",
     # The reference plugin: built and tested with the workspace so the
     # driver, routing and notification seams cannot drift from it.
     "examples/plugin-example",
@@ -76,6 +79,9 @@ antares-ws = { path = "crates/antares-ws" }
 antares-icsr = { path = "crates/antares-icsr" }
 antares-geojson = { path = "crates/antares-geojson" }
 antares-feed = { path = "crates/antares-feed" }
+antares-gbfs = { path = "crates/antares-gbfs" }
+antares-gtfsrt = { path = "crates/antares-gtfsrt" }
+antares-jsonstat = { path = "crates/antares-jsonstat" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
 # The storage driver seams are object-safe AND asynchronous, which no
@@ -291,6 +297,18 @@ overflow-checks = true
 codegen-units = 1
 
 [profile.release.package.antares-feed]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.antares-gbfs]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.antares-gtfsrt]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.antares-jsonstat]
 overflow-checks = true
 codegen-units = 1
 

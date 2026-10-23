@@ -106,9 +106,12 @@ dependencies = [
  "antares-api",
  "antares-bus",
  "antares-feed",
+ "antares-gbfs",
  "antares-geojson",
+ "antares-gtfsrt",
  "antares-ical",
  "antares-icsr",
+ "antares-jsonstat",
  "antares-linkml",
  "antares-mcp",
  "antares-odata",
@@ -188,12 +191,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "antares-gbfs"
+version = "0.3.0"
+dependencies = [
+ "antares-ops",
+ "axum",
+ "chrono",
+ "http-body-util",
+ "metrics",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "antares-geojson"
 version = "0.3.0"
 dependencies = [
  "antares-ops",
  "axum",
  "http-body-util",
+ "serde_json",
+ "tokio",
+ "tower",
+]
+
+[[package]]
+name = "antares-gtfsrt"
+version = "0.3.0"
+dependencies = [
+ "antares-ops",
+ "axum",
+ "chrono",
+ "http-body-util",
+ "metrics",
+ "prost",
  "serde_json",
  "tokio",
  "tower",
@@ -232,6 +265,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "antares-jsonstat"
+version = "0.3.0"
+dependencies = [
+ "antares-ops",
+ "axum",
+ "http-body-util",
+ "metrics",
+ "serde_json",
+ "tokio",
+ "tower",
 ]
 
 [[package]]
