@@ -334,22 +334,9 @@ fn selector(view: &ViewOps, wanted: &[&str], types: &[String]) -> Result<String,
 /// geo-query never replaced, so the output only narrows what the view shows.
 fn narrowed(filter: &mapping::Filter, asked: &Asked) -> Result<String, Problem> {
     let mut params = asked.passed.clone();
-    let geo = ["georel", "geometry", "coordinates", "geoproperty"];
-    let fixed = filter.georel.is_some();
-    if fixed && geo.iter().any(|k| params.contains_key(*k)) {
-        return Err(Problem::new(
-            StatusCode::BAD_REQUEST,
-            "this calendar fixes its geo-query: georel, geometry, coordinates and geoproperty are its own",
-        ));
-    }
-    for (key, value) in filter.params() {
-        // a caller's geo-query beside a fixed one was refused above
-        let merged = match (key, params.get(key)) {
-            ("q" | "scopeQ", Some(theirs)) => format!("({value});({theirs})"),
-            _ => value.to_owned(),
-        };
-        params.insert(key.to_owned(), merged);
-    }
+    filter
+        .narrow(&mut params)
+        .map_err(|why| Problem::new(StatusCode::BAD_REQUEST, why))?;
     let mut out = String::new();
     for (k, v) in params {
         let _ = write!(out, "&{k}={}", encode(&v));

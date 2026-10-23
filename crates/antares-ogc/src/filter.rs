@@ -1055,6 +1055,7 @@ mod tests {
     fn station() -> Collection {
         Collection {
             history: false,
+            output: None,
             id: "AirQualityObserved".into(),
             description: None,
             type_iri: "https://uri.etsi.org/ngsi-ld/default-context/AirQualityObserved".into(),

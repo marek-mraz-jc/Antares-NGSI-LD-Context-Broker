@@ -12,6 +12,7 @@ mod history;
 mod items;
 mod matrix;
 mod oas30;
+mod outputs;
 mod parquet;
 mod scan;
 mod schemas;
