@@ -182,6 +182,23 @@ fn row_id(v: &Value) -> &str {
 #[cfg(feature = "postgres")]
 const SIZE_SCAN_TIMEOUT: &str = "SET LOCAL statement_timeout = '5s'";
 
+/// The attribute instances of one tenant, both history tables.
+#[cfg(feature = "postgres")]
+async fn count_instances(
+    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    tenant: &TenantId,
+) -> Result<u64, NgsiError> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM attr_instances WHERE tenant_id = $1)
+              + (SELECT count(*) FROM attr_rows WHERE tenant_id = $1)",
+    )
+    .bind(tenant.as_str())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(db)?;
+    Ok(n.max(0) as u64)
+}
+
 impl AnyStore {
     /// Readiness ping: can the store answer a trivial request
     /// RIGHT NOW? Memory/file are in-process (always ready); the Pg arm runs
@@ -1955,15 +1972,30 @@ impl antares_store::TemporalDriver for AnyStore {
             AnyStore::Pg(p) => {
                 async {
                     let mut tx = tenant_tx(p, tenant).await?;
-                    let n: i64 = sqlx::query_scalar(
-                        "SELECT (SELECT count(*) FROM attr_instances WHERE tenant_id = $1)
-                              + (SELECT count(*) FROM attr_rows WHERE tenant_id = $1)",
-                    )
-                    .bind(tenant.as_str())
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(db)?;
-                    Ok(n as u64)
+                    count_instances(&mut tx, tenant).await
+                }
+                .await
+            }
+        }
+    }
+    async fn attr_instance_count_within(
+        &self,
+        tenant: &TenantId,
+        bound: std::time::Duration,
+    ) -> Result<u64, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => Ok(s.attr_instance_count(tenant)),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => {
+                async {
+                    let mut tx = tenant_tx(p, tenant).await?;
+                    // a scan of the tenant's history: a slow one answers no count
+                    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+                        .bind(format!("{}ms", bound.as_millis().max(1)))
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db)?;
+                    count_instances(&mut tx, tenant).await
                 }
                 .await
             }

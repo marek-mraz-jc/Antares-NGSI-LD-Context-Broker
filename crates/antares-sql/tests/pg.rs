@@ -1169,3 +1169,51 @@ async fn a_write_passes_an_in_flight_history_append_and_a_delete_waits() {
         .await
         .expect("cleanup");
 }
+
+/// T-5304: the history count of `GET /q/tenants/{tenant}` holds to its
+/// bound. A table the count must read is held by another session, so the
+/// count waits; with a bound under the session's 5 s lock_timeout it gives
+/// up as a statement timeout, and without the hold it answers what the
+/// unbounded count answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn history_count_within_gives_up_at_its_bound() {
+    use antares_store::TemporalDriver;
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect+migrate");
+    let store = antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(
+        pool.clone(),
+    ));
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let t = TenantId::new(&format!("pgcount{run}")).expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let bound = std::time::Duration::from_millis(300);
+    assert_eq!(
+        TemporalDriver::attr_instance_count_within(&store, &t, bound)
+            .await
+            .expect("bounded count"),
+        TemporalDriver::attr_instance_count(&store, &t)
+            .await
+            .expect("count"),
+    );
+
+    let mut hold = pool.begin().await.expect("begin");
+    sqlx::query("LOCK TABLE attr_rows IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *hold)
+        .await
+        .expect("hold attr_rows");
+    let started = std::time::Instant::now();
+    let cut = TemporalDriver::attr_instance_count_within(&store, &t, bound).await;
+    let waited = started.elapsed();
+    hold.rollback().await.expect("release");
+    assert_eq!(
+        cut.map_err(|e| e.to_string()),
+        Err(
+            antares_model::NgsiError::InternalError("database statement timeout".into())
+                .to_string()
+        )
+    );
+    assert!(waited < std::time::Duration::from_secs(3), "{waited:?}");
+}

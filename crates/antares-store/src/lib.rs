@@ -1056,6 +1056,18 @@ pub trait TemporalDriver: Send + Sync {
         let _ = tenant;
         Ok(0)
     }
+    /// [`Self::attr_instance_count`] for a read that answers without it when
+    /// the count is slow (`GET /q/tenants/{tenant}`, T-5304): a store that
+    /// scans for the count gives up after `bound` with an error. The default
+    /// counts without a bound.
+    async fn attr_instance_count_within(
+        &self,
+        tenant: &TenantId,
+        bound: std::time::Duration,
+    ) -> Result<u64, NgsiError> {
+        let _ = bound;
+        self.attr_instance_count(tenant).await
+    }
     /// The bytes those attribute instances take in the store; a driver
     /// without history reports 0.
     async fn attr_instance_bytes(&self, tenant: &TenantId) -> Result<u64, NgsiError> {
