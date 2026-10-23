@@ -22,6 +22,11 @@ use serde_json::{Map, Value};
 use std::sync::Arc;
 use tokio::time::{interval_at, sleep_until, timeout, Instant, MissedTickBehavior};
 
+/// How long a server close waits for the client's close frame: long enough
+/// for frames already on the wire, short enough that a client that never
+/// answers holds its connection one second and not a Pong deadline.
+const CLOSE_ANSWER: std::time::Duration = std::time::Duration::from_secs(1);
+
 tokio::task_local! {
     /// The connection a Subscription is being made for (rule 4, W6): the
     /// sink accepts `urn:antares:ws:<id>` only inside this scope.
@@ -381,13 +386,22 @@ impl Session {
         true
     }
 
-    /// Write the close frame.
+    /// Write the close frame, then wait up to [`CLOSE_ANSWER`] for the
+    /// client's (RFC 6455 7.1.1), discarding what it sent meanwhile. A socket
+    /// dropped with unread frames (a Pong on its way) answers with a reset,
+    /// and the client can lose the `x-closing` and the close frame before it
+    /// reads them (T-5245).
     async fn close(&mut self, code: u16, reason: &'static str) {
         let frame = CloseFrame {
             code: CloseCode::from(code),
             reason: reason.into(),
         };
-        let _closed = self.write(Message::Close(Some(frame))).await;
+        if self.write(Message::Close(Some(frame))).await {
+            let _answered = timeout(CLOSE_ANSWER, async {
+                while let Some(Ok(_)) = self.socket.next().await {}
+            })
+            .await;
+        }
     }
 
     /// The server closes: `x-closing`, then the close frame.
