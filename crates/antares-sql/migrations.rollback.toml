@@ -84,3 +84,7 @@ note = "two added btree indexes; an older release reads geo and !location pages 
 [0019]
 rollback = "compatible"
 note = "index drop; an older release names no index in its statements and plans its q= reads without it, as it already did under RLS"
+
+[0020]
+rollback = "compatible"
+note = "new empty iri_ids, attr_rows and history_cutover (NULL): every history row is still written to attr_instances, which an older release reads"

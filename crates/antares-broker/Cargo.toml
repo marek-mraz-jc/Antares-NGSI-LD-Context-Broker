@@ -115,8 +115,8 @@ ogc = ["views", "dep:antares-ogc"]
 # OGC API - Features items as Apache Parquet and GeoParquet 1.1 (T-4465,
 # EP-119): `f=parquet` or `Accept: application/vnd.apache.parquet`, through
 # the optional antares-export crate; a build without it writes no file. Not
-# in `full`: `full` sits at its ADR-0027 size budget (vanilla + 10 MiB) and
-# Parquet with zstd crosses it; the platform image names it beside `full`.
+# in `full`: Parquet with zstd crossed the ADR-0027 size budget when it was
+# vanilla + 10 MiB (now 15 MiB, T-5246); the platform image names it beside `full`.
 parquet = ["ogc", "antares-ogc/parquet"]
 # OGC API - Features items as CSV, and /collections as a ZIP bundle of a CSV
 # per collection (T-4477; no Excel, owner 2026-10-18): `f=csv|zip`. Beside `full`
@@ -151,7 +151,7 @@ feed = ["views", "dep:antares-feed"]
 # Every surface the broker serves (ADR-0027 Consequences, T-3636): what
 # `ANTARES_API_SURFACES` can name in one binary. The vanilla image never
 # sets it; the platform image builds `full,jc-policy,linkml,parquet,tabular,ical,feed`
-# (image-jc.yml): those three sit beside `full`, which is at its ADR-0027 size budget.
+# (image-jc.yml): those three sit beside `full`, kept out under the 10 MiB ADR-0027 size budget (15 MiB since T-5246).
 full = ["views", "mcp", "odata", "ogc", "sta", "ws"]
 
 # Decay-purging allocator + heap stats (glibc malloc holds far more RSS).

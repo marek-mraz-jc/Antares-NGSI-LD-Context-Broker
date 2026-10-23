@@ -31,6 +31,11 @@ const EXEMPT: &[(&str, &str)] = &[
          filtered where they are served, listed and deleted",
     ),
     (
+        "history_cutover",
+        "one row for the whole deployment, no tenant column: the instant from \
+         which history rows go to attr_rows (0020, T-5200)",
+    ),
+    (
         "maintenance_jobs",
         "one row per internal job, no tenant column — the sweep leases it \
          with SELECT … FOR UPDATE SKIP LOCKED",

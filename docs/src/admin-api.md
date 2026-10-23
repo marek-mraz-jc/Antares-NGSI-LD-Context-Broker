@@ -540,7 +540,12 @@ whose statement fails (the log line `retention sweep failed`) runs again 2,
 4, 8 and at most 30 sweeps later, with half the batch per failure (at least
 100 rows), and each clean sweep doubles its batch back. A rule that holds
 a sweep for a second or more logs `retention sweep step slow` with its
-batch, count and milliseconds.
+batch, count and milliseconds. The history of a type (or of the Tenant's
+other types) is deleted Entity by Entity, in id order and chunks of a tenth
+of the batch (10 to 100 Entities): a step reads the chunk's own history
+index range, never a join of the type to the whole history, goes on to the
+next chunk for up to a second while the ones before held nothing to delete,
+and the next sweep continues where it stopped.
 `ANTARES_TEMPORAL_RETENTION_DAYS` stays the broker-wide horizon beside it.
 
 ### GET /q/retention/{tenant}
