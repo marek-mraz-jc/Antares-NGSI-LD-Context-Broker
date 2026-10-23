@@ -283,3 +283,217 @@ async fn reads_over_both_parents_answer_byte_identically() {
     assert!(s.delete(&t, id).await.expect("delete"));
     assert_eq!(keyed_rows(&pool, &t).await, 0, "the delete left keyed rows");
 }
+
+/// `v` as JSON text without `supersededAt`, the wall clock of each
+/// correction and the one member two stores cannot share.
+fn without_clock(v: &Value) -> String {
+    fn strip(v: &mut Value) {
+        match v {
+            Value::Object(o) => {
+                o.remove("supersededAt");
+                o.values_mut().for_each(strip);
+            }
+            Value::Array(a) => a.iter_mut().for_each(strip),
+            _ => {}
+        }
+    }
+    let mut v = v.clone();
+    strip(&mut v);
+    v.to_string()
+}
+
+async fn count(pool: &sqlx::PgPool, t: &TenantId, sql: &'static str) -> i64 {
+    let mut tx = pool.begin().await.expect("tx");
+    pg::set_tenant(&mut tx, t).await.expect("tenant");
+    sqlx::query_scalar(sql)
+        .bind(t.as_str())
+        .fetch_one(&mut *tx)
+        .await
+        .expect(sql)
+}
+
+/// The writes one Entity's history takes: create, a correction, a repeated
+/// value (dedup), a new value, an instance update (mutate), a late write.
+async fn write_history(s: &PgTemporalStore, t: &TenantId, id: &str) {
+    let _ = s.delete(t, id).await;
+    assert!(s.create(t, id, &doc(id)).await.expect("create"));
+    let at = |h: usize| format!("2026-01-{:02}T{:02}:00:00Z", 1 + h / 24, h % 24);
+    let appends = [
+        // same observedAt as the client's id at h 30, another value: a correction
+        json!({SPEED: [{"type": "Property", "value": 99, "observedAt": at(30),
+            "instanceId": "urn:ngsi-ld:Instance:00000000-0000-4000-8000-0000000000aa"}]}),
+        // the newest level again without observedAt: no new observation
+        json!({LEVEL: [{"type": "Property", "value": 44, "datasetId": "urn:ngsi-ld:Dataset:tank",
+            "modifiedAt": "2026-01-02T23:30:00Z",
+            "instanceId": "urn:ngsi-ld:Instance:00000000-0000-4000-a000-000000000001"}]}),
+        // a new value without observedAt
+        json!({LEVEL: [{"type": "Property", "value": 45, "datasetId": "urn:ngsi-ld:Dataset:tank",
+            "modifiedAt": "2026-01-02T23:40:00Z",
+            "instanceId": "urn:ngsi-ld:Instance:00000000-0000-4000-a000-000000000002"}]}),
+        // a late write: observed before the cut-over
+        json!({SPEED: [{"type": "Property", "value": 5, "observedAt": "2026-01-01T05:30:00Z",
+            "instanceId": "urn:ngsi-ld:Instance:00000000-0000-4000-a000-000000000003"}]}),
+    ];
+    for a in &appends {
+        s.append(t, id, &doc(id), a).await.expect("append");
+    }
+    // 5.6.14 on a keyed instance and on the client's one
+    let changed = s
+        .mutate(t, id, |d| {
+            let Some(speed) = d.get_mut(SPEED).and_then(Value::as_array_mut) else {
+                return Err("no speed");
+            };
+            for i in speed.iter_mut() {
+                let h40 = i["observedAt"] == json!(at(40));
+                if h40 || i["instanceId"] == json!("urn:client:speed:thirty") {
+                    i["value"] = json!(1000);
+                }
+            }
+            Ok(())
+        })
+        .await
+        .expect("mutate");
+    assert_eq!(changed, Some(Ok(())));
+}
+
+/// T-5243: a store with a cut-over writes the rows observed from it on to
+/// `attr_rows` and every earlier one, a late write included, to
+/// `attr_instances`; each read answers byte-identically to a store that
+/// writes the text shape only, and a client's instanceId comes back as sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_route_by_the_cut_over_and_read_as_the_text_shape() {
+    let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
+        eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
+        return;
+    };
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let cut = chrono::DateTime::parse_from_rfc3339(MOVED_FROM)
+        .expect("stamp")
+        .to_utc();
+    let mut text = PgTemporalStore::with_cutover(pool.clone(), None);
+    let mut keyed = PgTemporalStore::with_cutover(pool.clone(), Some(cut));
+    // the appends need no current Entity in `entities`
+    text.temporal_only = true;
+    keyed.temporal_only = true;
+    let (tt, tk) = (
+        TenantId::new("pgcuttext").expect("tenant"),
+        TenantId::new("pgcutkeyed").expect("tenant"),
+    );
+    for t in [&tt, &tk] {
+        pg::ensure_tenant(&pool, t).await.expect("tenant row");
+    }
+    let id = "urn:ngsi-ld:Tank:cut1";
+    write_history(&text, &tt, id).await;
+    write_history(&keyed, &tk, id).await;
+
+    let rows = "SELECT count(*) FROM attr_rows WHERE tenant_id = $1";
+    let old = "SELECT count(*) FROM attr_instances WHERE tenant_id = $1";
+    let late = "SELECT count(*) FROM attr_instances WHERE tenant_id = $1
+                 AND observed_at = '2026-01-01T05:30:00Z'";
+    let newer = "SELECT count(*) FROM attr_instances WHERE tenant_id = $1
+                  AND observed_at >= '2026-01-02T00:00:00Z'";
+    assert_eq!(
+        count(&pool, &tt, rows).await,
+        0,
+        "no cut-over, no keyed row"
+    );
+    let moved = count(&pool, &tt, newer).await;
+    assert!(moved >= 30, "speed h 24..47 and level h 24..44: {moved}");
+    assert_eq!(
+        count(&pool, &tk, rows).await,
+        moved,
+        "rows from the cut-over on"
+    );
+    assert_eq!(
+        count(&pool, &tk, newer).await,
+        0,
+        "no newer row in the text shape"
+    );
+    assert_eq!(
+        count(&pool, &tk, old).await + moved,
+        count(&pool, &tt, old).await,
+        "one row each, in one parent"
+    );
+    assert_eq!(
+        count(&pool, &tk, late).await,
+        1,
+        "the late write stays in the text shape"
+    );
+    let foreign = "SELECT count(*) FROM attr_rows WHERE tenant_id = $1 AND data ? 'instanceId'";
+    assert_eq!(
+        count(&pool, &tk, foreign).await,
+        1,
+        "only the client's id rides in data"
+    );
+
+    let (a, b) = (reads(&text, &tt, id).await, reads(&keyed, &tk, id).await);
+    for ((name, x), (_, y)) in a.iter().zip(&b) {
+        assert_eq!(
+            without_clock(x),
+            without_clock(y),
+            "{name}: the keyed store answered otherwise"
+        );
+    }
+    let got = keyed.get(&tk, id).await.expect("get").expect("entity");
+    let ids: Vec<&str> = got[SPEED]
+        .as_array()
+        .expect("speed")
+        .iter()
+        .filter_map(|i| i["instanceId"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&"urn:client:speed:thirty"),
+        "the client's id came back: {ids:?}"
+    );
+
+    for (s, t) in [(&text, &tt), (&keyed, &tk)] {
+        assert!(s.delete(t, id).await.expect("delete"));
+    }
+    assert_eq!(
+        count(&pool, &tk, rows).await,
+        0,
+        "the delete left keyed rows"
+    );
+}
+
+/// T-5243: a batch append for an Entity absent from `entities` writes
+/// nothing, its dictionary first sights included: no `iri_ids` row names
+/// an IRI only that skipped append carried.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_skipped_append_leaves_no_dictionary_row() {
+    let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
+        eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
+        return;
+    };
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let cut = chrono::DateTime::parse_from_rfc3339(MOVED_FROM)
+        .expect("stamp")
+        .to_utc();
+    let keyed = PgTemporalStore::with_cutover(pool.clone(), Some(cut));
+    let t = TenantId::new("pgorphan").expect("tenant");
+    let id = "urn:ngsi-ld:Tank:t5243-absent";
+    let probe = "https://example.org/t5243/orphanProbe";
+    let shell = json!({"id": id, "type": "Tank",
+        "createdAt": "2026-01-03T00:00:00Z", "modifiedAt": "2026-01-03T00:00:00Z"});
+    let additions = json!({probe: [{"type": "Property", "value": 1,
+        "observedAt": "2026-01-03T00:00:00Z"}]});
+    let mut tx = pool.begin().await.expect("tx");
+    pg::set_tenant(&mut tx, &t).await.expect("tenant");
+    sqlx::query("DELETE FROM iri_ids WHERE tenant_id = $1")
+        .bind(t.as_str())
+        .execute(&mut *tx)
+        .await
+        .expect("clean");
+    tx.commit().await.expect("commit");
+    keyed
+        .append_many(&[(&t, id, &shell, additions)])
+        .await
+        .expect("append_many");
+    let rows = count(
+        &pool,
+        &t,
+        "SELECT count(*) FROM iri_ids WHERE tenant_id = $1",
+    )
+    .await;
+    assert_eq!(rows, 0);
+}

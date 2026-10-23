@@ -150,9 +150,11 @@ is lost); rolling forward again restores the answers.
 ### Integer history keys: the design (T-5193)
 
 Slice 1 built (T-5200, migration 0020): the tables, the dictionary
-lookup, every read over both parents and the maintenance of both. The
-write routing and the cut-over (T-5243) and the dev measurement (T-5244)
-follow. A history row keys on three texts: the Entity id (~60 B),
+lookup, every read over both parents and the maintenance of both. Slice 2
+(T-5243) routes the writes by the cut-over and leaves it NULL: the keyed
+write still costs ~11 % more PostgreSQL CPU than the text one (write bench
+in the task), so the migration that sets it ships with the slice that binds
+the ids once per transaction; the dev measurement (T-5244) follows. A history row keys on three texts: the Entity id (~60 B),
 the full expanded Attribute IRI (~70 B) and the broker's
 `urn:ngsi-ld:Instance:<uuid>` (57 B). Each is stored twice, in the heap and
 in `u_attr_instances_time`. The plan replaces them with an `entity_no
@@ -207,12 +209,32 @@ The shape, as it is to be built:
   `instanceId`, which the read path since T-5131 already returns as stored.
   A v5 collision could only merge two instances that one writer created on
   one Attribute at one `observedAt`.
-- The store keeps the dictionary per Tenant in memory. A write looks an IRI
-  up and only on its first sight inserts it (`ON CONFLICT DO NOTHING`, then
-  a read for the id another pod won). A read knows the ids from the request
-  (the Entity ids of the page, the expanded Attribute names) and maps the
-  answer's ids back from the same map, so a warm process sends no extra
-  statement.
+- The store keeps, per Tenant, the set of IRIs a committed `iri_ids` row
+  holds. A write sends `INSERT ... ON CONFLICT DO NOTHING RETURNING iri`
+  only for the IRIs missing there, in IRI order (a batch append sends its
+  whole batch's first sights in one statement before any Entity), inside
+  its own transaction, so RLS checks the Tenant. An IRI enters the set only
+  once a later write finds it stored, because the transaction that inserted
+  it may still roll back. A warm process sends no extra statement. A batch
+  append sends first sights only for the Entities it finds in `entities`
+  (locked `FOR KEY SHARE` until commit), so a skipped append leaves no
+  dictionary row behind.
+- The set is a two-generation LRU of 100 000 (Tenant, IRI) pairs per
+  generation: about 30 MB per process when full. A pair read from the older
+  generation moves to the newer one; when the newer one fills, the older
+  one is dropped. A pair aged out costs its next write one
+  `INSERT ... ON CONFLICT DO NOTHING` that finds the row (measured: 0.02 to
+  0.05 ms in PostgreSQL, 12 buffer hits, plus one round trip), after which
+  it is known again.
+- Decided (worker-t5243, owner may override): the ids themselves are bound
+  in SQL by `iri_no` in every statement, reads and writes alike, and never
+  cached in memory. A cached id outlives a rolled-back insert or another
+  pod's tenant purge and would key a row by an id that names nothing, which
+  loses the row silently; `iri_no` is one probe of `iri_ids`' unique index
+  per statement (per row for `attr_no`). A stale set entry instead fails the
+  write with 23502 and clears that Tenant's entries. Options: ids in memory
+  bound as parameters (the design above, no probe, silent loss on a stale
+  id).
 - Each history statement reads both parents as `UNION ALL`, one arm per
   parent, each arm through its own unique index. An ordered read with a
   `LIMIT` (the newest instance a write compares with, lastN's N-th newest)
@@ -221,8 +243,7 @@ The shape, as it is to be built:
   does not make those leading index columns redundant in the parent's
   ordering, and it sorts every row of the Attribute otherwise. Copies into
   `attr_versions` keep whole documents, as now.
-- Until the store keeps the dictionary in memory (T-5243), an arm binds
-  its ids with `iri_no(tenant, iri)`, a STABLE invoker's-rights SQL
+- An arm binds its ids with `iri_no(tenant, iri)`, a STABLE invoker's-rights PL/pgSQL
   function the planner evaluates once per index scan. `attr_rows_of(tenant,
   entity)` and `attr_rows_at(tenant, entity, attribute)` return `attr_rows`
   in the row type of `attr_instances`; the planner inlines them, so the
@@ -232,6 +253,10 @@ The shape, as it is to be built:
   miss every row since the cut-over, so the migration that sets the
   cut-over is `breaking_` (`migrations.rollback.toml`). 0020 leaves it NULL
   and is `compatible`: until it is set every row goes to `attr_instances`.
+  That later migration sets it to `date_trunc('week', now()) + 1 week`,
+  the partition job's own week boundary, once. The store reads it
+  on its first write; a row whose `observedAt` (or the stamp that stands in
+  for it) cannot be parsed stays in the text shape.
 
 The keys save about 390 B a row. Getting a dev row under 300 B also needs
 the `data` side; today only TimescaleDB's columnstore gets there (120 B).
@@ -264,3 +289,4 @@ unless `ANTARES_MIGRATE=0` hands the job to an init container.
 | `0019_drop_entities_jsonb` | Drops `i_entities_jsonb`, the `jsonb_path_ops` GIN over the whole document (T-5193). No jsonb operator is leakproof (`@?`, `@>`, `?|`), so under forced RLS the broker's role never used it as an index condition: as `antares_app`, a q= page of 200,000 Entities read the primary key and filtered 199,998 rows with the GIN in place, while a superuser's plan read the GIN. Every Entity write still paid a GIN entry per path. 1,869 -> 1,754 B an Entity on that synthetic set; a deployment that bypasses RLS loses the GIN path its q= pages used. |
 | `0020_history_integer_keys` | The second history parent of the integer keys (T-5200, "Integer history keys" above): `iri_ids` (per-Tenant dictionary of full expanded IRIs, 0005's per-command RLS, no UPDATE policy), `attr_rows` (partitioned or a hypertable as `attr_instances`, unique key (`tenant_id`, `entity_no`, `attr_no`, `observed_at`, `instance_no`), its RLS and compression as 0001 gives `attr_instances`), the one-row `history_cutover` holding NULL, and the functions `iri_no`, `attr_rows_of` and `attr_rows_at`. Every history read and delete covers both parents; nothing writes `attr_rows` while the cut-over is NULL. |
 | `0021_name_key` | A leakproof key for `name=="…"` (T-5349): `entities.name_key` (generated, `text COLLATE "C"`) holds the core-@context `name` (`https://uri.etsi.org/ngsi-ld/default-context/name`) of one instance whose `value` is a string up to 1,024 bytes, `''` without a `name`, NULL for every other shape; btree `i_entities_name_key` (`tenant_id`, `name_key`). The store ANDs `(name_key = $n OR name_key IS NULL)` to a top-level `name=="…"`, so a name filter without a type (STA `Things?$filter=name eq '…'`) reads the matching rows instead of the whole Tenant; the `@?` stays and decides. Rewrites `entities` once on upgrade. Changes no access and no result. |
+| `0022_iri_no_plpgsql` | `iri_no` in PL/pgSQL with the same signature (T-5243): 0020's `LANGUAGE sql` body is never inlined and PostgreSQL 17 plans it again in every calling statement (~0.16 ms a call, 17 calls a keyed write); PL/pgSQL keeps the plan for the session. Still `STABLE` and invoker's rights, so RLS on `iri_ids` applies. |

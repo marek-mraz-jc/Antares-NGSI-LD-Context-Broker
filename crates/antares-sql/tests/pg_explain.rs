@@ -1095,7 +1095,12 @@ async fn the_keyed_history_arms_read_their_unique_index_under_rls() {
         let indexed = plan
             .lines()
             .any(|l| l.contains("Index Cond:") && l.contains(cond));
-        if !indexed || plan.contains("Seq Scan on attr_rows") {
+        // Once a cut-over is set, maintenance creates the weeks from it on in
+        // attr_rows; an empty week is read by a free Seq Scan, the right plan.
+        let walks = plan
+            .lines()
+            .any(|l| l.contains("Seq Scan on attr_rows") && !l.contains("(cost=0.00..0.00 "));
+        if !indexed || walks {
             bad.push(format!(
                 "{shape} (wants an index condition {cond}):\n{plan}"
             ));
