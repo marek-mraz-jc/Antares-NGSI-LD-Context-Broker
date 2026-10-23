@@ -1822,6 +1822,14 @@ impl antares_store::TemporalDriver for AnyStore {
     async fn close(&self) {
         AnyStore::close(self).await;
     }
+    fn set_short_history(&self, short: antares_store::ShortHistory) {
+        match self {
+            // ponytail: memory has no WAL to save
+            AnyStore::Mem(_) => drop(short),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p.temporal.set_short_history(short),
+        }
+    }
     async fn versions(
         &self,
         tenant: &TenantId,

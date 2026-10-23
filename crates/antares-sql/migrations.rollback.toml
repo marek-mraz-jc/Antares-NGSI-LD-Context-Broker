@@ -96,3 +96,7 @@ note = "a generated column and its btree; an older release names no generated co
 [0022]
 rollback = "compatible"
 note = "iri_no's body moves from LANGUAGE sql to PL/pgSQL with the same signature and answers; an older release calls it the same way"
+
+[0023]
+rollback = "breaking"
+note = "attr_rows becomes a parent partitioned by short (plain mode: the 0020 parent renamed attr_rows_long, the unlogged attr_rows_short beside it) and its unique key takes short: a 0022 release's ON CONFLICT names a key no index has and every history write to attr_rows fails, so the boot stops at 0023; the way back is the pre-release backup"

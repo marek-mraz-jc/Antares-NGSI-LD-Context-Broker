@@ -497,3 +497,155 @@ async fn a_skipped_append_leaves_no_dictionary_row() {
     .await;
     assert_eq!(rows, 0);
 }
+
+fn short_for(t: &TenantId, short: bool) -> antares_store::ShortHistory {
+    let mut s = antares_store::ShortHistory::default();
+    s.types
+        .insert((t.as_str().to_owned(), "Tank".to_owned()), short);
+    s
+}
+
+/// T-5249: a type whose retention is PT1H or less writes every history row
+/// as `short` (plain mode: the unlogged `attr_rows_short`), before any cut-over, and each read answers
+/// as the text shape does. A rule grown past PT1H sends new rows to the logged
+/// side (`attr_rows_long`), reads merge both children in order, and the retention
+/// sweep deletes the short rows older than its cut.
+#[tokio::test(flavor = "multi_thread")]
+async fn short_history_lands_unlogged_and_reads_as_the_text_shape() {
+    let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
+        eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
+        return;
+    };
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let mut text = PgTemporalStore::with_cutover(pool.clone(), None);
+    // a cut-over before every row: short rows ignore it, long ones key by it
+    let cut = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+        .expect("stamp")
+        .to_utc();
+    let mut short = PgTemporalStore::with_cutover(pool.clone(), Some(cut));
+    text.temporal_only = true;
+    short.temporal_only = true;
+    let (tt, ts) = (
+        TenantId::new("pgshorttext").expect("tenant"),
+        TenantId::new("pgshort").expect("tenant"),
+    );
+    for t in [&tt, &ts] {
+        pg::ensure_tenant(&pool, t).await.expect("tenant row");
+    }
+    short.set_short_history(short_for(&ts, true));
+    let id = "urn:ngsi-ld:Tank:short1";
+    write_history(&text, &tt, id).await;
+    write_history(&short, &ts, id).await;
+
+    // `short` is the partition key of the two children (plain mode); under
+    // timescale the same column of the one hypertable
+    let unlogged = "SELECT count(*) FROM attr_rows WHERE tenant_id = $1 AND short";
+    let logged = "SELECT count(*) FROM attr_rows WHERE tenant_id = $1 AND NOT short";
+    let old = "SELECT count(*) FROM attr_instances WHERE tenant_id = $1";
+    let all = count(&pool, &tt, old).await;
+    assert!(all >= 60, "speed and level rows: {all}");
+    assert_eq!(count(&pool, &ts, unlogged).await, all, "every row is short");
+    assert_eq!(count(&pool, &ts, old).await, 0, "no row in the text shape");
+    assert_eq!(count(&pool, &ts, logged).await, 0, "no row logged");
+    let (a, b) = (reads(&text, &tt, id).await, reads(&short, &ts, id).await);
+    for ((name, x), (_, y)) in a.iter().zip(&b) {
+        assert_eq!(
+            without_clock(x),
+            without_clock(y),
+            "{name}: the short store answered otherwise"
+        );
+    }
+
+    // P30D now: a new row goes to the logged child, reads merge both
+    short.set_short_history(short_for(&ts, false));
+    let newest = json!({SPEED: [{"type": "Property", "value": 77,
+        "observedAt": "2026-01-03T00:00:00Z",
+        "instanceId": "urn:ngsi-ld:Instance:00000000-0000-4000-a000-000000000077"}]});
+    short
+        .append(&ts, id, &doc(id), &newest)
+        .await
+        .expect("append");
+    assert_eq!(count(&pool, &ts, logged).await, 1, "the long rule logs");
+    let got = short.get(&ts, id).await.expect("get").expect("entity");
+    let at: Vec<&str> = got[SPEED]
+        .as_array()
+        .expect("speed")
+        .iter()
+        .filter_map(|i| i["observedAt"].as_str())
+        .collect();
+    let mut sorted = at.clone();
+    sorted.sort_unstable();
+    assert_eq!(at, sorted, "one order over both children");
+    assert_eq!(at.last(), Some(&"2026-01-03T00:00:00Z"), "the logged row");
+
+    let swept = pg::maintenance::retain_history(
+        &pool,
+        ts.as_str(),
+        antares_store::HistoryScope::Type {
+            type_iri: "Tank",
+            except_ids: &[],
+        },
+        MOVED_FROM,
+        10_000,
+        false,
+    )
+    .await
+    .expect("sweep");
+    let older = "SELECT count(*) FROM attr_rows WHERE tenant_id = $1 AND short
+                  AND observed_at < '2026-01-02T00:00:00Z'";
+    assert!(swept >= 20, "the rows before the cut: {swept}");
+    assert_eq!(
+        count(&pool, &ts, older).await,
+        0,
+        "a short row outlived its cut"
+    );
+    assert!(
+        count(&pool, &ts, unlogged).await > 0,
+        "the newer short rows stay"
+    );
+    for (s, t) in [(&text, &tt), (&short, &ts)] {
+        assert!(s.delete(t, id).await.expect("delete"));
+    }
+    assert_eq!(
+        count(&pool, &ts, unlogged).await,
+        0,
+        "the delete left short rows"
+    );
+}
+
+/// T-5249: a burst of 10 reports of one vehicle within a second records 10
+/// short rows; the same 10 sent again (new instance ids, same observedAt and
+/// value) record none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_short_burst_keeps_every_report_and_no_repeat() {
+    let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
+        eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
+        return;
+    };
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let mut s = PgTemporalStore::with_cutover(pool.clone(), None);
+    s.temporal_only = true;
+    let t = TenantId::new("pgshortburst").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    s.set_short_history(short_for(&t, true));
+    let id = "urn:ngsi-ld:Tank:burst1";
+    let _ = s.delete(&t, id).await;
+    let shell = json!({"id": id, "type": "Tank",
+        "createdAt": "2026-01-01T00:00:00Z", "modifiedAt": "2026-01-01T00:00:00Z"});
+    assert!(s.create(&t, id, &shell).await.expect("create"));
+    let report = |n: usize, round: usize| {
+        json!({SPEED: [{"type": "Property", "value": n,
+            "observedAt": format!("2026-01-01T00:00:00.{:03}Z", n * 100),
+            "instanceId": format!("urn:ngsi-ld:Instance:00000000-0000-4000-b{round:03}-{n:012}")}]})
+    };
+    for round in 0..2 {
+        for n in 0..10 {
+            s.append(&t, id, &shell, &report(n, round))
+                .await
+                .expect("append");
+        }
+    }
+    let rows = "SELECT count(*) FROM attr_rows WHERE tenant_id = $1 AND short";
+    assert_eq!(count(&pool, &t, rows).await, 10, "10 reports, no repeat");
+    assert!(s.delete(&t, id).await.expect("delete"));
+}
