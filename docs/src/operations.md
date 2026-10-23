@@ -76,6 +76,14 @@ later, at the first burst, as `FATAL: sorry, too many clients already` from
 whichever client asks last. Leave headroom for the migration job, the
 replicas rolling during an update, and anything else on the same database.
 
+The total includes the write reserve (`ANTARES_PG_WRITE_RESERVE`, default
+off): that many connections of the pool open as a second pool that only the
+batch writes draw from, and the reads share the rest. Turn it on when a
+pipeline's batch upsert has to keep its latency while public reads flood the
+broker: with the reserve at 4 of 16, at most 12 reads hold a connection and a
+batch never queues behind them. Batches beyond the reserve wait for a reserve
+connection, never for a read one.
+
 Three signals say the pool is the constraint:
 
 | Signal | Where | Reading |

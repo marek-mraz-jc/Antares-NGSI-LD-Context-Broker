@@ -629,6 +629,9 @@ components:
           type: string
         poolSize:
           type: integer
+        poolWriteReserve:
+          type: integer
+          description: Connections of poolSize only batch writes take (ANTARES_PG_WRITE_RESERVE); 0 when off.
         poolAcquireTimeoutSeconds:
           type: integer
         server:

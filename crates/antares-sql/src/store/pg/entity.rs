@@ -34,6 +34,10 @@ pub struct PgEntityStore {
     /// `ANTARES_PG_BATCH_ASYNC_COMMIT` for a feed that rewrites itself every
     /// second, where the next batch restores what a crash lost.
     async_batch: std::sync::atomic::AtomicBool,
+    /// The pool the batch writes begin on: `pool` itself, or the write
+    /// reserve (`ANTARES_PG_WRITE_RESERVE`, T-5150) when the broker set one,
+    /// whose connections no read takes.
+    batch_pool: PgPool,
 }
 
 // EntityFilter/Page/QueryOutcome live in `store::filter` (pure data,
@@ -491,10 +495,17 @@ pub fn ngsi_error(e: &sqlx::Error) -> Option<&NgsiError> {
 impl PgEntityStore {
     pub fn new(pool: PgPool) -> Self {
         Self {
+            batch_pool: pool.clone(),
             pool,
             outbox: std::sync::atomic::AtomicBool::new(false),
             async_batch: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Run the batch writes on `reserve` instead of the shared pool.
+    pub fn with_batch_pool(mut self, reserve: PgPool) -> Self {
+        self.batch_pool = reserve;
+        self
     }
 
     /// Asynchronous commit for the batch writes (see the field).
@@ -506,7 +517,7 @@ impl PgEntityStore {
     /// A batch write's transaction, with `synchronous_commit = off` set
     /// LOCAL to it when [`Self::set_async_batch_commit`] is on.
     async fn begin_batch(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
-        let mut tx = super::begin(&self.pool).await?;
+        let mut tx = super::begin(&self.batch_pool).await?;
         if self.async_batch.load(std::sync::atomic::Ordering::Relaxed) {
             sqlx::query("SET LOCAL synchronous_commit = off")
                 .execute(&mut *tx)

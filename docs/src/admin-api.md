@@ -113,7 +113,7 @@ progress). A memory-store broker answers:
 | `status` | `UP`, or `DRAINING` with status 503 once shutdown began. |
 | `store` | The current-state backend: `memory`, `file`, `postgres`, `timescale`. |
 | `temporal` | The history backend: one of the four, or `none` when history is off (`ANTARES_TEMPORAL`). |
-| `storeInfo`, `temporalInfo` | What each driver actually runs on: `{engine}` for the built-in stores (`memory` or `redb`), and on Postgres `{engine, poolSize, poolAcquireTimeoutSeconds, server, postgis?, timescaledb?}` — the pool's own shape always, the server probe read once at startup and omitted if it failed. Absent when a driver has nothing to add to its name (`none` history). Two deployments answering `postgres` are told apart here. |
+| `storeInfo`, `temporalInfo` | What each driver actually runs on: `{engine}` for the built-in stores (`memory` or `redb`), and on Postgres `{engine, poolSize, poolWriteReserve, poolAcquireTimeoutSeconds, server, postgis?, timescaledb?}` — the pool's own shape always, the server probe read once at startup and omitted if it failed. Absent when a driver has nothing to add to its name (`none` history). Two deployments answering `postgres` are told apart here. |
 | `version`, `commit` | Workspace version and the git hash the binary was built from. |
 | `notificationSchemes` | The `notification.endpoint.uri` schemes this build can deliver to — the registered bindings (6.3.8, clause 7, and any a deployment added). A subscription naming a scheme absent here is refused at creation with `BadRequestData`. |
 | `deadLetters` | Dead letters this process wrote since start ([notification delivery](operations.md#notification-delivery)). |
