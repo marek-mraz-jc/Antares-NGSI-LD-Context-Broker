@@ -646,6 +646,53 @@ mod change_pipeline {
         assert_eq!(pending.load(Ordering::SeqCst), 0, "every batch released");
     }
 
+    /// T-5245: one process may serve several states (tests run a broker
+    /// each, with the same tenants and subscription ids): a fold keeps to
+    /// the state of its first group, so no state's change is delivered
+    /// through another's sinks, and the lanes are keyed by broker.
+    #[tokio::test]
+    async fn lane_fold_keeps_to_one_state() {
+        let (a, b) = (
+            AppState::new("antares-lane-a".into()),
+            AppState::new("antares-lane-b".into()),
+        );
+        let pending: Arc<AtomicUsize> = Arc::default();
+        let job = |st: &AppState| {
+            pending.fetch_add(1, Ordering::SeqCst);
+            LaneJob {
+                st: st.clone(),
+                group: Matched {
+                    tenant: TenantId::new("a").expect("tenant"),
+                    sub: Arc::new(json!({"id": "urn:ngsi-ld:Subscription:s1"})),
+                    ctx: antares_jsonld::Loader::new().core(),
+                    data: vec![json!({})],
+                },
+                _batch: Arc::new(BatchDone {
+                    pending: pending.clone(),
+                    taken: 1,
+                }),
+                _held: LANE_LEDGER.take(0, usize::MAX).expect("no budget"),
+            }
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(DELIVERY_LANE);
+        for st in [&a, &a, &b, &b, &a] {
+            assert!(tx.try_send(job(st)).is_ok(), "lane has room");
+        }
+        let mut folds = Vec::new();
+        let mut next = rx.try_recv().ok();
+        while let Some(first) = next {
+            let (st, group, batches, rest) = fold(first, &mut rx);
+            folds.push((st.same(&a), group.data.len(), batches.len()));
+            next = rest.or_else(|| rx.try_recv().ok());
+        }
+        assert_eq!(folds, [(true, 2, 2), (false, 2, 2), (true, 1, 1)]);
+        assert!(!a.same(&b) && a.same(&a.clone()));
+        // and each broker's groups wait on lanes of their own
+        assert_ne!(a.broker(), b.broker());
+        assert_eq!(a.broker(), a.clone().broker());
+        assert_eq!(pending.load(Ordering::SeqCst), 0, "every batch released");
+    }
+
     /// T-4549: the lanes together hold at most their byte budget; a group
     /// past it is refused, a group larger than the budget still leaves when
     /// nothing else waits, and what a group held is given back when it goes.
