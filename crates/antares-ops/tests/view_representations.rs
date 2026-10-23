@@ -92,7 +92,7 @@ async fn a_surface_reads_its_representation_and_the_admin_token() -> Result<(), 
         .await?
         .with_admin_auth(AdminAuth::new(TOKEN, true)?);
     let app = broker.serve(Probe)?;
-    let ical = json!({"preset": "schema-org"});
+    let ical = json!([{"name": "events", "sources": [{"preset": "schema-org"}]}]);
     for (id, r) in [("mapped", Some(json!({"ical": ical}))), ("plain", None)] {
         let (status, _) = send(
             &app,

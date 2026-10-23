@@ -73,14 +73,19 @@ async fn send(
     (status, String::from_utf8(bytes.to_vec()).expect("utf-8"))
 }
 
+/// The view `events`; `None`: one output `events` of the `sdm-event` preset.
 fn view(representations: Option<Value>) -> Value {
     let mut v = json!({"id": "events", "tenant": "city", "selector": ["Event"],
         "operations": ["query_entities"],
         "rules": [{"types": ["Event"], "attributes": ["name", "title", "startDate", "address"]}]});
-    if let Some(r) = representations {
-        v["representations"] = r;
-    }
+    v["representations"] =
+        representations.unwrap_or_else(|| json!({"ical": [{"name": "events", "sources": [{}]}]}));
     v
+}
+
+/// `representations` of one output `events` over `source`.
+fn one(source: &Value) -> Value {
+    json!({"ical": [{"name": "events", "sources": [source]}]})
 }
 
 async fn put_view(app: &Router, doc: &Value) -> (StatusCode, String) {
@@ -209,16 +214,24 @@ async fn the_views_mapping_renders_the_feed_and_a_new_mapping_changes_it() {
     let (_broker, app) = fixture(false).await;
     let (_, before) = send(&app, "GET", FEED, "", false).await;
     assert!(before.contains("SUMMARY:Podujatie zv1"), "{before}");
-    let mapping = json!({"ical": {"preset": "sdm-event", "mapping": {
-        "SUMMARY": "title", "LOCATION": "address.addressLocality"}}});
+    let mapping = one(&json!({"preset": "sdm-event", "mapping": {
+        "SUMMARY": "title", "LOCATION": "address.addressLocality"}}));
     let (status, body) = put_view(&app, &view(Some(mapping))).await;
     assert!(status.is_success(), "{body}");
     let (_, after) = send(&app, "GET", FEED, "", false).await;
     assert!(after.contains("SUMMARY:Jarmok"), "{after}");
     assert!(after.contains("LOCATION:Banská Bystrica"), "{after}");
     assert!(!after.contains("Podujatie"), "{after}");
-    // a representation the broker does not know, or a mapping that is no object, is no view
-    for bad in [json!({"icall": {}}), json!({"ical": "sdm-event"})] {
+    // a representation the broker does not know, outputs that are no list or more than 20
+    let many: Vec<Value> = (0..21)
+        .map(|i| json!({"name": format!("o{i}"), "sources": [{}]}))
+        .collect();
+    for bad in [
+        json!({"icall": []}),
+        json!({"ical": "sdm-event"}),
+        json!({"ical": {"preset": "sdm-event"}}),
+        json!({"ical": many}),
+    ] {
         let (status, body) = put_view(&app, &view(Some(bad.clone()))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
     }
@@ -227,7 +240,7 @@ async fn the_views_mapping_renders_the_feed_and_a_new_mapping_changes_it() {
 #[tokio::test]
 async fn a_stored_mapping_that_does_not_hold_serves_no_feed_and_says_so() {
     let (broker, app) = fixture(false).await;
-    let no_start = json!({"ical": {"mapping": {"SUMMARY": "title"}}});
+    let no_start = one(&json!({"mapping": {"SUMMARY": "title"}}));
     broker
         .store_view_doc("events", view(Some(no_start)))
         .await
@@ -345,7 +358,7 @@ async fn attrs_select_what_the_feed_reads_and_a_bad_bound_or_view_segment_is_ref
 #[tokio::test]
 async fn a_stored_mapping_of_an_unknown_shape_serves_no_feed() {
     let (broker, app) = fixture(false).await;
-    let unknown = json!({"ical": {"preset": "sdm-event", "template": "{{name}}"}});
+    let unknown = one(&json!({"preset": "sdm-event", "template": "{{name}}"}));
     broker
         .store_view_doc("events", view(Some(unknown)))
         .await

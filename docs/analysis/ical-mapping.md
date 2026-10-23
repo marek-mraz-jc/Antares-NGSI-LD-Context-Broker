@@ -34,7 +34,7 @@ against the data model is the platform's, at propose.
 | `VEVENT` property | RFC 5545 | `sdm-event` | Absent value |
 |---|---|---|---|
 | `UID` | 3.8.4.7 | the Entity `id`, fixed | never absent |
-| `DTSTAMP` | 3.8.7.2 | `modifiedAt`, fixed | the time of the request |
+| `DTSTAMP` | 3.8.7.2 | the mapped `LAST-MODIFIED`, else the newest `modifiedAt` of the mapped attributes, else the Entity's (T-5208) | the time of the request |
 | `DTSTART` | 3.8.2.4 | `startDate` | no `VEVENT`, counted (section 4) |
 | `DTEND` | 3.8.2.2 | `endDate`, the last day (`endInclusive`) | no `DTEND` |
 | `DURATION` | 3.8.2.5 | | no `DURATION` |
@@ -47,14 +47,14 @@ against the data model is the platform's, at propose.
 | `STATUS` | 3.8.1.11 | (`schema-org`: `eventStatus`, mapped) | absent |
 | `ORGANIZER` | 3.8.4.3 | | absent |
 | `CLASS` | 3.8.1.3 | | absent |
-| `LAST-MODIFIED` | 3.8.7.3 | `modifiedAt` unless mapped | absent |
+| `LAST-MODIFIED` | 3.8.7.3 | as `DTSTAMP` unless mapped | absent |
 
 The `schema-org` preset is `sdm-event` with `STATUS` from `eventStatus`: `EventScheduled`, `EventRescheduled` and
 `EventMovedOnline` (bare or as `https://schema.org/…`) `CONFIRMED`, `EventPostponed` `TENTATIVE`, `EventCancelled`
 `CANCELLED`, any other `CONFIRMED`.
 
 A value is a Property's `value` (a typed literal's `@value`, a VocabProperty's `vocab`), a LanguageProperty's text
-in the `language` asked (default its first), a GeoProperty's geometry, the default instance of a multi-instance
+in the `language` asked (a BCP 47 tag, else the output's `lang`; then the same primary language, `@none`, the first tag), a GeoProperty's geometry, the default instance of a multi-instance
 Attribute (else its first). A dotted path (`address.addressLocality`) reads a member of the value, else a
 sub-attribute. `firstOf` takes the first path with a value, `join` the values of those that have one joined by
 `separator` (`, `), `constant` a fixed text, `truncate` the first n characters, `map` a source value's calendar
@@ -67,10 +67,13 @@ an e-mail address written as `mailto:`.
 - `2026-10-20` is a date: `DTSTART;VALUE=DATE:20261020`. An `endInclusive` end names the last day and RFC 5545
   `DTEND` the day after it, so a fair of `2026-09-10` to `2026-09-12` ends `DTEND;VALUE=DATE:20260913`; without it a
   date end is written as it is. The presets read `endDate` as inclusive, as the feed did before mappings.
-- An RFC 3339 date-time is written in UTC (`20261020T160000Z`). A date-time without offset is a floating time
-  (`20261020T180000`); with `timezone` (an IANA zone) it is read in that zone and written in UTC, so no
-  `VTIMEZONE` is needed. A wall time the zone skips is unreadable.
-- `date: date` writes a day (an instant's day in the zone, else in UTC), `date: datetime` a day's midnight.
+- An RFC 3339 date-time is written in UTC (`20261020T160000Z`). A date-time without offset is read in the field's
+  `timezone`, else the output's (default `Europe/Bratislava`), and written in UTC: `2026-10-20T18:00:00` is
+  `20261020T160000Z`, never a floating time (RFC 5545 3.3.5 form 1 would show 18:00 in every zone, T-5208). A start
+  and an end of different value types are both read in that zone before the end takes the start's type. The feed
+  carries the output zone's `VTIMEZONE` and `X-WR-TIMEZONE`. A wall time the zone skips is unreadable.
+- `date: date` writes a day (an instant's day in the zone), `date: datetime` a day's midnight in the zone.
+- `DURATION: {constant: PT1H}` is the length of an Event with a date-time start and no end; a mapped `DTEND` wins.
 - `DTEND` takes the value type of `DTSTART` (3.8.2.2).
 - `from` and `to` take a date or a date-time. An Event is in the feed when it starts before the end of `to` (a date
   `to` is inclusive) and has not ended before `from`. Bad or reversed bounds answer `400`.
@@ -89,7 +92,7 @@ holding white space).
 Text is escaped (3.3.11: backslash, semicolon, comma, newline; other control characters dropped) and every content
 line is folded at 75 octets between UTF-8 characters (3.1), each ending in CRLF. One `VEVENT` per Entity, so each
 `UID` once. The calendar carries `VERSION:2.0`, `PRODID:-//Antares//antares-ical//EN`, `CALSCALE:GREGORIAN` and
-`X-WR-CALNAME` the view id. A feed reads at most `RESIDUAL_SCAN` (10 000) Entities and answers `413` past that; the
+`NAME`, `X-WR-CALNAME` (the output's title, else the view id), `REFRESH-INTERVAL` and the `VTIMEZONE`. A feed reads at most `RESIDUAL_SCAN` (10 000) Entities and answers `413` past that; the
 window is applied after the read, so a large view is narrowed with `q`.
 
 ## 6. Preview

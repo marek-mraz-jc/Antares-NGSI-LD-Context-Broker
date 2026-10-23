@@ -135,6 +135,9 @@ pub struct View {
 /// The surfaces a view's `representations` may name.
 pub const REPRESENTATIONS: &[&str] = &["ical", "feed"];
 
+/// The most named outputs one representation lists (owner 2026-10-22T09:30Z).
+pub const MAX_OUTPUTS: usize = 20;
+
 /// One allowlist of a [`View`]: the Entities of `types` for which the
 /// condition holds show `attributes`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -309,16 +312,15 @@ impl View {
         };
         if let Some(named) = &self.representations {
             if let Some((name, _)) = named.iter().find(|(name, member)| {
-                // `feed` is a list of named outputs (T-5202), `ical` one object
-                let shaped = if name.as_str() == "feed" {
-                    member.is_array()
-                } else {
-                    member.is_object()
-                };
-                !REPRESENTATIONS.contains(&name.as_str()) || !shaped
+                // each is a list of named outputs: `feed` (T-5202) checks its list when
+                // it serves, `ical` (T-5208) refuses more than MAX_OUTPUTS here
+                !REPRESENTATIONS.contains(&name.as_str())
+                    || member
+                        .as_array()
+                        .is_none_or(|outputs| *name == "ical" && outputs.len() > MAX_OUTPUTS)
             }) {
                 return Err(format!(
-                    "representations: {name:?} is not one of {REPRESENTATIONS:?} with an object (a list for feed)"
+                    "representations: {name:?} is not one of {REPRESENTATIONS:?} with a list of outputs (ical: at most {MAX_OUTPUTS})"
                 ));
             }
         }
@@ -1318,7 +1320,8 @@ mod tests {
 
     #[test]
     fn a_view_keeps_the_representations_it_names_and_refuses_another_name() {
-        let ical = json!({"ical": {"preset": "sdm-event"}, "feed": [{"name": "news"}]});
+        let ical = json!({"ical": [{"name": "events", "sources": [{"preset": "sdm-event"}]}],
+            "feed": [{"name": "news"}]});
         let loaded = load(&with("representations", ical.clone())).expect("loads");
         assert_eq!(
             loaded
@@ -1329,9 +1332,14 @@ mod tests {
             Some(ical)
         );
         assert!(load(&base()).is_ok_and(|l| l.representations.is_none()));
+        let many: Vec<Value> = (0..=MAX_OUTPUTS)
+            .map(|i| json!({"name": format!("o{i}")}))
+            .collect();
+        assert!(load(&with("representations", json!({"feed": many.clone()}))).is_ok());
         for bad in [
-            json!({"vcard": {}}),
-            json!({"ical": []}),
+            json!({"vcard": []}),
+            json!({"ical": {"preset": "sdm-event"}}),
+            json!({"ical": many}),
             json!({"feed": {}}),
             json!([]),
         ] {
