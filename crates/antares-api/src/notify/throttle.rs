@@ -309,13 +309,18 @@ pub(super) fn owned_heap(v: &Value) -> usize {
     }
 }
 
-/// (tenant, subscription id) → the lane its groups wait on. An entry lives
-/// while its lane has work: the lane's task removes it when it finds the
-/// lane empty, under this lock, so a group is never sent to a lane nobody
-/// serves.
+/// (broker, tenant, subscription id) → the lane its groups wait on. An
+/// entry lives while its lane has work: the lane's task removes it when it
+/// finds the lane empty, under this lock, so a group is never sent to a lane
+/// nobody serves. The broker part keeps two brokers of one process (tests
+/// run one each, with the same tenants and subscription ids) on lanes of
+/// their own, each served on its own runtime (T-5245).
 #[cfg(not(target_arch = "wasm32"))]
-pub(super) type Lanes =
-    std::sync::Mutex<HashMap<(String, String), tokio::sync::mpsc::Sender<LaneJob>>>;
+pub(super) type Lanes = std::sync::Mutex<HashMap<LaneKey, tokio::sync::mpsc::Sender<LaneJob>>>;
+
+/// A lane's key: [`AppState::broker`], tenant, subscription id.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) type LaneKey = (usize, String, String);
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) static LANES: std::sync::LazyLock<Lanes> = std::sync::LazyLock::new(Lanes::default);
 
@@ -326,6 +331,7 @@ pub(super) static LANES: std::sync::LazyLock<Lanes> = std::sync::LazyLock::new(L
 pub(super) fn to_lane(st: &AppState, group: Matched, batch: &Arc<BatchDone>) {
     use tokio::sync::mpsc::error::TrySendError;
     let key = (
+        st.broker(),
         group.tenant.as_str().to_owned(),
         group
             .sub
@@ -380,7 +386,7 @@ pub(super) fn to_lane(st: &AppState, group: Matched, batch: &Arc<BatchDone>) {
 
 /// Serve one subscription's lane in order until it is empty, then retire it.
 #[cfg(not(target_arch = "wasm32"))]
-pub(super) async fn run_lane(key: (String, String), mut rx: tokio::sync::mpsc::Receiver<LaneJob>) {
+pub(super) async fn run_lane(key: LaneKey, mut rx: tokio::sync::mpsc::Receiver<LaneJob>) {
     // a group the last fold had no room for leads the next notification
     let mut carry = None;
     loop {
@@ -424,7 +430,9 @@ pub(super) type Folded = (
 /// [`CHANGE_BATCH`] entities and hands that group back, so a backed-up lane
 /// sends several bounded POSTs, never its whole depth in one. The newest
 /// group carries the subscription as it reads now; the batches stay pending
-/// until the delivery ends.
+/// until the delivery ends. A group of another state (a second broker in
+/// the process, with the same tenant and subscription id) leads the next
+/// notification: each leaves through its own state's sinks.
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn fold(job: LaneJob, rx: &mut tokio::sync::mpsc::Receiver<LaneJob>) -> Folded {
     let LaneJob {
@@ -435,7 +443,9 @@ pub(super) fn fold(job: LaneJob, rx: &mut tokio::sync::mpsc::Receiver<LaneJob>) 
     } = job;
     let mut batches = vec![(_batch, _held)];
     while let Ok(next) = rx.try_recv() {
-        if group.data.len().saturating_add(next.group.data.len()) > CHANGE_BATCH {
+        if group.data.len().saturating_add(next.group.data.len()) > CHANGE_BATCH
+            || !next.st.same(&st)
+        {
             return (st, group, batches, Some(next));
         }
         let mut data = std::mem::take(&mut group.data);
@@ -464,7 +474,7 @@ pub(super) fn tell_lost(st: &AppState, g: &Matched) {
 /// subscription in the log, so an operator can tell which subscriber fell
 /// behind and lost changes (T-4086).
 #[cfg(not(target_arch = "wasm32"))]
-pub(super) fn note_lane_drop(key: &(String, String), entities: usize) {
+pub(super) fn note_lane_drop(key: &LaneKey, entities: usize) {
     let n = LANE_DROPS
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         .saturating_add(1);
@@ -472,8 +482,8 @@ pub(super) fn note_lane_drop(key: &(String, String), entities: usize) {
     if n == 1 || n.is_multiple_of(100) {
         tracing::warn!(
             "subscription {} of tenant {} is slower than its changes: {entities} entities dropped from its delivery lane ({n} groups so far, all subscriptions)",
-            key.1,
-            key.0
+            key.2,
+            key.1
         );
     }
 }

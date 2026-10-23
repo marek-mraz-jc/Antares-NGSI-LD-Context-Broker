@@ -393,6 +393,26 @@ impl std::ops::DerefMut for AppState {
 }
 
 impl AppState {
+    /// This state's broker, told apart from the other brokers of the
+    /// process: its narrowed copies share it, and no live broker shares it
+    /// with another.
+    pub(crate) fn broker(&self) -> usize {
+        Arc::as_ptr(&self.shared).addr()
+    }
+
+    /// Whether `other` is this state: the same broker and the same view.
+    #[must_use]
+    pub fn same(&self, other: &Self) -> bool {
+        #[cfg(feature = "views")]
+        let view = match (&self.view, &other.view) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (a, b) => a.is_none() && b.is_none(),
+        };
+        #[cfg(not(feature = "views"))]
+        let view = true;
+        Arc::ptr_eq(&self.shared, &other.shared) && view
+    }
+
     /// The built-in store: in-memory, or — under the reserved harness
     /// variable `ANTARES_TEST_STORE=file` — a fresh on-disk redb store per
     /// state, so the same test binary proves the durable backend without a
