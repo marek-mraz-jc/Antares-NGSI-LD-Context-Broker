@@ -148,7 +148,7 @@ misspelt one. `/items/{featureId}` takes `properties`, `profile` and `crs` and
 is one Query Entities by `id` and type: an Entity the view hides, of another type, absent, or an id
 that is no URI is `404`.
 
-A `parquet` build (`--features full,parquet`; not in `full`, which sits at
+A `parquet` build (`--features full,parquet`; not in `full`, kept out under
 its ADR-0027 size budget) also writes `/items` as one file (T-4465,
 EP-119): `f=parquet` or `Accept: application/vnd.apache.parquet` returns
 the whole answer of the request's filters (`bbox`, `datetime`, `filter`,

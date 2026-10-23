@@ -46,6 +46,7 @@ a source name. Each call is inverted and rebuilt as on the view root.
 
 | Tool | Operation | Paged |
 |---|---|---|
+| `area_overview` | Query Entities (10.4.3), once per type for one area | no |
 | `batch_query` | Query Entities, POST form (10.4.3) | yes |
 | `batch_query_temporal` | Temporal Query, POST form (11.3.3) | yes |
 | `describe_type` | Retrieve Available Entity Type Information (10.6.5), with the type's query guide | no |
@@ -83,6 +84,44 @@ tight; a row over 1 MiB is skipped and counted. At most four summaries run at
 once (a busy one runs alone); one that waits 2 s for its turn is a tool error
 saying so. Use it for a broad question; use `query_entities` for specific
 Entities.
+
+`area_overview` (T-5279) runs `query_entities`' operation too and is listed
+wherever it is. It answers what lies in one area across every Entity type in
+one call, so a model asks once instead of once per type:
+
+- The area: `geometry` `Point` with `maxDistance` in metres as its radius
+  (default 500), `LineString` with `maxDistance` as its buffer (default 50),
+  `Polygon` or `MultiPolygon`; `coordinates` in WGS84, longitude first. `type`
+  narrows the types (default: every type the view shows), `limit` is the
+  number of Entities per type (default 5, at most 20), `lang` picks a
+  LanguageProperty's text. The names are those of 4.10 and 6.3.10.
+- The limits, checked before anything is read: `maxDistance` at most
+  5,000 m, at most 1,000 positions, each ring closed and not crossing itself,
+  coordinates in range, and an area of at most `ANTARES_AREA_MAX_KM2` (100 km²
+  by default; a `LineString` counts its buffered bounding box). A refusal is
+  a tool error whose structured `error.type` is the slug:
+  `distance-too-large`, `too-many-vertices`, `invalid-polygon`,
+  `invalid-geometry`, `coordinates-out-of-range` or `area-too-large`, with
+  `status` 400.
+- Each type is one Query Entities through the view, eight at a time: a Point
+  reads `near;maxDistance`, a Polygon `intersects`, a `LineString` its
+  buffered box with `intersects`, which the distance to the line then narrows
+  (at most 1,000 rows per type; past them `countExact` is false). The view's
+  rules, `q` narrowings and areas apply to every read, so a count never
+  includes an Entity the caller cannot read and a type the gate refuses is
+  left out. On PostgreSQL each read takes the geohash cover of migration 0015,
+  the index path under row-level security (T-4852).
+- The answer, under `overview`: the area's `bbox`, `km2`, what distances are
+  measured from (`point`, `line`, or the box's `centre` for a polygon) and the
+  `limit`;
+  then each type with Entities, most first: `count`, `countExact`, `ranked`
+  (`nearest`, or `sample` when the type had more than 200 Entities and the
+  nearest were picked from 200 of them) and `entities`, nearest first, each
+  `id`, `name`, `distance_m` and up to four scalar Attributes (those with a
+  unit or an `observedAt` first, text cut at 80 characters). The Entities are
+  cut round by round across types to keep the answer near 18 KiB; `truncated`
+  says when. A distance is measured from an Entity's nearest position, so a
+  large polygon Entity reads farther than its nearest edge.
 
 The write tools (section 3) are listed the same way:
 

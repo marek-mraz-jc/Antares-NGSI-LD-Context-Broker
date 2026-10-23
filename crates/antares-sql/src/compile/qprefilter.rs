@@ -161,9 +161,10 @@ fn leaf(
     }
     let (inner, arm_exact) = instance_predicate(path, cmp, first, &mut binds)?;
     let sql = format!(
-        "EXISTS (SELECT 1 FROM attr_instances qi \
-         WHERE qi.tenant_id = {entity}.tenant_id AND qi.entity_id = {entity}.id \
-         AND qi.attr_id = ${first}{window} AND {inner})"
+        "EXISTS (SELECT 1 FROM (SELECT * FROM attr_instances \
+         WHERE tenant_id = {entity}.tenant_id AND entity_id = {entity}.id AND attr_id = ${first} \
+         UNION ALL SELECT * FROM attr_rows_at({entity}.tenant_id, {entity}.id, ${first})) qi \
+         WHERE true{window} AND {inner})"
     );
     Some((sql, binds, win_exact && arm_exact))
 }
@@ -304,8 +305,13 @@ mod tests {
         let c = pf("speed>25").expect("compiles");
         assert!(!c.sql.contains("speed"), "IRI must travel as a bind");
         assert_eq!(c.binds[0], ex("speed"));
-        assert!(c.sql.contains("EXISTS (SELECT 1 FROM attr_instances qi"));
-        assert!(c.sql.contains("qi.attr_id = $3"), "{}", c.sql);
+        assert!(c
+            .sql
+            .contains("EXISTS (SELECT 1 FROM (SELECT * FROM attr_instances"));
+        assert!(c
+            .sql
+            .contains("UNION ALL SELECT * FROM attr_rows_at(m.tenant_id, m.id, $"));
+        assert!(c.sql.contains("AND attr_id = $3 "), "{}", c.sql);
         // byte-exact text window predicate INSIDE the existence test
         // (5.7.4.4 S2 — this is what makes a Cmp leaf EXACT), its binds
         // [timeproperty, timeAt, endTimeAt] at $4..$6…
