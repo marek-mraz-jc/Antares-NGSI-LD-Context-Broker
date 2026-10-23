@@ -107,7 +107,7 @@ env:
   # describe_type parity case (T-4537, T-4559; conformance main 2594d95)
   # conformance main d581c6d since T-4879: tests/ws/test_rfc6455.py (RFC 6455
   # close handshake and protocol-error codes) joins ws-conformance
-  CONFORMANCE_REF: d581c6d242bc35d9afcbc20d0421d76b3d8b76b2
+  CONFORMANCE_REF: 184b8d8fec7f2f8f9f615eab192a72cab30462d9
   NIGHTLY: ${{ github.event_name != 'pull_request' && !inputs.fast }}
 
 jobs:
