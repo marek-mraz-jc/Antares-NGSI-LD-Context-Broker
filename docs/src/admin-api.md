@@ -196,7 +196,10 @@ GET /q/tenants/acme
 `200`, `404` for a tenant that does not exist, `400` for a name outside the
 tenant grammar or one of the broker's internal names. `createdAt` is present
 on Postgres, where the `tenants` table records it. The default tenant always
-exists (5.5.10) and is always readable, even when empty.
+exists (5.5.10) and is always readable, even when empty. `attrInstances`
+counts the tenant's history under a 5 s statement bound, the same bound as a
+size scan: when a long history does not count in time, the answer leaves
+`attrInstances` out and the other counts still answer.
 
 ### DELETE /q/tenants/{tenant}
 
