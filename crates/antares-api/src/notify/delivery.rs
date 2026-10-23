@@ -372,14 +372,20 @@ pub(super) async fn deliver_as(
     // One store call: the stamp is a fixed mutation, so a backend can write
     // it as a single statement instead of locking the row across a round
     // trip. At fan-out that lock is what serializes delivery.
-    let booked = st
-        .store
-        .record_delivery(tenant, kind, &sub_id, &now)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!("bookkeeping writeback failed: {e}");
-            None
-        });
+    // An in-process delivery (a WebSocket, the forward transport) books with
+    // every other one of its tenant in one statement (T-5159); a network one
+    // keeps its own stamp right before its own send (046_12_01).
+    let booked = if !policed && kind == Kind::Subscription {
+        super::coalesce::book_in_process(st, tenant, &sub_id, &now).await
+    } else {
+        st.store
+            .record_delivery(tenant, kind, &sub_id, &now)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("bookkeeping writeback failed: {e}");
+                None
+            })
+    };
     // 5.8.6: notifications are sent for the subscriptions the broker holds.
     // No row to book against means the subscription was deleted (or the
     // store failed) between matching and delivery — nothing may be sent.

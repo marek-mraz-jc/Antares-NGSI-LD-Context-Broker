@@ -2976,3 +2976,169 @@ mod context_memo {
         assert!(memo.is_empty(), "an inline @context left a memo entry");
     }
 }
+
+/// T-5159: the store calls of in-process deliveries are shared per tenant.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod coalesced_delivery {
+    use super::coalesce::{book, Coalescer};
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn subscription(st: &AppState, tenant: &TenantId, id: &str) {
+        st.store
+            .create(
+                tenant,
+                Kind::Subscription,
+                id,
+                json!({"id": id, "type": "Subscription",
+                       "notification": {"endpoint": {"uri": "x-inproc:a"}}}),
+            )
+            .await
+            .expect("seed subscription");
+    }
+
+    /// Two attempts on one subscription in one batch book two notifications,
+    /// the second getting back the stamp the first wrote; a subscription that
+    /// is gone books nothing and is told so.
+    #[tokio::test]
+    async fn a_batch_books_every_attempt_once() {
+        let st = AppState::new("antares-coalesced-book".into());
+        let tenant = TenantId::new("default").expect("tenant");
+        let (a, b) = ("urn:ngsi-ld:Subscription:a", "urn:ngsi-ld:Subscription:b");
+        subscription(&st, &tenant, a).await;
+        subscription(&st, &tenant, b).await;
+        let (t1, t2) = ("2026-01-01T00:00:01.000Z", "2026-01-01T00:00:02.000Z");
+        let attempts: Vec<(String, String)> = [
+            (a, t1),
+            (b, t1),
+            (a, t2),
+            ("urn:ngsi-ld:Subscription:gone", t1),
+        ]
+        .iter()
+        .map(|(id, t)| ((*id).to_owned(), (*t).to_owned()))
+        .collect();
+        let booked = book(&st, &tenant, &attempts).await;
+        let prev: Vec<Option<Option<Value>>> = booked
+            .iter()
+            .map(|d| d.as_ref().map(|d| d.prev_success.clone()))
+            .collect();
+        assert_eq!(
+            prev,
+            vec![Some(None), Some(None), Some(Some(json!(t1))), None]
+        );
+        let times = |doc: Option<Value>| doc.map(|d| d["notification"]["timesSent"].clone());
+        let stored_a = st
+            .store
+            .get(&tenant, Kind::Subscription, a)
+            .await
+            .expect("read a");
+        let stored_b = st
+            .store
+            .get(&tenant, Kind::Subscription, b)
+            .await
+            .expect("read b");
+        assert_eq!(times(stored_a), Some(json!(2)));
+        assert_eq!(times(stored_b), Some(json!(1)));
+    }
+
+    /// Questions arriving while a tenant's statement runs are answered by
+    /// ONE next statement, each with its own answer, and a question never
+    /// joins the statement already running.
+    #[tokio::test]
+    async fn waiting_questions_share_the_next_statement() {
+        static UNDER_TEST: std::sync::LazyLock<Coalescer<usize, usize>> =
+            std::sync::LazyLock::new(Coalescer::new);
+        let st = AppState::new("antares-coalescer".into());
+        let tenant = TenantId::new("default").expect("tenant");
+        let rounds: Arc<std::sync::Mutex<Vec<Vec<usize>>>> = Arc::default();
+        let started = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let run = {
+            let (rounds, started, gate) = (rounds.clone(), started.clone(), gate.clone());
+            move |_st: AppState, _t: TenantId, qs: Vec<usize>| {
+                let (rounds, started, gate) = (rounds.clone(), started.clone(), gate.clone());
+                async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    // each statement waits for the test to let it finish
+                    gate.acquire().await.map(|p| p.forget()).ok();
+                    if let Ok(mut r) = rounds.lock() {
+                        r.push(qs.clone());
+                    }
+                    qs.iter().map(|q| q.saturating_mul(10)).collect()
+                }
+            }
+        };
+        let first = {
+            let (st, tenant, run) = (st.clone(), tenant.clone(), run.clone());
+            tokio::spawn(async move { UNDER_TEST.call(&st, &tenant, 0, run).await })
+        };
+        while started.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let rest: Vec<_> = (1..=5)
+            .map(|q| {
+                let (st, tenant, run) = (st.clone(), tenant.clone(), run.clone());
+                tokio::spawn(async move { UNDER_TEST.call(&st, &tenant, q, run).await })
+            })
+            .collect();
+        // every waiting question is queued behind the held statement
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        gate.add_permits(2);
+        assert_eq!(first.await.expect("first"), Some(0));
+        let mut answers = Vec::new();
+        for r in rest {
+            answers.push(r.await.expect("waiting"));
+        }
+        assert_eq!(answers, (1..=5).map(|q| Some(q * 10)).collect::<Vec<_>>());
+        let rounds = rounds.lock().map(|r| r.clone()).unwrap_or_default();
+        assert_eq!(rounds, vec![vec![0], vec![1, 2, 3, 4, 5]]);
+    }
+
+    /// Subscriptions that differ only in their endpoint and bookkeeping get
+    /// one payload; a different shape or @context gets its own.
+    #[test]
+    fn equal_shapes_share_one_payload() {
+        let loader = antares_jsonld::Loader::new();
+        let ctx = loader.core();
+        let sub = |uri: &str, extra: Value| {
+            let mut s = json!({"id": "urn:x", "notification": {
+                "endpoint": {"uri": uri}, "format": "keyValues", "timesSent": 3}});
+            if let (Some(n), Value::Object(extra)) = (s["notification"].as_object_mut(), extra) {
+                n.extend(extra);
+            }
+            s
+        };
+        let base = payload_key(&sub("x-inproc:a", json!({})), &ctx, &[], false);
+        let other_socket = payload_key(
+            &sub(
+                "x-inproc:b",
+                json!({"timesSent": 9, "lastNotification": "t"}),
+            ),
+            &ctx,
+            &[],
+            false,
+        );
+        assert_eq!(base, other_socket);
+        let picked = payload_key(
+            &sub("x-inproc:a", json!({"attributes": ["speed"]})),
+            &ctx,
+            &[],
+            false,
+        );
+        assert_ne!(base, picked);
+        let deleted = payload_key(
+            &sub("x-inproc:a", json!({})),
+            &ctx,
+            &["speed".into()],
+            false,
+        );
+        assert_ne!(base, deleted);
+        let own_ctx = Arc::new((*ctx).clone());
+        assert_ne!(
+            base,
+            payload_key(&sub("x-inproc:a", json!({})), &own_ctx, &[], false)
+        );
+    }
+}
