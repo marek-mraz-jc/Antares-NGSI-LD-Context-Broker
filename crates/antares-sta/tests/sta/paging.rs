@@ -116,8 +116,8 @@ async fn an_id_filter_is_read_by_id_and_its_negation_excludes_it() -> Result<(),
     assert_eq!(ids(&hidden.body).len(), 0);
     for refused in [
         "id gt 'a'",
-        "speed gt 1 or id eq 'a'",
-        "id eq 'a' and speed gt 1",
+        "Datastream/Thing/name gt 1 or id eq 'a'",
+        "id eq 'a' and Datastream/Thing/name gt 1",
     ] {
         let r = sta(&f.app, &format!("/Observations?$filter={refused}")).await;
         assert_eq!(r.status, StatusCode::BAD_REQUEST, "{refused}");

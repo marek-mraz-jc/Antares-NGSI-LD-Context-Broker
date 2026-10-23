@@ -59,7 +59,7 @@ dev/ogc-compliance/baseline.py check testng-results.xml ci/ogc-compliance/all.js
 | Part 4 Create, Replace, Update and Delete (20-002, draft) | create-replace-delete, update, features | none: no ETS tests Part 4; the endpoint's own tests cover the W rows |
 | Part 5 Schemas (23-058, draft) | schemas, core-roles-features, feature-references, returnables-and-receivables, sortables, profile-parameter, profile-references | none: no ETS tests Part 5; the endpoint's own tests cover the S rows |
 
-The job pins the 1.8 release; 1.9 is a release candidate.
+The job pins the 1.8 release; 1.9 is a release candidate. Watch: when ETS 1.9 or the published Parts 4 and 5 (drafts 20-002r1, 23-058r1) appear, re-validate the draft conformance ids `antares_ogc::CONFORMANCE` declares (T-5204).
 
 ## 3. The baseline and the regression gate
 

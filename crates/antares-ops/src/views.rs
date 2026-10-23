@@ -311,11 +311,15 @@ impl View {
         };
         if let Some(named) = &self.representations {
             if let Some((name, _)) = named.iter().find(|(name, member)| {
-                // a list past MAX_OUTPUTS loads and serves nobody: the surface refuses it
-                !REPRESENTATIONS.contains(&name.as_str()) || !member.is_array()
+                // each is a list of named outputs: `feed`, `ogc`, `geojson` and `csv` check theirs when
+                // it serves, `ical` (T-5208) refuses more than MAX_OUTPUTS here
+                !REPRESENTATIONS.contains(&name.as_str())
+                    || member
+                        .as_array()
+                        .is_none_or(|outputs| *name == "ical" && outputs.len() > MAX_OUTPUTS)
             }) {
                 return Err(format!(
-                    "representations: {name:?} is not one of {REPRESENTATIONS:?} with a list of outputs"
+                    "representations: {name:?} is not one of {REPRESENTATIONS:?} with a list of outputs (ical: at most {MAX_OUTPUTS})"
                 ));
             }
         }
@@ -1326,6 +1330,10 @@ mod tests {
             Some(ical)
         );
         assert!(load(&base()).is_ok_and(|l| l.representations.is_none()));
+        let many: Vec<Value> = (0..=MAX_OUTPUTS)
+            .map(|i| json!({"name": format!("o{i}")}))
+            .collect();
+        assert!(load(&with("representations", json!({"feed": many.clone()}))).is_ok());
         for bad in [
             json!({"vcard": []}),
             json!({"ical": {"preset": "sdm-event"}}),

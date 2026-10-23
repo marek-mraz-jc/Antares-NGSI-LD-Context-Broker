@@ -21,6 +21,7 @@
 //! ```
 #![forbid(unsafe_code)]
 
+mod area;
 mod budget;
 mod confirm;
 mod cursor;
@@ -83,11 +84,15 @@ pub const SUMMARY_MAX_BYTES_ENV: &str = "ANTARES_SUMMARY_MAX_BYTES";
 /// Concurrency limit for summary tasks.
 pub const SUMMARY_CONCURRENCY_ENV: &str = "ANTARES_SUMMARY_CONCURRENCY";
 
+/// The largest area `area_overview` searches, in km² (T-5279).
+pub const AREA_MAX_KM2_ENV: &str = "ANTARES_AREA_MAX_KM2";
+
 /// Every variable this crate reads. The broker accepts these as config keys
 /// from here, so a new one is added in this crate alone (T-3766).
 pub const ENV_KEYS: &[&str] = &[
     ALLOWED_HOSTS_ENV,
     ALLOWED_ORIGINS_ENV,
+    AREA_MAX_KM2_ENV,
     MAX_RESULT_BYTES_ENV,
     REQUEST_STATE_KEY_FILE_ENV,
     SUBSCRIPTION_ENDPOINTS_ENV,

@@ -12,7 +12,7 @@
 //! travels as a bind).
 
 use antares_model::{NgsiError, TenantId};
-use antares_ql::QNode;
+use antares_ql::{CmpOp, QNode, QValue};
 use serde_json::Value;
 use sqlx::postgres::PgPool;
 use sqlx::Row;
@@ -277,6 +277,34 @@ fn unlocated(q: &QNode, expand: &dyn Fn(&str) -> String) -> bool {
         }
         QNode::And(all) => all.iter().any(|n| unlocated(n, expand)),
         _ => false,
+    }
+}
+
+/// The `name` the core @context gives an Entity (`@vocab` + `name`), the one
+/// attribute `entities.name_key` (0020) keys.
+/// ponytail: one IRI; a `name` another @context maps elsewhere filters as before.
+const NAME_IRI: &str = "https://uri.etsi.org/ngsi-ld/default-context/name";
+
+/// The string a top-level `name=="…"` term of `q` requires. Every match then
+/// has `name_key` equal to it or NULL (0020: NULL is each shape the key
+/// cannot hold), so `(name_key = $n OR name_key IS NULL)` narrows by a
+/// leakproof btree under RLS where the `@?` read the whole Tenant (T-5349);
+/// the `@?` stays and decides. A NUL is no Postgres text: no narrowing.
+fn named<'q>(q: &'q QNode, expand: &dyn Fn(&str) -> String) -> Option<&'q str> {
+    match q {
+        QNode::Cmp {
+            path,
+            op: CmpOp::Eq,
+            value: QValue::Str(want),
+        } if path.links.is_empty()
+            && path.bracket.is_none()
+            && !want.contains('\0')
+            && matches!(path.path.as_slice(), [term] if expand(term) == NAME_IRI) =>
+        {
+            Some(want)
+        }
+        QNode::And(all) => all.iter().find_map(|n| named(n, expand)),
+        _ => None,
     }
 }
 
@@ -891,6 +919,10 @@ impl PgEntityStore {
             if unlocated(node, f.expand) {
                 wheres.push("location IS NULL".to_owned());
             }
+            if let Some(name) = named(node, f.expand) {
+                binds.push(Bind::Text(name.to_owned()));
+                wheres.push(format!("(name_key = ${} OR name_key IS NULL)", binds.len()));
+            }
         }
         if let Some(sq) = f.scope_q {
             decided = false;
@@ -979,10 +1011,9 @@ impl PgEntityStore {
         // plus `$n` placeholders — no caller-supplied text reaches it.
         // The audit lives here, next to the builder.
         // Unprepared: a prepared statement goes to a generic plan after five
-        // runs on a connection, and that plan cannot tell a selective `@?`
-        // from one `jsonb_path_ops` cannot narrow. It ORs one GIN scan per
-        // `q` alternative over the whole type: 1.6 s instead of 1.5 ms at
-        // 100 000 entities (T-3735). The text varies with every q, geo and
+        // runs on a connection, and that plan cannot see a selective value:
+        // 1.6 s instead of 1.5 ms at 100 000 entities when a GIN still
+        // existed (T-3735). The text varies with every q, geo and
         // projection shape, so the statement cache saved little anyway.
         let mut qy = sqlx::query(sqlx::AssertSqlSafe(sql.clone())).persistent(false);
         for b in &binds {
@@ -1751,6 +1782,39 @@ mod tests {
             "!location[x]",
         ] {
             assert!(!narrows(q), "{q}");
+        }
+    }
+
+    /// T-5349: only a `name=="…"` string every match must equal narrows to
+    /// `name_key`; an alternative, another operator or value, a sub-path or
+    /// another attribute does not.
+    #[test]
+    fn only_a_required_name_string_narrows_to_the_name_key() {
+        let expand = |t: &str| match t {
+            "name" => NAME_IRI.to_owned(),
+            t => format!("https://x/{t}"),
+        };
+        let wants =
+            |q: &str| named(&antares_ql::parse_q(q).expect("q parses"), &expand).map(str::to_owned);
+        for (q, want) in [
+            (r#"name=="Bratislavský""#, "Bratislavský"),
+            (r#"a>1;name=="x""#, "x"),
+            (r#"(a==1;name=="");b"#, ""),
+        ] {
+            assert_eq!(wants(q).as_deref(), Some(want), "{q}");
+        }
+        for q in [
+            "name",
+            r#"name!="x""#,
+            r#"name=="x"|a==1"#,
+            "name==1",
+            r#"name=="x","y""#,
+            r#"name~="x""#,
+            r#"name.sub=="x""#,
+            r#"name[x]=="x""#,
+            r#"title=="x""#,
+        ] {
+            assert_eq!(wants(q), None, "{q}");
         }
     }
 

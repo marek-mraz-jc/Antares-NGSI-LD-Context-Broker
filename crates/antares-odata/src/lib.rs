@@ -120,11 +120,25 @@ async fn respond(ops: &Ops, mut req: Request) -> Response {
     let Some(view) = ops.view(&id) else {
         return not_found();
     };
-    let Some((edm, csdl, metadata_etag)) = model(&id, &view, csdl_version(&req)) else {
+    let version = csdl_version(&req);
+    let Some((edm, csdl, metadata_etag)) = model(&id, &view, version) else {
         return not_found();
     };
+    // A 4.0 document serves an Untyped member as a dynamic property of an open type (CSDL XML
+    // 3.4); its URLs resolve against the 4.01 model, which names each, so a name no model holds
+    // stays unknown (T-5206).
+    let open = csdl
+        .schemas
+        .iter()
+        .flat_map(|s| &s.entity_types)
+        .any(|t| t.open);
+    let url_model = (version == CsdlVersion::V4_0 && open)
+        .then(|| model(&id, &view, CsdlVersion::V4_01))
+        .flatten()
+        .map(|(_, csdl, _)| csdl);
     let state = Arc::new(ODataState {
         model: csdl,
+        url_model,
         // Absolute: a path-only context URL is read as a file path by
         // Microsoft.OData.Core on Linux (T-3688).
         service_root: format!(

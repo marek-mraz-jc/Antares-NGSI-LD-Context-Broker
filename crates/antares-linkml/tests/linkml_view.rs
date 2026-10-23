@@ -802,7 +802,7 @@ impl PolicyEngine for NotCoreCarNotCoreSpeed {
 
 /// T-3645: a schema in another vocabulary (`sdm:`, as Model Tools renders helsinki's) and a view
 /// written with short names, as the Portal writes them. The surface shows what the view names,
-/// read under the core @context, keeps the model's own IRIs in what it serves, hides the rest,
+/// read under the core @context, serves the IRIs the view reads (the `OData` surface's, T-5206), hides the rest,
 /// and asks the engine about the IRI the view shows.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_schema_of_another_vocabulary_serves_what_a_short_named_view_shows() {
@@ -825,7 +825,10 @@ async fn a_schema_of_another_vocabulary_serves_what_a_short_named_view_shows() {
     let (s, _, car) = get(&app, "classes/Car").await;
     assert_eq!(s, StatusCode::OK, "{car}");
     let car: Value = serde_json::from_str(&car).expect("json");
-    assert_eq!(car["iri"], "https://smartdatamodels.org/Car");
+    assert_eq!(
+        car["iri"],
+        "https://uri.etsi.org/ngsi-ld/default-context/Car"
+    );
     assert_eq!(get(&app, "slots/speed").await.0, StatusCode::OK);
     for path in ["classes/Person", "slots/owner_secret", "slots/name"] {
         assert_eq!(get(&app, path).await.0, StatusCode::NOT_FOUND, "{path}");

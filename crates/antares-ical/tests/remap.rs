@@ -319,11 +319,11 @@ fn lists_relationships_and_an_organizer_object_are_read() {
         has(&l, "DESCRIPTION:urn:ngsi-ld:Place:dom-kultury"),
         "{l:?}"
     );
-    // CN is a quoted parameter: no quote, CR or LF survives into it
+    // CN is a quoted parameter: a quote and LF are caret escapes, CR is dropped
     assert!(
         has(
             &l,
-            "ORGANIZER;CN=\"Mestský úradATTENDEE:x\":https://zvolen.sk"
+            "ORGANIZER;CN=\"Mestský ^'úrad^'^nATTENDEE:x\":https://zvolen.sk"
         ),
         "{l:?}"
     );
@@ -470,5 +470,46 @@ fn an_output_is_refused_with_its_reason() {
         &"sk-a".repeat(10),
     ] {
         assert!(!is_language_tag(tag), "{tag}");
+    }
+}
+
+#[test]
+fn an_organizer_object_writes_its_name_as_cn_and_needs_a_url() {
+    // T-5134: the sdm-event preset maps `organizer`, the Event model's `{name, url}`.
+    let ical = json!({"preset": "sdm-event"});
+    let organizer =
+        |value: Value| entity(&json!({"organizer": {"type": "Property", "value": value}}));
+    let l = render(
+        &ical,
+        &organizer(json!({"name": "Kultúra, šport; \"Zvolen\"", "url": "https://www.zvolen.sk"})),
+    );
+    assert!(
+        has(
+            &l,
+            "ORGANIZER;CN=\"Kultúra, šport; ^'Zvolen^'\":https://www.zvolen.sk"
+        ),
+        "{l:?}"
+    );
+    let l = render(
+        &ical,
+        &organizer(json!({"name": "a^b\nc\td", "url": "mailto:info@zvolen.sk"})),
+    );
+    assert!(
+        has(&l, "ORGANIZER;CN=\"a^^b^ncd\":mailto:info@zvolen.sk"),
+        "{l:?}"
+    );
+    let l = render(&ical, &organizer(json!({"url": "https://www.zvolen.sk"})));
+    assert!(has(&l, "ORGANIZER:https://www.zvolen.sk"), "{l:?}");
+    // no url, or one that is no cal-address: no ORGANIZER, never the event's own URL instead
+    for value in [
+        json!({"name": "Mestský úrad"}),
+        json!({"name": "Mestský úrad", "url": "zvolen.sk"}),
+        json!({"name": "Mestský úrad", "url": "https://x.sk/a b"}),
+    ] {
+        let mut e = organizer(value);
+        e["url"] = json!({"type": "Property", "value": "https://www.zvolen.sk/podujatie/1"});
+        let l = render(&ical, &e);
+        assert!(!l.iter().any(|x| x.starts_with("ORGANIZER")), "{l:?}");
+        assert!(has(&l, "URL:https://www.zvolen.sk/podujatie/1"), "{l:?}");
     }
 }

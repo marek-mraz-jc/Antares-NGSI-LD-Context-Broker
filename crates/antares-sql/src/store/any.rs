@@ -1664,6 +1664,41 @@ impl antares_store::CurrentStateDriver for AnyStore {
         }
         antares_store::record_delivery_via_mutate(self, tenant, kind, id, now).await
     }
+    /// The Postgres arm books every attempt in ONE statement (see
+    /// `pg::doc::record_deliveries`); every other arm books them one by one.
+    async fn record_deliveries(
+        &self,
+        tenant: &TenantId,
+        kind: Kind,
+        attempts: &[(&str, &str)],
+    ) -> Result<Vec<Option<antares_store::Delivery>>, NgsiError> {
+        #[cfg(feature = "postgres")]
+        {
+            if let (AnyStore::Pg(p), Ok(dk)) = (self, doc_kind(kind)) {
+                let mut found = p
+                    .docs
+                    .record_deliveries(tenant, dk, attempts)
+                    .await
+                    .map_err(db)?;
+                return Ok(attempts
+                    .iter()
+                    .map(|(id, _)| {
+                        found
+                            .remove(*id)
+                            .map(|(doc, prev_success)| antares_store::Delivery {
+                                doc,
+                                prev_success,
+                            })
+                    })
+                    .collect());
+            }
+        }
+        let mut out = Vec::with_capacity(attempts.len());
+        for (id, now) in attempts {
+            out.push(antares_store::record_delivery_via_mutate(self, tenant, kind, id, now).await?);
+        }
+        Ok(out)
+    }
     async fn sweep_expired(&self) -> usize {
         AnyStore::sweep_expired(self)
     }
@@ -1921,7 +1956,8 @@ impl antares_store::TemporalDriver for AnyStore {
                 async {
                     let mut tx = tenant_tx(p, tenant).await?;
                     let n: i64 = sqlx::query_scalar(
-                        "SELECT count(*) FROM attr_instances WHERE tenant_id = $1",
+                        "SELECT (SELECT count(*) FROM attr_instances WHERE tenant_id = $1)
+                              + (SELECT count(*) FROM attr_rows WHERE tenant_id = $1)",
                     )
                     .bind(tenant.as_str())
                     .fetch_one(&mut *tx)
@@ -1945,8 +1981,10 @@ impl antares_store::TemporalDriver for AnyStore {
                         .await
                         .map_err(db)?;
                     let n: i64 = sqlx::query_scalar(
-                        "SELECT coalesce(sum(pg_column_size(a.*)), 0)::bigint
-                           FROM attr_instances a WHERE tenant_id = $1",
+                        "SELECT (SELECT coalesce(sum(pg_column_size(a.*)), 0)
+                                   FROM attr_instances a WHERE tenant_id = $1)::bigint
+                              + (SELECT coalesce(sum(pg_column_size(r.*)), 0)
+                                   FROM attr_rows r WHERE tenant_id = $1)::bigint",
                     )
                     .bind(tenant.as_str())
                     .fetch_one(&mut *tx)
@@ -1972,6 +2010,8 @@ impl antares_store::TemporalDriver for AnyStore {
                     // attr_instances tenant-predicate check reads literals
                     for sql in [
                         "DELETE FROM attr_instances WHERE tenant_id = $1",
+                        "DELETE FROM attr_rows WHERE tenant_id = $1",
+                        "DELETE FROM iri_ids WHERE tenant_id = $1",
                         "DELETE FROM attr_versions WHERE tenant_id = $1",
                         "DELETE FROM temporal_entities WHERE tenant_id = $1",
                     ] {

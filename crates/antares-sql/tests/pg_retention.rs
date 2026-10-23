@@ -477,6 +477,79 @@ async fn history_scopes_reach_one_entity_a_type_and_the_rest() {
 /// DM-97: a weekly partition below the pre-created window that the sweeps
 /// emptied is dropped, so its disk goes back; one that still holds a row,
 /// and the window itself, stay.
+/// A type's history is deleted by a walk over its Entities in chunks of a
+/// tenth of the batch (T-5157), never by one JOIN of the type to the whole
+/// history: Entities with nothing to delete are passed in the same call, a
+/// backlog spread over chunks drains in batches, and the same type in
+/// another Tenant keeps its rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_type_is_walked_in_chunks_of_entities() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let store = PgTemporalStore::new(pool.clone());
+    let attr = "https://example.org/speed";
+    let put = |t: &'static str, id: String, minutes: Vec<i64>| {
+        let store = &store;
+        async move {
+            let tenant = TenantId::new(t).expect("tenant");
+            let _ = store.delete(&tenant, &id).await;
+            let instances: Vec<_> = minutes
+                .iter()
+                .map(|m| json!({"type": "Property", "value": m, "observedAt": ago(*m), "instanceId": format!("urn:i:{id}:{m}")}))
+                .collect();
+            let doc = json!({"id": id, "type": [V], "createdAt": ago(120), "modifiedAt": ago(1), attr: instances});
+            assert!(store.create(&tenant, &id, &doc).await.expect("create"));
+        }
+    };
+    for t in ["retain-walk", "retain-walk-b"] {
+        let tenant = TenantId::new(t).expect("tenant");
+        pg::ensure_tenant(&pool, &tenant).await.expect("tenant row");
+    }
+    // 35 Entities with only fresh rows, then one with an old row: four chunks.
+    for i in 0..35 {
+        put("retain-walk", format!("urn:v:a{i:02}"), vec![1]).await;
+    }
+    put("retain-walk", "urn:v:z".to_owned(), vec![1, 10]).await;
+    put("retain-walk-b", "urn:v:z".to_owned(), vec![1, 10]).await;
+    assert_eq!(
+        retain_history(&pool, "retain-walk", ty(V), &ago(5), 100, false)
+            .await
+            .expect("walk"),
+        1,
+        "the old row behind 35 Entities with nothing to delete"
+    );
+    let left = |t: &'static str| {
+        count(
+            &pool,
+            "SELECT count(*) FROM attr_instances WHERE tenant_id = $1",
+            t,
+        )
+    };
+    assert_eq!(left("retain-walk").await, 36);
+    assert_eq!(
+        left("retain-walk-b").await,
+        2,
+        "the other Tenant keeps its row"
+    );
+
+    // 25 Entities with 3 old rows each, batch 20 (chunks of 10).
+    for i in 0..25 {
+        put("retain-walk", format!("urn:v:b{i:02}"), vec![10, 11, 12]).await;
+    }
+    let mut rounds = Vec::new();
+    loop {
+        let n = retain_history(&pool, "retain-walk", ty(V), &ago(5), 20, false)
+            .await
+            .expect("retain");
+        rounds.push(n);
+        if n < 20 {
+            break;
+        }
+    }
+    assert_eq!(rounds, [20, 20, 20, 15]);
+    assert_eq!(left("retain-walk").await, 36);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_past_partition_the_sweeps_emptied_is_dropped_and_a_held_one_stays() {
     let url = require_db!();

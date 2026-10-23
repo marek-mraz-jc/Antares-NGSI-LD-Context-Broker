@@ -659,3 +659,33 @@ async fn a_hidden_attribute_filters_as_unknown_and_a_malformed_filter_is_400() -
     }
     Ok(())
 }
+
+/// T-5169: an id list selects the same Entities on every surface, a missing id selecting none;
+/// OGC lowers `id IN (…)`, alone or with a value conjunct, to the NGSI-LD `id` list.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_id_list_selects_the_same_on_every_surface() -> Result<(), String> {
+    let (_broker, app) = broker().await?;
+    let (a, b, none) = (
+        "urn:ngsi-ld:Vehicle:03",
+        "urn:ngsi-ld:Vehicle:10",
+        "urn:ngsi-ld:Vehicle:99",
+    );
+    let want = sorted([a.to_owned(), b.to_owned()]);
+    let uri = format!(
+        "/x/views/{VIEW}/ngsi-ld/v1/entities?{}",
+        query(&[("type", "Vehicle"), ("id", &format!("{a},{b},{none}"))])
+    );
+    let (status, body) = send(&app, "GET", &uri, "", &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(sorted(ids_at(&body, "")), want, "ngsi-ld");
+    let odata_ids = odata(&app, &format!("id in ('{a}','{b}','{none}')")).await?;
+    assert_eq!(sorted(odata_ids), want, "odata");
+    let form = format!("filter=id IN ('{a}','{b}','{none}')");
+    assert_eq!(sorted(ogc(&app, &form).await?), want, "ogc");
+    #[cfg(feature = "tabular")]
+    assert_eq!(ogc_csv(&app, &form).await?, want, "ogc csv");
+    // Vehicle 03 is a car, 10 a tram: the value conjunct keeps one.
+    let anded = format!("filter=id IN ('{a}','{b}') AND vehicleType = 'tram'");
+    assert_eq!(ogc(&app, &anded).await?, [b.to_owned()], "ogc and");
+    Ok(())
+}

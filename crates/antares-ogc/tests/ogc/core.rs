@@ -60,6 +60,10 @@ async fn conformance_lists_what_is_served() -> Result<(), String> {
         json!({"conformsTo": read_only}),
         "a view that offers no write declares no Part 4 class (W4)"
     );
+    // `/functions` lists none, so CQL2 `functions` is not declared (T-5204).
+    assert!(!antares_ogc::CONFORMANCE
+        .iter()
+        .any(|c| c.ends_with("/conf/functions")));
     let fleet = get(&f.app, "/x/views/fleet/ogc/features/conformance").await;
     assert_eq!(
         fleet.body,
@@ -102,7 +106,7 @@ async fn head_is_the_get_without_its_body() -> Result<(), String> {
 async fn unknown_and_invalid_parameters_are_400() -> Result<(), String> {
     let f = fixture().await?;
     for uri in [
-        format!("{ROOT}?f=json"),
+        format!("{ROOT}?f=xml"),
         format!("{ROOT}/conformance?x=1"),
         format!("{ROOT}/collections?limit=1"),
         format!("{ROOT}/collections/Car?bbox=0,0,1,1"),
@@ -117,7 +121,7 @@ async fn unknown_and_invalid_parameters_are_400() -> Result<(), String> {
         format!("{ROOT}/collections/Car/items?datetime=yesterday"),
         format!("{ROOT}/collections/Car/items?limit=1&limit=2"),
         format!("{ROOT}/collections/Car/items?next=garbage"),
-        format!("{ROOT}/collections/Car/schema?f=json"),
+        format!("{ROOT}/collections/Car/schema?f=html"),
         format!("{ROOT}/collections/Car/sortables?limit=1"),
         format!("{ROOT}/collections/Car/items/urn:ngsi-ld:Car:1?sortby=speed"),
         format!("{ROOT}/collections/Car/items?sortby=wheels"),
@@ -219,6 +223,22 @@ async fn a_write_the_view_does_not_offer_is_405_with_allow() -> Result<(), Strin
             Some(&b"GET, HEAD, OPTIONS"[..]),
             "{method}"
         );
+    }
+    Ok(())
+}
+
+/// T-5204: `f=json` and `f=geojson` choose the JSON this surface writes, whatever `Accept` says.
+#[tokio::test(flavor = "multi_thread")]
+async fn f_json_is_the_json_encoding() -> Result<(), String> {
+    let f = fixture().await?;
+    for uri in [
+        format!("{ROOT}?f=json"),
+        format!("{ROOT}/collections?f=json"),
+        format!("{ROOT}/collections/Car/items?f=geojson&limit=1"),
+        format!("{ROOT}/collections/Car/schema?f=json"),
+    ] {
+        let a = send(&f.app, "GET", &uri, "", &[("Accept", "text/html")]).await;
+        assert_eq!(a.status, StatusCode::OK, "{uri}: {}", a.body);
     }
     Ok(())
 }

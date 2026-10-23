@@ -3,7 +3,9 @@
 //!
 //! The platform's gateway verifies the caller and names it in
 //! `JC-Provenance-Channel`, `JC-Provenance-Actor`, `JC-Reason` and
-//! `X-Request-Id`. Those headers are believed only from the gateway itself:
+//! `X-Request-Id`, the writer's Organization and kind in
+//! `JC-Provenance-Organization` and `JC-Provenance-Actor-Kind`, and an audited
+//! Endpoint's write in `JC-Provenance-Audit: changes` (ADR-N-054 2.8). Those headers are believed only from the gateway itself:
 //! the request must carry the mesh identity `ANTARES_PROVENANCE_FROM` names in
 //! `l5d-client-id`, the header the Linkerd proxy in front of the broker sets
 //! from the caller's mTLS certificate. Unset, or from anyone else, a write is
@@ -18,6 +20,9 @@ use serde_json::{json, Value};
 #[cfg(feature = "jc")]
 /// The channels a write may name (ADR-N-054 2.3); anything else is `api`.
 const CHANNELS: &[&str] = &["pipeline", "api", "ui", "import", "backfill", "mqtt"];
+#[cfg(feature = "jc")]
+/// The kinds of writer (ADR-N-054 2.3); anything else is left out.
+const ACTOR_KINDS: &[&str] = &["person", "serviceAccount", "pipeline", "agent"];
 #[cfg(feature = "jc")]
 const MAX_ACTOR: usize = 200;
 #[cfg(feature = "jc")]
@@ -39,8 +44,26 @@ pub fn of_request(headers: &HeaderMap, gateway: Option<&str>) -> Value {
     if !believed {
         return Value::Object(out);
     }
-    if let Some(actor) = header("jc-provenance-actor").filter(|a| plain(a, MAX_ACTOR)) {
+    // The gateway percent-encodes the actor (`serviceAccount%3Apl-parking`).
+    if let Some(actor) = header("jc-provenance-actor")
+        .and_then(percent_decoded)
+        .filter(|a| plain(a, MAX_ACTOR))
+    {
         out.insert("actor".into(), json!(actor));
+    }
+    if let Some(organization) = header("jc-provenance-organization")
+        .and_then(percent_decoded)
+        .filter(|o| plain(o, MAX_ACTOR))
+    {
+        out.insert("organization".into(), json!(organization));
+    }
+    if let Some(kind) = header("jc-provenance-actor-kind").filter(|k| ACTOR_KINDS.contains(k)) {
+        out.insert("actorKind".into(), json!(kind));
+    }
+    // An audited Endpoint's write (DM-136): kept as a version whatever the
+    // type's history rule; the row says why it exists.
+    if header("jc-provenance-audit") == Some("changes") {
+        out.insert(AUDIT.into(), json!(true));
     }
     if let Some(reason) = header("jc-reason")
         .and_then(percent_decoded)
@@ -57,6 +80,15 @@ pub fn of_request(headers: &HeaderMap, gateway: Option<&str>) -> Value {
         out.insert("requestId".into(), json!(id));
     }
     Value::Object(out)
+}
+
+/// The provenance member that marks a row kept because its Endpoint audits
+/// changes (ADR-N-054 2.8, DM-136).
+pub const AUDIT: &str = "audit";
+
+/// Whether `provenance` is an audited write's (DM-136).
+pub fn audited(provenance: &Value) -> bool {
+    provenance.get(AUDIT) == Some(&Value::Bool(true))
 }
 
 /// Vanilla: no header is read, every write is `channel: api`.
@@ -184,6 +216,57 @@ mod tests {
         ] {
             assert_eq!(of_request(&h, gateway), json!({"channel": "api"}));
         }
+    }
+
+    #[cfg(feature = "jc")]
+    #[test]
+    fn the_actor_is_stored_as_the_gateway_named_it() {
+        let h = headers(&[
+            ("l5d-client-id", GATEWAY),
+            ("jc-provenance-channel", "pipeline"),
+            ("jc-provenance-actor", "serviceAccount%3Apl-parking"),
+        ]);
+        assert_eq!(
+            of_request(&h, Some(GATEWAY)),
+            json!({"channel": "pipeline", "actor": "serviceAccount:pl-parking"})
+        );
+        // A broken escape or a decoded control character names nobody.
+        for bad in ["user%3", "user%0Ajana"] {
+            let h = headers(&[("l5d-client-id", GATEWAY), ("jc-provenance-actor", bad)]);
+            assert_eq!(of_request(&h, Some(GATEWAY)), json!({"channel": "api"}));
+        }
+    }
+
+    #[cfg(feature = "jc")]
+    #[test]
+    fn organization_kind_and_audit_are_believed_from_the_gateway_alone() {
+        let named = [
+            ("jc-provenance-actor", "user%3Ajana"),
+            ("jc-provenance-organization", "banska-bystrica"),
+            ("jc-provenance-actor-kind", "agent"),
+            ("jc-provenance-audit", "changes"),
+        ];
+        let mut from_gateway = named.to_vec();
+        from_gateway.push(("l5d-client-id", GATEWAY));
+        let stored = of_request(&headers(&from_gateway), Some(GATEWAY));
+        assert_eq!(
+            stored,
+            json!({"channel": "api", "actor": "user:jana", "organization": "banska-bystrica",
+                   "actorKind": "agent", "audit": true})
+        );
+        assert!(audited(&stored));
+        // Forged by anyone else: nothing of it is kept, no audit row forced.
+        let forged = of_request(&headers(&named), Some(GATEWAY));
+        assert_eq!(forged, json!({"channel": "api"}));
+        assert!(!audited(&forged));
+        // An unknown kind, an organization with a control character, another audit word.
+        let odd = headers(&[
+            ("l5d-client-id", GATEWAY),
+            ("jc-provenance-organization", "hel%0Afi"),
+            ("jc-provenance-actor-kind", "robot"),
+            ("jc-provenance-audit", "all"),
+        ]);
+        assert_eq!(of_request(&odd, Some(GATEWAY)), json!({"channel": "api"}));
     }
 
     #[cfg(feature = "jc")]

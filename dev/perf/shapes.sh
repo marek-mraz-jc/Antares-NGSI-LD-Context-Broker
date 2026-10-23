@@ -11,7 +11,7 @@
 #
 # Env: BIN (target/release/antares), SETUP (a command run against PORT once
 #      each broker answers, before its seed), BIN_SURFACES (unset: a `full` build,
-#      whose `query`, `view`, `odata` and `mcp` rows follow the vanilla
+#      whose `query`, `view`, `odata`, `mcp` and `ogc` rows follow the vanilla
 #      ones), SURFACE_VUS (50: their closed-loop clients), OUT
 #      (results/perf), PORT (9471),
 #      DATABASE_URL, RUNS (3), DURATION (5s), ENTITIES (100, seeded per
@@ -124,7 +124,7 @@ unseed() {  # unseed <store>: the seeded Vehicles out again, so a PostgreSQL kee
     [ -x "$BIN_SURFACES" ] || { echo "missing $BIN_SURFACES" >&2; exit 1; }
     mkdir -p "$DATA/surfaces"
     ANTARES_STORE=memory ANTARES_DATA_DIR="$DATA/surfaces" ANTARES_HTTP_PORT="$PORT" \
-      ANTARES_ALLOW_SHARED_LOCAL=1 ANTARES_API_SURFACES=admin,views,odata,mcp \
+      ANTARES_ALLOW_SHARED_LOCAL=1 ANTARES_API_SURFACES=admin,views,odata,mcp,ogc \
       ANTARES_SCHEMA_MAX_BYTES=65536 "$BIN_SURFACES" > "$OUT/shapes-surfaces.log" 2>&1 & PID=$!
     until curl -sf -o /dev/null "http://127.0.0.1:$PORT/q/health"; do
       kill -0 "$PID" 2>/dev/null || { echo "broker exited: $OUT/shapes-surfaces.log" >&2; exit 1; }
@@ -147,7 +147,7 @@ unseed() {  # unseed <store>: the seeded Vehicles out again, so a PostgreSQL kee
                              "annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "GeoProperty"}}}}}'
     echo "shapes surfaces seed" > "$OUT/phase"
     seed memory
-    for shape in query view odata mcp; do
+    for shape in query view odata mcp ogc; do
       spec="$shape ${SURFACE_VUS:-50}"
       echo "shapes surfaces ${spec// /-c}" > "$OUT/phase"
       read -r shape vus <<<"$spec"
