@@ -39,7 +39,11 @@ pub fn of_request(headers: &HeaderMap, gateway: Option<&str>) -> Value {
     if !believed {
         return Value::Object(out);
     }
-    if let Some(actor) = header("jc-provenance-actor").filter(|a| plain(a, MAX_ACTOR)) {
+    // The gateway percent-encodes the actor (`serviceAccount%3Apl-parking`).
+    if let Some(actor) = header("jc-provenance-actor")
+        .and_then(percent_decoded)
+        .filter(|a| plain(a, MAX_ACTOR))
+    {
         out.insert("actor".into(), json!(actor));
     }
     if let Some(reason) = header("jc-reason")
@@ -183,6 +187,25 @@ mod tests {
             (headers(&from_gateway), None),
         ] {
             assert_eq!(of_request(&h, gateway), json!({"channel": "api"}));
+        }
+    }
+
+    #[cfg(feature = "jc")]
+    #[test]
+    fn the_actor_is_stored_as_the_gateway_named_it() {
+        let h = headers(&[
+            ("l5d-client-id", GATEWAY),
+            ("jc-provenance-channel", "pipeline"),
+            ("jc-provenance-actor", "serviceAccount%3Apl-parking"),
+        ]);
+        assert_eq!(
+            of_request(&h, Some(GATEWAY)),
+            json!({"channel": "pipeline", "actor": "serviceAccount:pl-parking"})
+        );
+        // A broken escape or a decoded control character names nobody.
+        for bad in ["user%3", "user%0Ajana"] {
+            let h = headers(&[("l5d-client-id", GATEWAY), ("jc-provenance-actor", bad)]);
+            assert_eq!(of_request(&h, Some(GATEWAY)), json!({"channel": "api"}));
         }
     }
 
