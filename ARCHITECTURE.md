@@ -91,6 +91,7 @@ module's header comment.
 | `paging.rs` | 4.12, 6.3.10 limit/offset/count and the next/prev links, 4.23 ordering and ICU collation, 6.3.17 `NGSILD-Warning`, the query body of 5.2.23 lifted into parameters; every list operation pages through it |
 | `admin_auth.rs` | the optional `/q` admin credential (T-3569): one bearer secret from `ANTARES_ADMIN_TOKEN_FILE`, compared without an early exit; health and readiness stay open, metrics configurable |
 | `attrs.rs` | 5.6.2–5.6.5 attribute operations, 10.2.6 Set Attribute Value |
+| `channels.rs` | inbound bridge Channels (ADR-0031, feature `channels`): `/x/channels`, the loopback and MQTT bridges, bind and relay through the policy seam |
 | `batch.rs` | 5.6.7–5.6.10, 5.6.20 `/entityOperations/*` |
 | `temporal.rs` | 5.6.11–5.6.16, 5.7.3–5.7.4 `/temporal/entities` |
 | `temporalq.rs` | 5.2.21 `TemporalQ` from the timerel/timeAt/endTimeAt/timeproperty parameters and the 4.11 instance match; named by temporal, csource, federation and subscriptions |

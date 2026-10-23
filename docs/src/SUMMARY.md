@@ -26,6 +26,7 @@
 - [GTFS Realtime of a view](gtfsrt.md)
 - [JSON-stat of a view](jsonstat.md)
 - [WebSocket notifications](websocket.md)
+- [Inbound Channels](channels.md)
 - [Federation](federation.md)
 - [Internal context sources](internal-context-sources.md)
 - [Operations](operations.md)
