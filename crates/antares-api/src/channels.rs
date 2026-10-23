@@ -220,8 +220,10 @@ impl Bridge for Mqtt {
 }
 
 /// Aborts a task when dropped.
+#[cfg(feature = "mqtt")]
 struct AbortOnDrop(tokio::task::AbortHandle);
 
+#[cfg(feature = "mqtt")]
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
