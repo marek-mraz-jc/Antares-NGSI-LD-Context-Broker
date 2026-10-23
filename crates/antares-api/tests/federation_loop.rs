@@ -1041,6 +1041,58 @@ async fn clause_5_6_8_remote_204_upsert_is_update_not_create() {
     assert_eq!(m.hits.load(Ordering::SeqCst), 1, "one batch forward");
 }
 
+/// 5.6.8.4: S holds "one [Entity ID] for each NGSI-LD Entity which was
+/// successfully processed". Under an inclusive registration the Entity is
+/// created locally AND on the source, and its id is listed once (Coraine
+/// entity_batch_upsert_distops_inclusive listed it twice).
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_5_6_8_inclusive_upsert_lists_each_created_id_once() {
+    let body = format!("[\"{ENTITY}\"]");
+    let reply = format!(
+        "HTTP/1.1 201 Created\r\nConnection: close\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let m = mock_replying(Box::leak(reply.into_boxed_str()));
+    let st = state();
+    let reg = serde_json::json!({
+        "id": "urn:ngsi-ld:ContextSourceRegistration:ups-incl",
+        "type": "ContextSourceRegistration",
+        "mode": "inclusive",
+        "operations": ["upsertBatch"],
+        "information": [{"entities": [{"type": "Vehicle", "id": ENTITY}]}],
+        "endpoint": format!("http://127.0.0.1:{}", m.port),
+    })
+    .to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ngsi-ld/v1/csourceRegistrations")
+        .header("Content-Type", "application/json")
+        .header("Content-Length", reg.len())
+        .body(Body::from(reg))
+        .expect("request");
+    assert_eq!(send(&st, req).await.status(), StatusCode::CREATED);
+    let body = serde_json::json!([
+        {"id": ENTITY, "type": "Vehicle", "speed": {"type": "Property", "value": 7}}
+    ])
+    .to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ngsi-ld/v1/entityOperations/upsert")
+        .header("Content-Type", "application/json")
+        .header("Content-Length", body.len())
+        .body(Body::from(body))
+        .expect("request");
+    let res = send(&st, req).await;
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let ids: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(ids, serde_json::json!([ENTITY]));
+    assert_eq!(m.hits.load(Ordering::SeqCst), 1, "one batch forward");
+}
+
 /// The other half of that rule. 5.6.8.4's distributed branch says to "Merge
 /// the returned list of Entities successfully created with S", so an Entity
 /// a Context Source created is one this request created — and 5.6.8.5's

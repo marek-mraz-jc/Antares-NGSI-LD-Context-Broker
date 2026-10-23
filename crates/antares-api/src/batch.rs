@@ -895,7 +895,11 @@ async fn forward_batch(
     for (id, was_created) in remote_ok {
         if was_created {
             *any_created = true;
-            created_ids.push(id.clone());
+            // 5.6.8.4: one Entity ID per Entity, the local and the forwarded
+            // part of one Entity included
+            if !created_ids.contains(&id) {
+                created_ids.push(id.clone());
+            }
         }
         if !out.success.iter().any(|v| v.as_str() == Some(id.as_str())) {
             out.success.push(Value::String(id));
