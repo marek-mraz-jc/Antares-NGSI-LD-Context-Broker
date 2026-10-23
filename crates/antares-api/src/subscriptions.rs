@@ -40,6 +40,16 @@ fn norm_entity_selectors(v: &Value, ctx: &Context) -> Result<Value, NgsiError> {
         let eo = e
             .as_object()
             .ok_or_else(|| bad("entities entries must be objects".into()))?;
+        // the core @context aliases id to @id and type to @type: both names
+        // in one selector collide (JSON-LD 1.1 API expansion)
+        if let Some(k) = ["id", "type"]
+            .into_iter()
+            .find(|k| eo.contains_key(*k) && eo.contains_key(&format!("@{k}")))
+        {
+            return Err(bad(format!(
+                "EntitySelector carries both {k} and @{k} (5.2.33)"
+            )));
+        }
         let mut ne = Map::new();
         for (ek, ev) in eo {
             match ek.as_str() {
@@ -2007,6 +2017,9 @@ mod tests {
             json!([{"type": "Building", "idPattern": r"(?:\p{Any}{100}){100}"}]),
             json!([{"type": "Building", "idPattern": 7}]),
             json!(["Building"]),
+            // id and its keyword alias collide (Coraine duplicate_id_type_alias_every_level 03)
+            json!([{"type": "Building", "id": "urn:ngsi-ld:B:1", "@id": "urn:ngsi-ld:B:2"}]),
+            json!([{"type": "Building", "@type": "Room"}]),
         ] {
             assert!(
                 norm(&sub(json!({ "entities": bad }))).is_err(),
