@@ -396,12 +396,12 @@ impl Session {
             code: CloseCode::from(code),
             reason: reason.into(),
         };
-        if self.write(Message::Close(Some(frame))).await {
-            let _answered = timeout(CLOSE_ANSWER, async {
-                while let Some(Ok(_)) = self.socket.next().await {}
-            })
-            .await;
-        }
+        // a socket the write found broken ends the read at once
+        let _closed = self.write(Message::Close(Some(frame))).await;
+        let _answered = timeout(CLOSE_ANSWER, async {
+            while let Some(Ok(_)) = self.socket.next().await {}
+        })
+        .await;
     }
 
     /// The server closes: `x-closing`, then the close frame.
