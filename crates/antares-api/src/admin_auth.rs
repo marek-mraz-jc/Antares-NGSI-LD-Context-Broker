@@ -123,6 +123,41 @@ pub async fn require(State(st): State<AppState>, req: Request, next: Next) -> Re
     if auth.admits(presented) {
         return next.run(req).await;
     }
+    unauthorized("this admin route requires the broker's admin bearer token")
+}
+
+/// The NGSI-LD API layer (T-5032). On a broker that requires a subject
+/// (`subject_required` on the state), a request carrying none of the subject
+/// headers the deployment named is its own control plane or nobody: it is
+/// served only with the admin bearer token and answers `401` otherwise,
+/// with no credential configured as well. So a pod that merely reaches the
+/// API port neither registers a Context Source nor creates a Tenant. A
+/// request with a subject goes on to the policy engine unchanged.
+pub async fn subject_or_admin(State(st): State<AppState>, req: Request, next: Next) -> Response {
+    if admitted(&st, req.headers()) {
+        return next.run(req).await;
+    }
+    unauthorized("a request without a subject needs the broker's admin bearer token")
+}
+
+/// Whether [`subject_or_admin`] lets a request with `headers` through.
+fn admitted(st: &AppState, headers: &axum::http::HeaderMap) -> bool {
+    let carries_subject = crate::policy::SUBJECT_HEADERS
+        .iter()
+        .any(|name| headers.contains_key(name.as_str()));
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .map(axum::http::HeaderValue::as_bytes);
+    !st.subject_required
+        || carries_subject
+        || st
+            .admin_auth
+            .as_deref()
+            .is_some_and(|a| a.admits(presented))
+}
+
+/// `401` with a bearer challenge and `detail`.
+fn unauthorized(detail: &str) -> Response {
     (
         StatusCode::UNAUTHORIZED,
         [
@@ -133,7 +168,7 @@ pub async fn require(State(st): State<AppState>, req: Request, next: Next) -> Re
             "type": UNAUTHORIZED_TYPE,
             "title": "Unauthorized",
             "status": StatusCode::UNAUTHORIZED.as_u16(),
-            "detail": "this admin route requires the broker's admin bearer token",
+            "detail": detail,
         })),
     )
         .into_response()

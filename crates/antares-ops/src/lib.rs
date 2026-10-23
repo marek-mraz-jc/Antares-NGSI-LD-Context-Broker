@@ -41,6 +41,7 @@ mod mapped;
 pub mod mapping;
 mod names;
 mod operation;
+pub mod outputs;
 pub mod percent;
 mod scan;
 pub mod views;
