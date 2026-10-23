@@ -1984,7 +1984,11 @@ impl antares_store::TemporalDriver for AnyStore {
         bound: std::time::Duration,
     ) -> Result<u64, NgsiError> {
         match self {
-            AnyStore::Mem(s) => Ok(s.attr_instance_count(tenant)),
+            AnyStore::Mem(s) => {
+                // the memory store counts at once: no bound to apply
+                let _ = bound;
+                Ok(s.attr_instance_count(tenant))
+            }
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => {
                 async {
