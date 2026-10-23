@@ -455,3 +455,45 @@ async fn writes_route_by_the_cut_over_and_read_as_the_text_shape() {
         "the delete left keyed rows"
     );
 }
+
+/// T-5243: a batch append for an Entity absent from `entities` writes
+/// nothing, its dictionary first sights included: no `iri_ids` row names
+/// an IRI only that skipped append carried.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_skipped_append_leaves_no_dictionary_row() {
+    let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
+        eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
+        return;
+    };
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let cut = chrono::DateTime::parse_from_rfc3339(MOVED_FROM)
+        .expect("stamp")
+        .to_utc();
+    let keyed = PgTemporalStore::with_cutover(pool.clone(), Some(cut));
+    let t = TenantId::new("pgorphan").expect("tenant");
+    let id = "urn:ngsi-ld:Tank:t5243-absent";
+    let probe = "https://example.org/t5243/orphanProbe";
+    let shell = json!({"id": id, "type": "Tank",
+        "createdAt": "2026-01-03T00:00:00Z", "modifiedAt": "2026-01-03T00:00:00Z"});
+    let additions = json!({probe: [{"type": "Property", "value": 1,
+        "observedAt": "2026-01-03T00:00:00Z"}]});
+    let mut tx = pool.begin().await.expect("tx");
+    pg::set_tenant(&mut tx, &t).await.expect("tenant");
+    sqlx::query("DELETE FROM iri_ids WHERE tenant_id = $1")
+        .bind(t.as_str())
+        .execute(&mut *tx)
+        .await
+        .expect("clean");
+    tx.commit().await.expect("commit");
+    keyed
+        .append_many(&[(&t, id, &shell, additions)])
+        .await
+        .expect("append_many");
+    let rows = count(
+        &pool,
+        &t,
+        "SELECT count(*) FROM iri_ids WHERE tenant_id = $1",
+    )
+    .await;
+    assert_eq!(rows, 0);
+}

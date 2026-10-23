@@ -204,14 +204,21 @@ async fn attr_instances_decomposition_and_maintenance() {
         );
     } else {
         assert!(msg.contains("partition"), "plain-mode partitions: {msg}");
+        // the weeks [now-1w, now+4w): of attr_instances before the cut-over,
+        // of attr_rows from it on (0021 sets it to next Monday)
         let parts: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_inherits i JOIN pg_class p ON p.oid = i.inhparent
-             WHERE p.relname = 'attr_instances'",
+             JOIN pg_class c ON c.oid = i.inhrelid
+             WHERE p.relname IN ('attr_instances', 'attr_rows')
+               AND c.relname NOT LIKE '%default'",
         )
         .fetch_one(&pool)
         .await
         .expect("parts");
-        assert!(parts >= 5, "default + >=4 weekly partitions, got {parts}");
+        assert!(
+            parts >= 5,
+            ">=5 weekly partitions over both parents, got {parts}"
+        );
     }
 }
 

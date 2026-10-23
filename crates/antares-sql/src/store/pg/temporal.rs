@@ -38,15 +38,55 @@ struct Keys {
     /// roll back. The ids themselves come from `iri_no` inside each
     /// statement, so a stale entry fails a write (23502) instead of keying a
     /// row by an id that names nothing.
-    known: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    known: std::sync::Mutex<Known>,
 }
 
-/// ponytail: the known set is cleared whole at this size (a few hundred MB of
-/// IRIs at most); an LRU when one Tenant alone holds more Entities.
-const KNOWN_CAP: usize = 1_000_000;
+/// Pairs one generation of [`Known`] holds before it ages. Two generations
+/// hold at most twice this: about 150 B per pair (two `String`s with a
+/// 60-byte IRI, the table slot), so ~30 MB per process at the bound.
+const KNOWN_GEN: usize = 100_000;
+
+/// The known (Tenant, IRI) set, bounded as a two-generation LRU: a pair
+/// found in `old` moves to `new`; when `new` is full it becomes `old` and
+/// the previous `old` is dropped. A working set under [`KNOWN_GEN`] pairs
+/// never misses; a pair aged out costs its next write one
+/// `INSERT ... ON CONFLICT DO NOTHING` round trip, after which it is known
+/// again.
+#[derive(Default)]
+struct Known {
+    new: std::collections::HashSet<(String, String)>,
+    old: std::collections::HashSet<(String, String)>,
+}
+
+impl Known {
+    fn contains(&mut self, k: &(String, String)) -> bool {
+        if self.new.contains(k) {
+            return true;
+        }
+        match self.old.take(k) {
+            Some(k) => {
+                self.insert(k);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn insert(&mut self, k: (String, String)) {
+        if self.new.len() >= KNOWN_GEN {
+            self.old = std::mem::take(&mut self.new);
+        }
+        self.new.insert(k);
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&(String, String)) -> bool) {
+        self.new.retain(&mut keep);
+        self.old.retain(keep);
+    }
+}
 
 impl Keys {
-    fn known(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<(String, String)>> {
+    fn known(&self) -> std::sync::MutexGuard<'_, Known> {
         self.known
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -81,7 +121,7 @@ impl Keys {
         ensured: &mut std::collections::HashSet<(String, String)>,
     ) -> Result<(), sqlx::Error> {
         {
-            let known = self.known();
+            let mut known = self.known();
             iris.retain(|i| {
                 let k = (tenant.as_str().to_owned(), i.clone());
                 !known.contains(&k) && !ensured.contains(&k)
@@ -103,9 +143,6 @@ impl Keys {
         .into_iter()
         .collect();
         let mut known = self.known();
-        if known.len() >= KNOWN_CAP {
-            known.clear();
-        }
         for i in iris {
             let k = (tenant.as_str().to_owned(), i);
             if !fresh.contains(&k.1) {
@@ -1192,19 +1229,30 @@ impl PgTemporalStore {
         let mut ensured = std::collections::HashSet::new();
         // After the cut-over, the batch's first sights go in first, in one
         // order: an Entity at a time, two batches could each wait on an IRI
-        // the other wrote first.
+        // the other wrote first. Only live Entities count: append_in skips
+        // the others, and their IRIs would stay in iri_ids naming nothing.
+        // The FOR KEY SHARE taken here holds until commit, so append_in's
+        // own check finds the same Entities.
         if self.keys.cutover(&mut tx).await?.is_some() {
-            let mut by_tenant: std::collections::BTreeMap<&str, (&TenantId, Vec<String>)> =
+            // the batch's Entities per Tenant, as (id, additions)
+            type Docs<'a> = Vec<(&'a str, &'a Value)>;
+            let mut by_tenant: std::collections::BTreeMap<&str, (&TenantId, Docs)> =
                 std::collections::BTreeMap::new();
             for (tenant, id, _, additions) in appends {
                 by_tenant
                     .entry(tenant.as_str())
                     .or_insert_with(|| (tenant, Vec::new()))
                     .1
-                    .extend(iris_of(id, additions));
+                    .push((id, additions));
             }
-            for (tenant, iris) in by_tenant.into_values() {
+            for (tenant, docs) in by_tenant.into_values() {
                 crate::store::pg::set_tenant(&mut tx, tenant).await?;
+                let live = self.live_of(&mut tx, tenant, &docs).await?;
+                let iris = docs
+                    .into_iter()
+                    .filter(|(id, _)| live.contains(*id))
+                    .flat_map(|(id, additions)| iris_of(id, additions))
+                    .collect();
                 self.keys
                     .ensure(&mut tx, tenant, iris, &mut ensured)
                     .await?;
@@ -1216,6 +1264,32 @@ impl PgTemporalStore {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// The ids of `docs` stored in `entities` (all of them when this store
+    /// serves only the temporal seam), each locked FOR KEY SHARE until the
+    /// caller's commit.
+    async fn live_of(
+        &self,
+        tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+        tenant: &TenantId,
+        docs: &[(&str, &Value)],
+    ) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+        let mut ids: Vec<&str> = docs.iter().map(|(id, _)| *id).collect();
+        if self.temporal_only {
+            return Ok(ids.into_iter().map(str::to_owned).collect());
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let live = sqlx::query_scalar(
+            "SELECT id FROM entities WHERE tenant_id = $1 AND id = ANY($2)
+             ORDER BY id FOR KEY SHARE",
+        )
+        .bind(tenant.as_str())
+        .bind(&ids)
+        .fetch_all(&mut **tx)
+        .await?;
+        Ok(live.into_iter().collect())
     }
 
     async fn append_in(
@@ -1894,6 +1968,35 @@ impl PgTemporalStore {
 mod tests {
     use super::*;
     use crate::compile::temporal::InstanceRange;
+
+    fn pair(n: usize) -> (String, String) {
+        ("t".to_owned(), format!("urn:ngsi-ld:E:{n}"))
+    }
+
+    /// T-5243: the known set holds at most two generations; a pair read
+    /// while old survives the next ageing, one never read again is dropped.
+    #[test]
+    fn known_ages_by_generation_and_keeps_what_it_reads() {
+        let mut k = Known::default();
+        for n in 0..KNOWN_GEN {
+            k.insert(pair(n));
+        }
+        k.insert(pair(KNOWN_GEN));
+        assert_eq!(k.old.len(), KNOWN_GEN);
+        assert_eq!(k.new.len(), 1);
+        assert!(k.contains(&pair(0)));
+        assert!(!k.old.contains(&pair(0)));
+        for n in 1..KNOWN_GEN {
+            k.insert(pair(KNOWN_GEN.saturating_add(n)));
+        }
+        k.insert(pair(KNOWN_GEN.saturating_mul(3)));
+        assert!(k.contains(&pair(0)));
+        assert!(!k.contains(&pair(1)));
+        assert!(!k.contains(&pair(KNOWN_GEN.saturating_mul(4))));
+        k.retain(|(t, _)| t != "t");
+        assert!(k.new.is_empty());
+        assert!(k.old.is_empty());
+    }
 
     /// T-5243: the broker's own canonical id keys by its uuid; any other id,
     /// an upper-case uuid included, keys by its v5 and stays in data.

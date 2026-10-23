@@ -213,7 +213,17 @@ The shape, as it is to be built:
   whole batch's first sights in one statement before any Entity), inside
   its own transaction, so RLS checks the Tenant. An IRI enters the set only
   once a later write finds it stored, because the transaction that inserted
-  it may still roll back. A warm process sends no extra statement.
+  it may still roll back. A warm process sends no extra statement. A batch
+  append sends first sights only for the Entities it finds in `entities`
+  (locked `FOR KEY SHARE` until commit), so a skipped append leaves no
+  dictionary row behind.
+- The set is a two-generation LRU of 100 000 (Tenant, IRI) pairs per
+  generation: about 30 MB per process when full. A pair read from the older
+  generation moves to the newer one; when the newer one fills, the older
+  one is dropped. A pair aged out costs its next write one
+  `INSERT ... ON CONFLICT DO NOTHING` that finds the row (measured: 0.02 to
+  0.05 ms in PostgreSQL, 12 buffer hits, plus one round trip), after which
+  it is known again.
 - Decided (worker-t5243, owner may override): the ids themselves are bound
   in SQL by `iri_no` in every statement, reads and writes alike, and never
   cached in memory. A cached id outlives a rolled-back insert or another
@@ -277,3 +287,4 @@ unless `ANTARES_MIGRATE=0` hands the job to an init container.
 | `0019_drop_entities_jsonb` | Drops `i_entities_jsonb`, the `jsonb_path_ops` GIN over the whole document (T-5193). No jsonb operator is leakproof (`@?`, `@>`, `?|`), so under forced RLS the broker's role never used it as an index condition: as `antares_app`, a q= page of 200,000 Entities read the primary key and filtered 199,998 rows with the GIN in place, while a superuser's plan read the GIN. Every Entity write still paid a GIN entry per path. 1,869 -> 1,754 B an Entity on that synthetic set; a deployment that bypasses RLS loses the GIN path its q= pages used. |
 | `0020_history_integer_keys` | The second history parent of the integer keys (T-5200, "Integer history keys" above): `iri_ids` (per-Tenant dictionary of full expanded IRIs, 0005's per-command RLS, no UPDATE policy), `attr_rows` (partitioned or a hypertable as `attr_instances`, unique key (`tenant_id`, `entity_no`, `attr_no`, `observed_at`, `instance_no`), its RLS and compression as 0001 gives `attr_instances`), the one-row `history_cutover` holding NULL, and the functions `iri_no`, `attr_rows_of` and `attr_rows_at`. Every history read and delete covers both parents; nothing writes `attr_rows` while the cut-over is NULL. |
 | `0021_breaking_history_cutover` | Sets `history_cutover` to the Monday after the migration (T-5243): from it on the store writes each history row observed at or after it to `attr_rows` and every earlier one, a late write included, to `attr_instances`. Breaking: a release before 0020 reads only `attr_instances`. |
+| `0022_iri_no_plpgsql` | `iri_no` in PL/pgSQL with the same signature (T-5243): 0020's `LANGUAGE sql` body is never inlined and PostgreSQL 17 plans it again in every calling statement (~0.16 ms a call, 17 calls a keyed write); PL/pgSQL keeps the plan for the session. Still `STABLE` and invoker's rights, so RLS on `iri_ids` applies. |
