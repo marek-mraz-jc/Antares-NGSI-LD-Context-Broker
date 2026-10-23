@@ -14,6 +14,8 @@ mod admin_auth;
 mod api_surface;
 mod attr_path_name_5_6_4;
 mod bounded_reads_5_14_5_16;
+#[cfg(feature = "channels")]
+mod channels_adr0031;
 mod collation_4_23;
 mod contexts_5_13;
 mod contexts_fleet_5_13;

@@ -130,6 +130,11 @@ sta = ["views", "dep:antares-sta"]
 # (RFC 5545) feed, read only (T-4487, `ANTARES_API_SURFACES=admin,views,ical`).
 ical = ["views", "dep:antares-ical"]
 
+# Inbound bridge Channels (ADR-0031, T-5079): `/x/channels` binds one topic of
+# a configured bridge (`ANTARES_CHANNEL_BROKERS`, loopback or MQTT 5) to one
+# Attribute (`ANTARES_API_SURFACES=admin,channels`).
+channels = ["antares-api/channels"]
+
 # The WebSocket notification channel (ADR-0026, T-3517): `/x/ws/ngsi-ld/v1`
 # (`ANTARES_API_SURFACES=...,ws`), and with `views` also
 # `/x/views/{view}/ws` (`ws-views`); its sink serves `urn:antares:ws:`.
