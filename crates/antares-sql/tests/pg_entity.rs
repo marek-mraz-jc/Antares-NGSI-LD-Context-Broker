@@ -1300,6 +1300,22 @@ async fn the_attribute_catalogue_follows_every_write() {
         pairs().await,
         ["W urn:a:c", "X urn:a:a", "X urn:a:b", "Y urn:a:b"]
     );
+
+    // the same batch again over the stored Entity: ON CONFLICT DO UPDATE
+    // fires the update trigger from an INSERT statement
+    s.batch_upsert_replace(
+        &t,
+        &[(
+            "urn:ngsi-ld:W:1".into(),
+            doc("urn:ngsi-ld:W:1", json!(["W"]), "urn:a:d"),
+        )],
+    )
+    .await
+    .expect("upsert over");
+    assert_eq!(
+        pairs().await,
+        ["W urn:a:c", "W urn:a:d", "X urn:a:a", "X urn:a:b", "Y urn:a:b"]
+    );
     for id in ["urn:ngsi-ld:X:1", "urn:ngsi-ld:W:1"] {
         let _ = s.delete(&t, id).await;
     }
