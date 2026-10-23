@@ -93,6 +93,25 @@ to 48) spread PATCH p95 from 45 ms to 4 425 ms for the same binary:
 | 2 | 100 | dev | 18 212 of 30 005 | 0 | 25 217 | 360 |
 | 2 | 100 | T-4921 | 30 005 of 30 005 | 0 | 10 485 | 813 |
 
+T-5159 (2026-10-23) makes an in-process delivery (a WebSocket, the forward transport) join its tenant's
+next statement instead of issuing its own: one `UPDATE ... FROM unnest` books every waiting delivery,
+one read serves the Entities every waiting view delivery needs, a failure write-back waits in its own
+per-tenant queue, and a delivery that finds its tenant idle still runs its own statement at once.
+In-process deliveries leave the 8 network slots, and one change renders one payload per notification
+shape. A test pins the statement count: 50 in-process subscriptions on one change took 50 bookkeeping
+statements before and at most 3 after (`crates/antares-api/tests/fanout_bookkeeping_t5159.rs`). Two
+runs back to back of the same shape (20 000 Entities, 1 000 sockets, dev 18dd4c2 first, sandbox load
+41 to 68 on 12 cores):
+
+| binary | delivered of owed | `x-gap` | fan-out p95 ms | PATCH p95 ms | broker CPU % avg / max |
+|---|---|---|---|---|---|
+| dev | 26 223 of 232 950 | 75 011 | 41 179 | 7 259 | 51.0 / 307.7 |
+| T-5159 | 113 199 of 204 250 | 43 172 | 18 889 | 7 411 | 45.8 / 500.1 |
+
+Delivery moved 4.3 times the notifications at the same average CPU, but the shape still breaches its
+budget on this host: the writer reached 136 of 200 PATCH/s, and at peak the broker used 5 cores, so the
+fan-out is now bound by CPU, not by the pool. The load-surfaces lane on an idle runner judges it.
+
 What repeats is the delivery: T-4921 delivered every notification at 100 subscribers both times, at a
 third of dev's fan-out p95, and dev lost changes without saying so.
 

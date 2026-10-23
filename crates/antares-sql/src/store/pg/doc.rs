@@ -498,8 +498,27 @@ impl PgDocStore {
         id: &str,
         now: &str,
     ) -> Result<Option<(Value, Option<Value>)>, sqlx::Error> {
+        let mut found = self.record_deliveries(tenant, kind, &[(id, now)]).await?;
+        Ok(found.remove(id))
+    }
+
+    /// [`Self::record_delivery`] for distinct subscriptions in ONE statement
+    /// (T-5159): the rows are locked in id order, so two batches over
+    /// overlapping subscriptions queue behind each other instead of
+    /// deadlocking, and each pre-image is still the value its own row lock
+    /// re-read. A subscription that is gone has no entry in the answer.
+    pub async fn record_deliveries(
+        &self,
+        tenant: &TenantId,
+        kind: DocKind,
+        attempts: &[(&str, &str)],
+    ) -> Result<std::collections::HashMap<String, (Value, Option<Value>)>, sqlx::Error> {
+        if attempts.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
         let table = kind.table();
         let col = kind.doc_column();
+        let (ids, stamps): (Vec<&str>, Vec<&str>) = attempts.iter().copied().unzip();
         // literals from DocKind; every value is bound
         let sql = format!(
             "UPDATE {table} AS d SET
@@ -507,38 +526,36 @@ impl PgDocStore {
                    d.{col} - 'status',
                    '{{notification,timesSent}}',
                    to_jsonb(COALESCE((d.{col} #>> '{{notification,timesSent}}')::bigint, 0) + 1)),
-                   '{{notification,lastNotification}}', to_jsonb($3::text)),
-                   '{{notification,lastSuccess}}', to_jsonb($3::text)),
+                   '{{notification,lastNotification}}', to_jsonb(prev.stamp)),
+                   '{{notification,lastSuccess}}', to_jsonb(prev.stamp)),
                    '{{notification,status}}', '\"ok\"'::jsonb),
                times_sent = COALESCE(d.times_sent, 0) + 1,
-               last_notification = $3::timestamptz,
-               last_success = $3::timestamptz
-             FROM (SELECT id AS locked_id,
-                          {col} #> '{{notification,lastSuccess}}' AS ls
-                     FROM {table}
-                    WHERE tenant_id = $1 AND id = $2
-                      FOR UPDATE) AS prev
+               last_notification = prev.stamp::timestamptz,
+               last_success = prev.stamp::timestamptz
+             FROM (SELECT s.id AS locked_id,
+                          s.{col} #> '{{notification,lastSuccess}}' AS ls,
+                          a.stamp
+                     FROM {table} AS s
+                     JOIN unnest($2::text[], $3::text[]) AS a(id, stamp) ON s.id = a.id
+                    WHERE s.tenant_id = $1
+                    ORDER BY s.id
+                      FOR UPDATE OF s) AS prev
              WHERE d.tenant_id = $1 AND d.id = prev.locked_id
-             RETURNING d.{col}, prev.ls"
+             RETURNING d.id, d.{col}, prev.ls"
         );
-        async move {
-            let mut tx = super::begin(&self.pool).await?;
-            crate::store::pg::set_tenant(&mut tx, tenant).await?;
-            let row = sqlx::query(sqlx::AssertSqlSafe(sql))
-                .bind(tenant.as_str())
-                .bind(id)
-                .bind(now)
-                .fetch_optional(&mut *tx)
-                .await?;
-            let Some(row) = row else {
-                return Ok(None);
-            };
-            let doc: Value = row.get(0);
-            let prev: Option<Value> = row.get(1);
-            tx.commit().await?;
-            Ok(Some((doc, prev)))
-        }
-        .await
+        let mut tx = super::begin(&self.pool).await?;
+        crate::store::pg::set_tenant(&mut tx, tenant).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(tenant.as_str())
+            .bind(&ids)
+            .bind(&stamps)
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>(0), (r.get(1), r.get(2))))
+            .collect())
     }
 
     pub async fn mutate<T, E>(
