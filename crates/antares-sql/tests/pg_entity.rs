@@ -1314,7 +1314,13 @@ async fn the_attribute_catalogue_follows_every_write() {
     .expect("upsert over");
     assert_eq!(
         pairs().await,
-        ["W urn:a:c", "W urn:a:d", "X urn:a:a", "X urn:a:b", "Y urn:a:b"]
+        [
+            "W urn:a:c",
+            "W urn:a:d",
+            "X urn:a:a",
+            "X urn:a:b",
+            "Y urn:a:b"
+        ]
     );
     for id in ["urn:ngsi-ld:X:1", "urn:ngsi-ld:W:1"] {
         let _ = s.delete(&t, id).await;
