@@ -295,11 +295,7 @@ fn output(view: &ViewOps, name: &str) -> Result<CompiledOutput, Problem> {
             "the view's calendar outputs do not hold; its Endpoint must be published again",
         )
     };
-    // more than MAX_OUTPUTS is a list the gateway refuses at save: it serves nobody
-    let outputs = written
-        .as_array()
-        .filter(|all| all.len() <= mapping::MAX_OUTPUTS)
-        .ok_or_else(broken)?;
+    let outputs = written.as_array().ok_or_else(broken)?;
     let chosen = outputs
         .iter()
         .find(|o| o.get("name").and_then(Value::as_str) == Some(name))
