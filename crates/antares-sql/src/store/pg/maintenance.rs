@@ -538,6 +538,14 @@ const ENTITY_ROWS: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instanc
            WHERE a.tenant_id = $1 AND a.entity_id = ANY($2::text[])
              AND a.observed_at < $3::timestamptz
            LIMIT $4";
+/// The same over `attr_rows` (T-5200), its keys mapped through the Tenant's
+/// `iri_ids`; both of its children, the short one included (T-5249).
+const KEYED_ROWS: &str = "SELECT a.tenant_id, a.entity_no, a.attr_no, a.instance_no, a.observed_at
+           FROM attr_rows a
+           WHERE a.tenant_id = $1
+             AND a.entity_no IN (SELECT i.id FROM iri_ids i WHERE i.tenant_id = $1 AND i.iri = ANY($2::text[]))
+             AND a.observed_at < $3::timestamptz
+           LIMIT $4";
 /// The same over the superseded versions (T-4665).
 const VERSION_ROWS: &str =
     "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
@@ -575,14 +583,8 @@ pub async fn retain_history(
              AND a.entity_id <> ALL($5::text[])
              AND a.observed_at < $3::timestamptz
            LIMIT $4";
-    // The same three over `attr_rows` (T-5200), its keys mapped through the
-    // Tenant's `iri_ids`.
-    const R_ENTITY: &str = "SELECT a.tenant_id, a.entity_no, a.attr_no, a.instance_no, a.observed_at
-           FROM attr_rows a
-           WHERE a.tenant_id = $1
-             AND a.entity_no IN (SELECT i.id FROM iri_ids i WHERE i.tenant_id = $1 AND i.iri = ANY($2::text[]))
-             AND a.observed_at < $3::timestamptz
-           LIMIT $4";
+    // The type and rest selections over `attr_rows` (T-5200), its keys mapped
+    // through the Tenant's `iri_ids`; KEYED_ROWS is the Entity one.
     const R_TYPE: &str = "SELECT a.tenant_id, a.entity_no, a.attr_no, a.instance_no, a.observed_at
            FROM attr_rows a
            JOIN iri_ids i ON i.tenant_id = a.tenant_id AND i.id = a.entity_no
@@ -660,7 +662,7 @@ pub async fn retain_history(
     let (rows, keyed, versions, names, except) = match scope {
         HistoryScope::Entity(id) => {
             one = [id.to_owned()];
-            (ENTITY, R_ENTITY, V_ENTITY, &one[..], None)
+            (ENTITY, KEYED_ROWS, V_ENTITY, &one[..], None)
         }
         HistoryScope::Type {
             type_iri,
@@ -762,8 +764,8 @@ impl Walk<'_> {
 /// it holds less than what is left of the batch; the walk goes on for up to
 /// [`WALK_TIME`] and remembers where it stopped, so a type of 50 000
 /// Entities is covered over a few sweeps instead of timing out in one. At
-/// the end it starts over. Returns the instances and versions deleted, at
-/// most `batch`.
+/// the end it starts over. Returns the instances of both history parents
+/// and the versions deleted, at most `batch`.
 async fn walk_history(
     pool: &PgPool,
     tenant: &str,
@@ -786,6 +788,11 @@ async fn walk_history(
                 ENTITY_ROWS,
                 "DELETE FROM attr_instances
              WHERE (tenant_id, entity_id, attr_id, instance_id, observed_at) IN",
+            ),
+            (
+                KEYED_ROWS,
+                "DELETE FROM attr_rows
+             WHERE (tenant_id, entity_no, attr_no, instance_no, observed_at) IN",
             ),
             (
                 VERSION_ROWS,
