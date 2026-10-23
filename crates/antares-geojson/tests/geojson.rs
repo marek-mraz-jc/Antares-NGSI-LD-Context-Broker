@@ -20,6 +20,7 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -130,6 +131,7 @@ async fn a_type_reads_through_the_view_without_what_it_hides() {
     assert_eq!((status, body.as_str()), (StatusCode::OK, ""));
     let info = antares_geojson::GeoJson.version_info();
     assert_eq!(info["endpoint"], "/x/views/{view}/geojson/v1/{type}");
+    assert_eq!(info["csv"], "/x/views/{view}/csv/v1/{name}.csv");
 }
 
 #[tokio::test]
@@ -309,4 +311,264 @@ async fn every_attribute_kind_is_a_plain_property_and_no_location_a_null_geometr
     seats.sort_unstable();
     assert_eq!(seats, [2, 4]);
     assert_eq!(stop("urn:ngsi-ld:Stop:2")["geometry"], Value::Null);
+}
+
+/// The view `ev` shows `Event` and `SportEvent` and lists `GeoJSON` and CSV outputs (docs API/11
+/// EP-159, T-5216); `Secret` stays hidden from it, and `secretNote` from every Event.
+async fn events() -> Router {
+    let app = fixture().await;
+    let geojson = json!([
+        {"name": "sport", "lang": "sk", "filter": {"q": "eventCategory==\"sport\""},
+         "sources": [{"type": "SportEvent", "mapping": {"instant": "startDate"}}, {"type": "Event"}]},
+        {"name": "catchment", "title": {"sk": "Spádové územie"},
+         "sources": [{"type": "Event", "mapping": {"geometry": ["operationSpace", "location"],
+            "properties": ["name", "address.addressLocality"], "start": "startDate", "end": "endDate"}}]},
+        {"name": "leak", "sources": [{"type": "Secret"}, {"type": "Event"}]},
+        {"name": "hidden", "sources": [{"type": "Secret"}]},
+        {"name": "broken", "sources": []},
+        {"name": "ends", "filter": {"scopeQ": "/bb"},
+         "sources": [{"type": "SportEvent", "mapping": {"end": "startDate"}}]},
+        {"name": "near", "limit": 1, "sources": [{"type": "Event"}],
+         "filter": {"georel": "near;maxDistance==1000", "geometry": "Point", "coordinates": "[19.146,48.736]"}},
+    ]);
+    let csv = json!([
+        {"name": "events", "sources": [{"type": "Event", "mapping": {"columns": ["name", "startDate"]}}]},
+        {"name": "all", "sources": [{"type": "Event", "mapping": {"columns": ["name"]}}, {"type": "SportEvent"}]},
+        {"name": "one", "limit": 1, "sources": [{"type": "Event", "mapping": {"columns": ["name"]}}]},
+    ]);
+    let shown = json!([
+        "name",
+        "location",
+        "operationSpace",
+        "startDate",
+        "endDate",
+        "eventCategory",
+        "address"
+    ]);
+    let view = json!({"id": "ev", "tenant": "city", "selector": ["Event", "SportEvent"],
+        "operations": ["query_entities"], "rules": [{"types": ["Event", "SportEvent"], "attributes": shown}],
+        "representations": {"geojson": geojson, "csv": csv}});
+    let (status, body) = send(&app, "PUT", "/q/views/ev", &view.to_string()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let prop = |v: Value| json!({"type": "Property", "value": v});
+    let point = |x: f64, y: f64| json!({"type": "GeoProperty", "value": {"type": "Point", "coordinates": [x, y]}});
+    let area = json!({"type": "GeoProperty", "value": {"type": "Polygon",
+        "coordinates": [[[19.0, 48.0], [19.3, 48.0], [19.3, 48.9], [19.0, 48.9], [19.0, 48.0]]]}});
+    let entities = [
+        json!({"id": "urn:ngsi-ld:Event:e1", "type": "Event", "name": prop(json!("Koncert")),
+               "eventCategory": prop(json!("kultura")), "startDate": prop(json!("2026-11-01T18:00:00Z")),
+               "endDate": prop(json!("2026-11-01T20:00:00Z")), "location": point(19.146, 48.736),
+               "operationSpace": area, "address": prop(json!({"addressLocality": "Banská Bystrica"})),
+               "secretNote": prop(json!("hidden-note"))}),
+        json!({"id": "urn:ngsi-ld:Event:e2", "type": "Event", "name": prop(json!("=Futbal")),
+               "eventCategory": prop(json!("sport")), "startDate": prop(json!("2026-11-02T10:00:00Z")),
+               "location": point(20.0, 49.0)}),
+        json!({"id": "urn:ngsi-ld:SportEvent:s1", "type": "SportEvent", "scope": "/bb", "name": prop(json!("Beh")),
+               "eventCategory": prop(json!("sport")), "startDate": prop(json!("2026-11-03T09:00:00Z")),
+               "location": point(19.2, 48.7)}),
+    ];
+    for entity in entities {
+        let (status, body) = send(&app, "POST", "/ngsi-ld/v1/entities", &entity.to_string()).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    app
+}
+
+/// The Features of an answer, by id.
+fn by_id(body: &str) -> BTreeMap<String, Value> {
+    let page: Value = serde_json::from_str(body).expect("json");
+    page["features"]
+        .as_array()
+        .expect("features")
+        .iter()
+        .map(|f| (f["id"].as_str().expect("id").to_owned(), f.clone()))
+        .collect()
+}
+
+#[tokio::test]
+async fn an_output_serves_its_sources_under_its_filter_and_the_callers_q() {
+    let app = events().await;
+    let (status, body) = send(&app, "GET", "/x/views/ev/geojson/v1/sport", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let sport = by_id(&body);
+    let ids: Vec<&str> = sport.keys().map(String::as_str).collect();
+    assert_eq!(ids, ["urn:ngsi-ld:Event:e2", "urn:ngsi-ld:SportEvent:s1"]);
+    assert_eq!(
+        sport["urn:ngsi-ld:SportEvent:s1"]["time"],
+        json!({"instant": "2026-11-03T09:00:00Z"})
+    );
+    assert_eq!(sport["urn:ngsi-ld:Event:e2"].get("time"), None);
+    let (_, body) = send(
+        &app,
+        "GET",
+        "/x/views/ev/geojson/v1/sport?q=name==%22Beh%22",
+        "",
+    )
+    .await;
+    let ids: Vec<String> = by_id(&body).into_keys().collect();
+    assert_eq!(ids, ["urn:ngsi-ld:SportEvent:s1"]);
+    // a caller's q that would widen the output still only narrows it
+    let (_, body) = send(
+        &app,
+        "GET",
+        "/x/views/ev/geojson/v1/sport?q=eventCategory==%22kultura%22",
+        "",
+    )
+    .await;
+    assert_eq!(by_id(&body).len(), 0, "{body}");
+    // a q that closes its own group would OR past the filter: refused, never joined
+    let (status, body) = send(
+        &app,
+        "GET",
+        "/x/views/ev/geojson/v1/sport?q=eventCategory==%22sport%22%29%7C%28eventCategory==%22kultura%22",
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
+async fn an_output_maps_geometry_time_and_properties_by_roles() {
+    let app = events().await;
+    let (status, body) = send(&app, "GET", "/x/views/ev/geojson/v1/catchment", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let all = by_id(&body);
+    let e1 = &all["urn:ngsi-ld:Event:e1"];
+    assert_eq!(e1["geometry"]["type"], "Polygon");
+    assert_eq!(
+        e1["properties"],
+        json!({"type": "Event", "name": "Koncert", "address.addressLocality": "Banská Bystrica"})
+    );
+    assert_eq!(
+        e1["time"],
+        json!({"interval": ["2026-11-01T18:00:00Z", "2026-11-01T20:00:00Z"]})
+    );
+    let e2 = &all["urn:ngsi-ld:Event:e2"];
+    assert_eq!(
+        e2["geometry"],
+        json!({"type": "Point", "coordinates": [20.0, 49.0]})
+    );
+    assert_eq!(
+        e2["time"],
+        json!({"interval": ["2026-11-02T10:00:00Z", ".."]})
+    );
+    assert_eq!(e2["properties"]["address.addressLocality"], Value::Null);
+    // an interval open at its start; the output's scopeQ intersected with the caller's
+    let (_, body) = send(
+        &app,
+        "GET",
+        "/x/views/ev/geojson/v1/ends?scopeQ=/bb/%23",
+        "",
+    )
+    .await;
+    let ends = by_id(&body);
+    assert_eq!(
+        ends["urn:ngsi-ld:SportEvent:s1"]["time"],
+        json!({"interval": ["..", "2026-11-03T09:00:00Z"]})
+    );
+    let (status, _) = send(&app, "GET", "/x/views/ev/geojson/v1/ends?scopeQ=,", "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(!body.contains("hidden-note"), "{body}");
+}
+
+#[tokio::test]
+async fn an_output_never_serves_what_the_view_hides() {
+    let app = events().await;
+    let (status, body) = send(&app, "GET", "/x/views/ev/geojson/v1/leak", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(by_id(&body).len(), 2, "{body}");
+    assert!(
+        !body.contains("hidden-secret") && !body.contains("hidden-note"),
+        "{body}"
+    );
+    for (uri, expected) in [
+        ("/x/views/ev/geojson/v1/hidden", StatusCode::NOT_FOUND),
+        (
+            "/x/views/ev/geojson/v1/broken",
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        ("/x/views/ev/csv/v1/broken.csv", StatusCode::NOT_FOUND),
+        (
+            "/x/views/ev/geojson/v1/near?georel=within",
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let (status, body) = send(&app, "GET", uri, "").await;
+        assert_eq!(status, expected, "{uri}: {body}");
+        assert!(!body.contains("hidden-secret"), "{body}");
+    }
+    let (status, body) = send(&app, "GET", "/x/views/ev/geojson/v1/near", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ids: Vec<String> = by_id(&body).into_keys().collect();
+    assert_eq!(ids, ["urn:ngsi-ld:Event:e1"]);
+}
+
+#[tokio::test]
+async fn a_csv_output_is_one_type_or_a_union_with_a_type_column() {
+    let app = events().await;
+    let (status, body) = send(&app, "GET", "/x/views/ev/csv/v1/events.csv", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        "id,name,startDate\r\n\
+         urn:ngsi-ld:Event:e1,Koncert,2026-11-01T18:00:00Z\r\n\
+         urn:ngsi-ld:Event:e2,'=Futbal,2026-11-02T10:00:00Z\r\n"
+    );
+    let (_, body) = send(&app, "GET", "/x/views/ev/csv/v1/all.csv", "").await;
+    let mut lines = body.lines();
+    assert_eq!(
+        lines.next(),
+        Some("id,type,name,eventCategory,location,scope,startDate")
+    );
+    assert_eq!(lines.count(), 3, "{body}");
+    assert!(
+        body.contains("urn:ngsi-ld:SportEvent:s1,SportEvent,Beh,sport,"),
+        "{body}"
+    );
+    let (_, body) = send(&app, "GET", "/x/views/ev/csv/v1/one.csv", "").await;
+    assert_eq!(body, "id,name\r\nurn:ngsi-ld:Event:e1,Koncert\r\n");
+    let (_, body) = send(
+        &app,
+        "GET",
+        "/x/views/ev/csv/v1/events.csv?q=name==%22Koncert%22",
+        "",
+    )
+    .await;
+    assert_eq!(body.lines().count(), 2, "{body}");
+    // a type no output names: every column the view shows of it
+    let (status, body) = send(&app, "GET", "/x/views/city/csv/v1/Place.csv", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.starts_with("id,location,name\r\n"), "{body}");
+    assert!(!body.contains("hidden-owner"), "{body}");
+    for (uri, expected) in [
+        ("/x/views/ev/csv/v1/events.txt", StatusCode::NOT_FOUND),
+        ("/x/views/ev/csv/v1/Place.csv", StatusCode::NOT_FOUND),
+        (
+            "/x/views/ev/csv/v1/events.csv?limit=1",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/x/views/ev/csv/v1/events.csv?q=a&q=b",
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let (status, body) = send(&app, "GET", uri, "").await;
+        assert_eq!(status, expected, "{uri}: {body}");
+    }
+    let (status, _) = send(&app, "POST", "/x/views/ev/csv/v1/events.csv", "{}").await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
+async fn a_csv_past_its_ceiling_is_413_never_cut_short() {
+    let app = fixture().await;
+    let blob = "x".repeat(900_000);
+    for i in 0..5 {
+        let big = json!({"id": format!("urn:ngsi-ld:Big:{i}"), "type": "Big",
+                         "blob": {"type": "Property", "value": blob}});
+        let (status, body) = send(&app, "POST", "/ngsi-ld/v1/entities", &big.to_string()).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let (status, body) = send(&app, "GET", "/x/views/every/csv/v1/Big.csv", "").await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{}", body.len());
 }

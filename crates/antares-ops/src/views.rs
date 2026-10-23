@@ -133,10 +133,9 @@ pub struct View {
 }
 
 /// The surfaces a view's `representations` may name.
-pub const REPRESENTATIONS: &[&str] = &["ical", "feed", "gbfs"];
+pub const REPRESENTATIONS: &[&str] = &["ical", "feed", "ogc", "geojson", "csv", "gbfs"];
 
-/// The most named outputs one representation lists (owner 2026-10-22T09:30Z).
-pub const MAX_OUTPUTS: usize = 20;
+pub use crate::outputs::MAX_OUTPUTS;
 
 /// One allowlist of a [`View`]: the Entities of `types` for which the
 /// condition holds show `attributes`.
@@ -312,7 +311,7 @@ impl View {
         };
         if let Some(named) = &self.representations {
             if let Some((name, _)) = named.iter().find(|(name, member)| {
-                // each is a list of named outputs: `feed` (T-5202) checks its list when
+                // each is a list of named outputs: `feed`, `ogc`, `geojson` and `csv` check theirs when
                 // it serves, `ical` (T-5208) refuses more than MAX_OUTPUTS here
                 !REPRESENTATIONS.contains(&name.as_str())
                     || member
@@ -1323,8 +1322,7 @@ mod tests {
 
     #[test]
     fn a_view_keeps_the_representations_it_names_and_refuses_another_name() {
-        let ical = json!({"ical": [{"name": "events", "sources": [{"preset": "sdm-event"}]}],
-            "feed": [{"name": "news"}]});
+        let ical = json!({"ical": [{"name": "events", "sources": [{"preset": "sdm-event"}]}], "feed": [{"name": "news"}]});
         let loaded = load(&with("representations", ical.clone())).expect("loads");
         assert_eq!(
             loaded
@@ -1342,7 +1340,6 @@ mod tests {
         for bad in [
             json!({"vcard": []}),
             json!({"ical": {"preset": "sdm-event"}}),
-            json!({"ical": many}),
             json!({"feed": {}}),
             json!([]),
         ] {

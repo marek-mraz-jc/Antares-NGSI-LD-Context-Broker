@@ -1040,6 +1040,9 @@ async fn run(
         state.provenance_from = std::env::var("ANTARES_PROVENANCE_FROM")
             .ok()
             .filter(|g| !g.trim().is_empty());
+        // T-5032: a deployment that names who calls serves a caller
+        // without a subject only with the admin bearer token.
+        state.subject_required = !antares_api::policy::SUBJECT_HEADERS.is_empty();
     }
     // The surfaces mounted beside the NGSI-LD API root, from configuration
     // rather than from a hard-wired list: the selection replaces what the

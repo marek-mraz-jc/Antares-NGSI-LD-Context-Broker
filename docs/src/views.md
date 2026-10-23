@@ -40,11 +40,19 @@ A view may select every type and show every Attribute with one form:
 ["*"]}` (ADR-0023 rule 12). Its `q`, `scopeQ`, `geoQ`, `operations` and
 Tenant still apply. `*` anywhere else is refused when the view loads.
 
-A view may carry `representations`, an object keyed by a domain-standard
-surface: `ical` ([iCalendar feed](ical.md)), `feed` ([feeds](feed.md)) and
-`gbfs` ([GBFS](gbfs.md)), each a list of named outputs. Any other key, or a
-member that is not a list, is refused when the view loads; the surface reads
-and checks its own member.
+A view may carry `representations`, an object keyed by a format: `ical`
+([iCalendar](ical.md)), `feed` (Atom, RSS and JSON Feed), `ogc`
+([OGC API - Features](ogc.md)), `geojson` and `csv` ([GeoJSON](geojson.md)), and `gbfs`
+([GBFS](gbfs.md)), whose outputs carry the GBFS system fields that page
+lists instead. Each other member is a list of named outputs (docs API/11 EP-159, T-5216): `name`,
+`title` and `description` per language, `version`, `sources` (model classes
+with their role `mapping`), a `filter` (`q`, `scopeQ`, `georel`, `geometry`,
+`coordinates`, `geoproperty`) that only narrows the view, `lang` and `limit`.
+Any other key, or a member that is not a list, is refused when the view loads.
+A list of more than 20 outputs or with a name twice loads and serves nobody
+(the gateway refuses it when the Endpoint is saved); an output whose members
+do not hold serves nobody while the other outputs of the list still serve. The
+shared contract is `antares_ops::outputs`; the surface reads its own member.
 
 ## 2. What a client sees
 

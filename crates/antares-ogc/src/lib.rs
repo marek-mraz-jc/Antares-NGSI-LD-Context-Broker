@@ -398,7 +398,11 @@ fn offered(
     item: Option<(&str, Option<&str>)>,
     collections: &BTreeMap<String, Collection>,
 ) -> Option<Reply> {
-    let item = item.filter(|(c, _)| !collections.get(*c).is_some_and(|c| c.history));
+    let item = item.filter(|(c, _)| {
+        !collections
+            .get(*c)
+            .is_some_and(|c| c.history || c.output.is_some())
+    });
     let writes = [
         (Method::POST, "POST"),
         (Method::PUT, "PUT"),
@@ -475,6 +479,18 @@ fn collections(view: &ViewOps) -> Option<BTreeMap<String, Collection>> {
         for c in past {
             all.entry(c.id.clone()).or_insert(c);
         }
+    }
+    // T-5216: the view's named outputs, each over its one source's collection; a class keeps
+    // its own id.
+    let named: Vec<Collection> = antares_ops::outputs::listed(view.representation("ogc"), "ogc")
+        .into_iter()
+        .filter_map(|(_, o)| {
+            let o = o.ok()?;
+            model::output(all.get(&o.sources.first()?.entity_type)?, &o)
+        })
+        .collect();
+    for c in named {
+        all.entry(c.id.clone()).or_insert(c);
     }
     Some(all)
 }
@@ -756,7 +772,12 @@ impl Here<'_> {
         }
         let fields = [
             ("id", Some(Value::from(c.id.as_str()))),
-            ("title", Some(Value::from(c.id.as_str()))),
+            (
+                "title",
+                Some(Value::from(c.output.as_ref().map_or(c.id.as_str(), |o| {
+                    o.title_in(self.lang.split([',', ';', '-']).next().unwrap_or_default())
+                }))),
+            ),
             ("description", c.description.as_deref().map(Value::from)),
             ("itemType", Some(Value::from("feature"))),
             ("crs", Some(json!([crs::CRS84, crs::CRS84H]))),

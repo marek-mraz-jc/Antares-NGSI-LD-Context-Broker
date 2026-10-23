@@ -209,6 +209,7 @@ dependencies = [
 name = "antares-geojson"
 version = "0.3.0"
 dependencies = [
+ "antares-export",
  "antares-ops",
  "axum",
  "http-body-util",

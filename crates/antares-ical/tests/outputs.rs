@@ -191,6 +191,16 @@ async fn each_output_serves_its_own_sources_under_its_filter_and_events_is_the_f
     )
     .await;
     assert!(uids(&sport.body).is_empty(), "{}", sport.body);
+    // a q that closes its own group would OR past the filter: refused, never joined
+    let escape = send(
+        &app,
+        "GET",
+        "/x/views/town/ical/v1/kultura.ics?q=category==%22kultura%22%29%7C%28category==%22sport%22",
+        "",
+        None,
+    )
+    .await;
+    assert_eq!(escape.status, StatusCode::BAD_REQUEST, "{}", escape.body);
     let council = get(&app, "/x/views/town/ical/v1/zastupitelstvo.ics")
         .await
         .body;
