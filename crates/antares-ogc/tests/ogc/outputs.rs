@@ -237,6 +237,15 @@ async fn an_output_only_narrows_and_writes_nothing() -> Result<(), String> {
     )
     .await;
     assert_eq!(ids(&a.body).len(), 0, "{}", a.body);
+    // a q that closes its own group would OR past the filter: refused, never joined
+    let a = get(
+        &app,
+        &format!(
+            "{ITEMS}/catchment/items?ngsild.q=category==%22kultura%22%29%7C%28category==%22x%22"
+        ),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
     let a = get(&app, &format!("{ITEMS}/scoped/items")).await;
     assert_eq!(ids(&a.body), ["urn:ngsi-ld:Event:1"], "{}", a.body);
     let a = get(&app, &format!("{ITEMS}/scoped/items?ngsild.scopeQ=/zz")).await;

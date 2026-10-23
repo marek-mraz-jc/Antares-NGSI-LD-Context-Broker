@@ -93,12 +93,16 @@ impl Filter {
     /// `(filter);(caller's)`, a fixed geo-query never replaced.
     ///
     /// # Errors
-    /// When the filter fixes a geo-query and the caller names a member of one.
+    /// When the filter fixes a geo-query and the caller names a member of one, or the caller's
+    /// `q` is no expression of its own ([`one_q`]).
     pub fn narrow(&self, params: &mut BTreeMap<String, String>) -> Result<(), &'static str> {
         if self.georel.is_some() && GEO.iter().any(|k| params.contains_key(*k)) {
             return Err(
                 "this output fixes its geo-query: georel, geometry, coordinates and geoproperty are its own",
             );
+        }
+        if let Some(theirs) = params.get("q") {
+            one_q(theirs)?;
         }
         if let Some(scope) = self.scope_with(params.get("scopeQ").map(String::as_str))? {
             params.insert("scopeQ".to_owned(), scope);
@@ -113,6 +117,17 @@ impl Filter {
         }
         Ok(())
     }
+}
+
+/// Refuses a caller's `q` that does not parse alone (TS 104 175 4.9), so the text joined as
+/// `(filter);(q)` is one group: `b==2)|(c==3` would close the filter's group and OR past it.
+///
+/// # Errors
+/// When `q` is no query of its own.
+pub fn one_q(q: &str) -> Result<(), &'static str> {
+    antares_ql::parse_q(q).map(drop).map_err(|_| {
+        "q is no query expression of its own (TS 104 175 4.9): check its parentheses and quotes"
+    })
 }
 
 /// What a role reads: an attribute path, or a list of paths (of which the first with a value
@@ -546,6 +561,26 @@ mod tests {
         let mut theirs = BTreeMap::from([("geoproperty".to_owned(), "location".to_owned())]);
         assert_eq!(unfixed.narrow(&mut theirs), Ok(()));
         assert_eq!(theirs.get("geoproperty").map(String::as_str), Some("place"));
+    }
+
+    #[test]
+    fn a_callers_q_never_closes_the_filters_group() {
+        let filter = Filter {
+            q: Some("a==1".into()),
+            ..Filter::default()
+        };
+        for escape in ["b==2)|(c==3", "b==2)|(c==3;(d==4", ")", "b==\"2"] {
+            let mut params = BTreeMap::from([("q".to_owned(), escape.to_owned())]);
+            assert!(filter.narrow(&mut params).is_err(), "{escape}");
+            assert_eq!(params.get("q").map(String::as_str), Some(escape));
+        }
+        let unfiltered = Filter::default();
+        let mut params = BTreeMap::from([("q".to_owned(), "b==2)|(c==3".to_owned())]);
+        assert!(unfiltered.narrow(&mut params).is_err());
+        let mut quoted = BTreeMap::from([("q".to_owned(), "name==\"a)|(b\"".to_owned())]);
+        assert_eq!(filter.narrow(&mut quoted), Ok(()));
+        let joined = quoted.get("q").map(String::as_str);
+        assert_eq!(joined, Some("(a==1);(name==\"a)|(b\")"));
     }
 
     #[test]

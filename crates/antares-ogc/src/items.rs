@@ -195,6 +195,9 @@ pub(crate) fn params(c: &Collection, pairs: &[(String, String)]) -> Result<Param
             "ngsild.pick and ngsild.omit both select the properties; name one",
         ));
     }
+    if let Some(q) = p.option("q") {
+        antares_ops::outputs::one_q(q).map_err(bad)?;
+    }
     if let Some(o) = &c.output {
         o.filter.scope_with(p.option("scopeQ")).map_err(bad)?;
     }
