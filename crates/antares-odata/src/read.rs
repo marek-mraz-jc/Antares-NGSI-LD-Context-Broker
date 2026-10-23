@@ -1937,6 +1937,7 @@ mod tests {
             shape,
             list: false,
             json: false,
+            untyped: false,
             written: crate::edm::Written::Always,
         };
         Set {

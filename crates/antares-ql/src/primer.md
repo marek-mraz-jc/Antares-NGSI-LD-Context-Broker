@@ -8,6 +8,7 @@ Query (query_entities, query_temporal).
 - `type` and `id` take lists; `idPattern` is a regular expression over ids.
 - `q`: `;` AND, `|` OR, parentheses; == != > >= < <= ~= (regex) !~=, ranges `a..b`, lists `"x","y"`. E.g. `pm10>40`, `address[addressLocality]=="Banská Bystrica"`, `pm10.observedAt>=2026-10-12T00:00:00Z`, `!dateExpired`. `scopeQ`: `/city/#`.
 - Geo: `georel` near;maxDistance==500, within, intersects, contains, disjoint, equals, overlaps; `geometry` Point, Polygon…; `coordinates` longitude first; `geoproperty` when not location.
+- What is in an area, every type in one call: area_overview with `geometry` Point or LineString and `maxDistance` in metres, or Polygon; per type its count and the `limit` nearest.
 - `attrs` selects attributes; `pick` and `omit` keep or drop members. `lang=sk` gives each LanguageProperty in Slovak, e.g. the `name` of AirQualityObserved.
 - `join` (flat or inline) with `joinLevel` 1 to 3 returns the entities a Relationship names in the same answer.
 - `format`: normalized (default), concise, or keyValues: plain values, the cheapest for a large page, e.g. type Organization with `pick` name,pupilCount and `limit` 1000. `sysAttrs` adds createdAt and modifiedAt. `local` keeps to this broker; `orderBy` attr;desc sorts a local query.

@@ -531,6 +531,21 @@ async fn retain(
     Ok(n)
 }
 
+/// At most `$4` instances of the Entities `$2` of Tenant `$1` observed
+/// before `$3`, by the (tenant, entity) prefix of the history index.
+const ENTITY_ROWS: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
+           FROM attr_instances a
+           WHERE a.tenant_id = $1 AND a.entity_id = ANY($2::text[])
+             AND a.observed_at < $3::timestamptz
+           LIMIT $4";
+/// The same over the superseded versions (T-4665).
+const VERSION_ROWS: &str =
+    "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
+           FROM attr_versions a
+           WHERE a.tenant_id = $1 AND a.entity_id = ANY($2::text[])
+             AND a.observed_at < $3::timestamptz
+           LIMIT $4";
+
 /// Retention of history (`/q/retention`, T-3900, DM-97): at most `batch`
 /// attribute instances of the Entities `scope` names in one Tenant, observed
 /// before `before`. Types live on `temporal_entities`; the instance key is
@@ -545,11 +560,7 @@ pub async fn retain_history(
     dry_run: bool,
 ) -> Result<u64, sqlx::Error> {
     use antares_store::HistoryScope;
-    const ENTITY: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
-           FROM attr_instances a
-           WHERE a.tenant_id = $1 AND a.entity_id = ANY($2::text[])
-             AND a.observed_at < $3::timestamptz
-           LIMIT $4";
+    const ENTITY: &str = ENTITY_ROWS;
     const TYPE: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
            FROM attr_instances a
            JOIN temporal_entities t ON t.tenant_id = a.tenant_id AND t.id = a.entity_id
@@ -592,12 +603,7 @@ pub async fn retain_history(
     // (T-4665): the same three selections over `attr_versions`, written out so
     // every statement on `attr_instances` stays a literal the tenant guard
     // reads (tests/attr_instances_tenant_predicate.rs).
-    const V_ENTITY: &str =
-        "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
-           FROM attr_versions a
-           WHERE a.tenant_id = $1 AND a.entity_id = ANY($2::text[])
-             AND a.observed_at < $3::timestamptz
-           LIMIT $4";
+    const V_ENTITY: &str = VERSION_ROWS;
     const V_TYPE: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
            FROM attr_versions a
            JOIN temporal_entities t ON t.tenant_id = a.tenant_id AND t.id = a.entity_id
@@ -612,6 +618,44 @@ pub async fn retain_history(
              AND a.entity_id <> ALL($5::text[])
              AND a.observed_at < $3::timestamptz
            LIMIT $4";
+    // A sweep's delete of a type walks its Entities (T-5157): see
+    // [`walk_history`]. A dry run counts the whole scope in one statement.
+    if !dry_run {
+        let one;
+        let (ids, key, names, except) = match scope {
+            HistoryScope::Entity(_) => (None, String::new(), &[][..], &[][..]),
+            HistoryScope::Type {
+                type_iri,
+                except_ids,
+            } => {
+                one = [type_iri.to_owned()];
+                (
+                    Some(TYPE_IDS),
+                    format!("{tenant}\n{type_iri}"),
+                    &one[..],
+                    except_ids,
+                )
+            }
+            HistoryScope::Rest {
+                except_types,
+                except_ids,
+            } => (
+                Some(REST_IDS),
+                format!("{tenant}\n"),
+                except_types,
+                except_ids,
+            ),
+        };
+        if let Some(ids) = ids {
+            let walk = Walk {
+                ids,
+                key,
+                names,
+                except,
+            };
+            return walk_history(pool, tenant, &walk, before, batch).await;
+        }
+    }
     let one;
     let (rows, keyed, versions, names, except) = match scope {
         HistoryScope::Entity(id) => {
@@ -660,6 +704,155 @@ pub async fn retain_history(
     Ok(current
         .saturating_add(current_keyed)
         .saturating_add(superseded))
+}
+
+/// The Entities of a type (`$2`), or of no type of `$2` for the rest, in
+/// Tenant `$1` leaving out `$3`, after `$4` in id order, at most `$5`. The
+/// primary key serves the order; `types` is only a filter, as no array
+/// operator reaches an index under RLS (migration 0015).
+const TYPE_IDS: &str = "SELECT t.id FROM temporal_entities t
+       WHERE t.tenant_id = $1 AND t.types @> $2::text[]
+         AND t.id <> ALL($3::text[]) AND t.id > $4
+       ORDER BY t.id LIMIT $5";
+const REST_IDS: &str = "SELECT t.id FROM temporal_entities t
+       WHERE t.tenant_id = $1 AND NOT (t.types && $2::text[])
+         AND t.id <> ALL($3::text[]) AND t.id > $4
+       ORDER BY t.id LIMIT $5";
+
+/// How long one [`walk_history`] call goes on to the next chunk of Entities
+/// when the ones before held nothing to delete.
+const WALK_TIME: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Where the walk of each (Tenant, scope) stopped, by [`Walk::key`]: the
+/// next call, the next sweep included, starts after it. Per process; a
+/// restart walks from the start again.
+static WALKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// One history retention scope as a walk over its Entities.
+struct Walk<'a> {
+    ids: &'static str,
+    key: String,
+    names: &'a [String],
+    except: &'a [String],
+}
+
+impl Walk<'_> {
+    fn at(&self) -> String {
+        let walks = WALKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        walks.get(&self.key).cloned().unwrap_or_default()
+    }
+
+    fn stop(&self, after: String) {
+        let mut walks = WALKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        walks.insert(self.key.clone(), after);
+    }
+}
+
+/// History retention of a type (or the rest) as a walk over its Entities in
+/// id order (T-5157): each statement deletes at most `batch` instances of a
+/// chunk of `batch / 10` (10 to 100) Entities by the per-Entity index, so its
+/// cost is bounded by the chunk and never by the plan a JOIN of the type to
+/// the whole history gets. On dev that JOIN ran 4-10 s for a step with
+/// nothing to delete and timed out every few minutes. A chunk is left when
+/// it holds less than what is left of the batch; the walk goes on for up to
+/// [`WALK_TIME`] and remembers where it stopped, so a type of 50 000
+/// Entities is covered over a few sweeps instead of timing out in one. At
+/// the end it starts over. Returns the instances and versions deleted, at
+/// most `batch`.
+async fn walk_history(
+    pool: &PgPool,
+    tenant: &str,
+    walk: &Walk<'_>,
+    before: &str,
+    batch: usize,
+) -> Result<u64, sqlx::Error> {
+    let started = std::time::Instant::now();
+    let per = (batch / 10).clamp(10, 100);
+    let mut after = walk.at();
+    let mut total = 0usize;
+    loop {
+        let ids = entity_chunk(pool, tenant, walk, &after, per).await?;
+        let Some(last) = ids.last().cloned() else {
+            walk.stop(String::new());
+            return Ok(total as u64);
+        };
+        for (rows, delete) in [
+            (
+                ENTITY_ROWS,
+                "DELETE FROM attr_instances
+             WHERE (tenant_id, entity_id, attr_id, instance_id, observed_at) IN",
+            ),
+            (
+                VERSION_ROWS,
+                "DELETE FROM attr_versions
+             WHERE (tenant_id, entity_id, attr_id, instance_id, observed_at) IN",
+            ),
+        ] {
+            let left = batch.saturating_sub(total);
+            if left == 0 {
+                break;
+            }
+            let n = retain(
+                pool,
+                rows,
+                delete,
+                (tenant, &ids, None, before, left),
+                false,
+            )
+            .await?;
+            total = total.saturating_add(usize::try_from(n).unwrap_or(usize::MAX));
+        }
+        if total >= batch {
+            // The chunk may hold more: the next call starts with it again.
+            walk.stop(after);
+            return Ok(total as u64);
+        }
+        if ids.len() < per {
+            walk.stop(String::new());
+            return Ok(total as u64);
+        }
+        after = last;
+        if started.elapsed() >= WALK_TIME {
+            walk.stop(after);
+            return Ok(total as u64);
+        }
+    }
+}
+
+/// The next chunk of a [`Walk`]'s Entities after `after`, under the rule's
+/// Tenant (`temporal_entities` has no service escape) and the same 5 s
+/// statement timeout as each delete.
+async fn entity_chunk(
+    pool: &PgPool,
+    tenant: &str,
+    walk: &Walk<'_>,
+    after: &str,
+    per: usize,
+) -> Result<Vec<String>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    crate::store::pg::set_service(&mut tx).await?;
+    sqlx::query(crate::SET_TENANT_SQL)
+        .bind(tenant)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout = '5s'")
+        .execute(&mut *tx)
+        .await?;
+    let ids = sqlx::query_scalar(walk.ids)
+        .bind(tenant)
+        .bind(walk.names)
+        .bind(walk.except)
+        .bind(after)
+        .bind(i64::try_from(per).unwrap_or(i64::MAX))
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(ids)
 }
 
 /// The Entities of every Tenant that carry their own history retention
