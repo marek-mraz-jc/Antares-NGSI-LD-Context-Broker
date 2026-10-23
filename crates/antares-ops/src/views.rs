@@ -133,7 +133,7 @@ pub struct View {
 }
 
 /// The surfaces a view's `representations` may name.
-pub const REPRESENTATIONS: &[&str] = &["ical", "feed", "ogc", "geojson", "csv"];
+pub const REPRESENTATIONS: &[&str] = &["ical", "feed", "ogc", "geojson", "csv", "gbfs"];
 
 pub use crate::outputs::MAX_OUTPUTS;
 

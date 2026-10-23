@@ -8,8 +8,8 @@
 //! statement runs, the deliveries arriving behind it queue, and the next
 //! statement serves all of them. A delivery never joins a statement already
 //! running, so the Entities it reads are read after it asked (ADR-0023
-//! rule 9: the view as the table serves it now). A tenant has at most one
-//! booking and one read statement in flight, whatever its fan-out.
+//! rule 9: the view as the table serves it now). A tenant of a store has at
+//! most one booking and one read statement in flight, whatever its fan-out.
 
 use super::*;
 use antares_store::Delivery;
@@ -19,12 +19,29 @@ use antares_store::Delivery;
 #[cfg(not(target_arch = "wasm32"))]
 type Waiting<Q, A> = Vec<(Q, tokio::sync::oneshot::Sender<A>)>;
 
-/// One queue per tenant. An entry exists exactly while a runner serves it, so
-/// a caller that finds none starts one, and the map holds only tenants with a
-/// statement in flight.
+/// A queue's key: the store the statement runs on and the tenant. The store
+/// part keeps two brokers of one process (tests run several, with the same
+/// tenants) apart: a statement runs on the first caller's store, so a
+/// question of another store answered there found nothing and its
+/// notification was dropped (T-5245). A runner holds its store, so no other
+/// store reuses the address while the entry lives.
+#[cfg(not(target_arch = "wasm32"))]
+type Key = (usize, String);
+
+#[cfg(not(target_arch = "wasm32"))]
+fn key(st: &AppState, tenant: &TenantId) -> Key {
+    (
+        Arc::as_ptr(&st.store).cast::<()>().addr(),
+        tenant.as_str().to_owned(),
+    )
+}
+
+/// One queue per store and tenant. An entry exists exactly while a runner
+/// serves it, so a caller that finds none starts one, and the map holds only
+/// queues with a statement in flight.
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) struct Coalescer<Q, A> {
-    queues: std::sync::Mutex<HashMap<String, Waiting<Q, A>>>,
+    queues: std::sync::Mutex<HashMap<Key, Waiting<Q, A>>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -53,18 +70,19 @@ impl<Q: Send + 'static, A: Send + 'static> Coalescer<Q, A> {
         F: Fn(AppState, TenantId, Vec<Q>) -> Fut + Clone + Send + 'static,
         Fut: std::future::Future<Output = Vec<A>> + Send,
     {
+        let key = key(st, tenant);
         let waiting = {
             // A poisoned map is a panic in some past runner; its guard
             // already removed that runner's entry.
             let mut queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
-            match queues.get_mut(tenant.as_str()) {
+            match queues.get_mut(&key) {
                 Some(waiting) => {
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     waiting.push((q, tx));
                     Err(rx)
                 }
                 None => {
-                    queues.insert(tenant.as_str().to_owned(), Vec::new());
+                    queues.insert(key.clone(), Vec::new());
                     Ok(q)
                 }
             }
@@ -84,7 +102,7 @@ impl<Q: Send + 'static, A: Send + 'static> Coalescer<Q, A> {
         };
         let _handoff = Retire {
             queues: &self.queues,
-            tenant: tenant.as_str(),
+            key: &key,
             armed: true,
             respawn: Some(Box::new(respawn)),
         };
@@ -97,19 +115,20 @@ impl<Q: Send + 'static, A: Send + 'static> Coalescer<Q, A> {
         F: Fn(AppState, TenantId, Vec<Q>) -> Fut,
         Fut: std::future::Future<Output = Vec<A>>,
     {
+        let key = key(st, tenant);
         let mut guard = Retire {
             queues: &self.queues,
-            tenant: tenant.as_str(),
+            key: &key,
             armed: true,
             respawn: None,
         };
         loop {
             let batch = {
                 let mut queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
-                match queues.get_mut(tenant.as_str()) {
+                match queues.get_mut(&key) {
                     Some(waiting) if !waiting.is_empty() => std::mem::take(waiting),
                     _ => {
-                        queues.remove(tenant.as_str());
+                        queues.remove(&key);
                         guard.armed = false;
                         return;
                     }
@@ -132,8 +151,8 @@ impl<Q: Send + 'static, A: Send + 'static> Coalescer<Q, A> {
 /// behind a dead runner; the questions still queued then get `None`.
 #[cfg(not(target_arch = "wasm32"))]
 struct Retire<'a, Q, A> {
-    queues: &'a std::sync::Mutex<HashMap<String, Waiting<Q, A>>>,
-    tenant: &'a str,
+    queues: &'a std::sync::Mutex<HashMap<Key, Waiting<Q, A>>>,
+    key: &'a Key,
     armed: bool,
     respawn: Option<Box<dyn FnOnce() + Send + 'a>>,
 }
@@ -145,14 +164,14 @@ impl<Q, A> Drop for Retire<'_, Q, A> {
             return;
         }
         let mut queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
-        let waiting = queues.get(self.tenant).is_some_and(|w| !w.is_empty());
+        let waiting = queues.get(self.key).is_some_and(|w| !w.is_empty());
         match self.respawn.take() {
             Some(respawn) if waiting && !std::thread::panicking() => {
                 drop(queues);
                 respawn();
             }
             _ => {
-                queues.remove(self.tenant);
+                queues.remove(self.key);
             }
         }
     }

@@ -353,7 +353,12 @@ impl Client {
                 .map_err(|_| "not closed within the wait".to_owned())?;
             match frame {
                 Some(Ok(Message::Text(t))) => seen.push(described(t.as_str())?),
-                Some(Ok(Message::Close(Some(c)))) => return Ok((c.code.into(), seen)),
+                Some(Ok(Message::Close(Some(c)))) => {
+                    // answer it, as a browser does: the next read sends
+                    // the close frame tungstenite queued
+                    let _answered = tokio::time::timeout(WAIT, self.ws.next()).await;
+                    return Ok((c.code.into(), seen));
+                }
                 Some(Ok(Message::Close(None))) | None => return Ok((1005, seen)),
                 Some(Ok(_)) => {}
                 Some(Err(e)) => return Err(format!("{e}; seen {seen:?}")),

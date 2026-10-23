@@ -3191,6 +3191,49 @@ mod coalesced_delivery {
         assert_eq!(answers, vec![Some(10), Some(20), Some(30)]);
     }
 
+    /// A question of another store (a second broker in the process, same
+    /// tenant) never joins a statement running on the first one's store: it
+    /// runs its own, on its own store (T-5245).
+    #[tokio::test]
+    async fn another_store_never_joins_the_statement() {
+        static UNDER_TEST: std::sync::LazyLock<Coalescer<usize, usize>> =
+            std::sync::LazyLock::new(Coalescer::new);
+        let a = AppState::new("antares-coalescer-a".into());
+        let b = AppState::new("antares-coalescer-b".into());
+        let store = |st: &AppState| Arc::as_ptr(&st.store).cast::<()>().addr();
+        let (store_a, store_b) = (store(&a), store(&b));
+        let tenant = TenantId::new("default").expect("tenant");
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let run = {
+            let gate = gate.clone();
+            move |st: AppState, _t: TenantId, qs: Vec<usize>| {
+                let gate = gate.clone();
+                async move {
+                    // a's statement waits for the test to let it finish
+                    if store(&st) == store_a {
+                        gate.acquire().await.map(|p| p.forget()).ok();
+                    }
+                    vec![store(&st); qs.len()]
+                }
+            }
+        };
+        let first = {
+            let (st, tenant, run) = (a.clone(), tenant.clone(), run.clone());
+            tokio::spawn(async move { UNDER_TEST.call(&st, &tenant, 0, run).await })
+        };
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        let other = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            UNDER_TEST.call(&b, &tenant, 1, run.clone()),
+        )
+        .await;
+        gate.add_permits(1);
+        assert_eq!(other.ok().flatten(), Some(store_b), "b ran on b's store");
+        assert_eq!(first.await.ok().flatten(), Some(store_a));
+    }
+
     /// Subscriptions that differ only in their endpoint and bookkeeping get
     /// one payload; a different shape or @context gets its own.
     #[test]

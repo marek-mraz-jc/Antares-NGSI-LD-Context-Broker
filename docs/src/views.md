@@ -42,8 +42,9 @@ Tenant still apply. `*` anywhere else is refused when the view loads.
 
 A view may carry `representations`, an object keyed by a format: `ical`
 ([iCalendar](ical.md)), `feed` (Atom, RSS and JSON Feed), `ogc`
-([OGC API - Features](ogc.md)), `geojson` and `csv` ([GeoJSON](geojson.md)).
-Each member is a list of named outputs (docs API/11 EP-159, T-5216): `name`,
+([OGC API - Features](ogc.md)), `geojson` and `csv` ([GeoJSON](geojson.md)), and `gbfs`
+([GBFS](gbfs.md)), whose outputs carry the GBFS system fields that page
+lists instead. Each other member is a list of named outputs (docs API/11 EP-159, T-5216): `name`,
 `title` and `description` per language, `version`, `sources` (model classes
 with their role `mapping`), a `filter` (`q`, `scopeQ`, `georel`, `geometry`,
 `coordinates`, `geoproperty`) that only narrows the view, `lang` and `limit`.

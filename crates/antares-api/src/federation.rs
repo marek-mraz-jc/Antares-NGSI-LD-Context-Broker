@@ -2762,10 +2762,19 @@ impl Part {
 /// Combine local + forwarded parts (6.3.17/6.4.3.1): all-success ⇒ `ok`,
 /// single failing part ⇒ its own error, mixed ⇒ 207 Multi-Status.
 pub fn combine(parts: Vec<Part>, ok: Response, tenant: &TenantId) -> Response {
+    // 6.3.17: "a registration endpoint responding with no data and the HTTP
+    // status code 404 - Not Found should not be considered as abnormal
+    // behaviour for distributed operations": a 404 beside a success is no
+    // error, and 404 everywhere is the one 404 the operation answers.
+    let found = parts.iter().any(Part::ok);
+    let parts: Vec<Part> = parts
+        .into_iter()
+        .filter(|p| !found || p.status != 404)
+        .collect();
     if parts.iter().all(Part::ok) {
         return ok;
     }
-    if parts.len() == 1 {
+    if parts.len() == 1 || parts.iter().all(|p| p.status == 404) {
         let Some(p) = parts.first() else {
             return ok;
         };
@@ -3129,6 +3138,21 @@ mod tests {
             h.insert("via", v.parse().expect("via"));
         }
         h
+    }
+
+    /// 6.3.17: a source's 404 beside a success is no error; 404 on every
+    /// part is one 404 (Coraine distop_delete_inclusive_source_404 03, 05).
+    #[test]
+    fn a_source_404_is_not_abnormal() {
+        let t = antares_model::TenantId::new(TenantId::DEFAULT).expect("tenant");
+        let part = |status: u16| Part {
+            status,
+            detail: String::new(),
+        };
+        let ok = || StatusCode::NO_CONTENT.into_response();
+        assert_eq!(combine(vec![part(204), part(404)], ok(), &t).status(), 204);
+        assert_eq!(combine(vec![part(404), part(404)], ok(), &t).status(), 404);
+        assert_eq!(combine(vec![part(204), part(500)], ok(), &t).status(), 207);
     }
 
     /// 4.3.6.6: contextSourceInfo carries the headers a source needs to

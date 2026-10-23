@@ -294,7 +294,6 @@ async fn icsr_a_revoked_grant_stops_notifications() {
 /// identity stays in b: no decision in a and no notification is taken
 /// about him, and the notification a's subscriber gets does not name him.
 #[tokio::test]
-#[ignore = "flaky on dev: T-3700, run 39917345205"]
 async fn icsr_a_notification_carries_no_subject() {
     let kit = Kit::default();
     let engine = Arc::new(Engine::default());
