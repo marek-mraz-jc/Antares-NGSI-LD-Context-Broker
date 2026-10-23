@@ -1270,6 +1270,8 @@ impl AnyStore {
                     }
                     for table in [
                         "entities",
+                        // emptied by the delete trigger of `entities` (0024)
+                        "entity_values",
                         "subscriptions",
                         "csource_subscriptions",
                         "csource_registrations",

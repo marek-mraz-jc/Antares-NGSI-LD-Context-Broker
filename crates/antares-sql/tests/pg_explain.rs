@@ -124,6 +124,12 @@ async fn seed_rls(pool: &sqlx::PgPool) {
         .execute(&mut *tx)
         .await
         .expect("no lock timeout: the seed holds the lock for seconds");
+    // the seed's writes key `entity_values` (0024) too: past the pool's
+    // statement timeout, both for the seeder and for a test waiting on it
+    sqlx::query("SET LOCAL statement_timeout = 0")
+        .execute(&mut *tx)
+        .await
+        .expect("no statement timeout for the seed");
     sqlx::query("SELECT pg_advisory_xact_lock(48520)")
         .execute(&mut *tx)
         .await
@@ -176,7 +182,7 @@ async fn seed_rls(pool: &sqlx::PgPool) {
         }
     }
     // statistics before the lock goes: a test waiting on it plans at once
-    sqlx::query("ANALYZE entities, temporal_entities, attr_instances")
+    sqlx::query("ANALYZE entities, entity_values, temporal_entities, attr_instances")
         .execute(&mut *tx)
         .await
         .expect("analyze");
@@ -278,12 +284,18 @@ async fn every_query_shape_reads_an_index_under_rls() {
     let speed = |cond: &str| {
         format!(r#"entity @? '$."https://x/speed"[*]."value" ? (@ {cond})'::jsonpath"#)
     };
+    let probe = |cond: &str| {
+        format!("SELECT id FROM entity_values WHERE tenant_id = '{RLS_A}' AND {cond} LIMIT 1001")
+    };
     // A walk: a sequential scan, a primary key read with the predicate left
     // as a filter, or any other index whose condition is the Tenant alone,
     // except the partial indexes that hold a sliver of it by construction
-    // (multi-type Entities, unextractable locations).
+    // (multi-type Entities, unextractable locations, Entities without one:
+    // the multi-type arm of `!location` may read the unlocated index by
+    // the Tenant alone).
     let sliver = [
         "i_entities_multi_type_id",
+        "i_entities_type_unlocated",
         "i_entities_types_multi",
         "i_entities_loc_ambiguous",
         "i_temporal_entities_multi_type",
@@ -328,6 +340,13 @@ async fn every_query_shape_reads_an_index_under_rls() {
             type_page(&format!("{w} AND entity ?| ARRAY['https://x/brand']"), &[&[&t1]], 21),
             "i_entities_first_type_id",
         ),
+        // T-5303: the store's `entity_values` probes (`value_probe`,
+        // `attrs_probe`); the page then reads its ids as the `id` shape does
+        ("q equality probe", probe("attr = 'https://x/speed' AND f = ANY(ARRAY[42, 'NaN'::float8])"), "i_entity_values_num"),
+        ("q range probe", probe("attr = 'https://x/speed' AND f >= 98"), "i_entity_values_num"),
+        ("q at most probe", probe("attr = 'https://x/speed' AND (f <= 1 OR f = 'NaN')"), "i_entity_values_num"),
+        ("q string probe", probe("attr = 'https://x/brand' AND (txt = 'b7' OR f = 'NaN')"), "i_entity_values_txt"),
+        ("attrs probe", probe("attr = ANY(ARRAY['https://x/rare'])"), "i_entity_values_num"),
         (
             "geo near",
             format!(
