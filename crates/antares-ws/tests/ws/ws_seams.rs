@@ -242,7 +242,9 @@ async fn ws_an_upgrade_naming_the_tenant_wrongly_is_refused() -> Result<(), Stri
 #[tokio::test(flavor = "multi_thread")]
 async fn ws_a_resume_within_the_grace_keeps_the_subscriptions() -> Result<(), String> {
     let b = broker(Limits {
-        resume_grace: Duration::from_millis(300),
+        // the reconnect and resume fit in the grace under CI load; 300 ms
+        // did not (T-5245)
+        resume_grace: Duration::from_secs(2),
         ..Limits::default()
     })
     .await?;
@@ -254,7 +256,7 @@ async fn ws_a_resume_within_the_grace_keeps_the_subscriptions() -> Result<(), St
     let mut again = connect(b.addr, ROOT, &[]).await?;
     assert_eq!(status(&again.resume(&id, &token, 0).await?), 200);
     // past the grace the resumed connection still holds its Subscription
-    tokio::time::sleep(Duration::from_millis(900)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
     b.http.car(None, "urn:ngsi-ld:Car:g", 1).await?;
     let n = again.notification().await?;
     assert_eq!(text(&n, "/metadata/x-subscription"), sub, "{n}");
