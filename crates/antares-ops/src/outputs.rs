@@ -93,15 +93,15 @@ impl Filter {
     /// `(filter);(caller's)`, a fixed geo-query never replaced.
     ///
     /// # Errors
-    /// When the filter fixes a geo-query and the caller names a member of one, or the caller's
-    /// `q` is no expression of its own ([`one_q`]).
+    /// When the filter fixes a geo-query and the caller names a member of one, or the filter
+    /// has a `q` and the caller's is no expression of its own ([`one_q`]).
     pub fn narrow(&self, params: &mut BTreeMap<String, String>) -> Result<(), &'static str> {
         if self.georel.is_some() && GEO.iter().any(|k| params.contains_key(*k)) {
             return Err(
                 "this output fixes its geo-query: georel, geometry, coordinates and geoproperty are its own",
             );
         }
-        if let Some(theirs) = params.get("q") {
+        if let (Some(_), Some(theirs)) = (&self.q, params.get("q")) {
             one_q(theirs)?;
         }
         if let Some(scope) = self.scope_with(params.get("scopeQ").map(String::as_str))? {
@@ -574,9 +574,10 @@ mod tests {
             assert!(filter.narrow(&mut params).is_err(), "{escape}");
             assert_eq!(params.get("q").map(String::as_str), Some(escape));
         }
+        // nothing to join: the broker judges the caller's q alone, with its own answer
         let unfiltered = Filter::default();
         let mut params = BTreeMap::from([("q".to_owned(), "b==2)|(c==3".to_owned())]);
-        assert!(unfiltered.narrow(&mut params).is_err());
+        assert_eq!(unfiltered.narrow(&mut params), Ok(()));
         let mut quoted = BTreeMap::from([("q".to_owned(), "name==\"a)|(b\"".to_owned())]);
         assert_eq!(filter.narrow(&mut quoted), Ok(()));
         let joined = quoted.get("q").map(String::as_str);
