@@ -453,38 +453,14 @@ pub(super) async fn deliver_as(
         // 5.8.6 / 5.11.7: subscription status → "failed" on delivery failure;
         // roll back the optimistic lastSuccess stamp.
         let ts = now_iso();
-        let mut failed_doc: Option<Value> = None;
-        st.store
-            .mutate(tenant, kind, &sub_id, |doc| {
-                if let Some(o) = doc.as_object_mut() {
-                    o.insert("status".into(), Value::String("failed".into()));
-                }
-                if let Some(n) = doc
-                    .as_object_mut()
-                    .and_then(|o| o.get_mut("notification"))
-                    .and_then(Value::as_object_mut)
-                {
-                    match prev_success.take() {
-                        Some(v) => n.insert("lastSuccess".into(), v),
-                        None => n.remove("lastSuccess"),
-                    };
-                    n.insert("lastFailure".into(), Value::String(ts.clone()));
-                    // Table 5.2.14.2-1 timesFailed: "Number of times an
-                    // unsuccessful response (or timeout) has been received
-                    // when delivering the notification" — an output-only
-                    // member implementations shall generate.
-                    let failed = n.get("timesFailed").and_then(Value::as_i64).unwrap_or(0);
-                    n.insert("timesFailed".into(), json!(failed.saturating_add(1)));
-                    n.insert("status".into(), Value::String("failed".into()));
-                }
-                failed_doc = Some(doc.clone());
-                Ok::<(), antares_model::NgsiError>(())
-            })
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!("failure-status writeback failed: {e}");
-                None
-            });
+        // An in-process failure (a WebSocket queue that overflowed) waits in
+        // its tenant's queue like its booking did: a fan-out of overflowing
+        // sockets holds one write-back at a time, not one per socket (T-5159).
+        let failed_doc = if !policed && kind == Kind::Subscription {
+            super::coalesce::fail_in_process(st, tenant, &sub_id, prev_success.take(), &ts).await
+        } else {
+            record_failure(st, tenant, kind, &sub_id, prev_success.take(), &ts).await
+        };
         mirror_bookkeeping(st, tenant, kind, &sub_id, failed_doc);
         // Retries are transport, not new notifications: they run on their
         // own task (never on the request path, never delaying another
@@ -503,6 +479,53 @@ pub(super) async fn deliver_as(
             });
         }
     }
+}
+
+/// 5.8.6 / 5.11.7 after a failed attempt: status "failed", the optimistic
+/// `lastSuccess` rolled back to `prev_success`, `lastFailure` and
+/// `timesFailed` moved. The stored document as it now stands, `None` when the
+/// row is gone or the write failed (logged).
+pub(super) async fn record_failure(
+    st: &AppState,
+    tenant: &TenantId,
+    kind: Kind,
+    sub_id: &str,
+    mut prev_success: Option<Value>,
+    ts: &str,
+) -> Option<Value> {
+    let mut failed_doc: Option<Value> = None;
+    st.store
+        .mutate(tenant, kind, sub_id, |doc| {
+            if let Some(o) = doc.as_object_mut() {
+                o.insert("status".into(), Value::String("failed".into()));
+            }
+            if let Some(n) = doc
+                .as_object_mut()
+                .and_then(|o| o.get_mut("notification"))
+                .and_then(Value::as_object_mut)
+            {
+                match prev_success.take() {
+                    Some(v) => n.insert("lastSuccess".into(), v),
+                    None => n.remove("lastSuccess"),
+                };
+                n.insert("lastFailure".into(), Value::String(ts.to_owned()));
+                // Table 5.2.14.2-1 timesFailed: "Number of times an
+                // unsuccessful response (or timeout) has been received
+                // when delivering the notification" — an output-only
+                // member implementations shall generate.
+                let failed = n.get("timesFailed").and_then(Value::as_i64).unwrap_or(0);
+                n.insert("timesFailed".into(), json!(failed.saturating_add(1)));
+                n.insert("status".into(), Value::String("failed".into()));
+            }
+            failed_doc = Some(doc.clone());
+            Ok::<(), antares_model::NgsiError>(())
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("failure-status writeback failed: {e}");
+            None
+        });
+    failed_doc
 }
 
 /// A `KeyValuePair[]` member of `endpoint` (Table 5.2.15-1) as owned pairs.

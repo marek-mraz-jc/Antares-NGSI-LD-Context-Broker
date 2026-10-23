@@ -835,6 +835,42 @@ pub async fn run_current_state_contract(
         "an absent subscription books nothing"
     );
 
+    // T-5159: the batched stamp is the same rule, one answer per attempt in
+    // input order, and a batch never books another tenant's row.
+    let t3 = "2020-01-03T00:00:00.000Z";
+    let batch = d
+        .record_deliveries(
+            a,
+            Kind::Subscription,
+            &[(gone.as_str(), t3), (sub.as_str(), t3)],
+        )
+        .await
+        .expect("record_deliveries");
+    assert_eq!(batch.len(), 2, "one answer per attempt: {batch:?}");
+    assert!(
+        batch.first().is_some_and(Option::is_none),
+        "an absent subscription books nothing"
+    );
+    let third = batch
+        .get(1)
+        .and_then(Option::as_ref)
+        .expect("the subscription is booked");
+    assert_eq!(third.doc["notification"]["timesSent"], 3);
+    assert_eq!(third.doc["notification"]["lastSuccess"], t3);
+    assert_eq!(
+        third.prev_success.as_ref().and_then(Value::as_str),
+        Some(t2),
+        "each attempt of a batch gets back the lastSuccess it overwrote"
+    );
+    let elsewhere = d
+        .record_deliveries(b, Kind::Subscription, &[(sub.as_str(), t3)])
+        .await
+        .expect("record_deliveries");
+    assert!(
+        elsewhere.first().is_some_and(Option::is_none),
+        "a batch in another tenant books nothing: {elsewhere:?}"
+    );
+
     assert!(
         d.delete(a, Kind::Subscription, &sub).await.expect("delete"),
         "the contract's own subscription must be removable"

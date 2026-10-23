@@ -50,7 +50,7 @@ impl<Q: Send + 'static, A: Send + 'static> Coalescer<Q, A> {
         run: F,
     ) -> Option<A>
     where
-        F: Fn(AppState, TenantId, Vec<Q>) -> Fut + Send + 'static,
+        F: Fn(AppState, TenantId, Vec<Q>) -> Fut + Clone + Send + 'static,
         Fut: std::future::Future<Output = Vec<A>> + Send,
     {
         let waiting = {
@@ -73,29 +73,22 @@ impl<Q: Send + 'static, A: Send + 'static> Coalescer<Q, A> {
             Ok(q) => q,
             Err(rx) => return rx.await.ok(),
         };
-        let mut guard = Retire {
+        // Dropped mid-statement (its delivery's deadline) or done, the
+        // caller hands what queued behind it to a runner: a question that
+        // waited is never lost because the caller ahead of it went away.
+        let respawn = {
+            let (st, tenant, run) = (st.clone(), tenant.clone(), run.clone());
+            move || {
+                tokio::spawn(async move { self.serve(&st, &tenant, run).await });
+            }
+        };
+        let _handoff = Retire {
             queues: &self.queues,
             tenant: tenant.as_str(),
             armed: true,
+            respawn: Some(Box::new(respawn)),
         };
-        let answer = run(st.clone(), tenant.clone(), vec![q]).await.pop();
-        guard.armed = false;
-        if !self.retire_if_idle(tenant) {
-            let (st, tenant) = (st.clone(), tenant.clone());
-            tokio::spawn(async move { self.serve(&st, &tenant, run).await });
-        }
-        answer
-    }
-
-    /// Removes `tenant`'s entry when nothing waits in it; `false` when
-    /// questions are waiting and need a runner.
-    fn retire_if_idle(&self, tenant: &TenantId) -> bool {
-        let mut queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
-        if queues.get(tenant.as_str()).is_some_and(|w| !w.is_empty()) {
-            return false;
-        }
-        queues.remove(tenant.as_str());
-        true
+        run(st.clone(), tenant.clone(), vec![q]).await.pop()
     }
 
     /// Serve `tenant`'s queue until it is empty, one statement per round.
@@ -108,6 +101,7 @@ impl<Q: Send + 'static, A: Send + 'static> Coalescer<Q, A> {
             queues: &self.queues,
             tenant: tenant.as_str(),
             armed: true,
+            respawn: None,
         };
         loop {
             let batch = {
@@ -131,22 +125,35 @@ impl<Q: Send + 'static, A: Send + 'static> Coalescer<Q, A> {
     }
 }
 
-/// Removes a runner's entry when the runner (or the caller running its own
-/// statement) unwinds, so the tenant's next caller starts afresh instead of
-/// queueing behind a dead one; the questions still queued get `None`.
+/// What a runner leaves behind. With `respawn` (the caller that ran its own
+/// statement), questions still waiting go to a new runner, whether the caller
+/// finished or was dropped. Without it, or when unwinding from a panic, the
+/// entry goes, so the tenant's next caller starts afresh instead of queueing
+/// behind a dead runner; the questions still queued then get `None`.
 #[cfg(not(target_arch = "wasm32"))]
 struct Retire<'a, Q, A> {
     queues: &'a std::sync::Mutex<HashMap<String, Waiting<Q, A>>>,
     tenant: &'a str,
     armed: bool,
+    respawn: Option<Box<dyn FnOnce() + Send + 'a>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl<Q, A> Drop for Retire<'_, Q, A> {
     fn drop(&mut self) {
-        if self.armed {
-            let mut queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
-            queues.remove(self.tenant);
+        if !self.armed {
+            return;
+        }
+        let mut queues = self.queues.lock().unwrap_or_else(|p| p.into_inner());
+        let waiting = queues.get(self.tenant).is_some_and(|w| !w.is_empty());
+        match self.respawn.take() {
+            Some(respawn) if waiting && !std::thread::panicking() => {
+                drop(queues);
+                respawn();
+            }
+            _ => {
+                queues.remove(self.tenant);
+            }
         }
     }
 }
@@ -223,6 +230,56 @@ pub(super) async fn book(
         left = later;
     }
     out
+}
+
+/// The failure write-back of one in-process delivery
+/// ([`super::delivery::record_failure`]), queued per tenant behind the one in
+/// flight, so overflowing sockets of one fan-out never hold more than one
+/// pool connection for it. Rounds write in arrival order, so two failures of
+/// one subscription roll `lastSuccess` back in the order they were booked.
+pub(super) async fn fail_in_process(
+    st: &AppState,
+    tenant: &TenantId,
+    sub_id: &str,
+    prev_success: Option<Value>,
+    ts: &str,
+) -> Option<Value> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        type Failure = (String, Option<Value>, String);
+        static FAILURES: std::sync::LazyLock<Coalescer<Failure, Option<Value>>> =
+            std::sync::LazyLock::new(Coalescer::new);
+        FAILURES
+            .call(
+                st,
+                tenant,
+                (sub_id.to_owned(), prev_success, ts.to_owned()),
+                |st, tenant, failures: Vec<Failure>| async move {
+                    let mut docs = Vec::with_capacity(failures.len());
+                    for (id, prev, ts) in failures {
+                        docs.push(
+                            super::delivery::record_failure(
+                                &st,
+                                &tenant,
+                                Kind::Subscription,
+                                &id,
+                                prev,
+                                &ts,
+                            )
+                            .await,
+                        );
+                    }
+                    docs
+                },
+            )
+            .await
+            .flatten()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        super::delivery::record_failure(st, tenant, Kind::Subscription, sub_id, prev_success, ts)
+            .await
+    }
 }
 
 /// The stored Entities `ids` names, read in one statement with every other

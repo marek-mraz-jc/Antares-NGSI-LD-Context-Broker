@@ -3096,6 +3096,54 @@ mod coalesced_delivery {
         assert_eq!(rounds, vec![vec![0], vec![1, 2, 3, 4, 5]]);
     }
 
+    /// A caller dropped while its own statement runs (its delivery's
+    /// deadline) hands the questions queued behind it to a runner: none of
+    /// them is lost with it.
+    #[tokio::test]
+    async fn a_dropped_first_caller_hands_the_queue_on() {
+        static UNDER_TEST: std::sync::LazyLock<Coalescer<usize, usize>> =
+            std::sync::LazyLock::new(Coalescer::new);
+        let st = AppState::new("antares-coalescer-drop".into());
+        let tenant = TenantId::new("default").expect("tenant");
+        let started = Arc::new(AtomicUsize::new(0));
+        let run = {
+            let started = started.clone();
+            move |_st: AppState, _t: TenantId, qs: Vec<usize>| {
+                let started = started.clone();
+                async move {
+                    // the first statement never finishes on its own
+                    if started.fetch_add(1, Ordering::SeqCst) == 0 {
+                        std::future::pending::<()>().await;
+                    }
+                    qs.iter().map(|q| q.saturating_mul(10)).collect::<Vec<_>>()
+                }
+            }
+        };
+        let first = {
+            let (st, tenant, run) = (st.clone(), tenant.clone(), run.clone());
+            tokio::spawn(async move { UNDER_TEST.call(&st, &tenant, 0, run).await })
+        };
+        while started.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let rest: Vec<_> = (1..=3)
+            .map(|q| {
+                let (st, tenant, run) = (st.clone(), tenant.clone(), run.clone());
+                tokio::spawn(async move { UNDER_TEST.call(&st, &tenant, q, run).await })
+            })
+            .collect();
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        first.abort();
+        let mut answers = Vec::new();
+        for r in rest {
+            let answer = tokio::time::timeout(std::time::Duration::from_secs(5), r).await;
+            answers.push(answer.ok().and_then(Result::ok).flatten());
+        }
+        assert_eq!(answers, vec![Some(10), Some(20), Some(30)]);
+    }
+
     /// Subscriptions that differ only in their endpoint and bookkeeping get
     /// one payload; a different shape or @context gets its own.
     #[test]
