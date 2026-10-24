@@ -122,7 +122,9 @@ async fn a_views_type_list_over_100k_entities_probes_no_empty_group() {
                 jsonb_build_object('id', 'urn:ngsi-ld:' || t || ':' || lpad(n::text, 6, '0'),
                                    'type', jsonb_build_array($2 || t),
                                    $2 || 'zone', jsonb_build_array(
-                                       jsonb_build_object('type', 'Property', 'value', 'b'))),
+                                       jsonb_build_object('type', 'Property', 'value', 'b')),
+                                   $2 || 'speed', jsonb_build_array(
+                                       jsonb_build_object('type', 'Property', 'value', n))),
                 ARRAY[$2 || t], now(), now()
            FROM unnest(ARRAY['Car','Bus','Stop','Tree','Lamp']) AS t,
                 generate_series(1, 20000) AS n
@@ -190,6 +192,37 @@ async fn a_views_type_list_over_100k_entities_probes_no_empty_group() {
         "/types took {best:?} at best of 5, budget {budget:?}"
     );
 
+    // T-4934: the attribute catalogue answers through the same view; the
+    // `speed` every Entity carries is hidden by both rules, so it is neither
+    // listed nor probed (a probe would walk 20 000 Cars for nothing).
+    for (uri, want) in [
+        ("/ngsi-ld/v1/attributes", serde_json::json!(["zone"])),
+        (
+            "/ngsi-ld/v1/types?details=true",
+            serde_json::json!(["Bus", "Car", "Tree"]),
+        ),
+    ] {
+        let mut best = Duration::MAX;
+        for _ in 0..5 {
+            let (code, body, took) = types_at(&st, &tenant, uri).await;
+            assert_eq!(code, StatusCode::OK, "{body}");
+            let got = match body.as_array() {
+                Some(types) => types.iter().map(|t| t["typeName"].clone()).collect(),
+                None => body["attributeList"].clone(),
+            };
+            assert_eq!(got, want, "{uri}: {body}");
+            for t in body.as_array().into_iter().flatten() {
+                assert_eq!(t["attributeNames"], serde_json::json!(["zone"]), "{body}");
+            }
+            best = best.min(took);
+        }
+        eprintln!("{uri} over 100 000 Entities: {best:?} at best of 5");
+        assert!(
+            best < budget,
+            "{uri} took {best:?} at best of 5, budget {budget:?}"
+        );
+    }
+
     antares_sql::sqlx::query("DELETE FROM entities WHERE tenant_id = $1")
         .bind(&tenant)
         .execute(&pool)
@@ -197,11 +230,11 @@ async fn a_views_type_list_over_100k_entities_probes_no_empty_group() {
         .expect("clean");
 }
 
-/// `GET /types?details=true` folds every Entity (5.7.5 gives attributeNames,
-/// which no catalogue keeps). Over 100 000 Entities the fold reads each row
-/// once by keyset (T-4683): with OFFSET paging every page re-read the rows
-/// before it, 57-59 s on one prod tenant, holding three pool sessions. Local
-/// debug build: 11 s by OFFSET, under 2 s by keyset; the bound sits between.
+/// `GET /types?details=true` and `/attributes` over 100 000 Entities read
+/// the attribute catalogue (T-4934): a page of each type, no fold. The fold
+/// they replaced read each row once by keyset (T-4683, under 2 s locally;
+/// 13-19 s for `/attributes` on dev); OFFSET paging before it took 57-59 s
+/// on one prod tenant. Same 1 s bound at best of five as the type list.
 #[tokio::test(flavor = "multi_thread")]
 async fn type_details_over_100k_entities_read_each_row_once() {
     let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
@@ -250,8 +283,13 @@ async fn type_details_over_100k_entities_read_each_row_once() {
     let mut st = AppState::with_store("me".into(), Arc::new(store), "postgres");
     antares_api::wire(&mut st).await;
 
-    let (code, body, took) = types_at(&st, &tenant, "/ngsi-ld/v1/types?details=true").await;
-    assert_eq!(code, StatusCode::OK, "{body}");
+    let mut best = Duration::MAX;
+    let mut body = Value::Null;
+    for _ in 0..5 {
+        let (code, got, took) = types_at(&st, &tenant, "/ngsi-ld/v1/types?details=true").await;
+        assert_eq!(code, StatusCode::OK, "{got}");
+        (body, best) = (got, best.min(took));
+    }
     let names: Vec<&str> = body
         .as_array()
         .expect("an EntityType array")
@@ -266,8 +304,23 @@ async fn type_details_over_100k_entities_read_each_row_once() {
             .all(|t| t["attributeNames"] == serde_json::json!(["zone"])),
         "{body}"
     );
-    eprintln!("details over 100 000 Entities: {took:?}");
-    assert!(took < Duration::from_secs(5), "details took {took:?}");
+    eprintln!("details over 100 000 Entities: {best:?} at best of 5");
+    assert!(best < Duration::from_secs(1), "details took {best:?}");
+    let mut best = Duration::MAX;
+    for _ in 0..5 {
+        let (code, body, took) =
+            types_at(&st, &tenant, "/ngsi-ld/v1/attributes?details=true").await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert_eq!(body.as_array().map(Vec::len), Some(1), "{body}");
+        assert_eq!(
+            body[0]["typeNames"],
+            serde_json::json!(["Bus", "Car", "Lamp", "Stop", "Tree"]),
+            "{body}"
+        );
+        best = best.min(took);
+    }
+    eprintln!("/attributes?details=true over 100 000 Entities: {best:?} at best of 5");
+    assert!(best < Duration::from_secs(1), "/attributes took {best:?}");
 
     antares_sql::sqlx::query("DELETE FROM entities WHERE tenant_id = $1")
         .bind(&tenant)

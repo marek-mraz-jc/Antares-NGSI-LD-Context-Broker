@@ -501,6 +501,10 @@ A backend from outside the workspace:
    `entity_types_beside` is optional the same way: the types of the live
    Entities that carry one of the given types; `None` makes `/types` under
    a view probe every type beside each type a rule names.
+   `entity_attr_pairs` is optional too: every (type, member name) pair a
+   live Entity of the tenant carries, sorted; it may keep a pair no live
+   Entity carries any more, never miss one. `None` makes `/types` with
+   details and `/attributes` fold the Entities.
 3. Hold it to the driver contract. `antares-store`'s `test-kit` feature
    exports `run_current_state_contract` and `run_temporal_contract`
    (`crates/antares-store/src/contract.rs`): the rules `antares-api` writes

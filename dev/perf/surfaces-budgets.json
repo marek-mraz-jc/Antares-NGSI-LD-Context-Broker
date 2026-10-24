@@ -112,6 +112,16 @@
       "max_error_pct": 0.1,
       "reason": "a page or one entity a person waits on: OPS-18's p95 50 ms for a read, p99 three times that for a shared runner's tail; the view root must stay within the root's budget (ADR-0027 section 6)"
     },
+    "view-attributes": {
+      "builds": [
+        "platform"
+      ],
+      "rate": 20,
+      "p95_ms": 300,
+      "p99_ms": 900,
+      "max_error_pct": 0.1,
+      "reason": "T-4934: the view's attribute list a schema browser or an MCP agent opens first; the task's 300 ms on dev as p95, p99 three times that for a shared runner's tail; the fold it replaced took 13-19 s on dev"
+    },
     "odata": {
       "builds": [
         "platform"
