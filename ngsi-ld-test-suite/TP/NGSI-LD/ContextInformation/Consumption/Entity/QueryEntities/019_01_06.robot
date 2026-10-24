@@ -19,24 +19,30 @@ ${entity_type}=             https://ngsi-ld-test-suite/context#Building
 
 
 *** Test Cases ***    SCOPEQ    EXPECTED_COUNT
-019_01_06 QueryWithFullScope
+019_01_06_01 QueryWithFullScope
     [Tags]    e-query    4_19    since_v1.5.1
     /Madrid/Gardens/ParqueNorte    ${2}
-019_01_06 QueryWithPlusMatching
+019_01_06_02 QueryWithPlusMatching
     [Tags]    e-query    4_19    since_v1.5.1
     /Madrid/+/ParqueNorte    ${2}
-019_01_06 QueryWithHashMatching
+019_01_06_03 QueryWithHashMatching
     [Tags]    e-query    4_19    since_v1.5.1
     /CompanyA/#    ${1}
-019_01_06 QueryNonEmptyScope
+019_01_06_04 QueryNonEmptyScope
     [Tags]    e-query    4_19    since_v1.5.1
     /#    ${2}
-019_01_06 QueryWithAndScope
+019_01_06_05 QueryWithAndScope
     [Tags]    e-query    4_19    since_v1.5.1
-    /Madrid/Gardens/ParqueNorte;/CompanyA/OrganizationB/UnitC    ${1}
-019_01_06 QueryWithOrScope
+    (/Madrid/Gardens/ParqueNorte;/CompanyA/OrganizationB/UnitC)    ${1}
+019_01_06_06 QueryWithOrScope
     [Tags]    e-query    4_19    since_v1.5.1
     /Madrid/Gardens/ParqueNorte,/CompanyA/OrganizationB/UnitC    ${2}
+019_01_06_07 QueryWithHashMatchingIncludingScope
+    [Tags]    e-query    4_19    since_v1.5.1
+    /Madrid/Gardens/ParqueNorte/#    ${2}
+019_01_06_08 QueryWithPlusAndHashMatching
+    [Tags]    e-query    4_19    since_v1.5.1
+    /Madrid/+/#    ${2}
 
 
 *** Keywords ***

@@ -5,7 +5,7 @@ task: T-4855
 
 # Local edits of the vendored ETSI suite
 
-`ngsi-ld-test-suite/` is the ETSI NGSI-LD test suite (forge.etsi.org `cim/ngsi-ld-test-suite`, GS CIM 009 V1.9.1) as this repository carries it; `dev/etsi-baseline.json` names its 1823 TPs (+12 MQTT) and every per-commit ETSI cell must pass all of them. This page lists every commit that changed a file of the suite after it was vendored, why, under which clause, and where the change stands upstream. A suite edit that is not on this page is a defect of this page.
+`ngsi-ld-test-suite/` is the ETSI NGSI-LD test suite (forge.etsi.org `cim/ngsi-ld-test-suite`, GS CIM 009 V1.9.1) as this repository carries it; `dev/etsi-baseline.json` names its 1833 TPs (+12 MQTT) and every per-commit ETSI cell must pass all of them. This page lists every commit that changed a file of the suite after it was vendored, why, under which clause, and where the change stands upstream. A suite edit that is not on this page is a defect of this page.
 
 ## 1. Data sources
 
@@ -29,6 +29,7 @@ Each row changes a forge TP, fixture or library. The TP's verdict on forge's def
 | `b676b19c` | `subscription-building-entities-active-watchedAttributes-query.jsonld` | the Subscription `q` in the body is written as is, not percent-encoded | TS 104 175 7.2.3.2: a filter is URI-encoded only "whenever the string acting as a filter is part of the HTTP binding's URI" | raise §23; forge `cd2ef2ba` |
 | `00a67a78` | `libraries/FederationReset.py` | the reset's Link header names `SUITE_CONTEXT`, the context the run serves, instead of a fixed remote URL | harness, no clause: a run fetches no context off the run (`dev/etsi-local-context.sh`) | not for forge: run plumbing |
 | `6281bcbd` | `itb/.../pom.xml`, `requirements.txt` | jackson 2.21.7 through Spring Boot 3.5.12, deepdiff 8.6.2 | none: five fixable HIGH CVEs in the ITB runner and its Python deps | not for forge in this form; no TP changes |
+| `d24fefce` | `019_01_06.robot`, new `019_03_07.robot` | forge develop `cc8711ce` taken unchanged: QueryWithAndScope sends `(/a;/b)`, the rows get ids `019_01_06_01`..`08` (two new wildcard rows), and `019_03_07` refuses eight scopeQs outside the grammar | TS 104 175 7.2.5: "For logical and grouping parenthesis are needed"; ScopeQLevel = unicodeLetter *ScopeQLevelChar | forge `cc8711ce` (upstream already) |
 
 ## 3. Edits of Antares' own TPs
 

@@ -437,7 +437,7 @@ grep -q "^url = '.*/ngsi-ld/v1/\?'" ngsi-ld-test-suite/resources/variables.py ||
   sed -i "s|^notification_server_host = .*|notification_server_host = '${CALLBACK_HOST:-localhost}'|" variables.py
   sed -i "s|^context_source_host = .*|context_source_host = '${CALLBACK_HOST:-localhost}'|" variables.py
   sed -i "s|^context_server_host = .*|context_server_host = '${CALLBACK_HOST:-localhost}'|" variables.py
-  sed -i "s|^ngsild_test_suite_context = .*|ngsild_test_suite_context = '$SUITE_CONTEXT'|" variables.py )
+  printf "\nngsild_test_suite_context = '%s'\n" "$SUITE_CONTEXT" >> variables.py )
 # Console tee'd into the results dir: when robot dies before writing
 # output.xml (import error, unreachable broker), the artifact must still
 # say why — a 1 KB artifact with no clue is undebuggable in CI.
