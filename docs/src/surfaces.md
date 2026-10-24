@@ -21,6 +21,9 @@ surface hides, and which CI job proves each surface's conformance.
 | iCalendar | `ical` (adds `views`) | `ical` | `/x/views/{view}/ical/v1/events.ics` | [iCalendar feed of a view](ical.md) |
 | GeoJSON of a view | `geojson` (adds `views`) | `geojson` | `/x/views/{view}/geojson/v1/{type}` | [GeoJSON of a view](geojson.md) |
 | Feeds of a view | `feed` (adds `views`) | `feed` | `/x/views/{view}/feed/v1/{name}/{atom.xml\|rss.xml\|feed.json}` | [Feeds of a view](feed.md) |
+| GBFS of a view | `gbfs` (adds `views`) | `gbfs` | `/x/views/{view}/gbfs/v1/{name}/{file}.json` | [GBFS of a view](gbfs.md) |
+| GTFS Realtime of a view | `gtfsrt` (adds `views`) | `gtfsrt` | `/x/views/{view}/gtfsrt/v1/vehicle-positions.{pb,json}` | [GTFS Realtime of a view](gtfsrt.md) |
+| JSON-stat of a view | `jsonstat` (adds `views`) | `jsonstat` | `/x/views/{view}/jsonstat/v1/{table}` | [JSON-stat of a view](jsonstat.md) |
 | WebSocket notifications | `ws` | `ws`, and `ws-views` for a view | `/x/ws/ngsi-ld/v1`, `/x/views/{view}/ws` | [WebSocket notifications](websocket.md) |
 | Internal context sources | `internal-csr` (adds `views`) | none (it serves forwards, not requests) | none | [Internal context sources](internal-context-sources.md) |
 
@@ -28,7 +31,8 @@ surface hides, and which CI job proves each surface's conformance.
 `items` as a Parquet file, [OGC](ogc.md#2-items)), `tabular` (CSV
 files and a ZIP of a CSV per collection) and `ical` (a view's Events as an
 iCalendar feed, [iCalendar](ical.md)) are named beside it,
-because `full` sits at its ADR-0027 size budget. `linkml` and
+because they were kept out of `full` under its ADR-0027 size budget of
+vanilla + 10 MiB (15 MiB since T-5246). `linkml` and
 `internal-csr` stay separate. A feature links a surface; only
 `ANTARES_API_SURFACES` mounts one ([Configuration](configuration.md)). A
 name the binary was not built with stops the broker at start.

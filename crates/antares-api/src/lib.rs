@@ -70,9 +70,12 @@ macro_rules! gate {
 }
 
 pub mod admin_auth;
+// Inbound bridge Channels (ADR-0031): `/x/channels`, off in the vanilla build.
 pub(crate) mod attrs;
 pub(crate) mod batch;
 pub mod bounds;
+#[cfg(all(feature = "channels", not(target_arch = "wasm32")))]
+pub mod channels;
 pub mod conformance;
 pub(crate) mod contexts;
 pub(crate) mod csource;
@@ -121,7 +124,7 @@ pub use antares_notifier::DeliveryPolicy;
 pub use antares_notifier::{
     build_message, DeliveryError, DeliveryFuture, NotificationSink, Outbound,
 };
-pub use antares_store::{HistoryScope, HISTORY_RETENTION};
+pub use antares_store::{HistoryScope, ShortHistory, HISTORY_RETENTION, SHORT_HISTORY};
 pub use contexts::public_base;
 pub use federation::{
     AdmitFuture, BuiltForward, ForwardAnswer, ForwardFuture, ForwardTransport, NotifyFuture,

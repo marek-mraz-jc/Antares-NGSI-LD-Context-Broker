@@ -416,6 +416,15 @@ async fn an_output_serves_its_sources_under_its_filter_and_the_callers_q() {
     )
     .await;
     assert_eq!(by_id(&body).len(), 0, "{body}");
+    // a q that closes its own group would OR past the filter: refused, never joined
+    let (status, body) = send(
+        &app,
+        "GET",
+        "/x/views/ev/geojson/v1/sport?q=eventCategory==%22sport%22%29%7C%28eventCategory==%22kultura%22",
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
 #[tokio::test]

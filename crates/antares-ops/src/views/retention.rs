@@ -307,6 +307,30 @@ pub(super) fn history_off(rules: &Rules) -> antares_api::HistoryRules {
     out
 }
 
+/// Which writes keep [`antares_api::SHORT_HISTORY`] of history or less
+/// (T-5249): a type rule or the Tenant's `*` rule with such a duration.
+/// `off` records nothing and `forever` keeps it all; both count as not short
+/// for a type, so its other types' short rules do not reach it.
+pub(super) fn short_history(rules: &Rules) -> antares_api::ShortHistory {
+    let mut out = antares_api::ShortHistory::default();
+    for (t, list) in rules {
+        for r in list {
+            let short = !r.history_off
+                && !r.history_forever
+                && r.history.is_some_and(|d| d <= antares_api::SHORT_HISTORY);
+            if r.type_iri == ANY_TYPE {
+                if short {
+                    out.tenants.insert(t.as_str().to_owned());
+                }
+            } else if r.rules_history() {
+                out.types
+                    .insert((t.as_str().to_owned(), r.type_iri.clone()), short);
+            }
+        }
+    }
+    out
+}
+
 /// What one sweep deleted of one Tenant's type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Deleted {
@@ -1022,6 +1046,35 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{}", String::from_utf8_lossy(bad));
         }
+    }
+
+    /// T-5249: PT1H or less is short, a longer duration, `off` and `forever`
+    /// are not; a `*` rule makes its Tenant short.
+    #[test]
+    fn short_history_is_a_duration_of_an_hour_or_less() {
+        let doc = br#"{"rules":[{"type":"*","history":"PT5M"},
+                                 {"type":"https://e.org/Vehicle","history":"PT1H"},
+                                 {"type":"https://e.org/Stop","history":"P30D"},
+                                 {"type":"https://e.org/Off","history":"off"},
+                                 {"type":"https://e.org/Keep","history":"forever"},
+                                 {"type":"https://e.org/Now","current":"PT5M"}]}"#;
+        let rules = parse(doc).unwrap_or_default();
+        assert_eq!(rules.len(), 6);
+        let short = short_history(&vec![(TenantId::new("city").expect("tenant"), rules)]);
+        let pair = |t: &str| ("city".to_owned(), format!("https://e.org/{t}"));
+        assert_eq!(
+            short.types,
+            std::collections::HashMap::from([
+                (pair("Vehicle"), true),
+                (pair("Stop"), false),
+                (pair("Off"), false),
+                (pair("Keep"), false),
+            ])
+        );
+        assert_eq!(
+            short.tenants,
+            std::collections::HashSet::from(["city".to_owned()])
+        );
     }
 
     /// DM-97: the `*` rule is the Tenant's default, history only; `forever`

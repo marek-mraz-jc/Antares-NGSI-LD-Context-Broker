@@ -150,13 +150,29 @@ pub(crate) struct GeoQ {
     pub geometry: Value,
 }
 
-/// A filter lowered for one collection: `q` conjuncts, at most one `geoQ`, and the conjuncts
-/// the residual evaluates. Their conjunction is the filter.
+/// A filter lowered for one collection: the `id` list, `q` conjuncts, at most one `geoQ`, and
+/// the conjuncts the residual evaluates. Their conjunction is the filter.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Lowered {
+    /// The ids `id = '…'` and `id IN (…)` conjuncts allow, intersected (T-5169); empty when
+    /// no Entity can match.
+    pub ids: Option<Vec<String>>,
     pub q: Vec<String>,
     pub geo: Option<GeoQ>,
     pub residual: Vec<Expr>,
+}
+
+impl Lowered {
+    /// The NGSI-LD `id` parameter of [`Self::ids`], empty without one.
+    pub(crate) fn id_param(&self) -> String {
+        self.ids.as_ref().map_or_else(String::new, |ids| {
+            let ids: Vec<String> = ids
+                .iter()
+                .map(|id| antares_ops::percent::encode(id))
+                .collect();
+            format!("&id={}", ids.join(","))
+        })
+    }
 }
 
 /// Lowers `filter` for `c` under `terms`; `geo_free` when the request has no other geo query.
@@ -166,11 +182,7 @@ pub(crate) fn lower(
     filter: &Cql,
     geo_free: bool,
 ) -> Result<Lowered, Problem> {
-    let mut l = Lower {
-        c,
-        terms,
-        stamps: Vec::new(),
-    };
+    let mut l = Lower { c, terms };
     let mut conjuncts = Vec::new();
     flatten(filter, &mut conjuncts);
     let mut out = Lowered::default();
@@ -180,12 +192,22 @@ pub(crate) fn lower(
         if e == Expr::Lit(Lit::Bool(true)) {
             continue;
         }
+        if let Some(ids) = by_id(&e) {
+            out.ids = Some(match out.ids.take() {
+                None => ids,
+                Some(kept) => kept.into_iter().filter(|id| ids.contains(id)).collect(),
+            });
+            continue;
+        }
         if let Some(q) = l.q(&e) {
             let size = q_bytes.saturating_add(q.len()).saturating_add(3);
             if size <= MAX_Q_BYTES {
                 q_bytes = size;
                 out.q.push(q);
-                continue;
+                // A widened time bound selects a superset: the residual decides.
+                if !approximate(&e) {
+                    continue;
+                }
             }
         }
         if geo_free && out.geo.is_none() {
@@ -199,6 +221,38 @@ pub(crate) fn lower(
     Ok(out)
 }
 
+/// The ids `e` allows when it is `id = '…'` or `id IN (…)` of strings, in the order written and
+/// without the strings no Entity id can be (no URI). `None` when a string holds a `,`, which
+/// the NGSI-LD `id` list cannot carry, or the list passes the broker's `q` bound: the residual
+/// decides those.
+fn by_id(e: &Expr) -> Option<Vec<String>> {
+    let lits: &[Lit] = match e {
+        Expr::Cmp(Cmp::Eq, left, right) => match (left.as_ref(), right.as_ref()) {
+            (Expr::Path(Path::Id), Expr::Lit(lit)) | (Expr::Lit(lit), Expr::Path(Path::Id)) => {
+                std::slice::from_ref(lit)
+            }
+            _ => return None,
+        },
+        Expr::In(value, lits) if **value == Expr::Path(Path::Id) => lits,
+        _ => return None,
+    };
+    let mut ids: Vec<String> = Vec::new();
+    for lit in lits {
+        let Lit::Str(id) = lit else { return None };
+        if id.contains(',') {
+            return None;
+        }
+        if antares_ops::EntityId::new(id).is_ok() && !ids.contains(id) {
+            ids.push(id.clone());
+        }
+    }
+    let bytes = ids
+        .iter()
+        .map(|id| id.len().saturating_add(1))
+        .sum::<usize>();
+    (bytes <= MAX_Q_BYTES).then_some(ids)
+}
+
 /// Lowers `filter` for `c` under `terms` to residual conjuncts alone, for a collection the
 /// store cannot query: a history (T-5100) evaluates the whole filter in process.
 pub(crate) fn residual(
@@ -206,11 +260,7 @@ pub(crate) fn residual(
     terms: &crate::terms::Terms,
     filter: &Cql,
 ) -> Result<Vec<Expr>, Problem> {
-    let mut l = Lower {
-        c,
-        terms,
-        stamps: Vec::new(),
-    };
+    let mut l = Lower { c, terms };
     let mut conjuncts = Vec::new();
     flatten(filter, &mut conjuncts);
     conjuncts.into_iter().map(|e| l.expr(e).map(fold)).collect()
@@ -273,8 +323,6 @@ impl Bound {
 struct Lower<'a> {
     c: &'a Collection,
     terms: &'a crate::terms::Terms,
-    /// The text of each date and date-time literal, which `q` writes as sent.
-    stamps: Vec<(Lit, String)>,
 }
 
 impl Lower<'_> {
@@ -311,8 +359,8 @@ impl Lower<'_> {
             Cql::Str(s) => Expr::Lit(Lit::Str(s.clone())),
             Cql::Num(n) => Expr::Lit(number(*n)?),
             Cql::Bool(b) => Expr::Lit(Lit::Bool(*b)),
-            Cql::Timestamp(t) => Expr::Lit(self.instant(DateTime::parse(t).map(Lit::DateTime), t)?),
-            Cql::Date(d) => Expr::Lit(self.instant(Date::parse(d).map(Lit::Date), d)?),
+            Cql::Timestamp(t) => Expr::Lit(instant(DateTime::parse(t).map(Lit::DateTime))?),
+            Cql::Date(d) => Expr::Lit(instant(Date::parse(d).map(Lit::Date))?),
             Cql::Geometry(g) => Expr::Lit(Lit::Geometry(geojson(g))),
             Cql::BBox(numbers) => Expr::Lit(Lit::Geometry(bbox(numbers)?)),
             Cql::Interval(..) | Cql::Unbounded | Cql::Array(_) => {
@@ -322,15 +370,6 @@ impl Lower<'_> {
             }
             Cql::Op(op, args) => self.op(op, args)?,
         })
-    }
-
-    /// A date or date-time literal, its text kept for `q`.
-    fn instant(&mut self, lit: Option<Lit>, text: &str) -> Result<Lit, Problem> {
-        let lit = lit.ok_or(bad(
-            "a date or timestamp of the filter is no calendar instant",
-        ))?;
-        self.stamps.push((lit.clone(), text.to_owned()));
-        Ok(lit)
     }
 
     fn op(&mut self, op: &Op, args: &[Cql]) -> Result<Expr, Problem> {
@@ -548,7 +587,7 @@ impl Lower<'_> {
                 };
                 let term = self.scalar(path)?;
                 lits.first()?;
-                let values: Option<Vec<String>> = lits.iter().map(|lit| self.value(lit)).collect();
+                let values: Option<Vec<String>> = lits.iter().map(Self::value).collect();
                 Some(format!("{term}=={}", values?.join(",")))
             }
             Expr::IsNull(value) => Some(format!("!{}", attribute(value)?)),
@@ -580,7 +619,7 @@ impl Lower<'_> {
                 };
                 let term = self.list(path).filter(|_| **var == member(0))?;
                 lits.first()?;
-                let values: Option<Vec<String>> = lits.iter().map(|lit| self.value(lit)).collect();
+                let values: Option<Vec<String>> = lits.iter().map(Self::value).collect();
                 Some(format!("{term}=={}", values?.join(",")))
             }
             _ => None,
@@ -589,6 +628,16 @@ impl Lower<'_> {
 
     fn compare(&self, p: &Path, op: Cmp, l: &Lit) -> Option<String> {
         let term = self.scalar(p)?;
+        if let Some(at) = moment(l) {
+            // `q` orders text: a value written with an offset or as a whole day is in order
+            // only to within 48 h, so the bound moves out by that much and `=`/`<>` stay residual.
+            let (op, later) = match op {
+                Cmp::Lt | Cmp::Le => ("<=", true),
+                Cmp::Gt | Cmp::Ge => (">=", false),
+                Cmp::Eq | Cmp::Ne => return None,
+            };
+            return Some(format!("{term}{op}{}", slack(at, later)?));
+        }
         let op = match op {
             Cmp::Eq => "==",
             Cmp::Ne => "!=",
@@ -597,7 +646,7 @@ impl Lower<'_> {
             Cmp::Gt => ">",
             Cmp::Ge => ">=",
         };
-        Some(format!("{term}{op}{}", self.value(l)?))
+        Some(format!("{term}{op}{}", Self::value(l)?))
     }
 
     /// The term of a scalar Attribute's value, which `q` compares as CQL2 does.
@@ -621,18 +670,13 @@ impl Lower<'_> {
     }
 
     /// A literal as a `q` value.
-    fn value(&self, l: &Lit) -> Option<String> {
+    fn value(l: &Lit) -> Option<String> {
         match l {
             Lit::Bool(b) => Some(b.to_string()),
             Lit::Int(n) => Some(n.to_string()),
             Lit::Num(n) => n.is_finite().then(|| format!("{n}")),
             Lit::Str(s) => Some(Value::from(s.as_str()).to_string()),
-            Lit::DateTime(_) | Lit::Date(_) => self
-                .stamps
-                .iter()
-                .find(|(lit, _)| lit == l)
-                .map(|(_, text)| text.clone()),
-            Lit::Time(_) | Lit::Geometry(_) => None,
+            Lit::DateTime(_) | Lit::Date(_) | Lit::Time(_) | Lit::Geometry(_) => None,
         }
     }
 
@@ -683,6 +727,50 @@ impl Lower<'_> {
             rel,
             geometry: g.clone(),
         })
+    }
+}
+
+/// A date or date-time literal of the filter, which the filter refuses unless it is a calendar
+/// instant.
+fn instant(lit: Option<Lit>) -> Result<Lit, Problem> {
+    lit.ok_or(bad(
+        "a date or timestamp of the filter is no calendar instant",
+    ))
+}
+
+/// How far a `q` bound on a date or date-time moves out: past any UTC offset (at most 14 h)
+/// and a whole day, so the store's text order selects a superset of the instants.
+const SLACK_MICROS: i64 = 48 * 3_600 * 1_000_000;
+
+/// `at` moved [`SLACK_MICROS`] later or earlier, as `q` text in UTC; `None` past the years
+/// 0000 to 9999, where the bound stays in the residual alone.
+pub(crate) fn slack(at: DateTime, later: bool) -> Option<String> {
+    let micros = if later {
+        at.unix_micros().saturating_add(SLACK_MICROS)
+    } else {
+        at.unix_micros().saturating_sub(SLACK_MICROS)
+    };
+    DateTime::from_unix_micros(micros).map(|d| d.to_string())
+}
+
+/// A date literal as the instant its day starts in UTC, a date-time as itself.
+fn moment(l: &Lit) -> Option<DateTime> {
+    match l {
+        Lit::DateTime(at) => Some(*at),
+        Lit::Date(d) => DateTime::parse(&format!("{d}T00:00:00Z")),
+        _ => None,
+    }
+}
+
+/// Whether the `q` of `e` holds a widened time bound ([`slack`]), so it selects a superset the
+/// residual must still decide.
+fn approximate(e: &Expr) -> bool {
+    match e {
+        Expr::And(es) | Expr::Or(es) => es.iter().any(approximate),
+        Expr::Cmp(_, a, b) => [a, b]
+            .iter()
+            .any(|x| matches!(x.as_ref(), Expr::Lit(Lit::DateTime(_) | Lit::Date(_)))),
+        _ => false,
     }
 }
 
@@ -1015,6 +1103,14 @@ mod tests {
         )
     }
 
+    /// [`q`] of a filter pushed widened into `expected` and decided by one residual conjunct.
+    fn widened(expected: &str) -> String {
+        format!(
+            "{:?}",
+            Ok::<_, Problem>((expected.to_owned(), None::<GeoQ>, 1_usize))
+        )
+    }
+
     /// Whether `filter` is one residual conjunct and nothing pushed.
     fn residual(filter: &str) -> bool {
         lowered(filter).map(|l| (l.q.len(), l.geo.is_some(), l.residual.len())) == Ok((0, false, 1))
@@ -1092,6 +1188,42 @@ mod tests {
     }
 
     #[test]
+    fn id_conjuncts_are_the_id_list() {
+        let ids = |filter: &str| lowered(filter).map(|l| (l.ids, l.q.len(), l.residual.len()));
+        let list = |ids: &[&str]| Some(ids.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>());
+        assert_eq!(ids("id = 'urn:a'"), Ok((list(&["urn:a"]), 0, 0)));
+        assert_eq!(ids("'urn:a' = id"), Ok((list(&["urn:a"]), 0, 0)));
+        assert_eq!(
+            ids("id IN ('urn:a', 'urn:b', 'urn:a')"),
+            Ok((list(&["urn:a", "urn:b"]), 0, 0))
+        );
+        // ANDed lists intersect; beside another conjunct the id list still holds.
+        assert_eq!(
+            ids("id IN ('urn:a', 'urn:b') AND id = 'urn:b'"),
+            Ok((list(&["urn:b"]), 0, 0))
+        );
+        assert_eq!(ids("id = 'urn:a' AND id = 'urn:b'"), Ok((list(&[]), 0, 0)));
+        assert_eq!(
+            ids("id = 'urn:a' AND pm10 > 3"),
+            Ok((list(&["urn:a"]), 1, 0))
+        );
+        // A string no Entity id can be matches nothing.
+        assert_eq!(ids("id = 'not an id'"), Ok((list(&[]), 0, 0)));
+        assert_eq!(ids("id IN ('urn:a', 'x y')"), Ok((list(&["urn:a"]), 0, 0)));
+        // What the id list cannot say stays the residual's.
+        assert_eq!(ids("id = 'urn:a,b'"), Ok((None, 0, 1)));
+        assert_eq!(ids("id IN ('urn:a', 3)"), Ok((None, 0, 1)));
+        assert_eq!(ids("id <> 'urn:a'"), Ok((None, 0, 1)));
+        assert_eq!(ids("id = 'urn:a' OR pm10 > 3"), Ok((None, 0, 1)));
+        assert_eq!(ids("NOT id IN ('urn:a')"), Ok((None, 0, 1)));
+        let long = (0..600)
+            .map(|i| format!("'urn:x:{i}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(ids(&format!("id IN ({long})")), Ok((None, 0, 1)));
+    }
+
+    #[test]
     fn not_is_residual() {
         assert!(residual("NOT pm10 > 50"));
         assert!(residual("NOT (pm10 > 50 OR pm25 < 1)"));
@@ -1104,7 +1236,7 @@ mod tests {
     #[test]
     fn non_scalar_and_relationship_comparisons_are_residual() {
         assert!(residual("labels = 'x'"));
-        assert!(residual("id = 'urn:ngsi-ld:AirQualityObserved:1'"));
+        assert!(residual("id <> 'urn:ngsi-ld:AirQualityObserved:1'"));
         assert!(residual("pm10 = pm25"));
         assert!(residual("pm10 + 1 > 5"));
     }
@@ -1113,34 +1245,36 @@ mod tests {
     fn temporal_functions_pushed_or_residual() {
         let t = "TIMESTAMP('2026-09-01T00:00:00Z')";
         let i = "INTERVAL('2026-09-01T00:00:00Z','2026-09-02T00:00:00Z')";
+        // `q` reads text, so a time bound is pushed 48 h wider and the residual decides.
         for (filter, expected) in [
             (
                 format!("T_AFTER(dateObserved, {t})"),
-                "dateObserved>2026-09-01T00:00:00Z",
+                "dateObserved>=2026-08-30T00:00:00Z",
             ),
             (
                 format!("T_BEFORE(dateObserved, {t})"),
-                "dateObserved<2026-09-01T00:00:00Z",
-            ),
-            (
-                format!("T_EQUALS(dateObserved, {t})"),
-                "dateObserved==2026-09-01T00:00:00Z",
+                "dateObserved<=2026-09-03T00:00:00Z",
             ),
             (
                 format!("T_DURING(dateObserved, {i})"),
-                "(dateObserved>2026-09-01T00:00:00Z;dateObserved<2026-09-02T00:00:00Z)",
+                "(dateObserved>=2026-08-30T00:00:00Z;dateObserved<=2026-09-04T00:00:00Z)",
             ),
             (
                 format!("T_INTERSECTS(dateObserved, {i})"),
-                "(dateObserved<=2026-09-02T00:00:00Z;dateObserved>=2026-09-01T00:00:00Z)",
+                "(dateObserved<=2026-09-04T00:00:00Z;dateObserved>=2026-08-30T00:00:00Z)",
             ),
             (
                 "T_AFTER(dateObserved, DATE('2026-09-18'))".to_owned(),
-                "dateObserved>2026-09-18",
+                "dateObserved>=2026-09-16T00:00:00Z",
             ),
         ] {
-            assert_eq!(q(&filter), pushed(expected), "{filter}");
+            assert_eq!(q(&filter), widened(expected), "{filter}");
         }
+        // Equality of instants written in two offsets is no text equality.
+        assert!(residual(&format!("T_EQUALS(dateObserved, {t})")));
+        assert!(residual(&format!("dateObserved <> {t}")));
+        // A bound the widening would push past 9999 stays residual alone.
+        assert!(residual("dateObserved < TIMESTAMP('9999-12-31T00:00:00Z')"));
         // An open end against a value is the value's own `v = v`: residual, unknown when missing.
         assert!(residual(
             "T_DURING(dateObserved, INTERVAL('..', '2026-09-02T00:00:00Z'))"
@@ -1447,7 +1581,6 @@ mod tests {
         let mut l = Lower {
             c: &c,
             terms: &terms,
-            stamps: Vec::new(),
         };
         let n = || Cql::Num(1.0);
         assert!(operands::<2>(&[n()]).is_err());

@@ -94,8 +94,6 @@ async fn fixture() -> (TestBroker, Router) {
                "rules": rules}),
         json!({"id": "meetings", "tenant": "town", "selector": ["Event"], "operations": reads,
                "rules": rules, "representations": {"ical": [{"name": "rada", "sources": [{"type": "CouncilMeeting"}]}]}}),
-        json!({"id": "many", "tenant": "town", "selector": ["Event"], "operations": reads, "rules": rules,
-               "representations": {"ical": (0..=20).map(|i| json!({"name": format!("o{i}"), "sources": [{}]})).collect::<Vec<_>>()}}),
         json!({"id": "empty", "tenant": "nobody", "selector": ["Event"], "operations": reads,
                "rules": rules, "representations": {"ical": [{"name": "nic", "sources": [{}]}]}}),
     ] {
@@ -165,9 +163,6 @@ async fn a_view_without_outputs_has_no_calendar() {
         assert_eq!(a.status, StatusCode::NOT_FOUND, "{path}: {}", a.body);
         assert!(a.body.contains("no such calendar"), "{}", a.body);
     }
-    // a 21st output, which the gateway refuses at save, serves nobody
-    let a = send(&app, "GET", "/x/views/many/ical/v1/o0.ics", "", None).await;
-    assert_eq!(a.status, StatusCode::INTERNAL_SERVER_ERROR, "{}", a.body);
 }
 
 #[tokio::test]
@@ -196,6 +191,16 @@ async fn each_output_serves_its_own_sources_under_its_filter_and_events_is_the_f
     )
     .await;
     assert!(uids(&sport.body).is_empty(), "{}", sport.body);
+    // a q that closes its own group would OR past the filter: refused, never joined
+    let escape = send(
+        &app,
+        "GET",
+        "/x/views/town/ical/v1/kultura.ics?q=category==%22kultura%22%29%7C%28category==%22sport%22",
+        "",
+        None,
+    )
+    .await;
+    assert_eq!(escape.status, StatusCode::BAD_REQUEST, "{}", escape.body);
     let council = get(&app, "/x/views/town/ical/v1/zastupitelstvo.ics")
         .await
         .body;

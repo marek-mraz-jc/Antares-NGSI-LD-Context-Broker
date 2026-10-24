@@ -198,6 +198,23 @@ fn comparison_promotes_numbers_and_reads_text_as_dates() {
     ]);
 }
 
+/// A date and a date-time compare by the date-time's UTC day: a date is the whole day it names.
+#[test]
+fn a_date_and_a_date_time_compare_by_utc_day() {
+    check(&[
+        // `when` is 2026-10-11T10:30:15.25Z
+        (eq(p("when"), date("2026-10-11")), T),
+        (cmp(Cmp::Gt, p("when"), date("2026-10-10")), T),
+        (cmp(Cmp::Lt, p("when"), date("2026-10-11")), F),
+        (cmp(Cmp::Le, p("day"), dt("2026-10-11T00:00:00Z")), T),
+        (cmp(Cmp::Ge, p("day"), dt("2026-10-11T23:59:59Z")), T),
+        (cmp(Cmp::Ge, p("day"), dt("2026-10-12T00:30:00+01:00")), T),
+        (cmp(Cmp::Ge, p("day"), dt("2026-10-12T00:00:00Z")), F),
+        (eq(s("2026-10-11T23:30:00-01:00"), date("2026-10-12")), T),
+        (eq(p("broken"), date("2026-10-11")), U),
+    ]);
+}
+
 #[test]
 fn logic_is_three_valued_and_not_is_exact() {
     let unknown = || eq(p("missing"), i(1));

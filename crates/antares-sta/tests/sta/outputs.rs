@@ -97,17 +97,17 @@ async fn a_filtered_output_never_holds_an_entity_outside_its_filter_by_query_or_
     )
     .await;
     assert_eq!((status, ids(&series).len()), (StatusCode::OK, 3));
-    // the Device and the Stop are no source of the output
-    for set in [
-        "/Sensors",
-        "/Locations?$filter=id%20eq%20'urn:ngsi-ld:Stop:1'",
+    // the Device and the Stop are no source of the output: its Sensors are only the one of
+    // Datastreams whose Entity names no Device (T-5205)
+    for (set, want) in [
+        ("/Sensors", vec!["unknown".to_owned()]),
+        (
+            "/Locations?$filter=id%20eq%20'urn:ngsi-ld:Stop:1'",
+            Vec::new(),
+        ),
     ] {
         let (status, body) = get(&f, "slow", set).await;
-        assert_eq!(
-            (status, ids(&body)),
-            (StatusCode::OK, Vec::<String>::new()),
-            "{set}"
-        );
+        assert_eq!((status, ids(&body)), (StatusCode::OK, want), "{set}");
     }
     Ok(())
 }

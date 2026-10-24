@@ -116,6 +116,7 @@ fn ws_both_surfaces_report_their_limits() {
             "{name}: {info}"
         );
         assert_eq!(info.pointer("/connections"), Some(&json!(0)), "{name}");
+        assert_eq!(info.pointer("/queued"), Some(&json!(0)), "{name}");
         assert_eq!(needs_view, name == "ws-views");
     }
     assert_eq!(Ws::process().prefix(), "/x/ws");

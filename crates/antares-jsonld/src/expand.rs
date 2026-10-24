@@ -661,6 +661,13 @@ fn check_prohibited_members(
             )));
         }
     }
+    // 5.2.6/5.2.37: a Relationship's members name an object, never a
+    // datatype; valueType belongs to a Property value (4.5.2.2).
+    if obj.contains_key("valueType") && matches!(attr_type, "Relationship" | "ListRelationship") {
+        return Err(bad(format!(
+            "attribute {name}: valueType is not allowed on a {attr_type} (5.2.6)"
+        )));
+    }
     if let Some(m) = OUTPUT_ONLY.iter().find(|m| obj.contains_key(**m)) {
         return Err(bad(format!(
             "attribute {name}: {m} is output-only and not allowed in input (4.5.2.2)"
@@ -871,6 +878,23 @@ fn expand_instance(
             return Ok(json!({"type": "Property", "value": prim.clone()}));
         }
     };
+    // The core @context aliases type to @type: an Attribute written with the
+    // keyword is the same document, one with both names collides (JSON-LD
+    // 1.1 API expansion "colliding keywords").
+    let aliased;
+    let obj = match obj.get("@type") {
+        Some(_) if obj.contains_key("type") => {
+            return Err(bad(format!("attribute {name}: both type and @type given")))
+        }
+        Some(t) => {
+            let mut m = obj.clone();
+            m.remove("@type");
+            m.insert("type".into(), t.clone());
+            aliased = m;
+            &aliased
+        }
+        None => obj,
+    };
 
     let declared = match obj.get("type") {
         None => None,
@@ -926,6 +950,11 @@ fn expand_instance(
             } else {
                 // whole object is a Property value (4.5.2.3)
                 check_value_nulls(name, v, opts)?;
+                if embeds_context(v) {
+                    return Err(bad(format!(
+                        "attribute {name}: embedded @context is not allowed (4.5.1/5.5.7)"
+                    )));
+                }
                 return Ok(json!({"type": "Property", "value": v.clone()}));
             }
         }
@@ -949,6 +978,13 @@ fn expand_instance(
             }
             if let Some(vo) = val.as_object().filter(|o| o.contains_key("@value")) {
                 check_value_object(name, vo, ctx)?;
+            }
+            // 5.5.7: no part of a user @context below the top level, a
+            // structured Property value included
+            if embeds_context(val) {
+                return Err(bad(format!(
+                    "attribute {name}: embedded @context is not allowed (4.5.1/5.5.7)"
+                )));
             }
             out.insert("value".into(), val.clone());
         }
@@ -1193,6 +1229,15 @@ fn valid_language_map(lm: &Value) -> bool {
                 v.is_string() || v.as_array().is_some_and(|a| a.iter().all(Value::is_string))
             })
     })
+}
+
+/// Whether a JSON value holds an `@context` member at any depth.
+fn embeds_context(v: &Value) -> bool {
+    match v {
+        Value::Object(m) => m.contains_key("@context") || m.values().any(embeds_context),
+        Value::Array(a) => a.iter().any(embeds_context),
+        _ => false,
+    }
 }
 
 /// A Property value carrying `@value` is a JSON-LD value object (JSON-LD
@@ -1910,6 +1955,56 @@ mod tests {
                                  "@context": {"x": "https://e/x"}}}
         });
         assert!(expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default()).is_err());
+        // inside a structured Property value, normalized and concise
+        for speed in [
+            json!({"type": "Property", "value": {"street": "Main", "@context": "https://e/c"}}),
+            json!({"street": "Main", "n": [{"@context": "https://e/c"}]}),
+        ] {
+            let doc = json!({"id": "urn:x", "type": "T", "speed": speed});
+            assert!(
+                expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default()).is_err()
+            );
+        }
+        // a JsonProperty's json is opaque (@json): an @context there is data
+        let doc = json!({"id": "urn:x", "type": "T",
+                         "cfg": {"type": "JsonProperty", "json": {"@context": "https://e/c"}}});
+        assert!(expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default()).is_ok());
+    }
+
+    /// The core @context aliases type to @type (Coraine
+    /// duplicate_id_type_alias_every_level 01, 02, 04).
+    #[test]
+    fn attribute_type_keyword_alias() {
+        let doc = json!({"id": "urn:x", "type": "T", "p": {"@type": "Property", "value": 1}});
+        let out = expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default()).unwrap();
+        let p = &out["https://uri.etsi.org/ngsi-ld/default-context/p"][0];
+        assert_eq!(p["type"], json!("Property"));
+        assert_eq!(p.get("@type"), None);
+        for p in [
+            json!({"type": "Property", "@type": "Property", "value": 1}),
+            json!({"type": "Property", "value": 1, "s": {"type": "Property", "@type": "Property", "value": 2}}),
+        ] {
+            let doc = json!({"id": "urn:x", "type": "T", "p": p});
+            assert!(
+                expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default()).is_err()
+            );
+        }
+    }
+
+    /// 5.2.6: a Relationship has no valueType member (Coraine value_type_subattr 03).
+    #[test]
+    fn value_type_on_a_relationship_rejected() {
+        for r in [
+            json!({"type": "Relationship", "object": "urn:o", "valueType": "Integer"}),
+            json!({"type": "ListRelationship", "objectList": [{"object": "urn:o"}], "valueType": "Integer"}),
+        ] {
+            let doc = json!({"id": "urn:x", "type": "T", "r": r});
+            assert!(
+                expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default()).is_err()
+            );
+        }
+        let ok = json!({"id": "urn:x", "type": "T", "p": {"type": "Property", "value": 1, "valueType": "Integer"}});
+        assert!(expand_entity(ok.as_object().unwrap(), &core(), ExpandOpts::default()).is_ok());
     }
 
     fn core() -> std::sync::Arc<Context> {

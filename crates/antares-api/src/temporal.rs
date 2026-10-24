@@ -1058,7 +1058,12 @@ fn reject_linked_projection(trepr: &TRepr, clause: &str) -> Result<(), NgsiError
     let depth = |p: &Option<Vec<crate::repr::ProjNode>>| {
         p.as_deref().map(crate::repr::proj_depth).unwrap_or(0)
     };
-    if depth(&trepr.pick) > 0 || depth(&trepr.omit) > 0 {
+    // attrs=owner{object} names a Linked Entity projection too (4.21)
+    let linked_attrs = trepr
+        .attrs
+        .as_ref()
+        .is_some_and(|a| a.iter().any(|t| t.contains('{')));
+    if depth(&trepr.pick) > 0 || depth(&trepr.omit) > 0 || linked_attrs {
         return Err(NgsiError::BadRequestData(format!(
             "temporal projection must not use Linked Entity selection ({clause})"
         )));
@@ -3526,6 +3531,22 @@ fn add_temporal_instances(doc: &mut Value, expanded: &Value, ts: &str) {
     let Some(target) = doc.as_object_mut() else {
         return;
     };
+    // 5.6.12.4: "If type is included in the EntityTemporal Fragment and it
+    // includes Entity Type names that are not yet in the target ..., add
+    // them to the list of Entity Type names"
+    if let Some(Value::Array(add)) = expanded.get("type") {
+        let mut cur = match target.remove("type") {
+            Some(Value::Array(a)) => a,
+            Some(t) => vec![t],
+            None => Vec::new(),
+        };
+        for t in add {
+            if !cur.contains(t) {
+                cur.push(t.clone());
+            }
+        }
+        target.insert("type".into(), Value::Array(cur));
+    }
     for (k, v) in expanded.as_object().into_iter().flatten() {
         if is_meta(k) {
             continue;
@@ -5230,6 +5251,37 @@ mod clause_4_21 {
         kv.iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect()
+    }
+
+    /// 5.6.12.4: Append Attributes adds the fragment's new Entity Types
+    /// once, in order (Coraine troe_timescale_multi_type 04, 05).
+    #[test]
+    fn temporal_append_adds_new_entity_types() {
+        let mut doc = json!({"id": "urn:A1", "type": ["V", "C"]});
+        add_temporal_instances(
+            &mut doc,
+            &json!({"type": ["T", "V"]}),
+            "2026-01-01T00:00:00Z",
+        );
+        assert_eq!(doc["type"], json!(["V", "C", "T"]));
+        let mut doc = json!({"id": "urn:A1", "type": "V"});
+        add_temporal_instances(&mut doc, &json!({"p": []}), "2026-01-01T00:00:00Z");
+        assert_eq!(doc["type"], json!("V"));
+    }
+
+    /// 5.7.3.4/5.7.4.4: a Linked Entity projection in attrs is
+    /// BadRequestData like one in pick (Coraine
+    /// troe_timescale_temporal_linked_projection 05).
+    #[test]
+    fn linked_entity_attrs_refused_on_temporal_reads() {
+        let ctx = Loader::new().core();
+        let linked = parse_trepr(&params(&[("attrs", "owner{object}")]), &ctx).expect("parses");
+        assert!(matches!(
+            reject_linked_projection(&linked, "5.7.3.4"),
+            Err(NgsiError::BadRequestData(_))
+        ));
+        let plain = parse_trepr(&params(&[("attrs", "owner,speed")]), &ctx).expect("parses");
+        assert!(reject_linked_projection(&plain, "5.7.3.4").is_ok());
     }
 
     /// 4.21 Projections: "pick, omit and attrs are mutually exclusive" holds

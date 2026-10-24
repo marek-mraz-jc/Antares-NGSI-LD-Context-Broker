@@ -316,6 +316,13 @@ pub(super) fn routes(state: AppState) -> Router {
                     state.clone(),
                     tenant_exists_layer,
                 ))
+                // T-5032: a request without a subject needs the admin
+                // bearer, before the tenant lookup so a 404 tells such a
+                // caller nothing about which Tenants exist.
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::admin_auth::subject_or_admin,
+                ))
                 // Bounds wall: URI length, body size, JSON depth — checked
                 // before any parse (size-check-before-parse), and outside the
                 // tenant and snapshot lookups so 6.3.4's bare 411/414 is not

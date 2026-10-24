@@ -495,6 +495,30 @@ impl Hub {
         self.overflows.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The changes the queues hold for their sockets to write: a coalesced
+    /// notification counts each change it carries, an `x-gap` none
+    /// (`/q/version`).
+    ///
+    /// ```
+    /// let hub = antares_ws::Hub::new(antares_ws::Limits::default());
+    /// assert_eq!(hub.queued(), 0);
+    /// ```
+    #[must_use]
+    pub fn queued(&self) -> u64 {
+        let conns: Vec<Arc<Conn>> = lock(&self.conns).values().cloned().collect();
+        conns
+            .iter()
+            .flat_map(|c| {
+                lock(&c.state)
+                    .queue
+                    .iter()
+                    .filter(|q| q.gap_from.is_none())
+                    .map(|q| q.merged.saturating_add(1))
+                    .collect::<Vec<_>>()
+            })
+            .fold(0, u64::saturating_add)
+    }
+
     /// Deliver to connections other pods hold through `relay`.
     pub fn set_relay(&self, relay: Arc<dyn Relay>) {
         *lock(&self.relay) = Some(relay);

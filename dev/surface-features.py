@@ -15,7 +15,7 @@ surface joins by being declared, without a YAML edit.
   dev/surface-features.py --self-test  the gate is red on a synthetic overrun
 
 Budget: the "binary size" row of ADR-0027 section 6, read from the ADR so
-the gate cannot drift from it (`full` and each feature alone <= vanilla + 10 MiB, T-3775),
+the gate cannot drift from it (`full` and each feature alone <= vanilla + 15 MiB, T-5246),
 measured as the size of the stripped release binary (the release profile strips
 symbols). The builds run in lanes of their own target directory, side by side
 when CARGO_BUILD_JOBS allows (T-4032): one lane below 8 jobs, else one per 4 jobs,
@@ -160,8 +160,12 @@ def sizes(part=None):
 
 def self_test():
     vanilla = 30 * MIB
-    if budgets(ADR.read_text()) != ({"full": 10 * MIB}, 10 * MIB):
-        sys.exit(f"self-test: the ADR's budget reads as {budgets(ADR.read_text())}")
+    adr = budgets(ADR.read_text())
+    if adr != ({"full": 15 * MIB}, 15 * MIB):
+        sys.exit(f"self-test: the ADR's budget reads as {adr}")
+    rows = verdicts(vanilla, {"ogc": vanilla + 15 * MIB, "full": vanilla + 15 * MIB + 1}, adr)
+    if {r[0]: r[4] for r in rows} != {"ogc": True, "full": False}:
+        sys.exit(f"self-test: the ADR's 15 MiB budget does not hold at +15 MiB or fails at +1 byte: {rows}")
     rule = "| binary size | `full` ≤ vanilla + 6 MiB; each feature alone ≤ vanilla + 2 MiB, except `mcp` ≤ vanilla + 4.5 MiB | x |"
     budget = budgets(rule)
     if budget != ({"full": 6 * MIB, "mcp": 4.5 * MIB}, 2 * MIB):

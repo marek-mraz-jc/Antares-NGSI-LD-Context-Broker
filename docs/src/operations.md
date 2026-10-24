@@ -116,7 +116,7 @@ remove tenants; the admin surface has both.
 | Endpoint | Meaning |
 |---|---|
 | `GET /q/tenants` | The tenant names, sorted, and nothing else: the customer accounts, never the tenants the broker mints for its own bookkeeping. A deployment runs up to 10 000 tenants (ADR-0001); counting every kind for every one of them on a list call is a cost the list does not pay. |
-| `GET /q/tenants/{tenant}` | What one tenant holds: `{tenant, createdAt, counts: {entities, subscriptions, csourceSubscriptions, registrations, snapshots, entityMaps, distSubs, attrInstances}}`. 404 for a tenant that does not exist, 400 for a name outside the tenant grammar. `createdAt` is present on Postgres, where the `tenants` table records it. |
+| `GET /q/tenants/{tenant}` | What one tenant holds: `{tenant, createdAt, counts: {entities, subscriptions, csourceSubscriptions, registrations, snapshots, entityMaps, distSubs, attrInstances}}`. 404 for a tenant that does not exist, 400 for a name outside the tenant grammar. `createdAt` is present on Postgres, where the `tenants` table records it. `attrInstances` is left out when the history count does not finish within 5 s. |
 | `DELETE /q/tenants/{tenant}` | Purge: every document of the tenant leaves the current-state backend and the temporal backend in one transaction each. 204 when done, 404 for a tenant that does not exist, 409 while a distributed subscription of the tenant still holds a copy at a Context Source (delete those subscriptions first, which removes the copies at their source), 400 for a name outside the tenant grammar. The default tenant is emptied and keeps existing. |
 
 The path names the tenant; an `NGSILD-Tenant` header on these calls is
@@ -329,8 +329,8 @@ The script, step by step:
 
 1. `\copy` the file into an `UNLOGGED` staging table; the `jsonb` cast is
    the only parser the payload meets.
-2. Drop the eight secondary indexes (`i_entities_location`,
-   `i_entities_jsonb`, `i_entities_types`, `i_entities_loc_ambiguous`,
+2. Drop the seven secondary indexes (`i_entities_location`,
+   `i_entities_types`, `i_entities_loc_ambiguous`,
    `i_entities_expires`, `i_entities_first_type_id`,
    `i_entities_multi_type_id`, `i_entities_types_multi`);
    the primary key stays because the insert needs it.

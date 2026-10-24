@@ -208,7 +208,7 @@ jobs:
           cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/ship.yml@refs/heads/dev" \
             "$img@$DIGEST" > /dev/null
-          docker buildx imagetools create --tag "$img:$N" --tag "$img:latest" "$img@$DIGEST"
+          docker buildx imagetools create --prefer-index=false --tag "$img:$N" --tag "$img:latest" "$img@$DIGEST"
           for tag in "$N" latest; do
             got=$(docker buildx imagetools inspect "$img:$tag" --format '{{json .Manifest}}' | jq -r .digest)
             [ "$got" = "$DIGEST" ] || { echo "$img:$tag points at $got, not $DIGEST"; exit 1; }

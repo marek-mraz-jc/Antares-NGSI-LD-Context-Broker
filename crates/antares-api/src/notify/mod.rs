@@ -14,6 +14,7 @@
 //! never under-select. Full evaluation (selector/q/geo/scope/triggers)
 //! stays the truth for every candidate.
 
+mod coalesce;
 mod csource;
 mod delivery;
 mod interval;

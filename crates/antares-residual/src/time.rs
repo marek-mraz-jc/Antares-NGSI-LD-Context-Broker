@@ -97,6 +97,12 @@ impl DateTime {
         self.offset
     }
 
+    /// The day it falls on in UTC.
+    #[must_use]
+    pub fn utc_date(self) -> Date {
+        Date(self.utc.div_euclid(MICROS_PER_DAY))
+    }
+
     /// The wall-clock date and time of day in its own offset.
     pub(crate) fn local(self) -> Option<(Date, Time)> {
         let local = self

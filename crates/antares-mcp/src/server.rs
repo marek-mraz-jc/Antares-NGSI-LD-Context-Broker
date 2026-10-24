@@ -2,6 +2,7 @@
 //! The MCP server of one view, for one request: discovery, the tool list
 //! and calls, and the resources (MCP sections 3, 4, 6 and 8).
 
+use crate::area::{self, Shape, TypePart};
 use crate::budget;
 use crate::confirm;
 use crate::listen::{self, LIFETIME, MAX_URIS, SCHEME};
@@ -356,6 +357,180 @@ impl Server {
         let mut result = CallToolResult::structured(profile.to_json());
         result.content = vec![ContentBlock::text(summary::render(&profile))];
         result
+    }
+
+    /// `area_overview` (T-5279): checks the area, then reads each type the
+    /// caller names or the view shows through the view as `query_entities`
+    /// does, eight at a time, and answers per type its count and its `k`
+    /// nearest. A type the gate refuses adds nothing, its name included.
+    async fn area_overview(
+        &self,
+        tool: &'static ToolDef,
+        given: &serde_json::Map<String, Value>,
+    ) -> CallToolResult {
+        let args = match schema::check_all(tool.args, given, &self.names()) {
+            Ok(args) => args,
+            Err(why) => return refused(&why),
+        };
+        // the schema checked each of these; read back as text, absent as None
+        let arg = |name| args.get(name).map(tools::text);
+        let number = |name| arg(name).and_then(|t| t.parse::<u64>().ok());
+        let coordinates = arg("coordinates")
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        let geometry = arg("geometry").unwrap_or_default();
+        let shape = match area::shape(
+            &geometry,
+            &coordinates,
+            // a Point's radius and a LineString's buffer
+            number("maxDistance"),
+            number("maxDistance"),
+            *budget::AREA_MAX_KM2,
+        ) {
+            Ok(shape) => shape,
+            Err(no) => {
+                let mut result = refused(&format!("{}: {}", no.slug, no.why));
+                result.structured_content =
+                    Some(json!({"error": {"type": no.slug, "title": no.why, "status": 400}}));
+                return result;
+            }
+        };
+        let k = number("limit").unwrap_or(area::DEFAULT_K);
+        let lang = arg("lang");
+        let mut types: Vec<String> = match arg("type") {
+            // type names hold no comma (schema::is_type_name)
+            Some(list) => list.split(',').map(str::to_owned).collect(),
+            None => match self.area_types().await {
+                Ok(types) => types,
+                Err(failure) => return failure,
+            },
+        };
+        let types_cut = types.len() > area::MAX_TYPES;
+        types.truncate(area::MAX_TYPES);
+        let started = std::time::Instant::now();
+        let width = Arc::new(tokio::sync::Semaphore::new(AREA_WIDTH));
+        let mut reads = tokio::task::JoinSet::new();
+        for entity_type in types {
+            let (me, shape, lang, width) =
+                (self.clone(), shape.clone(), lang.clone(), width.clone());
+            reads.spawn(async move {
+                let _permit = width.acquire_owned().await;
+                me.area_type(tool, &shape, entity_type, k, lang.as_deref())
+                    .await
+            });
+        }
+        let mut parts = Vec::new();
+        while let Some(done) = reads.join_next().await {
+            match done {
+                Ok(Ok(Some(part))) => parts.push(part),
+                Ok(Err(failure)) => return failure,
+                // a type the gate refused or with nothing in the area; a read
+                // that panicked is left out too
+                Ok(Ok(None)) | Err(_) => {}
+            }
+        }
+        metrics::histogram!("antares_area_ms").record(started.elapsed().as_secs_f64() * 1000.0);
+        let answer = area::answer(&shape, k, parts, types_cut);
+        let mut result = CallToolResult::structured(answer.clone());
+        result.content = vec![ContentBlock::text(area::render(&answer))];
+        result
+    }
+
+    /// The types `area_overview` reads when the call names none: the view's
+    /// own names, or the Tenant's types through the view when it shows every name.
+    async fn area_types(&self) -> Result<Vec<String>, CallToolResult> {
+        let names = self.names();
+        if !names.every {
+            return Ok(names.types);
+        }
+        let types = Built {
+            method: Method::GET,
+            target: "/ngsi-ld/v1/types".to_owned(),
+            body: None,
+        };
+        let answer = self.run(OperationId::RetrieveEntityTypes, types).await;
+        if !answer.status.is_success() {
+            return Err(failed(&answer));
+        }
+        let list = answer.body.get("typeList").cloned().unwrap_or_default();
+        Ok(serde_json::from_value(list).unwrap_or_default())
+    }
+
+    /// One type of `area_overview`, read with `tool`'s operation
+    /// (`query_entities`'): `None` when the gate refused it or no Entity of it
+    /// lies in the area, a failure when the read failed otherwise.
+    async fn area_type(
+        &self,
+        tool: &'static ToolDef,
+        shape: &Shape,
+        entity_type: String,
+        k: u64,
+        lang: Option<&str>,
+    ) -> Result<Option<TypePart>, CallToolResult> {
+        let read = |radius: Option<f64>, limit: u64| {
+            let (georel, geometry, coordinates) = shape.query(radius);
+            let mut args = schema::Args::new();
+            args.insert("type", Checked::One(entity_type.clone()));
+            args.insert("georel", Checked::One(georel));
+            args.insert("geometry", Checked::One(geometry.to_owned()));
+            args.insert("coordinates", Checked::Json(coordinates));
+            args.insert("count", Checked::Flag(true));
+            args.insert("format", Checked::One("normalized".into()));
+            args.extend(lang.map(|l| ("lang", Checked::One(l.to_owned()))));
+            let max = u64::try_from(*antares_ops::bounds::MAX_LIMIT).unwrap_or(u64::MAX);
+            let built = tools::build(tool, &args, limit.min(max), 0);
+            async move {
+                let answer = self.run(tool.op, built).await;
+                log_call(&self.id, tool, answer.status);
+                answer
+            }
+        };
+        let line = matches!(shape, Shape::Line { .. });
+        let first = read(
+            None,
+            if line {
+                area::LINE_ROWS
+            } else {
+                area::RANK_ROWS
+            },
+        )
+        .await;
+        if answer_refused(&first) {
+            return Ok(None);
+        }
+        if !first.status.is_success() {
+            return Err(failed(&first));
+        }
+        let total = first.count.unwrap_or_default();
+        let mut rows: Vec<Value> = serde_json::from_value(first.body).unwrap_or_default();
+        let k_rows = usize::try_from(k).unwrap_or(usize::MAX);
+        let held = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+        let mut nearest = held >= total;
+        if let (Shape::Point { radius, .. }, false) = (shape, nearest) {
+            // a ring holding about 60 % of a page: when it holds k and is read
+            // whole, everything nearer than its edge is in it
+            let wide = |n: u64| f64::from(u32::try_from(n).unwrap_or(u32::MAX));
+            let part = (wide(area::RANK_ROWS) * 0.6 / wide(total)).sqrt();
+            let ring = read(Some(radius * part), area::RANK_ROWS).await;
+            let inner: Vec<Value> = serde_json::from_value(ring.body).unwrap_or_default();
+            if inner.len() >= k_rows && ring.count.unwrap_or(u64::MAX) <= area::RANK_ROWS {
+                rows = inner;
+                nearest = true;
+            }
+        }
+        let (inside, entities) = area::rank(shape, &rows, k_rows, lang);
+        let (count, exact) = if line {
+            (inside, nearest)
+        } else {
+            (total, true)
+        };
+        Ok((count > 0).then_some(TypePart {
+            entity_type,
+            count,
+            exact,
+            nearest,
+            entities,
+        }))
     }
 
     /// `describe_type` (T-4537): `get_type` through the view, so the gate decides as it does for
@@ -733,6 +908,17 @@ impl From<budget::Busy> for CallToolResult {
     }
 }
 
+/// Types `area_overview` reads at once.
+const AREA_WIDTH: usize = 8;
+
+/// Whether the view refused a read for the caller: the type adds nothing.
+fn answer_refused(answer: &Answer) -> bool {
+    matches!(
+        answer.status,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+    )
+}
+
 /// A refused argument: the rule, never the value.
 fn refused(why: &str) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(why.to_owned())])
@@ -957,6 +1143,9 @@ impl ServerHandler for Server {
         let given = request.arguments.unwrap_or_default();
         if describe {
             return Ok(self.describe(tool, &given).await.into());
+        }
+        if request.name == "area_overview" {
+            return Ok(self.area_overview(tool, &given).await.into());
         }
         if request.name == "summarize" {
             return Ok(self.summarize(tool, &given).await.into());
