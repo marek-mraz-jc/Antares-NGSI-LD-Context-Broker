@@ -668,7 +668,7 @@ mod tests {
     }
 
     /// One policy document of `policies` as the engine compiles it.
-    fn compiled(policies: Value) -> Result<Table, String> {
+    fn compiled(policies: &Value) -> Result<Table, String> {
         compile(&json!({ "policies": policies }))
     }
 
@@ -683,7 +683,7 @@ mod tests {
     #[test]
     fn an_attribute_is_granted_only_when_a_covering_selector_lists_it_or_none() -> Result<(), String>
     {
-        let t = compiled(json!([
+        let t = compiled(&json!([
             {"id": "speed", "assignee": {"kind": "role", "id": "public"},
              "operations": ["5.7.1", "5.6.4"],
              "information": [{"entities": [{"type": "Car"}], "propertyNames": ["speed"]}]},
@@ -736,7 +736,7 @@ mod tests {
 
     #[test]
     fn a_prohibition_refuses_its_whole_type_whichever_attributes_it_lists() -> Result<(), String> {
-        let t = compiled(json!([
+        let t = compiled(&json!([
             {"id": "read-car", "assignee": {"kind": "role", "id": "public"},
              "operations": ["5.7.1", "5.7.2"], "information": [{"entities": [{"type": "Car"}]}]},
             {"id": "no-speed", "effect": "prohibit", "assignee": {"kind": "role", "id": "public"},
@@ -780,7 +780,7 @@ mod tests {
     #[test]
     fn the_attribute_table_answers_each_action_and_a_reason_naming_no_policy() -> Result<(), String>
     {
-        let t = compiled(json!([
+        let t = compiled(&json!([
             {"id": "editor", "assigner": "did:web:city.example.org",
              "assignee": {"kind": "role", "id": "public"},
              "operations": ["5.7.1", "5.6.4"],
@@ -851,8 +851,9 @@ mod tests {
             return false;
         };
         let ctx = context();
-        let types = vec![ctx.expand_key("Car")];
-        let attrs = vec![ctx.expand_key(attribute)];
+        let (ty, attr) = (ctx.expand_key("Car"), ctx.expand_key(attribute));
+        let types = vec![ty.clone()];
+        let attrs = vec![attr.clone()];
         let ids = ["urn:ngsi-ld:Car:1"];
         let op = Operation {
             types: &types,
@@ -864,8 +865,7 @@ mod tests {
             Decision::Allow => true,
             Decision::Deny(_) | Decision::AllowIf(_) => false,
             Decision::Filter(f) => f.rules.iter().any(|r| {
-                r.types.contains(&types[0])
-                    && (r.every_attribute || r.attributes.contains(&attrs[0]))
+                r.types.contains(&ty) && (r.every_attribute || r.attributes.contains(&attr))
             }),
         }
     }
@@ -906,7 +906,7 @@ mod tests {
                             }
                             policies.push(no);
                         }
-                        let t = compiled(Value::Array(policies))?;
+                        let t = compiled(&Value::Array(policies))?;
                         let public = caller(&[("x-jc-roles", "")]);
                         let grants = Grants::of(Some(&t), &public, Utc::now());
                         for (_, action) in ATTRIBUTE_ACTIONS {
