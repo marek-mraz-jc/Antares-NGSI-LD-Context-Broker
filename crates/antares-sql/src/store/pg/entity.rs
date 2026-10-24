@@ -817,7 +817,7 @@ impl PgEntityStore {
 
     /// Every (type, member name) pair the Tenant's Entities ever carried,
     /// sorted (T-4934): the attribute catalogue the writes keep (migration
-    /// 0023). A pair whose last carrier went stays listed; the reader checks
+    /// 0025). A pair whose last carrier went stays listed; the reader checks
     /// each against a live Entity, as it does a catalogued type.
     pub async fn attr_pairs(
         &self,
