@@ -100,7 +100,7 @@ pub(crate) async fn run(
         Write::Delete(id) => (path(id), None, None),
         Write::Create => {
             let feature = read(headers, body, false).await?;
-            let doc = attributes(c, &feature, false)?;
+            let doc = attributes(c, &feature, false, base)?;
             let id = match feature.get("id") {
                 None | Some(Value::Null) => format!(
                     "urn:ngsi-ld:{}:{}",
@@ -119,7 +119,7 @@ pub(crate) async fn run(
             if feature.get("id").is_some_and(|v| v != id) {
                 return Err(bad("the body's id is not the Feature's"));
             }
-            let doc = attributes(c, &feature, merge)?;
+            let doc = attributes(c, &feature, merge, base)?;
             let doc = if merge { doc } else { typed(doc, id) };
             (path(id), Some(doc), None)
         }
@@ -188,7 +188,12 @@ async fn read(headers: &HeaderMap, body: Body, merge: bool) -> Result<Value, Pro
 /// geometry as the collection's `GeoProperty`, each property by its kind. A property the
 /// collection does not have, hidden or misspelt, is the same 400. A `null` deletes in a merge
 /// and is absent otherwise.
-fn attributes(c: &Collection, feature: &Value, merge: bool) -> Result<Map<String, Value>, Problem> {
+fn attributes(
+    c: &Collection,
+    feature: &Value,
+    merge: bool,
+    base: &str,
+) -> Result<Map<String, Value>, Problem> {
     let Value::Object(feature) = feature else {
         return Err(bad("the body is a GeoJSON Feature"));
     };
@@ -225,12 +230,48 @@ fn attributes(c: &Collection, feature: &Value, merge: bool) -> Result<Map<String
                 doc.insert(p.iri.clone(), gone());
             }
             (Value::Null, false) => {}
+            (value, _) if p.reference => {
+                let value = urns(&value, base).ok_or(bad(NOT_A_REFERENCE))?;
+                doc.insert(p.iri.clone(), attribute(p, &value));
+            }
             (value, _) => {
                 doc.insert(p.iri.clone(), attribute(p, &value));
             }
         }
     }
     Ok(doc)
+}
+
+/// Why a reference of a write body is refused (Part 5 `profile-references`).
+const NOT_A_REFERENCE: &str = "a reference is a URN, or the href of a Feature of this endpoint as rel-as-uri or rel-as-link write it";
+
+/// A reference as a write body may hold it, in any `profile` a read wrote (Part 5
+/// `profile-references`): the URN (`rel-as-key`), the Feature's URI (`rel-as-uri`) or a link
+/// object with its `href` (`rel-as-link`), or a list of them; each read back to its URN. A URI
+/// of another server, or of no Feature of this endpoint, is `None`.
+fn urns(value: &Value, base: &str) -> Option<Value> {
+    let href = |h: &str| {
+        let rest = h.strip_prefix(base)?.strip_prefix("/collections/")?;
+        let (_, urn) = rest.split_once("/items/")?;
+        antares_ops::percent::decoded(urn).filter(|u| !u.is_empty() && !u.contains('/'))
+    };
+    match value {
+        Value::String(s) if s.starts_with("http://") || s.starts_with("https://") => {
+            href(s).map(Value::from)
+        }
+        Value::String(_) => Some(value.clone()),
+        Value::Object(link) => link
+            .get("href")
+            .and_then(Value::as_str)
+            .and_then(href)
+            .map(Value::from),
+        Value::Array(all) => all
+            .iter()
+            .map(|v| urns(v, base))
+            .collect::<Option<Vec<_>>>()
+            .map(Value::from),
+        _ => None,
+    }
 }
 
 /// One property's value as its normalized NGSI-LD Attribute, of the kind the schema names.
@@ -282,6 +323,86 @@ mod tests {
                 json!({"type": kind, member: 1}),
                 "{kind}"
             );
+        }
+    }
+
+    /// T-5204: a property read as a Feature and written back is the Attribute it was (Part 5
+    /// `returnables-and-receivables`, Part 4 replace).
+    #[test]
+    fn a_read_value_writes_back_unchanged() {
+        let attrs = [
+            ("Property", json!({"type": "Property", "value": {"a": 1}})),
+            (
+                "Relationship",
+                json!({"type": "Relationship", "object": "urn:ngsi-ld:Stop:1"}),
+            ),
+            (
+                "ListRelationship",
+                json!({"type": "ListRelationship", "objectList": ["urn:ngsi-ld:Stop:1"]}),
+            ),
+            (
+                "GeoProperty",
+                json!({"type": "GeoProperty", "value": {"type": "Point", "coordinates": [1, 2]}}),
+            ),
+            (
+                "JsonProperty",
+                json!({"type": "JsonProperty", "json": {"vocab": 1}}),
+            ),
+            (
+                "VocabProperty",
+                json!({"type": "VocabProperty", "vocab": "parked"}),
+            ),
+            (
+                "LanguageProperty",
+                json!({"type": "LanguageProperty", "languageMap": {"sk": "auto"}}),
+            ),
+            (
+                "ListProperty",
+                json!({"type": "ListProperty", "valueList": [1, 2]}),
+            ),
+        ];
+        for (kind, attr) in attrs {
+            let p = Prop {
+                name: "p".into(),
+                iri: "https://e.org/p".into(),
+                schema: json!({}),
+                role: None,
+                unit: None,
+                description: None,
+                sortable: false,
+                kind: kind.into(),
+                reference: false,
+                target: None,
+            };
+            let read = crate::items::served(kind, &crate::items::value_of(&attr));
+            assert_eq!(attribute(&p, &read), attr, "{kind}");
+        }
+    }
+
+    /// T-5204: a reference read with `profile=rel-as-uri` or `rel-as-link` writes back as its URN.
+    #[test]
+    fn a_reference_reads_back_from_each_profile() {
+        let base = "http://h/x/views/fleet/ogc/features";
+        let uri = format!("{base}/collections/Stop/items/urn%3Angsi-ld%3AStop%3A1");
+        let urn = json!("urn:ngsi-ld:Stop:1");
+        assert_eq!(urns(&urn, base), Some(urn.clone()));
+        assert_eq!(urns(&json!(uri), base), Some(urn.clone()));
+        assert_eq!(
+            urns(&json!({"href": uri, "title": "x"}), base),
+            Some(urn.clone())
+        );
+        assert_eq!(
+            urns(&json!([uri, "urn:ngsi-ld:Stop:2"]), base),
+            Some(json!([urn, "urn:ngsi-ld:Stop:2"]))
+        );
+        for bad in [
+            json!("https://evil.example/x/views/fleet/ogc/features/collections/Stop/items/urn%3Ax"),
+            json!(format!("{base}/collections/Stop/items/")),
+            json!(format!("{base}/collections/Stop")),
+            json!({"title": "no href"}),
+            json!(1),
+        ] {
+            assert_eq!(urns(&bad, base), None, "{bad}");
         }
     }
 }

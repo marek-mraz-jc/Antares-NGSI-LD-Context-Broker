@@ -40,6 +40,8 @@ pub(crate) struct Params {
     pub ngsild: Vec<(&'static str, String)>,
     /// `filter` and the queryables named as parameters (F1, F2), names checked.
     pub filter: Option<ogc_cql2::Expr>,
+    /// The NGSI-LD `lang` a `LanguageProperty` is read in: the caller's `Accept-Language`.
+    pub lang: Option<String>,
 }
 
 /// The `ngsild.` options a collection's `items` declares (ADR-0028 rule 6): each narrows.
@@ -193,6 +195,12 @@ pub(crate) fn params(c: &Collection, pairs: &[(String, String)]) -> Result<Param
             "ngsild.pick and ngsild.omit both select the properties; name one",
         ));
     }
+    if let Some(o) = &c.output {
+        if let (Some(_), Some(q)) = (&o.filter.q, p.option("q")) {
+            antares_ops::outputs::one_q(q).map_err(bad)?;
+        }
+        o.filter.scope_with(p.option("scopeQ")).map_err(bad)?;
+    }
     p.filter = crate::filter::read(c, &raw)?;
     if p.properties.is_some() && p.option("pick").is_some() {
         return Err(bad(
@@ -288,50 +296,84 @@ fn is_date_time(s: &str) -> bool {
                 .all(|&i| b.get(i).is_some_and(u8::is_ascii_digit))
     };
     head && zone.is_some_and(|z| z.eq_ignore_ascii_case("z") || offset(z))
+        && residual::DateTime::parse(s).is_some()
 }
 
 pub(crate) use antares_ops::percent::encode;
 
-/// The `q` the `datetime` parameter adds (C13, C14): the temporal geometry intersects the
-/// interval, or the Feature has none.
+/// What the `datetime` parameter adds (C13, C14): the temporal geometry intersects the
+/// interval, or the Feature has none. The residual decides by instant, an offset read as
+/// written and a value without a time (`2026-10-31`) as the whole UTC day; the `q` beside it
+/// compares text, so its bounds move out by [`crate::filter::slack`] to select a superset.
 fn time_q(
     time: Option<&Time>,
     terms: &Terms,
     (from, to): &(Option<String>, Option<String>),
-) -> Option<String> {
-    let cmp = |iri: &str, op: &str, at: &Option<String>| {
-        at.as_ref().map(|at| format!("{}{op}{at}", terms.term(iri)))
-    };
-    let either = |iri: &str, conds: Vec<String>| {
+) -> (Option<String>, Option<Expr>) {
+    let at = |s: &Option<String>| s.as_deref().and_then(residual::DateTime::parse);
+    let (from, to) = (at(from), at(to));
+    // (`>=`, the earlier end) or (`<=`, the later end), of one Attribute.
+    let bound = |iri: &str, later: bool, at: Option<residual::DateTime>| {
+        let at = at?;
         let t = terms.term(iri);
-        if conds.is_empty() {
-            None
+        let (op, cmp) = if later {
+            ("<=", residual::Cmp::Le)
         } else {
-            Some(format!("(({})|!{t})", conds.join(";")))
-        }
+            (">=", residual::Cmp::Ge)
+        };
+        let exact = Expr::Cmp(
+            cmp,
+            Box::new(Expr::Path(Path::value(t))),
+            Box::new(Expr::Lit(Lit::DateTime(at))),
+        );
+        let q = crate::filter::slack(at, later).map(|b| format!("{t}{op}{b}"));
+        Some((q, exact))
     };
-    let parts: Vec<String> = match time? {
-        Time::Instant(t) => either(
+    // The bounds of one Attribute, or the Feature lacks it.
+    let either = |iri: &str, bounds: Vec<(Option<String>, Expr)>| {
+        if bounds.is_empty() {
+            return None;
+        }
+        let t = terms.term(iri);
+        let q: Vec<String> = bounds.iter().filter_map(|(q, _)| q.clone()).collect();
+        let q = (!q.is_empty()).then(|| format!("(({})|!{t})", q.join(";")));
+        let exact = bounds.into_iter().map(|(_, e)| e).collect();
+        Some((
+            q,
+            Expr::Or(vec![
+                Expr::And(exact),
+                Expr::IsNull(Box::new(Expr::Path(Path::value(t)))),
+            ]),
+        ))
+    };
+    let parts: Vec<(Option<String>, Expr)> = match time {
+        None => Vec::new(),
+        Some(Time::Instant(t)) => either(
             t,
-            cmp(t, ">=", from)
+            bound(t, false, from)
                 .into_iter()
-                .chain(cmp(t, "<=", to))
+                .chain(bound(t, true, to))
                 .collect(),
         )
         .into_iter()
         .collect(),
-        Time::Interval(start, end) => [
+        Some(Time::Interval(start, end)) => [
             start
                 .as_ref()
-                .and_then(|s| either(s, cmp(s, "<=", to).into_iter().collect())),
+                .and_then(|s| either(s, bound(s, true, to).into_iter().collect())),
             end.as_ref()
-                .and_then(|e| either(e, cmp(e, ">=", from).into_iter().collect())),
+                .and_then(|e| either(e, bound(e, false, from).into_iter().collect())),
         ]
         .into_iter()
         .flatten()
         .collect(),
     };
-    (!parts.is_empty()).then(|| parts.join(";"))
+    if parts.is_empty() {
+        return (None, None);
+    }
+    let q: Vec<String> = parts.iter().filter_map(|(q, _)| q.clone()).collect();
+    let exact: Vec<Expr> = parts.into_iter().map(|(_, e)| e).collect();
+    ((!q.is_empty()).then(|| q.join(";")), conjunction(exact))
 }
 
 /// The `orderBy` keys of `sortby` (S5).
@@ -359,11 +401,31 @@ fn shape(c: &Collection, terms: &Terms, p: &Params) -> String {
         format!("&pick={}", encode(&names.join(",")))
     });
     let omit = if pick.is_some() { None } else { Some("omit") };
-    let options = ["pick", "scopeQ"]
+    let options = ["pick"]
         .into_iter()
         .chain(omit)
-        .filter_map(|name| p.option(name).map(|v| format!("&{name}={}", encode(v))));
-    pick.into_iter().chain(options).collect()
+        .filter_map(|name| p.option(name).map(|v| format!("&{name}={}", encode(v))))
+        .chain(scope_q(c, p).map(|v| format!("&scopeQ={}", encode(&v))));
+    let lang = p.lang.iter().map(|l| format!("&lang={}", encode(l)));
+    pick.into_iter().chain(options).chain(lang).collect()
+}
+
+/// The `q` of the collection's output filter (T-5216), a conjunct of every read of it.
+fn output_q(c: &Collection) -> Option<String> {
+    let q = c.output.as_ref()?.filter.q.as_ref()?;
+    Some(format!("({q})"))
+}
+
+/// The `scopeQ` of a read: the output filter's (T-5216) joined with the request's, which
+/// [`params`] has checked can be joined; the filter's alone otherwise, never wider.
+fn scope_q(c: &Collection, p: &Params) -> Option<String> {
+    match &c.output {
+        Some(o) => o
+            .filter
+            .scope_with(p.option("scopeQ"))
+            .unwrap_or(o.filter.scope_q.clone()),
+        None => p.option("scopeQ").map(str::to_owned),
+    }
 }
 
 /// One Query Entities an `items` request reads: the store's pushdown and the residual the
@@ -390,15 +452,19 @@ fn conjunction(mut all: Vec<Expr>) -> Option<Expr> {
 /// what the residual needs and drops it again.
 pub(crate) fn targets(c: &Collection, terms: &Terms, p: &Params, f: &Lowered) -> Vec<Part> {
     let bbox = p.bbox.zip(c.geometry.as_deref());
-    let residual = !f.residual.is_empty() || (bbox.is_some() && p.ngsild_geo());
+    let (time, when) = p
+        .datetime
+        .as_ref()
+        .map_or((None, None), |d| time_q(c.time.as_ref(), terms, d));
+    let residual = !f.residual.is_empty() || when.is_some() || (bbox.is_some() && p.ngsild_geo());
     let projection = if residual {
-        p.option("scopeQ")
-            .map(|v| format!("&scopeQ={}", encode(v)))
+        scope_q(c, p)
+            .map(|v| format!("&scopeQ={}", encode(&v)))
             .unwrap_or_default()
     } else {
         shape(c, terms, p)
     };
-    let mut base = format!("type={}{projection}", encode(&c.type_iri));
+    let mut base = format!("type={}{}{projection}", encode(&c.type_iri), f.id_param());
     if p.ngsild_geo() {
         for name in ["georel", "geometry", "coordinates", "geoproperty"] {
             if let Some(value) = p.option(name) {
@@ -424,10 +490,6 @@ pub(crate) fn targets(c: &Collection, terms: &Terms, p: &Params, f: &Lowered) ->
             encode(geometry)
         );
     }
-    let time = p
-        .datetime
-        .as_ref()
-        .and_then(|d| time_q(c.time.as_ref(), terms, d));
     let theirs = p.option("q").map(|q| format!("({q})"));
     let with_q = |extra: Option<String>| {
         let q: Vec<String> = time
@@ -435,6 +497,7 @@ pub(crate) fn targets(c: &Collection, terms: &Terms, p: &Params, f: &Lowered) ->
             .cloned()
             .chain(extra)
             .chain(theirs.clone())
+            .chain(output_q(c))
             .chain(f.q.iter().map(|q| format!("({q})")))
             .collect();
         if q.is_empty() {
@@ -447,6 +510,7 @@ pub(crate) fn targets(c: &Collection, terms: &Terms, p: &Params, f: &Lowered) ->
         conjunction(
             extra
                 .into_iter()
+                .chain(when.iter().cloned())
                 .chain(f.residual.iter().cloned())
                 .collect(),
         )
@@ -583,6 +647,14 @@ pub(crate) async fn page(
         Some(f) => crate::filter::lower(c, &terms, f, geo_free)?,
         None => Lowered::default(),
     };
+    if lowered.ids.as_ref().is_some_and(Vec::is_empty) {
+        // `id` conjuncts no Entity id meets: nothing to ask the store.
+        return Ok(Page {
+            features: Vec::new(),
+            matched: Some(0),
+            next: None,
+        });
+    }
     let parts = targets(c, &terms, p, &lowered);
     let (start, offset) = match &p.next {
         None => (0, 0),
@@ -778,18 +850,19 @@ pub(crate) fn feature(
         .geometry
         .as_ref()
         .and_then(|g| doc.get(terms.term(g)))
-        .cloned()
-        .unwrap_or(Value::Null);
+        .map_or(Value::Null, |g| {
+            antares_ops::rewound(served("GeoProperty", g))
+        });
     let properties: Map<String, Value> = c
         .properties
         .iter()
         .filter_map(|p| {
-            let value = doc.get(terms.term(&p.iri))?;
+            let value = served(&p.kind, doc.get(terms.term(&p.iri))?);
             let value = match (&p.target, refs.profile) {
                 (Some(target), Profile::Uri | Profile::Link) => {
-                    refer(value, &|urn| refs.render(target, urn))
+                    refer(&value, &|urn| refs.render(target, urn))
                 }
-                _ => value.clone(),
+                _ => value,
             };
             Some((p.name.clone(), value))
         })
@@ -806,6 +879,36 @@ pub(crate) fn feature(
         feature.insert("links".to_owned(), Value::from(links));
     }
     feature
+}
+
+/// A simplified Attribute value in the shape `/schema` declares for its kind (Part 5
+/// `returnables-and-receivables`), so a Feature read and written back stores it unchanged: an
+/// Attribute of several instances its default one (`@none`, as the broker's own `GeoJSON` picks;
+/// none is `null`), a `VocabProperty` its term, a `JsonProperty` its JSON, a `LanguageProperty`
+/// its language map. ponytail: a Property whose own value is an object of the one member
+/// `dataset` reads as instances, as the simplified form cannot tell them apart.
+pub(crate) fn served(kind: &str, value: &Value) -> Value {
+    let value = match value {
+        Value::Object(m) if m.len() == 1 => match m.get("dataset") {
+            Some(Value::Object(instances)) => {
+                instances.get("@none").cloned().unwrap_or(Value::Null)
+            }
+            _ => value.clone(),
+        },
+        _ => value.clone(),
+    };
+    let member = match kind {
+        "VocabProperty" => "vocab",
+        "JsonProperty" => "json",
+        "LanguageProperty" => "languageMap",
+        _ => return value,
+    };
+    match value {
+        Value::Object(mut m) if m.len() == 1 && m.contains_key(member) => {
+            m.remove(member).unwrap_or(Value::Null)
+        }
+        other => other,
+    }
 }
 
 /// How one request writes references (S7): the profile and the endpoint's URI.
@@ -880,10 +983,13 @@ pub(crate) async fn one(
     let terms = Terms::of(c);
     let pushdown = Pushdown {
         query: format!(
-            "id={}&type={}&format=simplified{}",
+            "id={}&type={}&format=simplified{}{}",
             encode(id),
             encode(&c.type_iri),
-            shape(c, &terms, p)
+            shape(c, &terms, p),
+            output_q(c)
+                .map(|q| format!("&q={}", encode(&q)))
+                .unwrap_or_default()
         ),
         context: terms.context(),
         ..Pushdown::default()
@@ -926,6 +1032,7 @@ mod tests {
     fn car() -> Collection {
         Collection {
             history: false,
+            output: None,
             id: "Car".into(),
             description: None,
             type_iri: "https://e.org/Car".into(),
@@ -939,6 +1046,20 @@ mod tests {
         q.iter()
             .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn a_q_that_closes_its_group_is_refused_beside_an_output_filter() {
+        let output = serde_json::from_value(json!({"name": "fast", "filter": {"q": "speed>9"},
+                                                   "sources": [{"type": "Car"}]}));
+        let filtered = Collection {
+            output: output.ok(),
+            ..car()
+        };
+        let escape = pairs(&[("ngsild.q", "speed<1)|(speed>0")]);
+        assert!(params(&filtered, &escape).is_err());
+        assert!(params(&filtered, &pairs(&[("ngsild.q", "speed<1")])).is_ok());
+        assert!(params(&car(), &escape).is_ok());
     }
 
     #[test]
@@ -1079,36 +1200,152 @@ mod tests {
         );
     }
 
+    /// Which of `events` (start, end) `datetime` keeps on an interval collection, and its `q`.
+    fn kept(datetime: &str, events: &[(&str, Option<&str>)]) -> (Option<String>, Vec<usize>) {
+        let terms = Terms {
+            context: Map::new(),
+            by_iri: vec![("s".into(), "s".into()), ("e".into(), "e".into())],
+        };
+        let range = super::datetime(datetime).unwrap_or_default();
+        let time = Time::Interval(Some("s".into()), Some("e".into()));
+        let (q, exact) = time_q(Some(&time), &terms, &range);
+        let program = exact.and_then(|e| residual::compile(&e, residual::DateTime::MIN).ok());
+        let hits = events
+            .iter()
+            .enumerate()
+            .filter(|(_, (start, end))| {
+                let mut entity = json!({"id": "urn:ngsi-ld:Event:1", "type": "Event",
+                    "s": {"type": "Property", "value": start}});
+                if let (Some(end), Some(m)) = (end, entity.as_object_mut()) {
+                    m.insert("e".into(), json!({"type": "Property", "value": end}));
+                }
+                program
+                    .as_ref()
+                    .is_some_and(|p| p.eval(&entity).ok() == Some(residual::Truth::True))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        (q, hits)
+    }
+
+    /// T-5204: the live Event runs 08:00+01:00 to 15:00+01:00, 07:00Z to 14:00Z; the
+    /// whole-day one ends 2026-10-31, inclusive.
+    #[test]
+    fn datetime_compares_instants_across_offsets_and_whole_days() {
+        let events = [
+            (
+                "2026-11-11T08:00:00+01:00",
+                Some("2026-11-11T15:00:00+01:00"),
+            ),
+            ("2026-10-30", Some("2026-10-31")),
+            ("2026-11-11T09:00:00.123456789+02:00", None),
+        ];
+        assert_eq!(kept("2026-11-11T07:30:00Z", &events).1, vec![0, 2]);
+        assert_eq!(kept("2026-11-11T14:30:00Z", &events).1, vec![2]);
+        assert_eq!(kept("../2026-11-11T07:30:00Z", &events).1, vec![0, 1, 2]);
+        assert_eq!(
+            kept("2026-11-11T07:00:00.000000001Z/..", &events).1,
+            vec![0, 2]
+        );
+        assert_eq!(kept("2026-11-11T14:00:00.000001Z/..", &events).1, vec![2]);
+        assert_eq!(kept("2026-10-31T12:00:00Z", &events).1, vec![1]);
+        assert_eq!(kept("2026-11-01T00:00:00+01:00", &events).1, vec![1]);
+        assert_eq!(kept("2026-11-01T00:00:00Z", &events).1, Vec::<usize>::new());
+        // The third starts 123 ms after 07:00Z, past this window.
+        assert_eq!(
+            kept("2026-11-11T06:59:59Z/2026-11-11T07:00:00Z", &events).1,
+            vec![0]
+        );
+        // The store's `q` reads text: its bounds sit 48 h out, a superset.
+        assert_eq!(
+            kept("2026-11-11T07:30:00+01:00/2026-11-11T08:00:00.5Z", &events)
+                .0
+                .as_deref(),
+            Some("((s<=2026-11-13T08:00:00.5Z)|!s);((e>=2026-11-09T06:30:00Z)|!e)")
+        );
+    }
+
     #[test]
     fn the_time_query_keeps_features_without_time() {
         let terms = Terms {
             context: Map::new(),
             by_iri: vec![("s".into(), "s".into()), ("e".into(), "e".into())],
         };
-        let range = (Some("A".to_owned()), Some("B".to_owned()));
+        let at = "2026-01-02T00:00:00Z".to_owned();
+        let range = (Some(at.clone()), Some(at));
         assert_eq!(
-            time_q(Some(&Time::Instant("s".into())), &terms, &range).as_deref(),
-            Some("((s>=A;s<=B)|!s)")
+            time_q(Some(&Time::Instant("s".into())), &terms, &range)
+                .0
+                .as_deref(),
+            Some("((s>=2025-12-31T00:00:00Z;s<=2026-01-04T00:00:00Z)|!s)")
         );
+        let missing = json!({"id": "urn:ngsi-ld:Car:1", "type": "Car"});
+        let (_, exact) = time_q(Some(&Time::Instant("s".into())), &terms, &range);
+        let program = exact.and_then(|e| residual::compile(&e, residual::DateTime::MIN).ok());
         assert_eq!(
-            time_q(
-                Some(&Time::Interval(Some("s".into()), Some("e".into()))),
-                &terms,
-                &range
-            )
-            .as_deref(),
-            Some("((s<=B)|!s);((e>=A)|!e)")
+            program.and_then(|p| p.eval(&missing).ok()),
+            Some(residual::Truth::True),
+            "a Feature without the time is kept"
         );
         assert_eq!(
             time_q(
                 Some(&Time::Interval(Some("s".into()), None)),
                 &terms,
-                &(Some("A".into()), None)
+                &(Some("2026-01-02T00:00:00Z".into()), None)
             ),
-            None,
+            (None, None),
             "an open end constrains nothing"
         );
-        assert_eq!(time_q(None, &terms, &range), None);
+        assert_eq!(time_q(None, &terms, &range), (None, None));
+    }
+
+    /// T-5204: a Feature holds one `GeoJSON` geometry and each property in its `/schema` shape,
+    /// whatever instances or kind the Attribute has.
+    #[test]
+    fn a_feature_serves_the_default_instance_and_the_schema_shape() {
+        let kinded = |name: &str, kind: &str| crate::model::Prop {
+            kind: kind.into(),
+            ..prop(name, false)
+        };
+        let c = Collection {
+            properties: vec![
+                kinded("speed", "Property"),
+                kinded("state", "VocabProperty"),
+                kinded("raw", "JsonProperty"),
+                kinded("label", "LanguageProperty"),
+            ],
+            ..car()
+        };
+        let terms = Terms::of(&c);
+        let here = json!({"type": "Point", "coordinates": [17.1, 48.1]});
+        let doc = simplified(json!({
+            "id": "urn:ngsi-ld:Car:1", "type": "Car",
+            "location": [
+                {"type": "GeoProperty", "value": {"type": "Point", "coordinates": [0, 0]}, "datasetId": "urn:ngsi-ld:Dataset:gps2"},
+                {"type": "GeoProperty", "value": here},
+            ],
+            "speed": [{"type": "Property", "value": 9, "datasetId": "urn:ngsi-ld:Dataset:a"}],
+            "state": {"type": "VocabProperty", "vocab": "parked"},
+            "raw": {"type": "JsonProperty", "json": {"a": [1]}},
+            "label": {"type": "LanguageProperty", "languageMap": {"sk": "auto", "en": "car"}},
+        }));
+        let refs = Refs {
+            profile: Profile::Key,
+            base: "http://h/x/views/city/ogc/features",
+            alternate: false,
+        };
+        let f = Value::Object(feature(&c, &terms, &doc, refs));
+        // A value already in its shape, or an object of other members, is served as it is.
+        assert_eq!(served("VocabProperty", &json!("x")), json!("x"));
+        let two = json!({"json": 1, "b": 2});
+        assert_eq!(served("JsonProperty", &two), two);
+        assert_eq!(served("JsonProperty", &json!({"b": 2})), json!({"b": 2}));
+        assert_eq!(f.get("geometry"), Some(&here));
+        assert_eq!(
+            f.get("properties"),
+            Some(&json!({"speed": null, "state": "parked", "raw": {"a": [1]},
+                         "label": {"sk": "auto", "en": "car"}}))
+        );
     }
 
     #[test]
@@ -1176,6 +1413,7 @@ mod tests {
     fn core_attributes_keep_their_name_and_others_get_a_context_term() {
         let c = Collection {
             history: false,
+            output: None,
             id: "Car".into(),
             description: None,
             type_iri: "https://e.org/Car".into(),
@@ -1201,6 +1439,7 @@ mod tests {
         assert_eq!(t.context.len(), 4);
         let long = Terms::of(&Collection {
             history: false,
+            output: None,
             properties: vec![prop(&"x".repeat(257), false), prop("1st", false)],
             ..c.clone()
         });
@@ -1211,6 +1450,7 @@ mod tests {
         assert_eq!(long.term("https://e.org/1st"), "p1");
         let only_core = Terms::of(&Collection {
             history: false,
+            output: None,
             properties: Vec::new(),
             ..c
         });

@@ -196,7 +196,10 @@ GET /q/tenants/acme
 `200`, `404` for a tenant that does not exist, `400` for a name outside the
 tenant grammar or one of the broker's internal names. `createdAt` is present
 on Postgres, where the `tenants` table records it. The default tenant always
-exists (5.5.10) and is always readable, even when empty.
+exists (5.5.10) and is always readable, even when empty. `attrInstances`
+counts the tenant's history under a 5 s statement bound, the same bound as a
+size scan: when a long history does not count in time, the answer leaves
+`attrInstances` out and the other counts still answer.
 
 ### DELETE /q/tenants/{tenant}
 
@@ -547,7 +550,12 @@ whose statement fails (the log line `retention sweep failed`) runs again 2,
 4, 8 and at most 30 sweeps later, with half the batch per failure (at least
 100 rows), and each clean sweep doubles its batch back. A rule that holds
 a sweep for a second or more logs `retention sweep step slow` with its
-batch, count and milliseconds.
+batch, count and milliseconds. The history of a type (or of the Tenant's
+other types) is deleted Entity by Entity, in id order and chunks of a tenth
+of the batch (10 to 100 Entities): a step reads the chunk's own history
+index range, never a join of the type to the whole history, goes on to the
+next chunk for up to a second while the ones before held nothing to delete,
+and the next sweep continues where it stopped.
 `ANTARES_TEMPORAL_RETENTION_DAYS` stays the broker-wide horizon beside it.
 
 ### GET /q/retention/{tenant}

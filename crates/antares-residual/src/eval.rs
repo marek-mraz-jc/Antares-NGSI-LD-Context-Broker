@@ -336,6 +336,12 @@ fn as_date(v: &Val<'_>) -> Option<Date> {
     }
 }
 
+/// A date, or the UTC day of a date-time: a date and a date-time compare by day, a date being
+/// the whole day it names (CQL2 21-065r2 7.8 instants at day granularity).
+fn day(v: &Val<'_>) -> Option<Date> {
+    as_date(v).or_else(|| as_datetime(v).map(DateTime::utc_date))
+}
+
 fn as_time(v: &Val<'_>) -> Option<Time> {
     match v {
         Val::Time(t) => Some(*t),
@@ -370,12 +376,11 @@ fn order(a: &Val<'_>, b: &Val<'_>) -> Option<Ordering> {
         }
         (Val::Str(x), Val::Str(y)) => Some(x.cmp(y)),
         (Val::Bool(x), Val::Bool(y)) => Some(x.cmp(y)),
-        (Val::DateTime(_), _) | (_, Val::DateTime(_)) => Some(
-            as_datetime(a)?
-                .unix_micros()
-                .cmp(&as_datetime(b)?.unix_micros()),
-        ),
-        (Val::Date(_), _) | (_, Val::Date(_)) => Some(as_date(a)?.cmp(&as_date(b)?)),
+        (Val::DateTime(_), _) | (_, Val::DateTime(_)) => match (as_datetime(a), as_datetime(b)) {
+            (Some(x), Some(y)) => Some(x.unix_micros().cmp(&y.unix_micros())),
+            _ => Some(day(a)?.cmp(&day(b)?)),
+        },
+        (Val::Date(_), _) | (_, Val::Date(_)) => Some(day(a)?.cmp(&day(b)?)),
         (Val::Time(_), _) | (_, Val::Time(_)) => Some(as_time(a)?.cmp(&as_time(b)?)),
         _ => None,
     }

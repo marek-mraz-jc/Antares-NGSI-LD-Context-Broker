@@ -41,10 +41,14 @@ mod mapped;
 pub mod mapping;
 mod names;
 mod operation;
+pub mod outputs;
 pub mod percent;
 mod scan;
 pub mod views;
 
+/// The one `GeoJSON` geometry rule of the broker (T-5208): the default instance, valid, RFC 7946
+/// winding, for every surface that writes `GeoJSON`.
+pub use antares_api::{geometry_of, rewound};
 /// The NGSI-LD primer a surface tells a model (T-4532), through `antares-ops` alone (rule M2).
 pub use antares_ql::PRIMER;
 /// The residual of a standard query (ADR-0028 rule 2), re-exported so a surface compiles into
@@ -77,7 +81,7 @@ pub mod policy {
 /// delivers notifications (WebSocket).
 pub use antares_api::{build_message, DeliveryError, DeliveryFuture, NotificationSink, Outbound};
 /// The error a sink's endpoint check answers with.
-pub use antares_model::{NgsiError, TenantId};
+pub use antares_model::{EntityId, NgsiError, TenantId};
 
 /// The request bounds a surface applies to what it parses itself (a
 /// WebSocket message never passes the HTTP bounds layer).

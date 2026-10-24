@@ -46,7 +46,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build the platform binary
-        run: cargo build --locked --release -p antares-broker --features full,jc-policy,linkml,parquet,tabular,ical
+        run: cargo build --locked --release -p antares-broker --features full,jc-policy,linkml,parquet,tabular,ical,feed
       - name: 1 000 distinct queries a second
         env:
           BIN: target/release/antares

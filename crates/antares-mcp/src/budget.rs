@@ -53,6 +53,16 @@ fn usize_or(raw: Option<&str>, default: usize, min: usize, max: usize) -> usize 
         .map_or(default, |n: usize| n.clamp(min, max))
 }
 
+/// `ANTARES_AREA_MAX_KM2`: the largest area `area_overview` searches (T-5279).
+pub(crate) static AREA_MAX_KM2: LazyLock<f64> =
+    LazyLock::new(|| area_max(std::env::var(crate::AREA_MAX_KM2_ENV).ok().as_deref()));
+
+/// A positive km² bound, or the default: `NaN` or `-1` would lift the bound.
+fn area_max(raw: Option<&str>) -> f64 {
+    Some(f64_or(raw, crate::area::DEFAULT_MAX_KM2))
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(crate::area::DEFAULT_MAX_KM2)
+}
 pub(crate) static BUSY_MEMORY_PCT: LazyLock<f64> =
     LazyLock::new(|| parse_env_f64(crate::SUMMARY_BUSY_MEMORY_PCT_ENV, 70.0));
 pub(crate) static TIGHT_MEMORY_PCT: LazyLock<f64> =
@@ -340,6 +350,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_area_bound_is_a_positive_number_or_the_default() {
+        assert_eq!(area_max(Some("25")), 25.0);
+        for raw in [
+            None,
+            Some("NaN"),
+            Some("-1"),
+            Some("0"),
+            Some("inf"),
+            Some("x"),
+        ] {
+            assert_eq!(area_max(raw), crate::area::DEFAULT_MAX_KM2, "{raw:?}");
+        }
+    }
 
     fn temp_test_dir(name: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
         let base =

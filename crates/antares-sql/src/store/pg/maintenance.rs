@@ -136,34 +136,43 @@ pub async fn temporal_maintenance(
     // pre-creation that keeps ingest writable.
     if backend == TemporalBackend::Hypertable {
         if let Some(days) = retention_days {
-            sqlx::query("SELECT public.drop_chunks('attr_instances', older_than => make_interval(days => $1::int))")
-                .bind(days)
-                .execute(&mut *tx)
-                .await?;
+            for sql in [
+                "SELECT public.drop_chunks('attr_instances', older_than => make_interval(days => $1::int))",
+                "SELECT public.drop_chunks('attr_rows', older_than => make_interval(days => $1::int))",
+            ] {
+                sqlx::query(sql).bind(days).execute(&mut *tx).await?;
+            }
             done.push(format!("timescale drop_chunks older than {days}d"));
         }
     } else {
-        // weekly partitions for [now-1w, now+4w)
+        // weekly partitions for [now-1w, now+4w); a week from the cut-over on
+        // (migration 0020, T-5200) is a week of attr_rows, every other one of
+        // attr_instances
         for off in -1i64..4 {
             let row = sqlx::query(
                 "SELECT to_char(date_trunc('week', now()) + make_interval(weeks => $1::int), 'IYYY\"w\"IW') AS suffix,
                         (date_trunc('week', now()) + make_interval(weeks => $1::int))::text AS lo,
-                        (date_trunc('week', now()) + make_interval(weeks => ($1::int) + 1))::text AS hi",
+                        (date_trunc('week', now()) + make_interval(weeks => ($1::int) + 1))::text AS hi,
+                        COALESCE(date_trunc('week', now()) + make_interval(weeks => $1::int)
+                                   >= (SELECT at FROM history_cutover), false) AS keyed",
             )
             .bind(off)
             .fetch_one(&mut *tx)
             .await?;
             let (suffix, lo, hi): (String, String, String) =
                 (row.get("suffix"), row.get("lo"), row.get("hi"));
+            let keyed: bool = row.get("keyed");
             // The failure below is EXPECTED (see module docs), and in
             // PostgreSQL a failed statement aborts the whole transaction —
             // every later one then returns 25P02. Tolerating an error means
             // owning a savepoint to roll back to; without it the first
             // already-occupied range poisons the entire maintenance pass.
             let mut sp = tx.begin().await?;
-            match sqlx::query(sqlx::AssertSqlSafe(create_partition_sql(&suffix, &lo, &hi)))
-                .execute(&mut *sp)
-                .await
+            match sqlx::query(sqlx::AssertSqlSafe(create_partition_sql(
+                keyed, &suffix, &lo, &hi,
+            )))
+            .execute(&mut *sp)
+            .await
             {
                 Ok(_) => {
                     sp.commit().await?;
@@ -178,7 +187,7 @@ pub async fn temporal_maintenance(
             // lock_timeout, and a loser simply retries on the next tick.
             let mut sp = tx.begin().await?;
             let mut adopted = Ok(());
-            for stmt in adopt_default_rows_sql(&suffix, &lo, &hi) {
+            for stmt in adopt_default_rows_sql(keyed, &suffix, &lo, &hi) {
                 adopted = sqlx::query(sqlx::AssertSqlSafe(stmt))
                     .execute(&mut *sp)
                     .await
@@ -197,7 +206,7 @@ pub async fn temporal_maintenance(
                     // (permissions) must be visible at default log level, or it
                     // silently degrades to "everything lands in DEFAULT".
                     sp.rollback().await?;
-                    tracing::warn!("partition attr_instances_{suffix} not created: {e}");
+                    tracing::warn!("weekly history partition {suffix} not created: {e}");
                     done.push(format!("partition {suffix}: left in default"));
                 }
             }
@@ -310,7 +319,7 @@ async fn plain_retention(pool: &PgPool, days: i64) -> Result<Vec<String>, sqlx::
          FROM pg_inherits i
          JOIN pg_class c ON c.oid = i.inhrelid
          JOIN pg_class p ON p.oid = i.inhparent
-         WHERE p.relname = 'attr_instances'
+         WHERE p.relname IN ('attr_instances', 'attr_rows_long')
            AND p.relnamespace = 'public'::regnamespace",
     )
     .fetch_all(&mut *tx)
@@ -339,14 +348,20 @@ async fn plain_retention(pool: &PgPool, days: i64) -> Result<Vec<String>, sqlx::
             done.push(format!("dropped expired partition {name}"));
         }
     }
-    let purged = sqlx::query(
+    let mut purged = 0u64;
+    for sql in [
         "DELETE FROM attr_instances_default
          WHERE observed_at < now() - make_interval(days => $1::int)",
-    )
-    .bind(days)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
+        "DELETE FROM attr_rows_default
+         WHERE observed_at < now() - make_interval(days => $1::int)",
+    ] {
+        let n = sqlx::query(sql)
+            .bind(days)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        purged = purged.saturating_add(n);
+    }
     tx.commit().await?;
     if purged > 0 {
         done.push(format!(
@@ -367,8 +382,9 @@ const DEFAULT_PARTITION_WARN_ROWS: i64 = 100_000;
 
 async fn default_partition_load(pool: &PgPool) -> Result<Option<String>, sqlx::Error> {
     let rows: Option<f32> = sqlx::query_scalar(
-        "SELECT reltuples FROM pg_class
-         WHERE relname = 'attr_instances_default' AND relnamespace = 'public'::regnamespace",
+        "SELECT sum(greatest(reltuples, 0))::real FROM pg_class
+         WHERE relname IN ('attr_instances_default', 'attr_rows_default')
+           AND relnamespace = 'public'::regnamespace",
     )
     .fetch_optional(pool)
     .await?;
@@ -377,7 +393,7 @@ async fn default_partition_load(pool: &PgPool) -> Result<Option<String>, sqlx::E
         return Ok(None);
     }
     tracing::warn!(
-        "attr_instances_default holds ~{est} rows: instances are being written outside the \
+        "the DEFAULT history partitions hold ~{est} rows: instances are being written outside the \
          maintained partition window (historic backfill, or an observedAt far in the future); \
          queries over those ranges cannot prune"
     );
@@ -409,6 +425,8 @@ async fn reap_expired_entities(pool: &PgPool) -> Result<u64, sqlx::Error> {
     for (tenant, ids) in by_tenant {
         for sql in [
             "DELETE FROM attr_instances WHERE tenant_id = $1 AND entity_id = ANY($2::text[])",
+            "DELETE FROM attr_rows WHERE tenant_id = $1 AND entity_no IN \
+             (SELECT i.id FROM iri_ids i WHERE i.tenant_id = $1 AND i.iri = ANY($2::text[]))",
             "DELETE FROM attr_versions WHERE tenant_id = $1 AND entity_id = ANY($2::text[])",
         ] {
             sqlx::query(sql)
@@ -513,6 +531,29 @@ async fn retain(
     Ok(n)
 }
 
+/// At most `$4` instances of the Entities `$2` of Tenant `$1` observed
+/// before `$3`, by the (tenant, entity) prefix of the history index.
+const ENTITY_ROWS: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
+           FROM attr_instances a
+           WHERE a.tenant_id = $1 AND a.entity_id = ANY($2::text[])
+             AND a.observed_at < $3::timestamptz
+           LIMIT $4";
+/// The same over `attr_rows` (T-5200), its keys mapped through the Tenant's
+/// `iri_ids`; both of its children, the short one included (T-5249).
+const KEYED_ROWS: &str = "SELECT a.tenant_id, a.entity_no, a.attr_no, a.instance_no, a.observed_at
+           FROM attr_rows a
+           WHERE a.tenant_id = $1
+             AND a.entity_no IN (SELECT i.id FROM iri_ids i WHERE i.tenant_id = $1 AND i.iri = ANY($2::text[]))
+             AND a.observed_at < $3::timestamptz
+           LIMIT $4";
+/// The same over the superseded versions (T-4665).
+const VERSION_ROWS: &str =
+    "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
+           FROM attr_versions a
+           WHERE a.tenant_id = $1 AND a.entity_id = ANY($2::text[])
+             AND a.observed_at < $3::timestamptz
+           LIMIT $4";
+
 /// Retention of history (`/q/retention`, T-3900, DM-97): at most `batch`
 /// attribute instances of the Entities `scope` names in one Tenant, observed
 /// before `before`. Types live on `temporal_entities`; the instance key is
@@ -527,11 +568,7 @@ pub async fn retain_history(
     dry_run: bool,
 ) -> Result<u64, sqlx::Error> {
     use antares_store::HistoryScope;
-    const ENTITY: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
-           FROM attr_instances a
-           WHERE a.tenant_id = $1 AND a.entity_id = ANY($2::text[])
-             AND a.observed_at < $3::timestamptz
-           LIMIT $4";
+    const ENTITY: &str = ENTITY_ROWS;
     const TYPE: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
            FROM attr_instances a
            JOIN temporal_entities t ON t.tenant_id = a.tenant_id AND t.id = a.entity_id
@@ -546,16 +583,29 @@ pub async fn retain_history(
              AND a.entity_id <> ALL($5::text[])
              AND a.observed_at < $3::timestamptz
            LIMIT $4";
+    // The type and rest selections over `attr_rows` (T-5200), its keys mapped
+    // through the Tenant's `iri_ids`; KEYED_ROWS is the Entity one.
+    const R_TYPE: &str = "SELECT a.tenant_id, a.entity_no, a.attr_no, a.instance_no, a.observed_at
+           FROM attr_rows a
+           JOIN iri_ids i ON i.tenant_id = a.tenant_id AND i.id = a.entity_no
+           JOIN temporal_entities t ON t.tenant_id = i.tenant_id AND t.id = i.iri
+           WHERE a.tenant_id = $1 AND t.types @> $2::text[]
+             AND i.iri <> ALL($5::text[])
+             AND a.observed_at < $3::timestamptz
+           LIMIT $4";
+    const R_REST: &str = "SELECT a.tenant_id, a.entity_no, a.attr_no, a.instance_no, a.observed_at
+           FROM attr_rows a
+           JOIN iri_ids i ON i.tenant_id = a.tenant_id AND i.id = a.entity_no
+           JOIN temporal_entities t ON t.tenant_id = i.tenant_id AND t.id = i.iri
+           WHERE a.tenant_id = $1 AND NOT (t.types && $2::text[])
+             AND i.iri <> ALL($5::text[])
+             AND a.observed_at < $3::timestamptz
+           LIMIT $4";
     // A measurement past retention takes its superseded versions along
     // (T-4665): the same three selections over `attr_versions`, written out so
     // every statement on `attr_instances` stays a literal the tenant guard
     // reads (tests/attr_instances_tenant_predicate.rs).
-    const V_ENTITY: &str =
-        "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
-           FROM attr_versions a
-           WHERE a.tenant_id = $1 AND a.entity_id = ANY($2::text[])
-             AND a.observed_at < $3::timestamptz
-           LIMIT $4";
+    const V_ENTITY: &str = VERSION_ROWS;
     const V_TYPE: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
            FROM attr_versions a
            JOIN temporal_entities t ON t.tenant_id = a.tenant_id AND t.id = a.entity_id
@@ -570,29 +620,76 @@ pub async fn retain_history(
              AND a.entity_id <> ALL($5::text[])
              AND a.observed_at < $3::timestamptz
            LIMIT $4";
+    // A sweep's delete of a type walks its Entities (T-5157): see
+    // [`walk_history`]. A dry run counts the whole scope in one statement.
+    if !dry_run {
+        let one;
+        let (ids, key, names, except) = match scope {
+            HistoryScope::Entity(_) => (None, String::new(), &[][..], &[][..]),
+            HistoryScope::Type {
+                type_iri,
+                except_ids,
+            } => {
+                one = [type_iri.to_owned()];
+                (
+                    Some(TYPE_IDS),
+                    format!("{tenant}\n{type_iri}"),
+                    &one[..],
+                    except_ids,
+                )
+            }
+            HistoryScope::Rest {
+                except_types,
+                except_ids,
+            } => (
+                Some(REST_IDS),
+                format!("{tenant}\n"),
+                except_types,
+                except_ids,
+            ),
+        };
+        if let Some(ids) = ids {
+            let walk = Walk {
+                ids,
+                key,
+                names,
+                except,
+            };
+            return walk_history(pool, tenant, &walk, before, batch).await;
+        }
+    }
     let one;
-    let (rows, versions, names, except) = match scope {
+    let (rows, keyed, versions, names, except) = match scope {
         HistoryScope::Entity(id) => {
             one = [id.to_owned()];
-            (ENTITY, V_ENTITY, &one[..], None)
+            (ENTITY, KEYED_ROWS, V_ENTITY, &one[..], None)
         }
         HistoryScope::Type {
             type_iri,
             except_ids,
         } => {
             one = [type_iri.to_owned()];
-            (TYPE, V_TYPE, &one[..], Some(except_ids))
+            (TYPE, R_TYPE, V_TYPE, &one[..], Some(except_ids))
         }
         HistoryScope::Rest {
             except_types,
             except_ids,
-        } => (REST, V_REST, except_types, Some(except_ids)),
+        } => (REST, R_REST, V_REST, except_types, Some(except_ids)),
     };
     let current = retain(
         pool,
         rows,
         "DELETE FROM attr_instances
          WHERE (tenant_id, entity_id, attr_id, instance_id, observed_at) IN",
+        (tenant, names, except, before, batch),
+        dry_run,
+    )
+    .await?;
+    let current_keyed = retain(
+        pool,
+        keyed,
+        "DELETE FROM attr_rows
+         WHERE (tenant_id, entity_no, attr_no, instance_no, observed_at) IN",
         (tenant, names, except, before, batch),
         dry_run,
     )
@@ -606,7 +703,163 @@ pub async fn retain_history(
         dry_run,
     )
     .await?;
-    Ok(current.saturating_add(superseded))
+    Ok(current
+        .saturating_add(current_keyed)
+        .saturating_add(superseded))
+}
+
+/// The Entities of a type (`$2`), or of no type of `$2` for the rest, in
+/// Tenant `$1` leaving out `$3`, after `$4` in id order, at most `$5`. The
+/// primary key serves the order; `types` is only a filter, as no array
+/// operator reaches an index under RLS (migration 0015).
+const TYPE_IDS: &str = "SELECT t.id FROM temporal_entities t
+       WHERE t.tenant_id = $1 AND t.types @> $2::text[]
+         AND t.id <> ALL($3::text[]) AND t.id > $4
+       ORDER BY t.id LIMIT $5";
+const REST_IDS: &str = "SELECT t.id FROM temporal_entities t
+       WHERE t.tenant_id = $1 AND NOT (t.types && $2::text[])
+         AND t.id <> ALL($3::text[]) AND t.id > $4
+       ORDER BY t.id LIMIT $5";
+
+/// How long one [`walk_history`] call goes on to the next chunk of Entities
+/// when the ones before held nothing to delete.
+const WALK_TIME: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Where the walk of each (Tenant, scope) stopped, by [`Walk::key`]: the
+/// next call, the next sweep included, starts after it. Per process; a
+/// restart walks from the start again.
+static WALKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// One history retention scope as a walk over its Entities.
+struct Walk<'a> {
+    ids: &'static str,
+    key: String,
+    names: &'a [String],
+    except: &'a [String],
+}
+
+impl Walk<'_> {
+    fn at(&self) -> String {
+        let walks = WALKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        walks.get(&self.key).cloned().unwrap_or_default()
+    }
+
+    fn stop(&self, after: String) {
+        let mut walks = WALKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        walks.insert(self.key.clone(), after);
+    }
+}
+
+/// History retention of a type (or the rest) as a walk over its Entities in
+/// id order (T-5157): each statement deletes at most `batch` instances of a
+/// chunk of `batch / 10` (10 to 100) Entities by the per-Entity index, so its
+/// cost is bounded by the chunk and never by the plan a JOIN of the type to
+/// the whole history gets. On dev that JOIN ran 4-10 s for a step with
+/// nothing to delete and timed out every few minutes. A chunk is left when
+/// it holds less than what is left of the batch; the walk goes on for up to
+/// [`WALK_TIME`] and remembers where it stopped, so a type of 50 000
+/// Entities is covered over a few sweeps instead of timing out in one. At
+/// the end it starts over. Returns the instances of both history parents
+/// and the versions deleted, at most `batch`.
+async fn walk_history(
+    pool: &PgPool,
+    tenant: &str,
+    walk: &Walk<'_>,
+    before: &str,
+    batch: usize,
+) -> Result<u64, sqlx::Error> {
+    let started = std::time::Instant::now();
+    let per = (batch / 10).clamp(10, 100);
+    let mut after = walk.at();
+    let mut total = 0usize;
+    loop {
+        let ids = entity_chunk(pool, tenant, walk, &after, per).await?;
+        let Some(last) = ids.last().cloned() else {
+            walk.stop(String::new());
+            return Ok(total as u64);
+        };
+        for (rows, delete) in [
+            (
+                ENTITY_ROWS,
+                "DELETE FROM attr_instances
+             WHERE (tenant_id, entity_id, attr_id, instance_id, observed_at) IN",
+            ),
+            (
+                KEYED_ROWS,
+                "DELETE FROM attr_rows
+             WHERE (tenant_id, entity_no, attr_no, instance_no, observed_at) IN",
+            ),
+            (
+                VERSION_ROWS,
+                "DELETE FROM attr_versions
+             WHERE (tenant_id, entity_id, attr_id, instance_id, observed_at) IN",
+            ),
+        ] {
+            let left = batch.saturating_sub(total);
+            if left == 0 {
+                break;
+            }
+            let n = retain(
+                pool,
+                rows,
+                delete,
+                (tenant, &ids, None, before, left),
+                false,
+            )
+            .await?;
+            total = total.saturating_add(usize::try_from(n).unwrap_or(usize::MAX));
+        }
+        if total >= batch {
+            // The chunk may hold more: the next call starts with it again.
+            walk.stop(after);
+            return Ok(total as u64);
+        }
+        if ids.len() < per {
+            walk.stop(String::new());
+            return Ok(total as u64);
+        }
+        after = last;
+        if started.elapsed() >= WALK_TIME {
+            walk.stop(after);
+            return Ok(total as u64);
+        }
+    }
+}
+
+/// The next chunk of a [`Walk`]'s Entities after `after`, under the rule's
+/// Tenant (`temporal_entities` has no service escape) and the same 5 s
+/// statement timeout as each delete.
+async fn entity_chunk(
+    pool: &PgPool,
+    tenant: &str,
+    walk: &Walk<'_>,
+    after: &str,
+    per: usize,
+) -> Result<Vec<String>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    crate::store::pg::set_service(&mut tx).await?;
+    sqlx::query(crate::SET_TENANT_SQL)
+        .bind(tenant)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout = '5s'")
+        .execute(&mut *tx)
+        .await?;
+    let ids = sqlx::query_scalar(walk.ids)
+        .bind(tenant)
+        .bind(walk.names)
+        .bind(walk.except)
+        .bind(after)
+        .bind(i64::try_from(per).unwrap_or(i64::MAX))
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(ids)
 }
 
 /// The Entities of every Tenant that carry their own history retention
@@ -704,7 +957,7 @@ async fn drop_partitions(
          JOIN pg_class p ON p.oid = i.inhparent
          CROSS JOIN LATERAL (SELECT substring(pg_get_expr(c.relpartbound, c.oid)
                                     FROM 'TO \(''([^'']+)''\)')::timestamptz AS hi) b
-         WHERE p.relname = 'attr_instances'
+         WHERE p.relname IN ('attr_instances', 'attr_rows_long')
            AND p.relnamespace = 'public'::regnamespace
            AND pg_get_expr(c.relpartbound, c.oid) LIKE 'FOR VALUES FROM%'
            AND b.hi <= GREATEST((SELECT max(x) FROM unnest($1::timestamptz[]) x),
@@ -752,7 +1005,7 @@ async fn drop_partitions(
     sqlx::query("SET LOCAL statement_timeout = '2s'")
         .execute(&mut *tx)
         .await?;
-    sqlx::query("LOCK TABLE public.attr_instances IN ACCESS EXCLUSIVE MODE")
+    sqlx::query("LOCK TABLE public.attr_instances, public.attr_rows IN ACCESS EXCLUSIVE MODE")
         .execute(&mut *tx)
         .await?;
     // Read again under the lock: another pod may have dropped one meanwhile.
@@ -803,13 +1056,22 @@ fn drop_partition_sql(name: &str) -> String {
     format!("DROP TABLE public.\"{}\"", name.replace('"', "\"\""))
 }
 
-/// One weekly partition, created directly under the parent. Fails while the
-/// DEFAULT partition still holds a row in `[lo, hi)`.
-fn create_partition_sql(suffix: &str, lo: &str, hi: &str) -> String {
-    format!(
-        "CREATE TABLE IF NOT EXISTS attr_instances_{suffix} PARTITION OF attr_instances \
-         FOR VALUES FROM ('{lo}') TO ('{hi}')"
-    )
+/// One weekly partition, created directly under the parent: `attr_rows_long`,
+/// the logged child of `attr_rows` (0023, T-5249), when `keyed`, else
+/// `attr_instances`. Fails while the parent's DEFAULT
+/// partition still holds a row in `[lo, hi)`.
+fn create_partition_sql(keyed: bool, suffix: &str, lo: &str, hi: &str) -> String {
+    if keyed {
+        format!(
+            "CREATE TABLE IF NOT EXISTS attr_rows_{suffix} PARTITION OF attr_rows_long \
+             FOR VALUES FROM ('{lo}') TO ('{hi}')"
+        )
+    } else {
+        format!(
+            "CREATE TABLE IF NOT EXISTS attr_instances_{suffix} PARTITION OF attr_instances \
+             FOR VALUES FROM ('{lo}') TO ('{hi}')"
+        )
+    }
 }
 
 /// Recovery for a range DEFAULT already holds rows for, in execution order:
@@ -818,7 +1080,24 @@ fn create_partition_sql(suffix: &str, lo: &str, hi: &str) -> String {
 /// makes the ATTACH legal, and its bounds are what keep every other row in
 /// DEFAULT. Run as one unit — a partial application would strand rows in an
 /// unattached table.
-fn adopt_default_rows_sql(suffix: &str, lo: &str, hi: &str) -> [String; 3] {
+fn adopt_default_rows_sql(keyed: bool, suffix: &str, lo: &str, hi: &str) -> [String; 3] {
+    if keyed {
+        return [
+            format!(
+                "CREATE TABLE IF NOT EXISTS attr_rows_{suffix} \
+                 (LIKE attr_rows_long INCLUDING DEFAULTS INCLUDING CONSTRAINTS)"
+            ),
+            format!(
+                "WITH moved AS (DELETE FROM attr_rows_default \
+                   WHERE observed_at >= '{lo}' AND observed_at < '{hi}' RETURNING *) \
+                 INSERT INTO attr_rows_{suffix} SELECT * FROM moved"
+            ),
+            format!(
+                "ALTER TABLE attr_rows_long ATTACH PARTITION attr_rows_{suffix} \
+                 FOR VALUES FROM ('{lo}') TO ('{hi}')"
+            ),
+        ];
+    }
     [
         format!(
             "CREATE TABLE IF NOT EXISTS attr_instances_{suffix} \
@@ -855,6 +1134,7 @@ async fn reap_expired_instances(pool: &PgPool) -> Result<u64, sqlx::Error> {
     // DELETE for the whole deployment, every tick, forever.
     for sql in [
         "DELETE FROM attr_instances WHERE try_timestamptz(data->>'expiresAt') < now()",
+        "DELETE FROM attr_rows WHERE try_timestamptz(data->>'expiresAt') < now()",
         "DELETE FROM attr_versions WHERE try_timestamptz(data->>'expiresAt') < now()",
     ] {
         n = n.saturating_add(sqlx::query(sql).execute(&mut *tx).await?.rows_affected());
@@ -1031,7 +1311,7 @@ mod tests {
 
     #[test]
     fn create_partition_covers_exactly_the_week() {
-        let sql = create_partition_sql("2026w34", LO, HI);
+        let sql = create_partition_sql(false, "2026w34", LO, HI);
         assert!(sql.contains("attr_instances_2026w34 PARTITION OF attr_instances"));
         assert!(sql.contains(&format!("FROM ('{LO}') TO ('{HI}')")));
     }
@@ -1041,7 +1321,7 @@ mod tests {
     /// range.
     #[test]
     fn adopt_builds_the_table_standalone_then_attaches_it() {
-        let [create, _move, attach] = adopt_default_rows_sql("2026w34", LO, HI);
+        let [create, _move, attach] = adopt_default_rows_sql(false, "2026w34", LO, HI);
         assert!(create.contains("LIKE attr_instances"), "{create}");
         assert!(!create.contains("PARTITION OF"), "{create}");
         assert!(
@@ -1060,7 +1340,7 @@ mod tests {
     /// deployment and stuff them into one week.
     #[test]
     fn adopt_moves_only_the_partition_range_out_of_default() {
-        let [_create, mv, _attach] = adopt_default_rows_sql("2026w34", LO, HI);
+        let [_create, mv, _attach] = adopt_default_rows_sql(false, "2026w34", LO, HI);
         assert!(mv.contains("DELETE FROM attr_instances_default"), "{mv}");
         assert!(mv.contains(&format!("observed_at >= '{LO}'")), "{mv}");
         assert!(mv.contains(&format!("observed_at < '{HI}'")), "{mv}");
@@ -1068,5 +1348,27 @@ mod tests {
             mv.contains("INSERT INTO attr_instances_2026w34"),
             "moved rows must land in the week's table: {mv}"
         );
+    }
+
+    /// A week from the cut-over on (T-5200) is a week of `attr_rows`, built,
+    /// moved and attached under its logged child `attr_rows_long` (0023,
+    /// T-5249) only.
+    #[test]
+    fn a_keyed_week_goes_to_attr_rows() {
+        let sql = create_partition_sql(true, "2026w34", LO, HI);
+        assert!(
+            sql.contains("attr_rows_2026w34 PARTITION OF attr_rows_long "),
+            "{sql}"
+        );
+        let [create, mv, attach] = adopt_default_rows_sql(true, "2026w34", LO, HI);
+        assert!(create.contains("(LIKE attr_rows_long "), "{create}");
+        assert!(mv.contains("DELETE FROM attr_rows_default"), "{mv}");
+        assert!(mv.contains("INSERT INTO attr_rows_2026w34"), "{mv}");
+        assert!(mv.contains(&format!("observed_at < '{HI}'")), "{mv}");
+        assert!(
+            attach.starts_with("ALTER TABLE attr_rows_long ATTACH PARTITION attr_rows_2026w34"),
+            "{attach}"
+        );
+        assert!(!format!("{sql}{create}{mv}{attach}").contains("attr_instances"));
     }
 }

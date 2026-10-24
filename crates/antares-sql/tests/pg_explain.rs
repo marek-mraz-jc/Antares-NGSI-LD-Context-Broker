@@ -124,6 +124,12 @@ async fn seed_rls(pool: &sqlx::PgPool) {
         .execute(&mut *tx)
         .await
         .expect("no lock timeout: the seed holds the lock for seconds");
+    // the seed's writes key `entity_values` (0024) too: past the pool's
+    // statement timeout, both for the seeder and for a test waiting on it
+    sqlx::query("SET LOCAL statement_timeout = 0")
+        .execute(&mut *tx)
+        .await
+        .expect("no statement timeout for the seed");
     sqlx::query("SELECT pg_advisory_xact_lock(48520)")
         .execute(&mut *tx)
         .await
@@ -149,7 +155,9 @@ async fn seed_rls(pool: &sqlx::PgPool) {
                     jsonb_build_object(
                       'https://x/tenant', $1,
                       'https://x/speed', jsonb_build_array(jsonb_build_object('type', 'Property', 'value', g % 100)),
-                      'https://x/brand', jsonb_build_array(jsonb_build_object('type', 'Property', 'value', 'b' || (g % 50)))),
+                      'https://x/brand', jsonb_build_array(jsonb_build_object('type', 'Property', 'value', 'b' || (g % 50))),
+                      'https://uri.etsi.org/ngsi-ld/default-context/name',
+                        jsonb_build_array(jsonb_build_object('type', 'Property', 'value', 'n' || g))),
                     CASE WHEN g % 100 = 0 THEN ARRAY['https://x/T' || (g % 10), 'https://x/M']
                          ELSE ARRAY['https://x/T' || (g % 10)] END,
                     ST_SetSRID(ST_MakePoint(10 + (g % 1000) / 100.0, 45 + ((g / 1000) % 100) / 100.0), 4326),
@@ -174,7 +182,7 @@ async fn seed_rls(pool: &sqlx::PgPool) {
         }
     }
     // statistics before the lock goes: a test waiting on it plans at once
-    sqlx::query("ANALYZE entities, temporal_entities, attr_instances")
+    sqlx::query("ANALYZE entities, entity_values, temporal_entities, attr_instances")
         .execute(&mut *tx)
         .await
         .expect("analyze");
@@ -276,12 +284,18 @@ async fn every_query_shape_reads_an_index_under_rls() {
     let speed = |cond: &str| {
         format!(r#"entity @? '$."https://x/speed"[*]."value" ? (@ {cond})'::jsonpath"#)
     };
+    let probe = |cond: &str| {
+        format!("SELECT id FROM entity_values WHERE tenant_id = '{RLS_A}' AND {cond} LIMIT 1001")
+    };
     // A walk: a sequential scan, a primary key read with the predicate left
     // as a filter, or any other index whose condition is the Tenant alone,
     // except the partial indexes that hold a sliver of it by construction
-    // (multi-type Entities, unextractable locations).
+    // (multi-type Entities, unextractable locations, Entities without one:
+    // the multi-type arm of `!location` may read the unlocated index by
+    // the Tenant alone).
     let sliver = [
         "i_entities_multi_type_id",
+        "i_entities_type_unlocated",
         "i_entities_types_multi",
         "i_entities_loc_ambiguous",
         "i_temporal_entities_multi_type",
@@ -326,6 +340,13 @@ async fn every_query_shape_reads_an_index_under_rls() {
             type_page(&format!("{w} AND entity ?| ARRAY['https://x/brand']"), &[&[&t1]], 21),
             "i_entities_first_type_id",
         ),
+        // T-5303: the store's `entity_values` probes (`value_probe`,
+        // `attrs_probe`); the page then reads its ids as the `id` shape does
+        ("q equality probe", probe("attr = 'https://x/speed' AND f = ANY(ARRAY[42, 'NaN'::float8])"), "i_entity_values_num"),
+        ("q range probe", probe("attr = 'https://x/speed' AND f >= 98"), "i_entity_values_num"),
+        ("q at most probe", probe("attr = 'https://x/speed' AND (f <= 1 OR f = 'NaN')"), "i_entity_values_num"),
+        ("q string probe", probe("attr = 'https://x/brand' AND (txt = 'b7' OR f = 'NaN')"), "i_entity_values_txt"),
+        ("attrs probe", probe("attr = ANY(ARRAY['https://x/rare'])"), "i_entity_values_num"),
         (
             "geo near",
             format!(
@@ -366,6 +387,17 @@ async fn every_query_shape_reads_an_index_under_rls() {
                 21,
             ),
             "i_entities_type_unlocated",
+        ),
+        (
+            // T-5349: a name filter without a type (STA `Things?$filter=name eq`),
+            // with the store's leakproof `name_key` narrowing
+            "q name, no type",
+            format!(
+                "SELECT entity FROM entities WHERE {w} AND (name_key = 'n4242' OR name_key IS NULL) \
+                 AND entity @? '$.\"https://uri.etsi.org/ngsi-ld/default-context/name\"[*].\"value\" \
+                 ? (@ == \"n4242\")'::jsonpath ORDER BY id LIMIT 101"
+            ),
+            "i_entities_name_key",
         ),
         (
             // a rare type (1 %): for a common one an id-ordered read of the
@@ -1031,4 +1063,71 @@ async fn the_history_write_probes_read_only_the_weeks_that_can_hold_the_instance
             "the {what} probe reads DEFAULT — plan:\n{plan}"
         );
     }
+}
+
+/// T-5200: the `attr_rows` arm of each history read reads its unique btree
+/// under RLS, both ids bound as index conditions by `iri_no` (migration 0020):
+/// a join with `iri_ids` would sort every row of the Attribute instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_keyed_history_arms_read_their_unique_index_under_rls() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    const T: &str = "pgexplain-keyed";
+    for stmt in [
+        "DELETE FROM attr_rows WHERE tenant_id = 'pgexplain-keyed'",
+        "INSERT INTO iri_ids (tenant_id, iri)
+         SELECT 'pgexplain-keyed', i FROM (SELECT 'urn:k:' || g AS i FROM generate_series(1, 50) g
+                                           UNION ALL VALUES ('https://x/speed'), ('https://x/level')) v
+         ON CONFLICT DO NOTHING",
+        "INSERT INTO attr_rows (tenant_id, entity_no, attr_no, instance_no, observed_at,
+                                created_at, modified_at, data)
+         SELECT 'pgexplain-keyed', e.id, a.id, gen_random_uuid(), now() - make_interval(mins => g),
+                now(), now(), jsonb_build_object('type', 'Property', 'value', g)
+           FROM iri_ids e, iri_ids a, generate_series(1, 40) g
+          WHERE e.tenant_id = 'pgexplain-keyed' AND e.iri LIKE 'urn:k:%'
+            AND a.tenant_id = 'pgexplain-keyed' AND a.iri LIKE 'https://x/%'",
+        "ANALYZE iri_ids, attr_rows",
+    ] {
+        sqlx::query(stmt).execute(&pool).await.expect(stmt);
+    }
+    let shapes = [
+        (
+            "newest of an Attribute",
+            format!(
+                "SELECT u.data FROM ((SELECT x.data, x.observed_at FROM attr_instances x \
+                   WHERE x.tenant_id = '{T}' AND x.entity_id = 'urn:k:7' AND x.attr_id = 'https://x/speed' \
+                   ORDER BY x.observed_at DESC LIMIT 5) \
+                 UNION ALL (SELECT x.data, x.observed_at FROM attr_rows_at('{T}', 'urn:k:7', 'https://x/speed') x \
+                   ORDER BY x.observed_at DESC LIMIT 5)) u ORDER BY u.observed_at DESC LIMIT 5"
+            ),
+            "attr_no = iri_no('pgexplain-keyed'::text, 'https://x/speed'::text)",
+        ),
+        (
+            "an Entity's history",
+            format!("SELECT x.attr_id, count(*) FROM attr_rows_of('{T}', 'urn:k:7') x GROUP BY 1"),
+            "entity_no = iri_no('pgexplain-keyed'::text, 'urn:k:7'::text)",
+        ),
+    ];
+    let mut bad = Vec::new();
+    for (shape, sql, cond) in &shapes {
+        let plan = plan_of(&pool, T, sql).await;
+        let indexed = plan
+            .lines()
+            .any(|l| l.contains("Index Cond:") && l.contains(cond));
+        // Once a cut-over is set, maintenance creates the weeks from it on in
+        // attr_rows; an empty week is read by a free Seq Scan, the right plan.
+        let walks = plan
+            .lines()
+            .any(|l| l.contains("Seq Scan on attr_rows") && !l.contains("(cost=0.00..0.00 "));
+        if !indexed || walks {
+            bad.push(format!(
+                "{shape} (wants an index condition {cond}):\n{plan}"
+            ));
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "keyed arms that walk:\n\n{}",
+        bad.join("\n\n")
+    );
 }

@@ -342,7 +342,7 @@ pub(crate) fn document(
     );
     for c in collections.values() {
         // T-5100: a history offers no write.
-        let read_only = |op| !c.history && offers(op);
+        let read_only = |op| !c.history && c.output.is_none() && offers(op);
         collection_paths(&mut paths, c, &read_only, (&items_params, &feature_id));
     }
     json!({
@@ -362,6 +362,7 @@ mod tests {
     fn every_operation_documents_its_refusals_and_only_shown_collections_appear() {
         let car = Collection {
             history: false,
+            output: None,
             id: "Car".into(),
             description: None,
             type_iri: "https://e.org/Car".into(),

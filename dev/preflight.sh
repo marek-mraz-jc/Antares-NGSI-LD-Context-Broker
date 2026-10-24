@@ -71,6 +71,7 @@ self_test() {
   # a dependency fuzz/Cargo.lock does not hold, on a crate a fuzz target uses
   probe fuzz-lock "machete|fuzz-compile" --no-coverage \
     "sed -i '/^\\[dependencies\\]/a hex = { version = \"0.4\", default-features = false }' crates/odata-url/Cargo.toml && cargo metadata --format-version 1 > /dev/null"
+  probe private-doc-link doc --no-coverage "sed -i '0,/^\/\/!/s//\/\/! [crate::preflight_probe_missing]\n\/\/!/' $lib"
   probe architecture-row spec --no-coverage "mkdir -p crates/zz-probe/src && echo '//! probe' > crates/zz-probe/src/lib.rs"
   probe red-alone "alone odata-axum::probe_b_needs_the_other" --no-coverage "cat >> $lib <<'RS'
 
@@ -251,6 +252,8 @@ debug_lane() {
     step 02 clippy cargo clippy --locked "${pflags[@]}" --all-targets --all-features -- -D warnings
     # workspace.yml "dev/unit-junit.sh all-features"
     step 03 test cargo test --locked "${pflags[@]}" --all-features
+    # strict.yml "Doc warnings + unused deps" (T-5198: a private intra-doc link went red only there)
+    step 18 doc env RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --document-private-items "${pflags[@]}"
     # ci 38133016763: a test red only when it runs alone (env and order)
     local k=0 path name c
     while read -r path name; do
@@ -260,6 +263,7 @@ debug_lane() {
   else
     echo "PASS clippy 0s (no crate touched)" > "$work/res/02"
     echo "PASS test 0s (no crate touched)" > "$work/res/03"
+    echo "PASS doc 0s (no crate touched)" > "$work/res/18"
   fi
   # workspace.yml "Vanilla binary links no surface"
   step 10 vanilla-symbols dev/check-vanilla-symbols.sh

@@ -36,6 +36,7 @@ One file per irreversible decision, numbered, never rewritten.
 | [ADR-0028](ADR-0028-residual-query-evaluation.md) | Standard queries over a view: NGSI-LD pushdown plus a bounded residual | accepted (owner may override) |
 | [ADR-0029](ADR-0029-ogc-features-surface.md) | OGC API - Features as a view surface: `antares-ogc` and the protocol crate `ogc-cql2` | accepted (owner may override); supersedes decision O-1 of `gateway-to-broker-map.md` for OGC Features |
 | [ADR-0030](ADR-0030-tenant-export-import-digest.md) | Tenant export, import and digest on the admin surface | accepted (owner may override) |
+| [ADR-0031](ADR-0031-inbound-bridge-channels.md) | Inbound bridge Channels | accepted (owner may override) |
 
 ## Format
 

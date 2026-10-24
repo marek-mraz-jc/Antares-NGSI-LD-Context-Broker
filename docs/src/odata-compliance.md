@@ -125,12 +125,18 @@ references), T-3737 (one `Content-Length` on `HEAD`), T-3738 (`$entity`
 
 | Level | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
-| Minimal | 197 | 76 | 20 | 72.2 % |
+| Minimal | 198 | 75 | 20 | 72.5 % |
 | Intermediate | 266 | 70 | 14 | 79.2 % |
-| Advanced | 304 | 221 | 42 | 57.9 % |
-| **All** (suite summary) | 767 | 367 | 76 | 67.6 % |
+| Advanced | 306 | 223 | 38 | 57.8 % |
+| **All** (suite summary) | 770 | 368 | 72 | 67.7 % |
 
-Measured by surfaces-conformance 39733975692 on `cf3b670` (train 20261022-0621), written by tasks/train.
+Measured by surfaces-conformance 39858006303 on `779b10e` (train 20261022-2059), written by tasks/train.
+
+`$metadata` declares `Capabilities.ConformanceLevel` `Minimal` (row C19). The table above is
+the measured level: the claim is not proven while Minimal stays under 100 %, and each failing
+Minimal test is a known gap listed in `ci/odata-compliance-baseline.json` (T-5206 finding 17).
+T-5206 fixed the 4.01 MUST that system query option names are case-insensitive with an
+optional `$` for `$apply` (`apply=`, `$APPLY=`); the next train run rewrites the table.
 
 One earlier pass was a skip after train 8, by the suite's own rule: `POST with
 nonexistent foreign key` posts a `ProductDescription` whose `ProductID` names

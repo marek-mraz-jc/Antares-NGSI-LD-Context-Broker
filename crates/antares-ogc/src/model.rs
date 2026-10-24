@@ -30,6 +30,9 @@ pub(crate) struct Collection {
     pub properties: Vec<Prop>,
     /// A `{type}-history` collection (T-5100): read from the temporal history, never written.
     pub history: bool,
+    /// A named output of the view's `representations.ogc` (T-5216): read only, its filter a
+    /// conjunct of every read.
+    pub output: Option<antares_ops::outputs::Output>,
 }
 
 /// One Attribute of a collection besides its geometry.
@@ -67,6 +70,94 @@ pub(crate) enum Time {
     Interval(Option<String>, Option<String>),
 }
 
+/// The collection of a named output (docs API/11 EP-159, T-5216) over its one source's
+/// collection `base`: its geometry (the first `geometry` path), its time and its properties from
+/// the source's roles, read only, narrowed by its filter. `None` when a role names an Attribute
+/// the collection does not show, or a geometry that is no `GeoProperty`.
+pub(crate) fn output(base: &Collection, o: &antares_ops::outputs::Output) -> Option<Collection> {
+    let source = o.sources.first()?;
+    let attribute = |name: &str| base.properties.iter().find(|p| p.name == name);
+    let iri = |name: &str| attribute(name).map(|p| p.iri.clone());
+    let one = |role: &str| source.role(role).first().map(|name| iri(name).ok_or(()));
+    let geometry = match source.role("geometry").first() {
+        None => base.geometry.clone(),
+        Some(name) => Some(
+            base.geometry
+                .clone()
+                .filter(|g| g.rsplit(['/', '#']).next() == Some(*name))
+                .or_else(|| {
+                    attribute(name)
+                        .filter(|p| p.kind == "GeoProperty")
+                        .map(|p| p.iri.clone())
+                })?,
+        ),
+    };
+    let time = match (one("instant"), one("start"), one("end")) {
+        (None, None, None) => base.time.clone(),
+        (Some(at), _, _) => Some(Time::Instant(at.ok()?)),
+        (None, start, end) => Some(Time::Interval(
+            start.transpose().ok()?,
+            end.transpose().ok()?,
+        )),
+    };
+    let shown = source.role("properties");
+    if shown.iter().any(|name| attribute(name).is_none()) {
+        return None;
+    }
+    let timed: Vec<&String> = match &time {
+        Some(Time::Instant(at)) => vec![at],
+        Some(Time::Interval(start, end)) => start.iter().chain(end).collect(),
+        None => Vec::new(),
+    };
+    // a time Attribute stays a property: the `datetime` query names it by its term
+    let properties = base
+        .properties
+        .iter()
+        .filter(|p| Some(&p.iri) != geometry.as_ref())
+        .filter(|p| shown.is_empty() || shown.contains(&p.name.as_str()) || timed.contains(&&p.iri))
+        .cloned()
+        .collect();
+    Some(Collection {
+        id: o.name.clone(),
+        description: o.description_in("en").map(str::to_owned),
+        type_iri: base.type_iri.clone(),
+        geometry,
+        time,
+        properties,
+        history: false,
+        output: Some(o.clone()),
+    })
+}
+
+/// The NGSI-LD Attribute kinds (TS 104 175 4.5) a Feature property reads and writes: a slot of
+/// any other kind is no property of the collection, so a write naming it is 400 and it is in
+/// neither `/schema` nor the queryables, never stored as a `Property`.
+pub(crate) const KINDS: [&str; 8] = [
+    "Property",
+    "Relationship",
+    "GeoProperty",
+    "JsonProperty",
+    "VocabProperty",
+    "LanguageProperty",
+    "ListProperty",
+    "ListRelationship",
+];
+
+/// Whether the `ogc_role` annotation `role` fits the slot `p` (Part 5 `core-roles-features`):
+/// the geometry a `GeoProperty`, a time a scalar text Property (a date, a date-time, or a
+/// string holding one, as Smart Data Models write `startDate`). Any other role is kept.
+fn fits(role: &str, p: &Prop) -> bool {
+    match role {
+        "primary-geometry" => p.kind == "GeoProperty",
+        "primary-instant" | "primary-interval-start" | "primary-interval-end" => {
+            p.kind == "Property"
+                && p.schema.get("type").and_then(Value::as_str) == Some("string")
+                && p.schema.get("enum").is_none()
+        }
+        _ => true,
+    }
+}
+
 /// A `collectionId` is a path segment as written: letters, digits, `_`, `-`, `.`.
 fn path_safe(name: &str) -> bool {
     !name.is_empty()
@@ -96,8 +187,13 @@ pub(crate) fn build(
             .class_slots(class_name)
             .into_iter()
             .map(|(name, slot)| prop(schema, name, &slot, |c| classes.contains_key(c)))
-            .filter(|p| attrs.contains(&p.iri))
+            .filter(|p| attrs.contains(&p.iri) && KINDS.contains(&p.kind.as_str()))
             .collect();
+        for p in &mut slots {
+            if p.role.as_deref().is_some_and(|r| !fits(r, p)) {
+                p.role = None;
+            }
+        }
         if let Some(guide) = antares_ops::guide::of(class_name) {
             guided(guide, &mut slots);
         }
@@ -126,6 +222,7 @@ pub(crate) fn build(
             class_name.to_owned(),
             Collection {
                 history: false,
+                output: None,
                 id: class_name.to_owned(),
                 description: class.description.clone(),
                 type_iri,
@@ -196,6 +293,9 @@ fn prop(
     let inlined = slot.inlined == Some(true) && matches!(range, Range::Class(_));
     let relationship = !inlined && matches!(kind, "Relationship" | "ListRelationship");
     let one = match (kind, range) {
+        // A kind this mapping does not know: any JSON value, neither sorted nor
+        // filtered (T-5207, mapping-contract rule 4).
+        _ if !linkml_model::known_kind(kind) => json!({}),
         _ if relationship => json!({"type": "string", "format": "uri"}),
         ("GeoProperty", _) => json!({"format": "geometry-any"}),
         ("JsonProperty" | "LanguageProperty", _) | (_, Range::Class(_)) => {
@@ -251,7 +351,7 @@ mod tests {
     /// One slot per NGSI-LD kind and `LinkML` range the surface writes a schema for.
     const KINDS: &str = r#"{"id": "https://e.org/s", "name": "s", "default_prefix": "e",
                 "prefixes": {"e": {"prefix_prefix": "e", "prefix_reference": "https://e.org/"}},
-                "classes": {"A": {"slots": ["i", "f", "b", "d", "dt", "t", "u", "s", "c", "inl", "lr", "rel", "json", "lang", "geo", "vocab", "e", "le"]},
+                "classes": {"A": {"slots": ["i", "f", "b", "d", "dt", "t", "u", "s", "c", "inl", "lr", "rel", "json", "lang", "geo", "vocab", "e", "le", "nk"]},
                             "B": {}},
                 "slots": {"i": {"range": "integer"}, "f": {"range": "double"}, "b": {"range": "boolean"},
                           "d": {"range": "date"}, "dt": {"range": "datetime"}, "t": {"range": "time"},
@@ -264,7 +364,8 @@ mod tests {
                           "geo": {"annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "GeoProperty"}}},
                           "vocab": {"range": "E", "annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "VocabProperty"}}},
                           "e": {"range": "E"},
-                          "le": {"range": "E", "annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "ListProperty"}}}},
+                          "le": {"range": "E", "annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "ListProperty"}}},
+                          "nk": {"range": "integer", "annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "TimeSeriesProperty"}}}},
                 "enums": {"E": {"permissible_values": {"x": {}}}}}"#;
 
     #[test]
@@ -326,6 +427,8 @@ mod tests {
                 Some("B".to_owned()),
             ),
             ("json", json!({"type": "object"}), false, false, None),
+            // T-5207: a kind a later NGSI-LD version adds is any value, never sorted
+            ("nk", json!({}), false, false, None),
             ("lang", json!({"type": "object"}), false, false, None),
             ("geo", json!({"format": "geometry-any"}), false, false, None),
             (
@@ -497,5 +600,67 @@ mod tests {
         assert!(!path_safe("Car 2"));
         assert!(!path_safe(""));
         assert!(!path_safe("Car/2"));
+    }
+
+    /// T-5204: a type no code knows gets its place and time from its model's annotations
+    /// alone, and a role on a slot of the wrong kind is dropped. (A kind NGSI-LD does not define
+    /// is refused when the schema loads; [`KINDS`] keeps one out should that ever loosen.)
+    #[test]
+    fn roles_come_from_the_model_and_are_checked() {
+        let ann = |kind: &str, role: &str| {
+            format!(
+                r#"{{"ngsi_ld_kind": {{"tag": "ngsi_ld_kind", "value": "{kind}"}}, "ogc_role": {{"tag": "ogc_role", "value": "{role}"}}}}"#
+            )
+        };
+        let m = schema(&format!(
+            r#"{{"id": "https://e.org/s", "name": "s", "default_prefix": "s",
+                 "prefixes": {{"s": {{"prefix_prefix": "s", "prefix_reference": "https://e.org/s/"}}}},
+                 "classes": {{"Kiosk": {{"slots": ["spot", "opened", "rank"]}},
+                              "Booth": {{"slots": ["size", "count", "area"]}}}},
+                 "slots": {{"spot": {{"range": "string", "annotations": {}}},
+                            "opened": {{"range": "string", "annotations": {}}},
+                            "rank": {{"range": "integer", "annotations": {{"ogc_role": {{"tag": "ogc_role", "value": "label"}}}}}},
+                            "size": {{"range": "float", "annotations": {}}},
+                            "count": {{"range": "integer", "annotations": {}}},
+                            "area": {{"range": "string", "annotations": {}}}}}}}"#,
+            ann("GeoProperty", "primary-geometry"),
+            ann("Property", "primary-instant"),
+            ann("Property", "primary-geometry"),
+            ann("Property", "primary-instant"),
+            ann("GeoProperty", "primary-instant"),
+        ));
+        let all = |t: &str, slots: &[&str]| {
+            (
+                format!("https://e.org/s/{t}"),
+                slots
+                    .iter()
+                    .map(|s| format!("https://e.org/s/{s}"))
+                    .collect(),
+            )
+        };
+        let c = build(
+            &m,
+            &BTreeMap::from([
+                all("Kiosk", &["spot", "opened", "rank"]),
+                all("Booth", &["size", "count", "area"]),
+            ]),
+        );
+        let kiosk = c.get("Kiosk").unwrap_or_else(|| unreachable!());
+        assert_eq!(kiosk.geometry.as_deref(), Some("https://e.org/s/spot"));
+        assert_eq!(
+            kiosk.time,
+            Some(Time::Instant("https://e.org/s/opened".into()))
+        );
+        let names: Vec<&str> = kiosk.properties.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["opened", "rank"]);
+        let rank = kiosk.properties.iter().find(|p| p.name == "rank");
+        assert_eq!(
+            rank.and_then(|p| p.role.as_deref()),
+            Some("label"),
+            "a role of no place or time is kept"
+        );
+        let booth = c.get("Booth").unwrap_or_else(|| unreachable!());
+        assert_eq!(booth.geometry, None, "a float is no geometry");
+        assert_eq!(booth.time, None, "an integer and a GeoProperty are no time");
     }
 }

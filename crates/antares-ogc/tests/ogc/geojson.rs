@@ -73,3 +73,52 @@ async fn feature_collection_and_feature_shape() -> Result<(), String> {
     assert_eq!(page.body.get("type"), Some(&json!("FeatureCollection")));
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_language_property_is_one_text_in_the_callers_language() -> Result<(), String> {
+    let f = fixture().await?;
+    let stop = json!({"id": "urn:ngsi-ld:Stop:2", "type": "Stop",
+        "name": {"type": "LanguageProperty", "languageMap": {"fi": "Kaivopuisto", "sv": "Brunnsparken"}}});
+    let a = crate::common::send(
+        &f.app,
+        "POST",
+        "/ngsi-ld/v1/entities",
+        &stop.to_string(),
+        &[("NGSILD-Tenant", "city")],
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    let item = "/x/views/city/ogc/features/collections/Stop/items/urn:ngsi-ld:Stop:2";
+    // past 200 characters even valid ranges read as `*`
+    let long = "sv,".repeat(70);
+    for (accept, name) in [
+        ("fi", "Kaivopuisto"),
+        (long.as_str(), "Kaivopuisto"),
+        ("sv-FI, fi;q=0.5", "Brunnsparken"),
+        ("de", "Kaivopuisto"),
+        // a header that is no language range reads as `*`
+        ("<script>", "Kaivopuisto"),
+        ("", "Kaivopuisto"),
+    ] {
+        let a = crate::common::send(&f.app, "GET", item, "", &[("Accept-Language", accept)]).await;
+        assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+        let got = a.body.pointer("/properties/name");
+        assert_eq!(got, Some(&json!(name)), "{accept}: {}", a.body);
+    }
+    // without the header one text still, never the languageMap object
+    let a = get(&f.app, "/x/views/city/ogc/features/collections/Stop/items").await;
+    let features = a.body.get("features").and_then(serde_json::Value::as_array);
+    let names: Vec<Option<&serde_json::Value>> = features
+        .into_iter()
+        .flatten()
+        .map(|f| f.pointer("/properties/name"))
+        .collect();
+    assert!(!names.is_empty(), "{}", a.body);
+    assert!(
+        names
+            .iter()
+            .all(|n| n.is_some_and(serde_json::Value::is_string)),
+        "{names:?}"
+    );
+    Ok(())
+}

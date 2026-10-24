@@ -180,58 +180,90 @@ async fn write_attrs(
     let ts = now_iso();
     let mut updated = Vec::new();
     let mut not_updated = Vec::new();
+    // The Entity's change, judged and applied on the document it lands on:
+    // inside the store's read-modify-write, or on a copy for a relay.
+    let apply = |doc: &mut Value| {
+        Condition::pre(cond.as_ref(), id, doc)?;
+        #[cfg(feature = "views")]
+        if let Some(g) = &guard {
+            g.pre(id, doc)?;
+        }
+        // 5.6.2.4 / 5.6.3.4: the ?type selector narrows the target — a
+        // mismatch means the entity is not known for this operation.
+        if !matches_type_param(doc, params, &parsed.ctx) {
+            return Err(NgsiError::ResourceNotFound(format!(
+                "entity {id} does not match the type selector"
+            ))
+            .into());
+        }
+        let target = antares_store::stored_object(doc)?;
+        let frag = antares_jsonld::expanded_object(&fragment)?;
+        // 5.6.2.4 / 5.6.3.4: Entity Type names not yet in the target are
+        // added to its list
+        if let Some(new_types) = frag.get("type").and_then(Value::as_array) {
+            let mut cur: Vec<Value> = target
+                .get("type")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let known = cur.len();
+            for t in new_types {
+                if !cur.contains(t) {
+                    cur.push(t.clone());
+                }
+            }
+            if cur.len() > known {
+                target.insert("type".into(), Value::Array(cur));
+                updated.push("type".into());
+            }
+        }
+        merge(target, frag, &ts, &mut updated, &mut not_updated);
+        if updated.is_empty() {
+            return Err(Unwritten::Untouched);
+        }
+        target.insert("modifiedAt".into(), Value::String(ts.clone()));
+        #[cfg(feature = "views")]
+        if let Some(g) = &guard {
+            g.post(doc)?;
+        }
+        Ok::<(), Unwritten>(())
+    };
+    // An inbound bridge Channel's bind probe and relay samples (ADR-0031):
+    // decided above exactly as a write, then answered here without one.
+    #[cfg(all(feature = "channels", not(target_arch = "wasm32")))]
+    if let Some(intent) = crate::channels::intent() {
+        if !regs.is_empty() {
+            return Err(NgsiError::BadRequestData(
+                "a Channel binds no attribute a Context Source registration serves".into(),
+            )
+            .into());
+        }
+        let before = st
+            .store
+            .get(&tenant, Kind::Entity, id)
+            .await?
+            .ok_or_else(|| NgsiError::ResourceNotFound(format!("entity {id} not found")))?;
+        if intent == crate::channels::Intent::Bind {
+            return Ok(no_content(&tenant));
+        }
+        let mut after = before.clone();
+        match apply(&mut after) {
+            Err(Unwritten::Failed(e)) => return Err(e.into()),
+            Err(Unwritten::Untouched) => {}
+            Ok(()) => {
+                #[cfg(feature = "views")]
+                if let Some(g) = &guard {
+                    g.settled()?;
+                }
+                crate::channels::relay(st, &tenant, before, after);
+            }
+        }
+        return Ok(update_result(&tenant, updated, not_updated));
+    }
     let local_resp: Option<ApiResult<Response>> = if local_covered {
         None
     } else {
-        let res = st
-            .store
-            .mutate(&tenant, Kind::Entity, id, |doc| {
-                Condition::pre(cond.as_ref(), id, doc)?;
-                #[cfg(feature = "views")]
-                if let Some(g) = &guard {
-                    g.pre(id, doc)?;
-                }
-                // 5.6.2.4 / 5.6.3.4: the ?type selector narrows the target — a
-                // mismatch means the entity is not known for this operation.
-                if !matches_type_param(doc, params, &parsed.ctx) {
-                    return Err(NgsiError::ResourceNotFound(format!(
-                        "entity {id} does not match the type selector"
-                    ))
-                    .into());
-                }
-                let target = antares_store::stored_object(doc)?;
-                let frag = antares_jsonld::expanded_object(&fragment)?;
-                // 5.6.2.4 / 5.6.3.4: Entity Type names not yet in the target are
-                // added to its list
-                if let Some(new_types) = frag.get("type").and_then(Value::as_array) {
-                    let mut cur: Vec<Value> = target
-                        .get("type")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    let known = cur.len();
-                    for t in new_types {
-                        if !cur.contains(t) {
-                            cur.push(t.clone());
-                        }
-                    }
-                    if cur.len() > known {
-                        target.insert("type".into(), Value::Array(cur));
-                        updated.push("type".into());
-                    }
-                }
-                merge(target, frag, &ts, &mut updated, &mut not_updated);
-                if updated.is_empty() {
-                    return Err(Unwritten::Untouched);
-                }
-                target.insert("modifiedAt".into(), Value::String(ts.clone()));
-                #[cfg(feature = "views")]
-                if let Some(g) = &guard {
-                    g.post(doc)?;
-                }
-                Ok::<(), Unwritten>(())
-            })
-            .await?;
+        let res = st.store.mutate(&tenant, Kind::Entity, id, apply).await?;
         #[cfg(feature = "views")]
         if let Some(g) = &guard {
             g.settled()?;

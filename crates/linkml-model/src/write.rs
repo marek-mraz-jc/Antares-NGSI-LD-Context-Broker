@@ -284,9 +284,29 @@ fn geo(model: &Model, slot: &Slot) -> bool {
     model.kind(slot) == "GeoProperty"
 }
 
+/// Whether the slot holds an object inlined, not a link: an inlined class, or
+/// a class range under a kind other than a Relationship's (T-5206 finding 3).
+fn inlined(model: &Model, slot: &Slot) -> bool {
+    matches!(model.range(slot), Range::Class(_))
+        && (slot.inlined == Some(true)
+            || !matches!(model.kind(slot), "Relationship" | "ListRelationship"))
+}
+
 fn slot_schema(model: &Model, slot: &Slot) -> Value {
+    let kind = model.kind(slot);
     let base = match model.range(slot) {
+        // A kind no surface maps yet: any value (T-5207, mapping-contract rule 4).
+        _ if !crate::known_kind(model.kind(slot)) => Map::new(),
         _ if geo(model, slot) => typed("object", None),
+        // keyValues: a LanguageProperty is its map of language to text (NGSI-LD 4.5.18).
+        _ if kind == "LanguageProperty" => {
+            let mut m = typed("object", None);
+            m.insert("additionalProperties".to_owned(), json!({"type": "string"}));
+            m
+        }
+        // Any JSON value.
+        _ if kind == "JsonProperty" => Map::new(),
+        _ if inlined(model, slot) => typed("object", None),
         Range::Type(b) => builtin_schema(b),
         // A relationship holds the target entity's id.
         Range::Class(_) => typed("string", Some("uri")),
@@ -308,17 +328,15 @@ fn slot_schema(model: &Model, slot: &Slot) -> Value {
             m
         }
     };
-    let mut out = if slot.multivalued == Some(true) {
+    let listed = matches!(kind, "ListProperty" | "ListRelationship");
+    let mut out = if slot.multivalued == Some(true) || listed {
         let mut m = typed("array", None);
         m.insert("items".to_owned(), Value::Object(base));
         m
     } else {
         base
     };
-    out.insert(
-        "x-ngsi-ld-kind".to_owned(),
-        Value::String(model.kind(slot).to_owned()),
-    );
+    out.insert("x-ngsi-ld-kind".to_owned(), Value::String(kind.to_owned()));
     if let Some(d) = &slot.description {
         out.insert("description".to_owned(), Value::String(d.clone()));
     }
@@ -397,15 +415,39 @@ pub fn context(model: &Model) -> String {
     let mut terms = Map::new();
     for (name, slot) in &s.slots {
         let iri = model.slot_iri(name);
-        let coerced = match model.range(slot) {
-            _ if geo(model, slot) => None,
-            Range::Class(_) => Some("@id".to_owned()),
-            Range::Type(Builtin::String) | Range::Enum(_) => None,
-            Range::Type(b) => Some(b.xsd().replacen("xsd:", XSD, 1)),
+        // The kind first, then the range (TS 104 175 5.2.6.4.6 to 5.2.6.4.10, T-5206 finding 3).
+        let kind = model.kind(slot);
+        let coerced = match (kind, model.range(slot)) {
+            ("VocabProperty", _) => Some("@vocab".to_owned()),
+            ("JsonProperty", _) => Some("@json".to_owned()),
+            ("Relationship" | "ListRelationship", _) => Some("@id".to_owned()),
+            // A kind no surface maps yet stays untyped (T-5207, mapping-contract rule 4).
+            (k, Range::Type(b))
+                if crate::known_kind(k)
+                    && k != "LanguageProperty"
+                    && b != Builtin::String
+                    && !geo(model, slot) =>
+            {
+                Some(b.xsd().replacen("xsd:", XSD, 1))
+            }
+            // a GeoProperty, a LanguageProperty, any other kind over a class (it holds the
+            // object, `inlined`), a string and an enum stay untyped
+            _ => None,
         };
-        let term = match coerced {
-            Some(ty) => json!({"@id": iri, "@type": ty}),
-            None => Value::String(iri),
+        let container = match kind {
+            "LanguageProperty" => Some("@language"),
+            "ListProperty" | "ListRelationship" => Some("@list"),
+            _ => None,
+        };
+        let term = match (coerced, container) {
+            (None, None) => Value::String(iri),
+            (ty, container) => {
+                let mut t = Map::new();
+                t.insert("@id".to_owned(), Value::String(iri));
+                t.extend(ty.map(|ty| ("@type".to_owned(), Value::String(ty))));
+                t.extend(container.map(|c| ("@container".to_owned(), json!(c))));
+                Value::Object(t)
+            }
         };
         terms.insert(name.clone(), term);
     }

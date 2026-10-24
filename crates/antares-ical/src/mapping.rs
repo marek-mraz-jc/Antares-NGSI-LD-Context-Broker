@@ -4,11 +4,16 @@
 //!
 //! A mapping names, for each calendar field, the NGSI-LD attribute it comes from and at most the
 //! remaps of a fixed allow-list (`firstOf`, `join`, `constant`, `language`, `date`, `timezone`,
-//! `endInclusive`, `map`, `truncate`): data, never an expression. `UID` is the entity id and
-//! `DTSTAMP` its `modifiedAt`, fixed. No mapping is the `sdm-event` preset: `startDate`,
+//! `endInclusive`, `map`, `truncate`): data, never an expression. `UID` is the entity id, fixed.
+//! `DTSTAMP` is the last revision of what the Event shows: the mapped `LAST-MODIFIED`, else the
+//! latest `modifiedAt` of the mapped attributes, else the Entity's (T-5208), so a re-ingest that
+//! rewrites other members leaves the feed byte for byte as it was. A time without an offset is
+//! read in the field's `timezone`, else the output's (default `Europe/Bratislava`), and written
+//! in UTC: no floating time leaves the feed. No mapping is the `sdm-event` preset: `startDate`,
 //! `endDate` (the last day, so a date `DTEND` is the day after it), `name`, `description`,
-//! `address`, `location` and `url`. An Entity with no value for `DTSTART` or `SUMMARY`, a date
-//! it cannot read, a `DTEND` not after `DTSTART`, a `GEO` off the globe or a `URL` that is not
+//! `address`, `location`, `url` and `organizer` (`{name, url}` as `ORGANIZER;CN=`). An Entity
+//! with no value for `DTSTART` or `SUMMARY`, a date it cannot read, a `DTEND` not after
+//! `DTSTART`, a `GEO` off the globe or a `URL` that is not
 //! http(s) is no `VEVENT` at all, and its reason is counted (EP-126).
 
 use chrono::{DateTime, Days, NaiveDate, NaiveDateTime, NaiveTime, TimeZone as _, Utc};
@@ -50,57 +55,59 @@ impl When {
             .map(Self::Date)
     }
 
-    /// Where it starts on one time line: a date at its midnight, a floating time as if in UTC.
+    /// Where it starts as a UTC instant, a date and a floating time read in `zone`.
     #[must_use]
-    pub fn key(self) -> NaiveDateTime {
-        match self {
+    pub fn utc_key(self, zone: Tz) -> NaiveDateTime {
+        let wall = match self {
+            Self::At(t) => return t.naive_utc(),
             Self::Date(d) => d.and_time(NaiveTime::MIN),
-            Self::At(t) => t.naive_utc(),
             Self::Floating(t) => t,
-        }
+        };
+        zone.from_local_datetime(&wall)
+            .earliest()
+            .map_or(wall, |t| t.naive_utc())
     }
 
-    /// Just past what it covers: a date's next midnight, an instant itself.
+    /// Just past what it covers as a UTC instant: a date's next midnight in `zone`.
     #[must_use]
-    pub fn past(self) -> NaiveDateTime {
+    pub fn utc_past(self, zone: Tz) -> NaiveDateTime {
         match self {
-            Self::Date(d) => next_day(d).and_time(NaiveTime::MIN),
-            other => other.key(),
+            Self::Date(d) => Self::Date(next_day(d)).utc_key(zone),
+            other => other.utc_key(zone),
         }
     }
 
     /// `end` written in the value type of `self`, as RFC 5545 3.8.2.2 requires of `DTEND`: a
-    /// date end is exclusive, so an inclusive last day becomes the day after it.
-    fn end_like(self, end: Self, inclusive: bool) -> Self {
+    /// date end is exclusive, so an inclusive last day becomes the day after it; an instant
+    /// end of a date start is the day after its date in `zone`.
+    fn end_like(self, end: Self, inclusive: bool, zone: Tz) -> Self {
         match (self, end) {
             (Self::Date(_), Self::Date(e)) if inclusive => Self::Date(next_day(e)),
             (Self::Date(_), Self::Date(e)) => Self::Date(e),
-            (Self::Date(_), other) => Self::Date(next_day(other.key().date())),
-            (Self::At(_), Self::At(t)) => Self::At(t),
-            (Self::At(_), other) => Self::At(other.past().and_utc()),
-            (Self::Floating(_), Self::At(t)) => Self::Floating(t.naive_utc()),
-            (Self::Floating(_), other) => Self::Floating(other.past()),
+            (Self::Date(_), other) => Self::Date(next_day(
+                other
+                    .utc_key(zone)
+                    .and_utc()
+                    .with_timezone(&zone)
+                    .date_naive(),
+            )),
+            (_, Self::At(t)) => Self::At(t),
+            (_, other) => Self::At(other.utc_past(zone).and_utc()),
         }
     }
 
-    /// As `mode` asks, a floating time read in `zone` when one is named; `None` for a wall
-    /// time the zone skips.
-    fn read(self, mode: DateMode, zone: Option<Tz>) -> Option<Self> {
+    /// As `mode` asks, a floating time read in `zone`; `None` for a wall time the zone skips.
+    fn read(self, mode: DateMode, zone: Tz) -> Option<Self> {
         let wall = match (mode, self) {
             (DateMode::Datetime, Self::Date(d)) => Self::Floating(d.and_time(NaiveTime::MIN)),
             (_, other) => other,
         };
-        let zoned = match (wall, zone) {
-            (Self::Floating(t), Some(z)) => {
-                Self::At(z.from_local_datetime(&t).earliest()?.to_utc())
-            }
-            (other, _) => other,
+        let zoned = match wall {
+            Self::Floating(t) => Self::At(zone.from_local_datetime(&t).earliest()?.to_utc()),
+            other => other,
         };
         Some(match (mode, zoned) {
-            (DateMode::Date, Self::At(t)) => {
-                Self::Date(zone.map_or(t.date_naive(), |z| t.with_timezone(&z).date_naive()))
-            }
-            (DateMode::Date, Self::Floating(t)) => Self::Date(t.date()),
+            (DateMode::Date, Self::At(t)) => Self::Date(t.with_timezone(&zone).date_naive()),
             (_, other) => other,
         })
     }
@@ -109,8 +116,11 @@ impl When {
     fn property(self, name: &str) -> String {
         match self {
             Self::Date(d) => format!("{name};VALUE=DATE:{}", d.format("%Y%m%d")),
-            Self::At(t) => format!("{name}:{}", t.format("%Y%m%dT%H%M%SZ")),
-            Self::Floating(t) => format!("{name}:{}", t.format("%Y%m%dT%H%M%S")),
+            // a read value is never floating (`Plan::when` zones it)
+            other => format!(
+                "{name}:{}",
+                other.utc_key(chrono_tz::UTC).format("%Y%m%dT%H%M%SZ")
+            ),
         }
     }
 }
@@ -119,8 +129,8 @@ fn next_day(d: NaiveDate) -> NaiveDate {
     d.checked_add_days(Days::new(1)).unwrap_or(d)
 }
 
-/// The `from`/`to` of a feed: an Event is in it when it starts before `to` and has not ended
-/// before `from`; a bound left out does not narrow.
+/// The `from`/`to` of a feed, as UTC instants: an Event is in it when it starts before `to`
+/// and has not ended before `from`; a bound left out does not narrow.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Window {
     /// The first instant served: a date's midnight.
@@ -130,9 +140,20 @@ pub struct Window {
 }
 
 impl Window {
-    fn holds(&self, start: When, end: Option<When>) -> bool {
-        let begins = start.key();
-        let ends = end.map_or_else(|| start.past(), When::past).max(begins);
+    /// The window of a feed's `from` and `to`, a date or a time without offset read in `zone`.
+    #[must_use]
+    pub fn read(from: Option<When>, to: Option<When>, zone: Tz) -> Self {
+        Self {
+            from: from.map(|w| w.utc_key(zone)),
+            to: to.map(|w| w.utc_past(zone)),
+        }
+    }
+
+    fn holds(&self, start: When, end: Option<When>, zone: Tz) -> bool {
+        let begins = start.utc_key(zone);
+        let ends = end
+            .map_or_else(|| start.utc_past(zone), |e| e.utc_past(zone))
+            .max(begins);
         self.to.is_none_or(|to| begins < to)
             && self.from.is_none_or(|from| ends > from || begins >= from)
     }
@@ -185,7 +206,7 @@ impl Field {
         match key {
             "firstOf" => !matches!(self, F::Class),
             "join" => text && self != F::Status,
-            "constant" => matches!(self, F::Class | F::Categories),
+            "constant" => matches!(self, F::Class | F::Categories | F::Duration),
             "language" => text,
             "date" => matches!(self, F::Dtstart | F::Dtend | F::LastModified),
             "timezone" => matches!(self, F::Dtstart | F::Dtend),
@@ -220,11 +241,55 @@ pub enum DateMode {
     Datetime,
 }
 
-/// The view's `representations.ical` member, as the Portal writes it from the Endpoint's
-/// `spec.representations.ical`.
+/// The version of the `representations.ical` contract this broker reads (T-5207,
+/// mapping-contract rule 1): a member added or given a new meaning takes the next one.
+pub const MAPPING_VERSION: u64 = 1;
+
+/// One named output of the view's `representations.ical` list, as the Portal writes it from
+/// the Endpoint's `spec.representations.ical` (owner 2026-10-22T09:30Z and 09:40Z, the one
+/// representation contract of T-5207): its sources, filter, titles and zone, served at
+/// `{name}.ics`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Output {
+    /// The slug the output is served at.
+    pub name: String,
+    /// The contract version the Portal wrote; [`MAPPING_VERSION`] when absent.
+    #[serde(default)]
+    pub version: Option<u64>,
+    /// The calendar's title per language tag: `NAME` (RFC 7986 5.1) and `X-WR-CALNAME`.
+    #[serde(default)]
+    pub title: BTreeMap<String, String>,
+    /// The calendar's description per language tag: `DESCRIPTION` (RFC 7986 5.2).
+    #[serde(default)]
+    pub description: BTreeMap<String, String>,
+    /// A query on top of the view that narrows the output, never widens it.
+    #[serde(default)]
+    pub filter: Filter,
+    /// The language a `LanguageProperty` is read in when a field names none (BCP 47).
+    #[serde(default)]
+    pub lang: Option<String>,
+    /// At most this many Events, 1 to 10000, the first in `sort` order.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// `start` (the default when `limit` is set) or `-start`: the Events by `DTSTART`.
+    #[serde(default)]
+    pub sort: Option<String>,
+    /// The IANA zone a time without offset is read in and the calendar is shown in; default
+    /// `Europe/Bratislava`.
+    #[serde(default)]
+    pub timezone: Option<String>,
+    /// The model classes the output maps, each with its own preset or mapping; 1 to 10.
+    pub sources: Vec<IcalMapping>,
+}
+
+/// One source of an [`Output`]: a model class and its field mapping.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IcalMapping {
+    /// The contract version the Portal wrote; `1` when absent.
+    #[serde(default = "first_version")]
+    pub version: u64,
     /// The NGSI-LD type the feed maps, by its local name; default `Event`.
     #[serde(rename = "type", default = "event")]
     pub entity_type: String,
@@ -238,6 +303,112 @@ pub struct IcalMapping {
 
 fn event() -> String {
     "Event".to_owned()
+}
+
+/// The types an iCal preset serves (owner 2026-10-22T09:25Z); another type maps `DTSTART`
+/// and `SUMMARY` itself.
+pub const PRESET_TYPES: [&str; 3] = ["Event", "CouncilMeeting", "OfficeHours"];
+
+/// The output contract every format shares (docs API/11, T-5216).
+pub use antares_ops::outputs::{is_language_tag, is_output_name, Filter, MAX_OUTPUTS};
+
+/// The zone of an output that names none.
+pub const DEFAULT_ZONE: Tz = chrono_tz::Europe::Bratislava;
+
+/// The text of a `languageMap` for `want`: its exact tag, the same tag in another case, a tag
+/// of the same primary language (`sk` for `sk-SK` and back), then `@none`, then the first tag
+/// in code-point order.
+fn pick<'a>(map: &'a serde_json::Map<String, Value>, want: Option<&str>) -> Option<&'a Value> {
+    let primary = |t: &str| t.split('-').next().unwrap_or(t).to_ascii_lowercase();
+    want.filter(|w| *w != "first")
+        .and_then(|w| {
+            map.get(w)
+                .or_else(|| {
+                    map.iter()
+                        .find(|(k, _)| k.eq_ignore_ascii_case(w))
+                        .map(|(_, v)| v)
+                })
+                .or_else(|| {
+                    map.iter()
+                        .find(|(k, _)| primary(k) == primary(w))
+                        .map(|(_, v)| v)
+                })
+        })
+        .or_else(|| map.get("@none"))
+        .or_else(|| map.values().next())
+}
+
+fn first_version() -> u64 {
+    1
+}
+
+/// A written output of the view's `representations.ical` list, and whether it is degraded:
+/// an output of a newer contract version than [`MAPPING_VERSION`] (the Portal released before
+/// the broker) keeps its name, texts, language, zone, sort, limit, filter and each source's
+/// type over its preset, and drops what this broker cannot read, instead of failing the
+/// calendar (T-5207, mapping-contract rule 1). Its filter still has to read, since serving
+/// the output without it would widen it. An output of this version is read strictly: the
+/// Portal checked it when it was saved.
+///
+/// # Errors
+/// Why an output of this version does not read, or why a newer one's filter does not.
+///
+/// ```
+/// let newer = serde_json::json!({"name": "koncerty", "version": 9, "rrule": "x",
+///     "sources": [{"type": "OfficeHours", "preset": "schema-org", "rrule": "eventSchedule"}]});
+/// let (output, degraded) = antares_ical::mapping::output_of(&newer).unwrap();
+/// assert!(degraded);
+/// assert_eq!(output.sources[0].entity_type, "OfficeHours");
+/// ```
+pub fn output_of(written: &Value) -> Result<(Output, bool), String> {
+    let version = written.get("version").and_then(Value::as_u64);
+    if version.is_none_or(|v| v <= MAPPING_VERSION) {
+        let output: Output = serde_json::from_value(written.clone()).map_err(|e| e.to_string())?;
+        return Ok((output, false));
+    }
+    let text = |name: &str| written.get(name).and_then(Value::as_str).map(str::to_owned);
+    let texts = |name: &str| {
+        written
+            .get(name)
+            .and_then(|t| serde_json::from_value(t.clone()).ok())
+            .unwrap_or_default()
+    };
+    let filter = match written.get("filter") {
+        Some(f) => serde_json::from_value(f.clone()).map_err(|e| format!("filter: {e}"))?,
+        None => Filter::default(),
+    };
+    let source = |s: &Value| IcalMapping {
+        version: MAPPING_VERSION,
+        entity_type: s
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|t| is_name(t))
+            .map_or_else(event, str::to_owned),
+        preset: s
+            .get("preset")
+            .and_then(|p| serde_json::from_value(p.clone()).ok()),
+        mapping: BTreeMap::new(),
+    };
+    let output = Output {
+        name: text("name").unwrap_or_default(),
+        version: None,
+        title: texts("title"),
+        description: texts("description"),
+        filter,
+        lang: text("lang"),
+        limit: written
+            .get("limit")
+            .and_then(|l| serde_json::from_value(l.clone()).ok()),
+        sort: text("sort").filter(|s| matches!(s.as_str(), "start" | "-start")),
+        timezone: text("timezone").filter(|z| z.parse::<Tz>().is_ok()),
+        sources: written
+            .get("sources")
+            .and_then(Value::as_array)
+            .map(|list| list.iter().map(source).collect())
+            .unwrap_or_default(),
+    };
+    tracing::warn!(version, name = %output.name, "newer calendar output: presets served");
+    Ok((output, true))
 }
 
 /// A field's source: an attribute path (`startDate`) or the object form.
@@ -270,7 +441,8 @@ pub struct Remap {
     /// A fixed value.
     #[serde(default)]
     pub constant: Option<String>,
-    /// Which text of a `LanguageProperty`: a two-letter code or `first` (the default).
+    /// Which text of a `LanguageProperty`: a BCP 47 tag or `first`; default the output's
+    /// `lang`, then `@none`, then the first.
     #[serde(default)]
     pub language: Option<String>,
     /// How a date field reads its value.
@@ -338,6 +510,7 @@ fn preset(preset: Preset) -> BTreeMap<Field, Remap> {
         (Field::Location, "address"),
         (Field::Geo, "location"),
         (Field::Url, "url"),
+        (Field::Organizer, "organizer"),
     ]
     .into_iter()
     .map(|(field, name)| (field, attribute(name)))
@@ -408,10 +581,12 @@ struct Compiled {
 pub struct Plan {
     entity_type: String,
     fields: BTreeMap<Field, Compiled>,
+    zone: Tz,
+    lang: Option<String>,
 }
 
 impl Default for Plan {
-    /// The `sdm-event` preset over `Event`: the feed of a view that writes no mapping.
+    /// The `sdm-event` preset over `Event` in `Europe/Bratislava`.
     fn default() -> Self {
         Self {
             entity_type: event(),
@@ -419,6 +594,8 @@ impl Default for Plan {
                 .into_iter()
                 .map(|(field, remap)| (field, Compiled { remap, zone: None }))
                 .collect(),
+            zone: DEFAULT_ZONE,
+            lang: None,
         }
     }
 }
@@ -430,6 +607,12 @@ impl Plan {
     /// # Errors
     /// The first reason the mapping cannot be rendered.
     pub fn compile(mapping: &IcalMapping) -> Result<Self, String> {
+        if mapping.version != MAPPING_VERSION {
+            return Err(format!(
+                "version {} is not one this broker reads ({MAPPING_VERSION})",
+                mapping.version
+            ));
+        }
         if !is_name(&mapping.entity_type) {
             return Err(format!(
                 "type {:?} is not an NGSI-LD type name",
@@ -453,15 +636,145 @@ impl Plan {
                 return Err(format!("the mapping maps no {name}"));
             }
         }
-        if fields.contains_key(&Field::Dtend) && fields.contains_key(&Field::Duration) {
+        let fallback = fields
+            .get(&Field::Duration)
+            .is_some_and(|c| c.remap.constant.is_some());
+        if fields.contains_key(&Field::Dtend) && fields.contains_key(&Field::Duration) && !fallback
+        {
             return Err("the mapping maps both DTEND and DURATION".to_owned());
+        }
+        let own = |f: Field| mapping.mapping.contains_key(&f);
+        let roles = own(Field::Dtstart) && own(Field::Summary);
+        if !roles && !PRESET_TYPES.contains(&mapping.entity_type.as_str()) {
+            return Err(format!(
+                "type {} has no calendar preset: map its DTSTART and SUMMARY",
+                mapping.entity_type
+            ));
         }
         Ok(Self {
             entity_type: mapping.entity_type.clone(),
             fields,
+            zone: DEFAULT_ZONE,
+            lang: None,
         })
     }
 
+    /// The zone a time without offset is read in and the calendar is shown in.
+    #[must_use]
+    pub fn zone(&self) -> Tz {
+        self.zone
+    }
+
+    /// Where the Event starts as a UTC instant, for `sort`; `None` when it has no start.
+    #[must_use]
+    pub fn start(&self, entity: &Value) -> Option<NaiveDateTime> {
+        self.when(entity, Field::Dtstart)
+            .ok()
+            .flatten()
+            .map(|w| w.utc_key(self.zone))
+    }
+}
+
+/// An [`Output`] checked: its plan per source, in the output's zone and language.
+#[derive(Debug, Clone)]
+pub struct CompiledOutput {
+    /// The output as written.
+    pub output: Output,
+    /// The zone its times are read and shown in.
+    pub zone: Tz,
+    /// One plan per source, by type local name.
+    pub plans: Vec<Plan>,
+    /// Newest `DTSTART` first.
+    pub descending: bool,
+}
+
+impl CompiledOutput {
+    /// The output checked as API/02 §8b shapes it.
+    ///
+    /// # Errors
+    /// The first reason the output cannot be served.
+    pub fn compile(output: &Output) -> Result<Self, String> {
+        let o = output;
+        if o.version.is_some_and(|v| v != MAPPING_VERSION) {
+            return Err(format!(
+                "{}: version {:?} is not {MAPPING_VERSION}",
+                o.name, o.version
+            ));
+        }
+        if !is_output_name(&o.name) {
+            return Err(format!(
+                "name {:?} is not 1 to 40 of a-z, 0-9 and -, nor `preview`",
+                o.name
+            ));
+        }
+        let fail = |why: String| Err(format!("{}: {why}", o.name));
+        let texts = o.title.iter().chain(&o.description);
+        if let Some((tag, _)) = texts.clone().find(|(tag, _)| !is_language_tag(tag)) {
+            return fail(format!("{tag:?} is not a language tag"));
+        }
+        if !texts.into_iter().all(|(_, text)| is_plain(text, 1000)) {
+            return fail(
+                "a title or description is empty, too long or holds control characters".to_owned(),
+            );
+        }
+        if let Some(lang) = o.lang.as_ref().filter(|l| !is_language_tag(l)) {
+            return fail(format!("lang {lang:?} is not a language tag"));
+        }
+        if o.limit.is_some_and(|n| n == 0 || n > 10_000) {
+            return fail("limit is 1 to 10000".to_owned());
+        }
+        let descending = match o.sort.as_deref() {
+            None | Some("start") => false,
+            Some("-start") => true,
+            Some(other) => return fail(format!("sort {other:?} is start or -start")),
+        };
+        if o.filter.params().iter().any(|(_, v)| !is_plain(v, 2000)) {
+            return fail(
+                "a filter member is empty, too long or holds control characters".to_owned(),
+            );
+        }
+        if o.sources.is_empty() || o.sources.len() > 10 {
+            return fail("sources lists 1 to 10 types".to_owned());
+        }
+        let zone = match &o.timezone {
+            None => DEFAULT_ZONE,
+            Some(name) => match name.parse::<Tz>() {
+                Ok(z) => z,
+                Err(_) => return fail(format!("timezone {name:?} is not an IANA zone")),
+            },
+        };
+        let mut plans: Vec<Plan> = Vec::new();
+        for source in &o.sources {
+            let mut plan = Plan::compile(source).map_err(|why| format!("{}: {why}", o.name))?;
+            if plans.iter().any(|p| p.entity_type == plan.entity_type) {
+                return fail(format!("type {} is a source twice", plan.entity_type));
+            }
+            plan.zone = zone;
+            plan.lang.clone_from(&o.lang);
+            plans.push(plan);
+        }
+        Ok(Self {
+            output: o.clone(),
+            zone,
+            plans,
+            descending,
+        })
+    }
+
+    /// The plan of an Entity's type, by its local name.
+    #[must_use]
+    pub fn plan(&self, entity: &Value) -> Option<&Plan> {
+        let ty = local(
+            entity
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        self.plans.iter().find(|p| p.entity_type == ty)
+    }
+}
+
+impl Plan {
     /// The type the feed maps, by its local name.
     #[must_use]
     pub fn entity_type(&self) -> &str {
@@ -523,10 +836,12 @@ fn compile_field(field: Field, remap: Remap) -> Result<Compiled, String> {
         return fail("takes TENTATIVE, CONFIRMED or CANCELLED");
     }
     if let Some(language) = &remap.language {
-        let code = language.len() == 2 && language.chars().all(|c| c.is_ascii_lowercase());
-        if !code && language != "first" {
-            return fail("`language` is a two-letter code or `first`");
+        if language != "first" && !is_language_tag(language) {
+            return fail("`language` is a BCP 47 tag or `first`");
         }
+    }
+    if field == Field::Duration && remap.constant.as_deref().is_some_and(|d| !is_duration(d)) {
+        return fail("`constant` is an RFC 5545 duration such as PT1H");
     }
     if remap.truncate.is_some_and(|n| n == 0 || n > 10_000) {
         return fail("`truncate` is 1 to 10000");
@@ -556,19 +871,28 @@ fn instance<'a>(entity: &'a Value, name: &str) -> Option<&'a Value> {
     }
 }
 
-/// A Property's `value` (a typed literal's `@value`, a `VocabProperty`'s `vocab`), a
-/// `LanguageProperty`'s text in `language` (`first` or none: its first), a `GeoProperty`'s
-/// geometry.
+/// The members an attribute of each NGSI-LD 1.9 kind holds its value in: Property and
+/// `GeoProperty`, `VocabProperty`, `Relationship`, `ListProperty`, `ListRelationship`, `JsonProperty`
+/// (a `LanguageProperty`'s `languageMap` is read by [`pick`]).
+const VALUE_MEMBERS: [&str; 6] = [
+    "value",
+    "vocab",
+    "object",
+    "valueList",
+    "objectList",
+    "json",
+];
+
+/// A Property's `value` (a typed literal's `@value`), a `VocabProperty`'s `vocab`, a
+/// Relationship's `object`, a list's items, a `JsonProperty`'s `json`, a `LanguageProperty`'s
+/// text in `language` ([`pick`]), a `GeoProperty`'s geometry.
 fn value_of<'a>(instance: &'a Value, language: Option<&str>) -> Option<&'a Value> {
     if let Some(map) = instance.get("languageMap").and_then(Value::as_object) {
-        return match language.filter(|l| *l != "first") {
-            Some(code) => map.get(code),
-            None => map.values().next(),
-        };
+        return pick(map, language);
     }
-    let value = instance
-        .get("value")
-        .or_else(|| instance.get("vocab"))
+    let value = VALUE_MEMBERS
+        .iter()
+        .find_map(|m| instance.get(*m))
         .unwrap_or(instance);
     Some(value.get("@value").unwrap_or(value))
 }
@@ -597,6 +921,41 @@ fn text(value: &Value) -> Option<String> {
         Value::Bool(b) => Some(b.to_string()),
         _ => None,
     }
+}
+
+/// A CAL-ADDRESS: a `mailto:` or http(s) URI as given, an e-mail address as `mailto:`, else none.
+fn cal_address(value: String) -> Option<String> {
+    if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
+    if ["mailto:", "https://", "http://"]
+        .iter()
+        .any(|s| value.starts_with(s))
+    {
+        Some(value)
+    } else if value.contains('@') && !value.contains(':') {
+        Some(format!("mailto:{value}"))
+    } else {
+        None
+    }
+}
+
+/// RFC 5545 3.2 param-value, always quoted so `,` `;` `:` stay literal; a `"`, a `^` and a
+/// newline are RFC 6868 caret escapes, the other control characters are dropped.
+fn param(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().saturating_add(2));
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '^' => out.push_str("^^"),
+            '"' => out.push_str("^'"),
+            '\n' => out.push_str("^n"),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// A structured postal address as one line: street, postal code, locality and country.
@@ -709,7 +1068,7 @@ impl Plan {
     fn text(&self, entity: &Value, field: Field) -> Option<String> {
         let c = self.field(field)?;
         let remap = &c.remap;
-        let language = remap.language.as_deref();
+        let language = remap.language.as_deref().or(self.lang.as_deref());
         let one = |path: &String| {
             at(entity, path, language).and_then(|v| match field {
                 Field::Location if v.is_object() => address(v),
@@ -743,7 +1102,12 @@ impl Plan {
             return Ok(None);
         };
         When::parse(&raw)
-            .and_then(|w| w.read(c.remap.date.unwrap_or_default(), c.zone))
+            .and_then(|w| {
+                w.read(
+                    c.remap.date.unwrap_or_default(),
+                    c.zone.unwrap_or(self.zone),
+                )
+            })
             .map(Some)
             .ok_or(reason::UNPARSABLE_DATE)
     }
@@ -756,8 +1120,8 @@ impl Plan {
             .field(Field::Dtend)
             .and_then(|c| c.remap.end_inclusive)
             .unwrap_or(false);
-        let end = start.end_like(end, inclusive);
-        if end.key() > start.key() {
+        let end = start.end_like(end, inclusive, self.zone);
+        if end.utc_key(self.zone) > start.utc_key(self.zone) {
             Ok(Some(end))
         } else {
             Err(reason::END_NOT_AFTER_START)
@@ -811,10 +1175,20 @@ impl Plan {
             .remap
             .attribute
             .as_ref()
-            .and_then(|p| at(entity, p, c.remap.language.as_deref()))
+            .and_then(|p| {
+                at(
+                    entity,
+                    p,
+                    c.remap.language.as_deref().or(self.lang.as_deref()),
+                )
+            })
             .and_then(Value::as_array);
         let values: Vec<String> = match list {
-            Some(items) => items.iter().filter_map(text).collect(),
+            // a ListRelationship's items are `{"object": id}`
+            Some(items) => items
+                .iter()
+                .filter_map(|i| text(i.get("object").unwrap_or(i)))
+                .collect(),
             None => self.text(entity, Field::Categories).into_iter().collect(),
         };
         let out: Vec<String> = values
@@ -834,22 +1208,65 @@ impl Plan {
             .then(|| format!("STATUS:{value}"))
     }
 
-    /// `ORGANIZER`, a CAL-ADDRESS: a `mailto:` or http(s) URI, or an e-mail address.
+    /// `ORGANIZER`, a CAL-ADDRESS: the first source holding a `mailto:` or http(s) URI or an
+    /// e-mail address, or an organizer object (schema.org `Organization`) whose `email`, else
+    /// `url`, is the address and whose `name` becomes `CN`. An object without a usable address
+    /// writes nothing: RFC 5545 requires the address, and the event's own `URL` is no organizer's.
     fn organizer(&self, entity: &Value) -> Option<String> {
-        let value = self.text(entity, Field::Organizer)?;
-        if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
-            return None;
-        }
-        let uri = ["mailto:", "https://", "http://"]
+        let c = self.field(Field::Organizer)?;
+        let language = c.remap.language.as_deref().or(self.lang.as_deref());
+        c.remap
+            .attribute
             .iter()
-            .any(|s| value.starts_with(s));
-        if uri {
-            Some(format!("ORGANIZER:{value}"))
-        } else if value.contains('@') && !value.contains(':') {
-            Some(format!("ORGANIZER:mailto:{value}"))
-        } else {
-            None
-        }
+            .chain(&c.remap.first_of)
+            .filter_map(|path| at(entity, path, language))
+            .find_map(|value| match value {
+                Value::Object(o) => {
+                    let member =
+                        |k: &str| o.get(k).and_then(|v| value_of(v, language)).and_then(text);
+                    let address = member("email")
+                        .and_then(cal_address)
+                        .or_else(|| member("url").and_then(cal_address))?;
+                    Some(match member("name") {
+                        Some(name) => format!("ORGANIZER;CN={}:{address}", param(&name)),
+                        None => format!("ORGANIZER:{address}"),
+                    })
+                }
+                _ => text(value)
+                    .and_then(cal_address)
+                    .map(|a| format!("ORGANIZER:{a}")),
+            })
+    }
+
+    /// The latest `modifiedAt` of the attributes the mapping reads, every instance counted.
+    fn revised(&self, entity: &Value) -> Option<DateTime<Utc>> {
+        let names: std::collections::BTreeSet<&str> = self
+            .fields
+            .values()
+            .flat_map(|c| {
+                c.remap
+                    .attribute
+                    .iter()
+                    .chain(&c.remap.first_of)
+                    .chain(&c.remap.join)
+            })
+            .map(|p| p.split('.').next().unwrap_or(p))
+            .collect();
+        let stamp = |i: &Value| {
+            i.get("modifiedAt")
+                .and_then(Value::as_str)
+                .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.to_utc())
+        };
+        entity
+            .as_object()?
+            .iter()
+            .filter(|(key, _)| names.contains(local(key)))
+            .flat_map(|(_, member)| match member {
+                Value::Array(all) => all.iter().filter_map(stamp).collect::<Vec<_>>(),
+                one => stamp(one).into_iter().collect(),
+            })
+            .max()
     }
 
     /// The `VEVENT` of one Entity, or why there is none; `now` stamps an Entity without
@@ -879,28 +1296,39 @@ impl Plan {
             .text(entity, Field::Summary)
             .ok_or(reason::MISSING_SUMMARY)?;
         let end = self.end(entity, start)?;
-        let duration = self.text(entity, Field::Duration);
+        // a constant DURATION is the length of an Event without an end; a date has its day
+        let constant = self
+            .field(Field::Duration)
+            .is_some_and(|c| c.remap.constant.is_some());
+        let duration = self
+            .text(entity, Field::Duration)
+            .filter(|_| !constant || (end.is_none() && !matches!(start, When::Date(_))));
         if duration.as_deref().is_some_and(|d| !is_duration(d)) {
             return Err(reason::UNPARSABLE_DURATION);
         }
         let (geo, url) = (self.geo(entity)?, self.url(entity)?);
-        let modified = match self.when(entity, Field::LastModified)? {
-            Some(w) => Some(When::At(w.key().and_utc())),
-            None if self.field(Field::LastModified).is_some() => None,
-            None => entity
+        let entity_stamp = || {
+            entity
                 .get("modifiedAt")
                 .and_then(Value::as_str)
                 .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
-                .map(|t| When::At(t.to_utc())),
+                .map(|t| t.to_utc())
         };
-        if !window.holds(start, end) {
+        let source = self
+            .when(entity, Field::LastModified)?
+            .map(|w| w.utc_key(self.zone).and_utc());
+        let revised = source
+            .or_else(|| self.revised(entity))
+            .or_else(entity_stamp);
+        let modified = match source {
+            Some(t) => Some(When::At(t)),
+            None if self.field(Field::LastModified).is_some() => None,
+            None => revised.map(When::At),
+        };
+        if !window.holds(start, end, self.zone) {
             return Ok(None);
         }
-        let stamp = entity
-            .get("modifiedAt")
-            .and_then(Value::as_str)
-            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
-            .map_or(now, |t| t.to_utc());
+        let stamp = revised.unwrap_or(now);
         let text = |field: Field, name: &str| {
             self.text(entity, field)
                 .map(|t| format!("{name}:{}", escape(&t)))

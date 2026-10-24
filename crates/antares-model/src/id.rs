@@ -32,6 +32,7 @@ impl TenantId {
         "antares-views",
         "antares-policy",
         "antares-grants",
+        "antares-channels",
     ];
 
     /// Whether `raw` names one of the broker's own tenants.

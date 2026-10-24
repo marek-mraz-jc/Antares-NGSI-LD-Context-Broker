@@ -108,6 +108,7 @@ pub(crate) fn of(c: &Collection) -> Collection {
         )),
         properties: own.chain(added).collect(),
         history: true,
+        output: None,
     }
 }
 
@@ -131,7 +132,7 @@ pub(crate) async fn page(
             .ok_or_else(|| bad("the next token does not belong to this request"))?,
     };
     let limit = usize::try_from(p.limit).unwrap_or(usize::MAX);
-    let window = window(p)?;
+    let window = window(p);
     let refs = Refs {
         alternate: false,
         ..refs
@@ -200,20 +201,16 @@ pub(crate) async fn one(
 /// The `datetime` window in microseconds, either end open.
 type Window = (Option<i64>, Option<i64>);
 
-fn window(p: &Params) -> Result<Window, Problem> {
-    let micros = |at: &Option<String>| -> Result<Option<i64>, Problem> {
+/// `params` already read each end as a calendar instant.
+fn window(p: &Params) -> Window {
+    let micros = |at: &Option<String>| {
         at.as_deref()
-            .map(|at| {
-                DateTime::parse(at)
-                    .map(DateTime::unix_micros)
-                    .ok_or_else(|| bad("datetime is an RFC 3339 date-time"))
-            })
-            .transpose()
+            .and_then(DateTime::parse)
+            .map(DateTime::unix_micros)
     };
-    match &p.datetime {
-        None => Ok((None, None)),
-        Some((from, to)) => Ok((micros(from)?, micros(to)?)),
-    }
+    p.datetime
+        .as_ref()
+        .map_or((None, None), |(from, to)| (micros(from), micros(to)))
 }
 
 /// The residual of `bbox` and `filter`, none when the request names neither; a `ngsild.`
@@ -511,6 +508,7 @@ mod tests {
         };
         Collection {
             history: false,
+            output: None,
             id: "Car".to_owned(),
             description: None,
             type_iri: "https://example.org/Car".to_owned(),

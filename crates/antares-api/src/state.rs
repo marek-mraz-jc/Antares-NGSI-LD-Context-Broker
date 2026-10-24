@@ -359,6 +359,12 @@ pub struct Shared {
     /// The mesh identity of the gateway whose provenance headers the broker
     /// believes (ANTARES_PROVENANCE_FROM, T-4665); `None` believes nobody.
     pub provenance_from: Option<String>,
+    /// A request to the NGSI-LD API that carries no subject header is served
+    /// only with the admin bearer token (T-5032,
+    /// [`crate::admin_auth::subject_or_admin`]). `false` (the default)
+    /// serves it as before; the platform build sets it when the deployment
+    /// names subject headers.
+    pub subject_required: bool,
     /// History gate 3 (T-4275): the (Tenant, expanded type) pairs whose
     /// retention rule says `history: "off"`. The views reload replaces the
     /// set; an Entity with any of these types records no attribute instance.
@@ -393,6 +399,26 @@ impl std::ops::DerefMut for AppState {
 }
 
 impl AppState {
+    /// This state's broker, told apart from the other brokers of the
+    /// process: its narrowed copies share it, and no live broker shares it
+    /// with another.
+    pub(crate) fn broker(&self) -> usize {
+        Arc::as_ptr(&self.shared).addr()
+    }
+
+    /// Whether `other` is this state: the same broker and the same view.
+    #[must_use]
+    pub fn same(&self, other: &Self) -> bool {
+        #[cfg(feature = "views")]
+        let view = match (&self.view, &other.view) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (a, b) => a.is_none() && b.is_none(),
+        };
+        #[cfg(not(feature = "views"))]
+        let view = true;
+        Arc::ptr_eq(&self.shared, &other.shared) && view
+    }
+
     /// The built-in store: in-memory, or — under the reserved harness
     /// variable `ANTARES_TEST_STORE=file` — a fresh on-disk redb store per
     /// state, so the same test binary proves the durable backend without a
@@ -648,6 +674,7 @@ impl AppState {
                 nats: false,
                 temporal_record: TemporalRecord::All,
                 provenance_from: None,
+                subject_required: false,
                 history_off: HistoryOff::default(),
                 public_url,
                 snapshot_cap: 1024,

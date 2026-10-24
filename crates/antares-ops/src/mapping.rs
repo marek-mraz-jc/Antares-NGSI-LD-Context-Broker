@@ -384,6 +384,16 @@ impl Mapping {
         served: Option<&Map<String, Value>>,
     ) -> Result<Self, String> {
         let members = ir.as_object().ok_or("mapping: the IR is an object")?;
+        if let Some(unknown) = members.keys().find(|k| {
+            !matches!(
+                k.as_str(),
+                "version" | "sourceClass" | "targetClass" | "slots"
+            )
+        }) {
+            return Err(format!(
+                "mapping: the IR member {unknown:?} is not one of version 2"
+            ));
+        }
         match members.get("version").and_then(Value::as_u64) {
             Some(IR_VERSION) => {}
             Some(v) => {
@@ -1577,6 +1587,25 @@ fn slot(index: usize, entry: &Value, iri: Expand<'_>) -> Result<RawSlot, String>
         .get("kind")
         .and_then(Value::as_str)
         .ok_or_else(|| at("names no kind"))?;
+    // Every member changes what the view answers or which `q` it inverts, so an unknown one
+    // (a typo such as `ofset`, or a member a newer compiler adds) refuses the IR instead of
+    // being dropped (T-5207, mapping-contract rule 3).
+    let own: &[&str] = match kind {
+        "unitConversion" => &["factor", "offset"],
+        "valueMappings" => &["forward", "inverse"],
+        "cast" => &["range"],
+        "constant" => &["value"],
+        "expr" => &["expression"],
+        _ => &[],
+    };
+    if let Some(unknown) = m.keys().find(|k| {
+        !matches!(k.as_str(), "target" | "source" | "kind" | "filterable")
+            && !own.contains(&k.as_str())
+    }) {
+        return Err(at(&format!(
+            "member {unknown:?} is not one a {kind} slot takes"
+        )));
+    }
     let derivation = match kind {
         "rename" => Derivation::Rename,
         "unitConversion" => {

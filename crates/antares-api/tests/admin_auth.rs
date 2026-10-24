@@ -192,3 +192,40 @@ async fn a_refused_purge_purges_nothing() {
     .await;
     assert_eq!(status, StatusCode::OK, "the tenant is still there");
 }
+
+/// T-5032: a broker that requires a subject serves an NGSI-LD request
+/// carrying no subject header only with the admin bearer and refuses it
+/// with none configured at all; a broker that does not require one serves
+/// it as before. (A request with a subject is the engine's: this process
+/// names no subject header, so the joinedcontext-policy engine tests cover
+/// it.)
+#[tokio::test]
+async fn a_request_without_a_subject_needs_the_admin_bearer_where_a_subject_is_required() {
+    let path = "/ngsi-ld/v1/csourceRegistrations?type=Car";
+    let good = format!("Bearer {SECRET}");
+    let mut st = secured(false);
+    st.subject_required = true;
+    let mut bare = AppState::new("admin-auth".into());
+    bare.subject_required = true;
+    for (state, authorization) in [
+        (&st, None),
+        (&st, Some("Bearer not-the-secret")),
+        (&bare, None),
+        (&bare, Some(good.as_str())),
+    ] {
+        let (status, challenge, body) = call(
+            antares_api::router(state.clone()),
+            "GET",
+            path,
+            authorization,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{authorization:?}");
+        assert!(challenge.is_some_and(|c| c.starts_with("Bearer")));
+        assert_eq!(body["type"], UNAUTHORIZED_TYPE);
+    }
+    let (status, ..) = call(antares_api::router(st), "GET", path, Some(&good)).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, ..) = call(antares_api::router(secured(false)), "GET", path, None).await;
+    assert_eq!(status, StatusCode::OK, "not required: served as before");
+}

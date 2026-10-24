@@ -1514,13 +1514,7 @@ async fn collect_flat_walk(
 /// default "location"), properties = the 5.2.31 FeatureProperties (entity
 /// type + attributes). The @context member is added by respond() (6.3.6).
 pub fn to_geojson_feature(entity: Value, geometry_property: Option<&String>) -> Value {
-    let geom_term = geometry_property
-        .cloned()
-        .unwrap_or_else(|| "location".into());
-    let geometry = entity
-        .get(&geom_term)
-        .map(geo_value_of)
-        .unwrap_or(Value::Null);
+    let geometry = geometry_of(&entity, geometry_property.map(String::as_str));
     let id = entity.get("id").cloned().unwrap_or(Value::Null);
     let mut props = entity.as_object().cloned().unwrap_or_default();
     props.remove("id");
@@ -1542,6 +1536,79 @@ pub fn to_geojson_collection(entities: Vec<Value>, geometry_property: Option<&St
         .map(|e| to_geojson_feature(e, geometry_property))
         .collect();
     serde_json::json!({"type": "FeatureCollection", "features": features})
+}
+
+/// The one geometry rule of every GeoJSON this broker writes (NGSI-LD geo+json, OGC items,
+/// the `geojson` surface; T-5208): the GeoProperty `property` (default `location`), its default
+/// instance, `null` unless it holds a valid geometry, rings wound as RFC 7946 3.1.6 asks. A
+/// geometry across the antimeridian is served as stored, not cut (3.1.9 is a SHOULD; no
+/// dataset of the platform crosses it).
+#[must_use]
+pub fn geometry_of(entity: &Value, property: Option<&str>) -> Value {
+    entity
+        .get(property.unwrap_or("location"))
+        .map(geo_value_of)
+        .map_or(Value::Null, rewound)
+}
+
+/// RFC 7946 3.1.6: a Polygon's exterior ring counterclockwise, its holes clockwise, in every
+/// Polygon of a MultiPolygon and a GeometryCollection; other geometries, and a ring across the
+/// antimeridian, as they are.
+#[must_use]
+pub fn rewound(mut geometry: Value) -> Value {
+    /// Twice the signed planar area, `None` for a ring with an edge across the antimeridian,
+    /// whose plane winding is not its winding on the globe.
+    fn area(ring: &[Value]) -> Option<f64> {
+        let point = |p: &Value| {
+            (
+                p.get(0).and_then(Value::as_f64),
+                p.get(1).and_then(Value::as_f64),
+            )
+        };
+        let mut sum = 0.0;
+        for w in ring.windows(2) {
+            if let (Some((Some(x0), Some(y0))), Some((Some(x1), Some(y1)))) =
+                (w.first().map(point), w.get(1).map(point))
+            {
+                if (x1 - x0).abs() > 180.0 {
+                    return None;
+                }
+                sum += x0 * y1 - x1 * y0;
+            }
+        }
+        Some(sum)
+    }
+    fn polygon(rings: &mut Value) {
+        for (i, ring) in rings.as_array_mut().into_iter().flatten().enumerate() {
+            if let Some(points) = ring.as_array_mut() {
+                if area(points).is_some_and(|a| (a > 0.0) == (i > 0)) {
+                    points.reverse();
+                }
+            }
+        }
+    }
+    match geometry.get("type").and_then(Value::as_str) {
+        Some("Polygon") => {
+            if let Some(rings) = geometry.get_mut("coordinates") {
+                polygon(rings);
+            }
+        }
+        Some("MultiPolygon") => {
+            let all = geometry
+                .get_mut("coordinates")
+                .and_then(Value::as_array_mut);
+            all.into_iter().flatten().for_each(polygon);
+        }
+        Some("GeometryCollection") => {
+            if let Some(Value::Array(parts)) = geometry.get_mut("geometries") {
+                for part in parts.iter_mut() {
+                    *part = rewound(part.take());
+                }
+            }
+        }
+        _ => {}
+    }
+    geometry
 }
 
 /// 4.5.16.1: with multiple instances the default one (no datasetId) is
@@ -2099,6 +2166,41 @@ mod clause_6_3_7 {
 
     /// 4.5.16.1/4.5.16.2/4.5.16.3: geometry selection (default instance,
     /// datasetId-narrowed single, invalid value -> null) and the
+    /// RFC 7946 3.1.6 on the way out: a clockwise exterior turns counterclockwise, a
+    /// counterclockwise hole clockwise; a geometry across the antimeridian stays as stored.
+    #[test]
+    fn geojson_rings_are_wound_and_the_antimeridian_is_not_cut() {
+        let cw = json!([[0, 0], [0, 1], [1, 1], [1, 0], [0, 0]]);
+        let ccw = json!([[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]);
+        let hole_ccw = json!([[0.2, 0.2], [0.8, 0.2], [0.8, 0.8], [0.2, 0.8], [0.2, 0.2]]);
+        let hole_cw = json!([[0.2, 0.2], [0.2, 0.8], [0.8, 0.8], [0.8, 0.2], [0.2, 0.2]]);
+        let polygon = |rings: Value| json!({"type": "Polygon", "coordinates": rings});
+        assert_eq!(
+            rewound(polygon(json!([cw, hole_ccw]))),
+            polygon(json!([ccw, hole_cw]))
+        );
+        assert_eq!(rewound(polygon(json!([ccw]))), polygon(json!([ccw])));
+        let multi = json!({"type": "MultiPolygon", "coordinates": [[cw]]});
+        assert_eq!(rewound(multi)["coordinates"], json!([[ccw]]));
+        let across = polygon(json!([[
+            [179, 0],
+            [-179, 0],
+            [-179, 1],
+            [179, 1],
+            [179, 0]
+        ]]));
+        let entity = json!({"location": {"type": "GeoProperty", "value": across}});
+        assert_eq!(geometry_of(&entity, None), across);
+        // the default instance, not the first, of a multi-instance GeoProperty
+        let two = json!({"place": [
+            {"type": "GeoProperty", "datasetId": "urn:a", "value": {"type": "Point", "coordinates": [1, 1]}},
+            {"type": "GeoProperty", "value": {"type": "Point", "coordinates": [2, 2]}}]});
+        assert_eq!(
+            geometry_of(&two, Some("place"))["coordinates"],
+            json!([2, 2])
+        );
+    }
+
     /// Feature/FeatureCollection shapes.
     #[test]
     fn geojson_feature_selection_and_shape() {

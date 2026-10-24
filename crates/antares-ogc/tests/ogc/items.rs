@@ -571,3 +571,180 @@ async fn a_feature_links_its_entity_and_its_schema() -> Result<(), String> {
     );
     Ok(())
 }
+
+/// The CQL2 temporal operators over the cars of
+/// `datetime_and_temporal_filters_read_offsets_as_instants`, with the speeds each selects.
+fn temporal_cases(at: &str) -> Vec<(String, Vec<u64>)> {
+    // Each operator is chosen so that text order of the stored values would answer wrong.
+    let march = "INTERVAL('2026-03-01T00:00:00Z', '2026-04-01T00:00:00Z')";
+    let february = "INTERVAL('2026-02-01T00:00:00Z', '2026-03-01T00:00:00Z')";
+    let midnight = "INTERVAL('2026-02-28T23:30:00Z', '2026-03-01T00:30:00Z')";
+    let to_year_end = "INTERVAL(seen, '2026-12-31T00:00:00Z')";
+    vec![
+        (format!("T_EQUALS(seen, TIMESTAMP('{at}'))"), vec![5, 10]),
+        ("T_EQUALS(seen, TIMESTAMP('2026-03-02T18:00:00Z'))".into(), vec![8]),
+        ("T_EQUALS(seen, DATE('2026-03-01'))".into(), vec![7]),
+        (format!("T_AFTER(seen, TIMESTAMP('{at}'))"), vec![7, 8, 60]),
+        (
+            "T_BEFORE(seen, TIMESTAMP('2026-01-01T00:00:00.1Z'))".into(),
+            vec![5, 10],
+        ),
+        (
+            "T_BEFORE(seen, TIMESTAMP('2026-03-01T01:00:00Z'))".into(),
+            vec![5, 7, 10],
+        ),
+        (
+            "T_INTERSECTS(seen, INTERVAL('2025-12-31T23:00:00Z', '2026-01-01T00:00:00Z'))".into(),
+            vec![5, 10],
+        ),
+        (
+            "T_INTERSECTS(seen, INTERVAL('..', '2026-03-01T00:00:00Z'))".into(),
+            vec![5, 7, 10],
+        ),
+        (format!("T_DURING(seen, {midnight})"), vec![7]),
+        (
+            "T_DURING(seen, INTERVAL('2026-03-01T12:00:00Z', '2026-03-03T00:00:00Z'))".into(),
+            vec![8],
+        ),
+        (
+            "T_DISJOINT(seen, INTERVAL('2026-03-01T00:30:00Z', '2026-05-01T00:00:00Z'))".into(),
+            vec![5, 7, 10, 60],
+        ),
+        (format!("T_MEETS(seen, {march})"), vec![7]),
+        (format!("T_METBY(seen, {february})"), vec![7]),
+        (format!("T_STARTS(seen, {march})"), vec![7]),
+        (format!("T_FINISHES(seen, {february})"), vec![7]),
+        (format!("T_STARTEDBY({march}, seen)"), vec![7]),
+        (format!("T_FINISHEDBY({february}, seen)"), vec![7]),
+        (format!("T_CONTAINS({midnight}, seen)"), vec![7]),
+        (
+            format!(
+                "T_OVERLAPS({to_year_end}, INTERVAL('2026-03-01T00:30:00Z', '2027-01-01T00:00:00Z'))"
+            ),
+            vec![5, 7, 10],
+        ),
+        (format!("T_OVERLAPPEDBY({to_year_end}, {midnight})"), vec![7]),
+    ]
+}
+
+/// T-5204: a time written with an offset is the instant it names, for `datetime` and for the
+/// CQL2 temporal functions alike (the live Events were written `+01:00`).
+#[tokio::test(flavor = "multi_thread")]
+async fn datetime_and_temporal_filters_read_offsets_as_instants() -> Result<(), String> {
+    let f = fixture().await?;
+    // Car 5 is 2026-01-01T00:00:00Z (+01:00, 9 fraction digits), Car 7 2026-03-01T00:00:00Z
+    // (+02:00), Car 8 the whole day 2026-03-02; Car 10 is January 1st, Car 60 June 1st (Z).
+    for (speed, at) in [
+        (5, "2026-01-01T01:00:00.000000001+01:00"),
+        (7, "2026-03-01T02:00:00+02:00"),
+        (8, "2026-03-02"),
+    ] {
+        let car = json!({"type": "Feature", "geometry": null,
+                         "properties": {"speed": speed, "seen": at}});
+        let made = send(
+            &f.app,
+            "POST",
+            "/x/views/fleet/ogc/features/collections/Car/items",
+            &car.to_string(),
+            &[("Content-Type", "application/geo+json")],
+        )
+        .await;
+        assert_eq!(made.status, StatusCode::CREATED, "{}", made.body);
+    }
+    let seen = |query: String| {
+        let app = f.app.clone();
+        async move {
+            let a = get(&app, &format!("{CARS}?{query}")).await;
+            assert_eq!(a.status, StatusCode::OK, "{query}: {}", a.body);
+            let mut got: Vec<u64> = a
+                .body
+                .get("features")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|f| f.pointer("/properties/seen").is_some())
+                .filter_map(|f| f.pointer("/properties/speed").and_then(Value::as_u64))
+                .collect();
+            got.sort_unstable();
+            got
+        }
+    };
+    let at = "2026-01-01T00:00:00Z";
+    for (query, want) in [
+        (format!("datetime={at}"), vec![5, 10]),
+        ("datetime=2026-01-01T00:00:00.5Z/..".into(), vec![7, 8, 60]),
+        ("datetime=../2025-12-31T23:59:59%2B00:00".into(), Vec::new()),
+        ("datetime=../2026-03-01T00:00:00Z".into(), vec![5, 7, 10]),
+        (
+            "datetime=2026-02-28T23:30:00Z/2026-03-01T00:30:00Z".into(),
+            vec![7],
+        ),
+        ("datetime=2026-03-02T12:00:00Z".into(), vec![8]),
+        ("datetime=2026-03-01T12:00:00Z/..".into(), vec![8, 60]),
+    ] {
+        assert_eq!(seen(query.clone()).await, want, "{query}");
+    }
+    for (filter, want) in temporal_cases(at) {
+        let query = format!("filter={}", antares_ops::percent::encode(&filter));
+        assert_eq!(seen(query).await, want, "{filter}");
+    }
+    Ok(())
+}
+
+/// T-5169: `id = '…'` and `id IN (…)`, alone or joined by `AND`, select by the NGSI-LD `id` list, so a
+/// collection larger than the residual's scan budget still answers them, counted exactly.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_id_filter_reads_by_id_past_the_scan_budget() -> Result<(), String> {
+    let f = fixture().await?;
+    let budget = antares_ops::RESIDUAL_SCAN;
+    let mut next = 0;
+    while next <= budget {
+        let batch: Vec<Value> = (next..(next + 1000).min(budget + 1))
+            .map(|i| json!({"id": format!("urn:ngsi-ld:Car:b{i}"), "type": "Car"}))
+            .collect();
+        next += batch.len();
+        let a = send(
+            &f.app,
+            "POST",
+            "/ngsi-ld/v1/entityOperations/create",
+            &Value::Array(batch).to_string(),
+            &[("NGSILD-Tenant", "city")],
+        )
+        .await;
+        assert!(a.status.is_success(), "{} {}", a.status, a.body);
+    }
+    let last = format!("urn:ngsi-ld:Car:b{budget}");
+    let cases = [
+        (format!("id = '{last}'"), vec![last.clone()]),
+        (format!("'{last}' = id"), vec![last.clone()]),
+        (
+            format!("id IN ('urn:ngsi-ld:Car:b7', '{last}', 'urn:ngsi-ld:Car:none')"),
+            vec![last.clone(), "urn:ngsi-ld:Car:b7".to_owned()],
+        ),
+        (
+            format!("id IN ('urn:ngsi-ld:Car:b7', '{last}') AND id = 'urn:ngsi-ld:Car:b7'"),
+            vec!["urn:ngsi-ld:Car:b7".to_owned()],
+        ),
+        (
+            "id = 'urn:ngsi-ld:Car:b7' AND id = 'urn:ngsi-ld:Car:b8'".to_owned(),
+            Vec::new(),
+        ),
+    ];
+    for (filter, want) in cases {
+        let uri = format!(
+            "{CARS}?filter-lang=cql2-text&filter={}",
+            crate::filter::enc(&filter)
+        );
+        let a = get(&f.app, &uri).await;
+        assert_eq!(a.status, StatusCode::OK, "{filter}: {}", a.body);
+        let mut got = ids(&a.body);
+        got.sort();
+        assert_eq!(got, want, "{filter}");
+        assert_eq!(
+            a.body.get("numberMatched"),
+            Some(&json!(want.len())),
+            "{filter}"
+        );
+    }
+    Ok(())
+}

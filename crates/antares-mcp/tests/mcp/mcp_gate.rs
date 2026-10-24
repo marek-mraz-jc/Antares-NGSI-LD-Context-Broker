@@ -21,6 +21,10 @@ fn minimal(tool: &str) -> Value {
         "get_entity" => json!({"id": id}),
         "describe_type" | "get_type" => json!({"type": "Car"}),
         "batch_query" | "query_entities" | "summarize" => json!({"type": ["Car"]}),
+        // one type read through the gate (T-5279)
+        "area_overview" => {
+            json!({"type": ["Car"], "geometry": "Point", "coordinates": [0.0, 0.0]})
+        }
         "retrieve_temporal" => time,
         _ => json!({}),
     }
@@ -37,7 +41,7 @@ async fn every_tool_and_resource_asks_the_policy_engine_exactly_once() -> Result
     let engine = Arc::new(Counting::default());
     let f = fixture_with(Some(engine.clone())).await?;
     let tools = tool_names(&f.app, "cars").await;
-    assert_eq!(tools.len(), 15, "{tools:?}");
+    assert_eq!(tools.len(), 16, "{tools:?}");
     for tool in &tools {
         let before = engine.count();
         let a = call(&f.app, "cars", tool, minimal(tool)).await;

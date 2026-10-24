@@ -273,6 +273,18 @@ fn an_ir_this_broker_does_not_run_is_refused_at_load() {
 }
 
 #[test]
+fn an_unknown_ir_member_is_refused_by_name() {
+    let got = compile(
+        &json!({ "version": 2, "sourceClass": "A", "targetClass": "B", "unitCode": "CEL",
+        "slots": [{ "target": "x", "source": "y", "kind": "rename" }] }),
+    );
+    assert_eq!(
+        got.err().as_deref(),
+        Some("mapping: the IR member \"unitCode\" is not one of version 2")
+    );
+}
+
+#[test]
 fn a_malformed_slot_is_refused_with_its_index() {
     let refused = |slot: Value| {
         compile(&json!({ "version": 2, "sourceClass": "A", "targetClass": "B", "slots": [slot] }))
@@ -290,6 +302,15 @@ fn a_malformed_slot_is_refused_with_its_index() {
             "slot 0 source is a name",
         ),
         (json!({ "target": "x", "source": "y" }), "names no kind"),
+        // T-5207: a misspelt or newer member refuses the IR instead of reading as absent
+        (
+            json!({ "target": "x", "source": "y", "kind": "unitConversion", "factor": 2, "ofset": 1 }),
+            "member \"ofset\" is not one a unitConversion slot takes",
+        ),
+        (
+            json!({ "target": "x", "source": "y", "kind": "rename", "factor": 2 }),
+            "member \"factor\" is not one a rename slot takes",
+        ),
         (
             json!({ "target": "x", "source": "y", "kind": "join" }),
             "\"join\" is not one",

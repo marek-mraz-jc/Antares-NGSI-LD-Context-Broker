@@ -74,6 +74,7 @@ Each row is a reading of the code above, filed as T-3672 for as long as the gate
 `View` (`crates/antares-ops/src/views.rs`, struct `View`, `deny_unknown_fields`) gains `mapping: Option<Value>`. At load, `View::load` parses it into the IR types of section 2.1, in a new module `antares-ops/src/mapping.rs`, and refuses the view when:
 
 - the version is not 2, a slot is malformed or names an unknown kind (the gateway's own refusals, `view_mapping.rs:724-795`);
+- the document or a slot carries a member version 2 does not define (T-5207): a slot takes `target`, `source`, `kind`, `filterable` and the members of its kind (`factor`/`offset`, `forward`/`inverse`, `range`, `value`, `expression`); a typo such as `ofset` is refused with the slot index and the member's name, never read as absent;
 - `sourceClass` is not one of the view's `selector` types: the view would select Entities the mapping does not describe;
 - an `operations` entry is not one of the reads of section 4.1 (section 7);
 - the document exceeds the `/q/views` body cap the other members already share.

@@ -134,7 +134,9 @@ pub struct View {
 }
 
 /// The surfaces a view's `representations` may name.
-pub const REPRESENTATIONS: &[&str] = &["ical"];
+pub const REPRESENTATIONS: &[&str] = &["ical", "feed", "ogc", "geojson", "csv", "gbfs"];
+
+pub use crate::outputs::MAX_OUTPUTS;
 
 /// One allowlist of a [`View`]: the Entities of `types` for which the
 /// condition holds show `attributes`.
@@ -308,10 +310,15 @@ impl View {
         };
         if let Some(named) = &self.representations {
             if let Some((name, _)) = named.iter().find(|(name, member)| {
-                !REPRESENTATIONS.contains(&name.as_str()) || !member.is_object()
+                // each is a list of named outputs: `feed`, `ogc`, `geojson` and `csv` check theirs when
+                // it serves, `ical` (T-5208) refuses more than MAX_OUTPUTS here
+                !REPRESENTATIONS.contains(&name.as_str())
+                    || member
+                        .as_array()
+                        .is_none_or(|outputs| *name == "ical" && outputs.len() > MAX_OUTPUTS)
             }) {
                 return Err(format!(
-                    "representations: {name:?} is not one of {REPRESENTATIONS:?} with an object"
+                    "representations: {name:?} is not one of {REPRESENTATIONS:?} with a list of outputs (ical: at most {MAX_OUTPUTS})"
                 ));
             }
         }
@@ -665,6 +672,9 @@ impl Reloader {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             retention::history_off(&retention);
+        self.state
+            .temporal
+            .set_short_history(retention::short_history(&retention));
         *self
             .retention
             .write()
@@ -1332,7 +1342,7 @@ mod tests {
 
     #[test]
     fn a_view_keeps_the_representations_it_names_and_refuses_another_name() {
-        let ical = json!({"ical": {"preset": "sdm-event"}});
+        let ical = json!({"ical": [{"name": "events", "sources": [{"preset": "sdm-event"}]}], "feed": [{"name": "news"}]});
         let loaded = load(&with("representations", ical.clone())).expect("loads");
         assert_eq!(
             loaded
@@ -1343,7 +1353,16 @@ mod tests {
             Some(ical)
         );
         assert!(load(&base()).is_ok_and(|l| l.representations.is_none()));
-        for bad in [json!({"vcard": {}}), json!({"ical": []}), json!([])] {
+        let many: Vec<Value> = (0..=MAX_OUTPUTS)
+            .map(|i| json!({"name": format!("o{i}")}))
+            .collect();
+        assert!(load(&with("representations", json!({"feed": many.clone()}))).is_ok());
+        for bad in [
+            json!({"vcard": []}),
+            json!({"ical": {"preset": "sdm-event"}}),
+            json!({"feed": {}}),
+            json!([]),
+        ] {
             assert!(
                 load(&with("representations", bad.clone())).is_err(),
                 "{bad}"

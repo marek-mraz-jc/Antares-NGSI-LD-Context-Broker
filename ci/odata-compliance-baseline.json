@@ -1,15 +1,15 @@
 {
  "counts": {
-  "FAIL": 367,
-  "PASS": 767,
-  "SKIP": 72
+  "FAIL": 368,
+  "PASS": 770,
+  "SKIP": 68
  },
  "results": {
-  "[V4.01] 11.2.12_query_schemaversion :: $metadata accepts $schemaversion=*": "SKIP",
-  "[V4.01] 11.2.12_query_schemaversion :: $schemaversion is accepted with OData-MaxVersion 4.01 and 4.0": "SKIP",
-  "[V4.01] 11.2.12_query_schemaversion :: Data request succeeds with advertised $schemaversion value": "SKIP",
-  "[V4.01] 11.2.12_query_schemaversion :: Unknown $schemaversion value returns 404 Not Found": "SKIP",
-  "[V4.01] 11.2.17_case_insensitive_system_query_options :: $apply accepts mixed case and no-$ forms equivalently": "FAIL",
+  "[V4.01] 11.2.12_query_schemaversion :: $metadata accepts $schemaversion=*": "FAIL",
+  "[V4.01] 11.2.12_query_schemaversion :: $schemaversion is accepted with OData-MaxVersion 4.01 and 4.0": "FAIL",
+  "[V4.01] 11.2.12_query_schemaversion :: Data request succeeds with advertised $schemaversion value": "FAIL",
+  "[V4.01] 11.2.12_query_schemaversion :: Unknown $schemaversion value returns 404 Not Found": "FAIL",
+  "[V4.01] 11.2.17_case_insensitive_system_query_options :: $apply accepts mixed case and no-$ forms equivalently": "PASS",
   "[V4.01] 11.2.17_case_insensitive_system_query_options :: $compute accepts mixed case and no-$ forms equivalently": "PASS",
   "[V4.01] 11.2.17_case_insensitive_system_query_options :: $count accepts mixed case and no-$ forms equivalently": "PASS",
   "[V4.01] 11.2.17_case_insensitive_system_query_options :: $expand accepts mixed case and no-$ forms equivalently": "PASS",
@@ -24,7 +24,7 @@
   "[V4.01] 11.2.17_case_insensitive_system_query_options :: 4.01 parses mixed-case $apply transformation names": "PASS",
   "[V4.01] 11.2.17_case_insensitive_system_query_options :: 4.01 rejects unknown service-defined set transformations in $apply": "FAIL",
   "[V4.01] 11.2.17_case_insensitive_system_query_options :: 4.01 still requires valid hierarchy transformation arguments and rejects empty invocations": "FAIL",
-  "[V4.01] 11.2.17_case_insensitive_system_query_options :: mixed-case and no-$ 4.01 URL syntax remains accepted with OData-MaxVersion: 4.0": "FAIL",
+  "[V4.01] 11.2.17_case_insensitive_system_query_options :: mixed-case and no-$ 4.01 URL syntax remains accepted with OData-MaxVersion: 4.0": "PASS",
   "[V4.01] 11.2.17_case_insensitive_system_query_options :: same system query option must not appear multiple times across case/$ variants": "FAIL",
   "[V4.01] 11.2.17_case_insensitive_system_query_options :: unknown parameters without $ are treated as custom query params and ignored": "FAIL",
   "[V4.01] 11.2.17_case_insensitive_system_query_options :: unknown query options with $ are rejected": "FAIL",
@@ -1030,7 +1030,7 @@
   "[V4] 5.2_complex_types :: Order by complex type property: non-null City values appear in ascending order": "FAIL",
   "[V4] 5.2_complex_types :: Retrieve entity with complex type property": "FAIL",
   "[V4] 5.2_complex_types :: Retrieve entity with null complex type: returned entity has null ShippingAddress or null City": "FAIL",
-  "[V4] 5.2_complex_types :: Select complex type property": "FAIL",
+  "[V4] 5.2_complex_types :: Select complex type property": "PASS",
   "[V4] 5.2_custom_query_options :: custom query option names not starting with $ or @ are accepted": "FAIL",
   "[V4] 5.2_custom_query_options :: custom query options are ignored by protocol semantics and do not change selected result set": "FAIL",
   "[V4] 5.3_enum_metadata_members :: ProductStatus enum metadata declares the exact expected members, values, and IsFlags facet": "SKIP",

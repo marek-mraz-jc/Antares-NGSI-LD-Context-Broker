@@ -63,7 +63,9 @@ pub(crate) async fn serve(
             .await
             .unwrap_or_else(IntoResponse::into_response);
     }
-    let (ODataUri::Resource { path, options }, None) = (&request.uri, later(&request.uri)) else {
+    let (ODataUri::Resource { path, options }, None) =
+        (&request.uri, later(&request.uri, &reads.edm.schema_version))
+    else {
         return not_implemented(version).into_response();
     };
     let answer = match path.as_slice() {
@@ -80,7 +82,7 @@ pub(crate) async fn serve(
             count(reads, caller, set, options, version).await
         }
         [Segment::EntitySet(set), Segment::Key(key)] => {
-            entity(reads, caller, &ctx, set, key, options).await
+            entity(reads, caller, &ctx, set, key, options, headers).await
         }
         [Segment::EntitySet(set), Segment::Key(key), Segment::Ref] if only_select(options) => {
             paths::reference(reads, caller, &ctx, (set, key), options).await

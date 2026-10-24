@@ -299,7 +299,7 @@ antares-broker v0.3.0
 │   │   │       │       │       │       │       └── indexmap v2.14.0 (*)
 │   │   │       │       │       │       ├── indexmap feature "std" (*)
 │   │   │       │       │       │       ├── tokio feature "default"
-│   │   │       │       │       │       │   └── tokio v1.53.1
+│   │   │       │       │       │       │   └── tokio v1.53.3
 │   │   │       │       │       │       │       ├── mio v1.2.2
 │   │   │       │       │       │       │       │   └── libc feature "default" (*)
 │   │   │       │       │       │       │       ├── libc feature "default" (*)
@@ -326,9 +326,9 @@ antares-broker v0.3.0
 │   │   │       │       │       │       │               ├── syn feature "default" (*)
 │   │   │       │       │       │       │               └── syn feature "full" (*)
 │   │   │       │       │       │       ├── tokio feature "io-util"
-│   │   │       │       │       │       │   ├── tokio v1.53.1 (*)
+│   │   │       │       │       │       │   ├── tokio v1.53.3 (*)
 │   │   │       │       │       │       │   └── tokio feature "bytes"
-│   │   │       │       │       │       │       └── tokio v1.53.1 (*)
+│   │   │       │       │       │       │       └── tokio v1.53.3 (*)
 │   │   │       │       │       │       ├── tokio-util feature "codec"
 │   │   │       │       │       │       │   ├── tokio-util v0.7.19
 │   │   │       │       │       │       │   │   ├── libc feature "default" (*)
@@ -343,7 +343,7 @@ antares-broker v0.3.0
 │   │   │       │       │       │       │   │   ├── pin-project-lite feature "default" (*)
 │   │   │       │       │       │       │   │   ├── tokio feature "default" (*)
 │   │   │       │       │       │       │   │   └── tokio feature "sync"
-│   │   │       │       │       │       │   │       └── tokio v1.53.1 (*)
+│   │   │       │       │       │       │   │       └── tokio v1.53.3 (*)
 │   │   │       │       │       │       │   └── tokio-util feature "libc"
 │   │   │       │       │       │       │       └── tokio-util v0.7.19 (*)
 │   │   │       │       │       │       ├── tokio-util feature "default"
@@ -408,13 +408,13 @@ antares-broker v0.3.0
 │   │   │       │       ├── hyper feature "http1"
 │   │   │       │       │   └── hyper v1.11.1 (*)
 │   │   │       │       ├── tokio feature "net"
-│   │   │       │       │   ├── tokio v1.53.1 (*)
+│   │   │       │       │   ├── tokio v1.53.3 (*)
 │   │   │       │       │   ├── tokio feature "libc"
-│   │   │       │       │   │   └── tokio v1.53.1 (*)
+│   │   │       │       │   │   └── tokio v1.53.3 (*)
 │   │   │       │       │   ├── tokio feature "mio"
-│   │   │       │       │   │   └── tokio v1.53.1 (*)
+│   │   │       │       │   │   └── tokio v1.53.3 (*)
 │   │   │       │       │   ├── tokio feature "socket2"
-│   │   │       │       │   │   └── tokio v1.53.1 (*)
+│   │   │       │       │   │   └── tokio v1.53.3 (*)
 │   │   │       │       │   ├── mio feature "net"
 │   │   │       │       │   │   └── mio v1.2.2 (*)
 │   │   │       │       │   ├── mio feature "os-ext"
@@ -423,7 +423,7 @@ antares-broker v0.3.0
 │   │   │       │       │   │       └── mio v1.2.2 (*)
 │   │   │       │       │   └── mio feature "os-poll" (*)
 │   │   │       │       ├── tokio feature "time"
-│   │   │       │       │   └── tokio v1.53.1 (*)
+│   │   │       │       │   └── tokio v1.53.3 (*)
 │   │   │       │       ├── log feature "default" (*)
 │   │   │       │       ├── hyper-rustls feature "http1"
 │   │   │       │       │   ├── hyper-rustls v0.27.9
@@ -494,7 +494,7 @@ antares-broker v0.3.0
 │   │   │       │       │   │   ├── hyper-util feature "client-legacy"
 │   │   │       │       │   │   │   ├── hyper-util v0.1.21
 │   │   │       │       │   │   │   │   ├── futures-util v0.3.34 (*)
-│   │   │       │       │   │   │   │   ├── tokio v1.53.1 (*)
+│   │   │       │       │   │   │   │   ├── tokio v1.53.3 (*)
 │   │   │       │       │   │   │   │   ├── libc feature "default" (*)
 │   │   │       │       │   │   │   │   ├── base64 feature "default" (*)
 │   │   │       │       │   │   │   │   ├── bytes feature "default" (*)
@@ -527,7 +527,7 @@ antares-broker v0.3.0
 │   │   │       │       │   │   │   └── hyper-util feature "tokio"
 │   │   │       │       │   │   │       ├── hyper-util v0.1.21 (*)
 │   │   │       │       │   │   │       ├── tokio feature "rt"
-│   │   │       │       │   │   │       │   └── tokio v1.53.1 (*)
+│   │   │       │       │   │   │       │   └── tokio v1.53.3 (*)
 │   │   │       │       │   │   │       ├── tokio feature "time" (*)
 │   │   │       │       │   │   │       └── hyper-util feature "tokio" (*)
 │   │   │       │       │   │   ├── hyper-util feature "tokio" (*)
@@ -794,19 +794,19 @@ antares-broker v0.3.0
 │   │   │       │           └── tokio feature "io-util" (*)
 │   │   │       ├── tokio feature "default" (*)
 │   │   │       ├── tokio feature "macros"
-│   │   │       │   ├── tokio v1.53.1 (*)
+│   │   │       │   ├── tokio v1.53.3 (*)
 │   │   │       │   └── tokio feature "tokio-macros"
-│   │   │       │       └── tokio v1.53.1 (*)
+│   │   │       │       └── tokio v1.53.3 (*)
 │   │   │       ├── tokio feature "net" (*)
 │   │   │       ├── tokio feature "rt-multi-thread"
-│   │   │       │   ├── tokio v1.53.1 (*)
+│   │   │       │   ├── tokio v1.53.3 (*)
 │   │   │       │   └── tokio feature "rt" (*)
 │   │   │       ├── tokio feature "signal"
-│   │   │       │   ├── tokio v1.53.1 (*)
+│   │   │       │   ├── tokio v1.53.3 (*)
 │   │   │       │   ├── tokio feature "libc" (*)
 │   │   │       │   ├── tokio feature "mio" (*)
 │   │   │       │   ├── tokio feature "signal-hook-registry"
-│   │   │       │   │   └── tokio v1.53.1 (*)
+│   │   │       │   │   └── tokio v1.53.3 (*)
 │   │   │       │   ├── mio feature "net" (*)
 │   │   │       │   ├── mio feature "os-ext" (*)
 │   │   │       │   └── mio feature "os-poll" (*)
@@ -929,6 +929,9 @@ antares-broker v0.3.0
 │   │   ├── futures-util v0.3.34 (*)
 │   │   ├── chrono feature "default" (*)
 │   │   ├── chrono feature "serde" (*)
+│   │   ├── uuid feature "default" (*)
+│   │   ├── uuid feature "v4" (*)
+│   │   ├── uuid feature "v5" (*)
 │   │   ├── ngsild-model feature "default" (*)
 │   │   ├── serde_json feature "default" (*)
 │   │   ├── tokio feature "default" (*)
@@ -1288,7 +1291,7 @@ antares-broker v0.3.0
 │   │   │   │   │       │   └── futures-io feature "std" (*)
 │   │   │   │   │       ├── indexmap feature "default" (*)
 │   │   │   │   │       ├── tokio feature "fs"
-│   │   │   │   │       │   └── tokio v1.53.1 (*)
+│   │   │   │   │       │   └── tokio v1.53.3 (*)
 │   │   │   │   │       ├── tokio feature "io-util" (*)
 │   │   │   │   │       ├── tokio feature "net" (*)
 │   │   │   │   │       ├── tokio feature "rt" (*)
@@ -1661,7 +1664,7 @@ antares-broker v0.3.0
 │   │   │   │   │       │       │   └── thiserror v2.0.21
 │   │   │   │   │       │       │       └── thiserror-impl feature "default" (*)
 │   │   │   │   │       │       ├── tokio feature "fs"
-│   │   │   │   │       │       │   └── tokio v1.53.1
+│   │   │   │   │       │       │   └── tokio v1.53.3
 │   │   │   │   │       │       │       ├── mio v1.2.2
 │   │   │   │   │       │       │       │   └── libc feature "default" (*)
 │   │   │   │   │       │       │       ├── libc feature "default" (*)
@@ -1673,17 +1676,17 @@ antares-broker v0.3.0
 │   │   │   │   │       │       │       └── socket2 feature "default"
 │   │   │   │   │       │       │           └── socket2 v0.6.5 (*)
 │   │   │   │   │       │       ├── tokio feature "io-util"
-│   │   │   │   │       │       │   ├── tokio v1.53.1 (*)
+│   │   │   │   │       │       │   ├── tokio v1.53.3 (*)
 │   │   │   │   │       │       │   └── tokio feature "bytes"
-│   │   │   │   │       │       │       └── tokio v1.53.1 (*)
+│   │   │   │   │       │       │       └── tokio v1.53.3 (*)
 │   │   │   │   │       │       ├── tokio feature "net"
-│   │   │   │   │       │       │   ├── tokio v1.53.1 (*)
+│   │   │   │   │       │       │   ├── tokio v1.53.3 (*)
 │   │   │   │   │       │       │   ├── tokio feature "libc"
-│   │   │   │   │       │       │   │   └── tokio v1.53.1 (*)
+│   │   │   │   │       │       │   │   └── tokio v1.53.3 (*)
 │   │   │   │   │       │       │   ├── tokio feature "mio"
-│   │   │   │   │       │       │   │   └── tokio v1.53.1 (*)
+│   │   │   │   │       │       │   │   └── tokio v1.53.3 (*)
 │   │   │   │   │       │       │   ├── tokio feature "socket2"
-│   │   │   │   │       │       │   │   └── tokio v1.53.1 (*)
+│   │   │   │   │       │       │   │   └── tokio v1.53.3 (*)
 │   │   │   │   │       │       │   ├── mio feature "net"
 │   │   │   │   │       │       │   │   └── mio v1.2.2 (*)
 │   │   │   │   │       │       │   ├── mio feature "os-ext"
@@ -1692,11 +1695,11 @@ antares-broker v0.3.0
 │   │   │   │   │       │       │   │       └── mio v1.2.2 (*)
 │   │   │   │   │       │       │   └── mio feature "os-poll" (*)
 │   │   │   │   │       │       ├── tokio feature "rt"
-│   │   │   │   │       │       │   └── tokio v1.53.1 (*)
+│   │   │   │   │       │       │   └── tokio v1.53.3 (*)
 │   │   │   │   │       │       ├── tokio feature "sync"
-│   │   │   │   │       │       │   └── tokio v1.53.1 (*)
+│   │   │   │   │       │       │   └── tokio v1.53.3 (*)
 │   │   │   │   │       │       ├── tokio feature "time"
-│   │   │   │   │       │       │   └── tokio v1.53.1 (*)
+│   │   │   │   │       │       │   └── tokio v1.53.3 (*)
 │   │   │   │   │       │       ├── tokio-stream feature "default"
 │   │   │   │   │       │       │   ├── tokio-stream v0.1.19
 │   │   │   │   │       │       │   │   ├── pin-project-lite feature "default" (*)
@@ -1704,7 +1707,7 @@ antares-broker v0.3.0
 │   │   │   │   │       │       │   │   │   ├── futures-core v0.3.34
 │   │   │   │   │       │       │   │   │   └── futures-core feature "std" (*)
 │   │   │   │   │       │       │   │   ├── tokio feature "default"
-│   │   │   │   │       │       │   │   │   └── tokio v1.53.1 (*)
+│   │   │   │   │       │       │   │   │   └── tokio v1.53.3 (*)
 │   │   │   │   │       │       │   │   └── tokio feature "sync" (*)
 │   │   │   │   │       │       │   └── tokio-stream feature "time"
 │   │   │   │   │       │       │       ├── tokio-stream v0.1.19 (*)
@@ -2908,7 +2911,7 @@ antares-broker v0.3.0
 │       │               ├── tokio feature "rt" (*)
 │       │               ├── tokio feature "sync" (*)
 │       │               ├── tokio feature "test-util"
-│       │               │   ├── tokio v1.53.1 (*)
+│       │               │   ├── tokio v1.53.3 (*)
 │       │               │   ├── tokio feature "rt" (*)
 │       │               │   ├── tokio feature "sync" (*)
 │       │               │   └── tokio feature "time" (*)

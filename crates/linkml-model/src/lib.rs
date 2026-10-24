@@ -29,10 +29,11 @@ mod write;
 
 pub use error::Error;
 pub use model::{
-    edm_types, Builtin, Limits, Model, Range, EDM_TYPE_TAG, FLAG_TAGS, KIND_TAG, QB_COMPONENT_TAG,
-    QB_DSD_TAG, SURFACE_LIMITS,
+    edm_types, known_kind, Builtin, Limits, Model, Range, EDM_TYPE_TAG, FLAG_TAGS, KINDS, KIND_TAG,
+    QB_COMPONENT_TAG, QB_DSD_TAG, SURFACE_LIMITS,
 };
 pub use schema::{
-    Annotation, Class, Enum, PermissibleValue, Prefix, Schema, Slot, Unit, DEFAULT_RANGE, IMPORTS,
+    normalize, Annotation, Class, Enum, PermissibleValue, Prefix, Schema, Slot, Unit,
+    DEFAULT_RANGE, IMPORTS, NON_SEMANTIC,
 };
 pub use write::{context, json_schema, markdown, owl, qb, rdfs, shacl, yaml};

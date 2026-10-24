@@ -14,6 +14,8 @@ mod admin_auth;
 mod api_surface;
 mod attr_path_name_5_6_4;
 mod bounded_reads_5_14_5_16;
+#[cfg(feature = "channels")]
+mod channels_adr0031;
 mod collation_4_23;
 mod contexts_5_13;
 mod contexts_fleet_5_13;
@@ -36,6 +38,7 @@ mod entity_maps_5_14;
 mod entity_maps_usage_5_7;
 mod entity_member_null_5_5_12;
 mod expiry_sub_attr_4_22;
+mod fanout_bookkeeping_t5159;
 mod fed_entity_map_shape_5_2_39;
 mod fed_fanout_4_3_6;
 mod fed_query_entity_types_4_3_6_1;

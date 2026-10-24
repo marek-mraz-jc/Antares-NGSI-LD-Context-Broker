@@ -32,6 +32,10 @@ members = [
     "crates/antares-ws",
     "crates/antares-icsr",
     "crates/antares-geojson",
+    "crates/antares-feed",
+    "crates/antares-gbfs",
+    "crates/antares-gtfsrt",
+    "crates/antares-jsonstat",
     # The reference plugin: built and tested with the workspace so the
     # driver, routing and notification seams cannot drift from it.
     "examples/plugin-example",
@@ -74,6 +78,10 @@ antares-ical = { path = "crates/antares-ical" }
 antares-ws = { path = "crates/antares-ws" }
 antares-icsr = { path = "crates/antares-icsr" }
 antares-geojson = { path = "crates/antares-geojson" }
+antares-feed = { path = "crates/antares-feed" }
+antares-gbfs = { path = "crates/antares-gbfs" }
+antares-gtfsrt = { path = "crates/antares-gtfsrt" }
+antares-jsonstat = { path = "crates/antares-jsonstat" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
 # The storage driver seams are object-safe AND asynchronous, which no
@@ -183,9 +191,11 @@ debug = "line-tables-only"
 [profile.release]
 # Resident code is the largest idle-RSS consumer (measured 10.9 MiB
 # of a 37.5 MB unstripped binary). Symbols stripped (cargo-auditable's
-# .dep-v0 section survives), thin LTO for smaller + slightly faster code.
+# .dep-v0 section survives). Fat LTO (T-5234): one module drops the copies
+# thin LTO imports into each unit; vanilla 32.3 -> 27.0 MB, `full` 42.4 -> 35.8 MB,
+# 3-9 % less broker CPU per request on every shape, +3 min per release link.
 strip = "symbols"
-lto = "thin"
+lto = "fat"
 # Integer overflow panics instead of wrapping: within 3 % of unchecked on
 # the stable perf-baseline shapes (docs/src/perf-baseline.md, T-3552).
 overflow-checks = true
@@ -196,18 +206,25 @@ overflow-checks = true
 # $metadata, $batch, schemas) build for size: +5.58 MiB, OData/MCP benches
 # within host noise. opt-level "s" everywhere reached +4.92 MiB but cost
 # 16-26 % on the OData and MCP benches. Vanilla links none of these crates.
+# T-5234 (`full` 3 KB under its budget): one codegen unit for the cold
+# crates too and for antares-ogc (-416 KiB thin, -260 KiB under fat LTO).
+# opt-level "s" cost antares-ogc 7 % CPU per OGC request and grew rmcp by
+# 10 KB, so neither is taken.
 # surfaces-threat-model 10.1: the new crates keep overflow checks in release.
 [profile.release.package.antares-ops]
 overflow-checks = true
 opt-level = "s"
+codegen-units = 1
 
 [profile.release.package.linkml-model]
 overflow-checks = true
 opt-level = "s"
+codegen-units = 1
 
 [profile.release.package.odata-csdl]
 overflow-checks = true
 opt-level = "s"
+codegen-units = 1
 
 [profile.release.package.odata-url]
 overflow-checks = true
@@ -228,6 +245,7 @@ codegen-units = 1
 [profile.release.package.odata-batch]
 overflow-checks = true
 opt-level = "s"
+codegen-units = 1
 
 [profile.release.package.odata-axum]
 overflow-checks = true
@@ -250,6 +268,7 @@ codegen-units = 1
 
 [profile.release.package.antares-ogc]
 overflow-checks = true
+codegen-units = 1
 
 [profile.release.package.antares-sta]
 overflow-checks = true
@@ -268,11 +287,28 @@ codegen-units = 1
 
 [profile.release.package.schemars]
 opt-level = "s"
+codegen-units = 1
 
 [profile.release.package.antares-icsr]
 overflow-checks = true
 
 [profile.release.package.antares-geojson]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.antares-feed]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.antares-gbfs]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.antares-gtfsrt]
+overflow-checks = true
+codegen-units = 1
+
+[profile.release.package.antares-jsonstat]
 overflow-checks = true
 codegen-units = 1
 

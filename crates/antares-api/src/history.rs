@@ -103,14 +103,33 @@ pub(crate) fn backfilled(doc: &Value, attr: &str, current: &Value, incoming: &Va
     false
 }
 
-/// The provenance of the request in flight with its `operation`
-/// (T-4665); outside a request, a write of the broker's own: `api`.
+/// The provenance of the request in flight with its `operation` and
+/// `writtenAt`, when the broker stored it (T-4665, T-5361); outside a
+/// request, a write of the broker's own: `api`.
 pub(crate) fn provenance(operation: &str) -> Value {
     #[cfg(not(target_arch = "wasm32"))]
-    if let Ok(p) = PROVENANCE.try_with(|p| crate::provenance::with_operation(p, operation)) {
-        return p;
+    let request = PROVENANCE.try_with(Clone::clone).ok();
+    #[cfg(target_arch = "wasm32")]
+    let request: Option<Value> = None;
+    let base = request.unwrap_or_else(|| serde_json::json!({"channel": "api"}));
+    let mut out = crate::provenance::with_operation(&base, operation);
+    if let Some(o) = out.as_object_mut() {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        o.insert("writtenAt".into(), Value::String(now));
     }
-    crate::provenance::with_operation(&serde_json::json!({"channel": "api"}), operation)
+    out
+}
+
+/// Whether the request in flight came through an Endpoint that audits its
+/// changes (ADR-N-054 2.8, DM-136): each change is then kept as a version
+/// whatever the type's history rule says.
+fn audited() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    return PROVENANCE
+        .try_with(crate::provenance::audited)
+        .unwrap_or(false);
+    #[cfg(target_arch = "wasm32")]
+    false
 }
 
 /// Buffer one entity change for the request in flight so the matcher
@@ -168,9 +187,15 @@ const GATES: &[fn(&AppState, &TemporalEvent) -> bool] = &[observed_gate];
 /// metadata-shaped writes leave no history; `none` admits nothing.
 fn observed_gate(st: &AppState, ev: &TemporalEvent) -> bool {
     use crate::state::TemporalRecord::*;
+    // An audited write (DM-136) is kept without `observedAt` too.
+    let audited = || {
+        ev.instance
+            .get(antares_store::PROVENANCE_KEY)
+            .is_some_and(crate::provenance::audited)
+    };
     match st.temporal_record {
         All | Ruled => true,
-        Observed => ev.instance.get("observedAt").is_some(),
+        Observed => ev.instance.get("observedAt").is_some() || audited(),
         None => false,
     }
 }
@@ -220,6 +245,9 @@ pub fn retention_of(own: &Value) -> Result<OwnRetention, String> {
 /// Tenant's `*` rule. Below them all, `ANTARES_TEMPORAL_RECORD=ruled`
 /// records nothing (T-5056: history is opt-in), any other mode everything.
 pub(crate) fn records_history(st: &AppState, tenant: &TenantId, doc: &Value) -> bool {
+    if audited() {
+        return true;
+    }
     match own_retention(doc) {
         Some(Ok(OwnRetention::Off)) => return false,
         Some(Ok(OwnRetention::Keep(_))) => return true,
@@ -345,6 +373,11 @@ pub(crate) fn admits_change(
     before: Option<&Value>,
     instance: &Value,
 ) -> bool {
+    // An audited write keeps every change (DM-136); gate 1 already dropped
+    // an exact repeat.
+    if audited() {
+        return true;
+    }
     let default = if st.temporal_record == crate::state::TemporalRecord::Ruled {
         RecordMode::Observed
     } else {

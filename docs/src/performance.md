@@ -922,11 +922,35 @@ moved every shape the broker pushes down onto those:
 - the temporal `type=` reads `types[1] = ANY(...)` and the multi-type
   Entities through two new `temporal_entities` indexes instead of `&&`.
 
-`q` and `attrs` have no leakproof form: they ride the type arm's index and
-filter the type's rows, so their cost grows with the type, and a `q`
-without `type` still reads the Tenant. The q-equality row below asks for
-`speed == 42`, which no Entity of the type holds: the worst case, all of
-the type's rows read.
+`q` and `attrs` have no leakproof form of their own: the jsonb operators
+are not, and neither are numeric's `=` and `<`. Since T-5303 the store
+keys them in `entity_values` (migration 0024): per Entity and Attribute
+each number as float8 and each string up to 1 024 bytes as
+`text COLLATE "C"`, kept by statement triggers on `entities`. A top-level
+`q` term (`==` a number, a string or a numeric range; `<`, `<=`, `>`, `>=`
+a number) or `attrs=` first probes those btrees for at most 1 000 Entity
+ids, and the page ANDs `id = ANY(...)` to its WHERE; the `@?` or `?|`
+stays and decides. A term more than 1 000 Entities of the Tenant match
+gets no id list and reads the type's rows as before, plus the probe
+(about 1 ms). A planner-joined `id IN (SELECT ...)` was measured and
+dropped: the planner takes `@?` and `?|` for selective and joined every
+candidate on an unselective page (`attrs` of a 10 000-Entity Tenant
+1.6 -> 11 ms).
+
+The keys cost writes. Same box, 100 000 Entities of five Attributes in
+one INSERT: 5.5 s without the triggers, 18.7 s with them; a one-Entity
+INSERT 0.68 -> 0.86 ms and UPDATE 0.84 -> 1.75 ms (`pgbench`, one client,
+2 000 runs). The table and its three btrees take up to as much room as
+`entities` does.
+
+The q-equality row asks for `speed == 42`, which no Entity of the type
+holds: the worst case, all of the type's rows read. At 1M, 10 000
+Entities of the Tenant hold 42, past the probe's 1 000, so that row keeps
+its cost: a `q` whose value is common in the Tenant and rare in the type
+still reads the type (ponytail: a `types[1]` column in `entity_values`
+would key it, at another index per write). `q-range-all` and
+`q-all-untyped` match every Entity: the probe's cost on a page it cannot
+narrow.
 
 `dev/rls-plan-bench.sh <url> <N> [R] [R_BEFORE]` seeds two Tenants of N
 Entities each (the second one is there so that a walk of the table is not
@@ -937,6 +961,11 @@ T-4852. `crates/antares-sql/tests/pg_explain.rs` asserts the same plans at
 100 000 Entities on every test run. Box: the 16-core sandbox host,
 PostGIS 17.5-3.5 in a container with its defaults (`shared_buffers`
 128 MB, `work_mem` 4 MB), one client, R = 200, R_BEFORE = 20 at 1M.
+The q and attrs rows are T-5303's (2026-10-23, same box and image): "before"
+without the `entity_values` probe, "after" the probe plus the page.
+`q-range` asks `> 98` (1 % of the Tenant); the `-untyped` rows carry no
+`type`, `attrs-untyped` names an Attribute no Entity has, `q-range-all`
+and `q-all-untyped` ask `>= 0`, which every Entity holds.
 
 | shape | form | 10k p50 / p99 ms | 100k p50 / p99 ms | 1M p50 / p99 ms | scan nodes at 1M |
 |---|---|---|---|---|---|
@@ -944,9 +973,20 @@ PostGIS 17.5-3.5 in a container with its defaults (`shared_buffers`
 | type | same | 0.34 / 0.62 | 0.78 / 0.96 | 5.05 / 14.16 | Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
 | type=A,B | before | 0.67 / 0.96 | 6.81 / 9.99 | 319.24 / 339.54 | Index Scan entities_pkey |
 | type=A,B | after | 0.48 / 2.00 | 1.03 / 1.38 | 6.63 / 15.25 | Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
-| q-equality | same | 1.04 / 2.35 | 14.48 / 18.29 | 375.89 / 436.12 | Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
-| q-range | same | 0.56 / 0.92 | 16.02 / 20.97 | 9.74 / 20.48 | Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
-| attrs | same | 0.45 / 1.74 | 17.30 / 23.08 | 7.05 / 12.00 | Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
+| q-equality | before | 1.30 / 2.05 | 10.12 / 21.62 | 511.62 / 3114.95 | Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
+| q-equality | after | 0.85 / 1.42 | 4.78 / 8.18 | 474.63 / 792.37 | Index Scan i_entity_values_num (past 1 000: no ids), Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
+| q-range | before | 1.30 / 2.08 | 11.20 / 28.00 | 468.58 / 584.63 | Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
+| q-range | after | 0.99 / 1.62 | 13.88 / 25.29 | 498.20 / 745.78 | Bitmap Index Scan i_entity_values_num (past 1 000 from 100k on), Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
+| q-range-all | before | 1.84 / 2.57 | 1.45 / 2.86 | 12.91 / 20.11 | Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
+| q-range-all | after | 2.74 / 4.17 | 2.63 / 3.63 | 14.36 / 33.95 | Index Scan i_entity_values_num (no ids), Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
+| attrs | before | 1.49 / 3.66 | 1.25 / 1.76 | 8.30 / 14.41 | Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
+| attrs | after | 2.17 / 14.70 | 2.48 / 3.55 | 3.65 / 18.34 | Seq Scan entity_values (stops at 1 001 rows: no ids), Index Scan i_entities_first_type_id, Index Scan i_entities_multi_type_id |
+| q-eq-untyped | before | 6.13 / 9.48 | 19.71 / 34.17 | 863.83 / 3621.25 | Index Scan entities_pkey |
+| q-eq-untyped | after | 0.99 / 2.03 | 2.24 / 4.46 | 835.04 / 1152.29 | Index Scan i_entity_values_num, Index Scan entities_pkey (ids at 10k and 100k) |
+| q-all-untyped | before | 10.13 / 13.80 | 0.18 / 1.14 | 0.19 / 0.24 | Index Scan entities_pkey |
+| q-all-untyped | after | 11.74 / 15.91 | 1.25 / 1.98 | 0.77 / 4.42 | Index Scan i_entity_values_num (no ids), Index Scan entities_pkey |
+| attrs-untyped | before | 3.21 / 3.82 | 67.59 / 120.80 | 3756.84 / 8989.36 | Index Scan entities_pkey |
+| attrs-untyped | after | 0.30 / 0.54 | 0.29 / 0.38 | 0.31 / 0.44 | Index Scan i_entity_values_num |
 | geo-near | before | 33.23 / 67.17 | 257.32 / 397.72 | 2823.12 / 2886.87 | Index Scan entities_pkey |
 | geo-near | after | 0.28 / 0.41 | 0.34 / 0.80 | 0.72 / 1.12 | Bitmap Index Scan i_entities_loc_ambiguous, Bitmap Index Scan i_entities_location_cell |
 | geo-within | before | 20.94 / 35.01 | 224.29 / 282.46 | 2005.86 / 2094.93 | Index Scan entities_pkey |
