@@ -521,3 +521,78 @@ async fn a_view_bound_to_policies_describes_those_alone() -> Res {
     assert_eq!(at(&decision, "/decision"), json!(false), "{decision}");
     Ok(())
 }
+
+/// T-5527: `resource.properties.attribute` narrows the check to one Attribute, and
+/// `access/attributes` answers the caller's read, write and delete per Attribute of a type.
+#[tokio::test]
+async fn the_check_and_the_attribute_table_answer_per_attribute() -> Res {
+    let (_b, app, _) = setup().await?;
+    let on = |attribute: &str| {
+        json!({"action": {"name": "retrieveEntity"},
+               "resource": {"type": "AirQualityObserved", "properties": {"attribute": attribute}}})
+    };
+    assert_eq!(
+        at(&check(&app, &ANONYMOUS, &on("pm10")).await?, "/decision"),
+        true
+    );
+    assert_eq!(
+        check(&app, &ANONYMOUS, &on("temperature")).await?,
+        json!({"decision": false})
+    );
+    let ask = json!({"type": "InternalIncident", "attributes": ["severity", "notes"]});
+    let (status, _, body) = call(
+        &app,
+        "POST",
+        "/x/views/air/access/attributes",
+        &STEWARD,
+        Some(&ask.to_string()),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // the view serves no delete_attribute, so no delete is granted through it
+    assert_eq!(
+        parse(&body)?,
+        json!({"type": "InternalIncident", "attributes": [
+            {"name": "severity", "read": false, "write": true, "delete": false, "reason": "grant"},
+            {"name": "notes", "read": false, "write": false, "delete": false, "reason": "not_in_grant"}
+        ]})
+    );
+    assert!(!body.contains("ovzdusie"), "a policy id in {body}");
+    let (_, _, anonymous) = call(
+        &app,
+        "POST",
+        "/x/views/air/access/attributes",
+        &ANONYMOUS,
+        Some(&ask.to_string()),
+    )
+    .await?;
+    assert_eq!(at(&parse(&anonymous)?, "/attributes/0/reason"), "no_grant");
+    let names: Vec<String> = (0..=200).map(|i| format!("a{i}")).collect();
+    for malformed in [
+        json!({"attributes": ["severity"]}),
+        json!({"type": "InternalIncident"}),
+        json!({"type": "InternalIncident", "attributes": []}),
+        json!({"type": "InternalIncident", "attributes": [1]}),
+        json!({"type": "InternalIncident", "attributes": names}),
+    ] {
+        let (status, _, body) = call(
+            &app,
+            "POST",
+            "/x/views/air/access/attributes",
+            &STEWARD,
+            Some(&malformed.to_string()),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{malformed} {body}");
+    }
+    let (status, _, _) = call(
+        &app,
+        "POST",
+        "/x/views/nosuch/access/attributes",
+        &STEWARD,
+        Some(&ask.to_string()),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}

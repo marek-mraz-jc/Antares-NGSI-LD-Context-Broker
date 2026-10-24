@@ -3,7 +3,7 @@
 //! section 5.6): the caller's grants and the `AuthZEN` check, answered from
 //! the table the engine decides with.
 
-use crate::access::{authzen, check, explain, Grants};
+use crate::access::{attribute_of, attributes_of, authzen, check, explain, Grants};
 use crate::subject::Caller as JcCaller;
 use crate::{odrl, ucast, JoinedcontextPolicy};
 use antares_api::policy::Subject;
@@ -23,6 +23,9 @@ pub const NAME: &str = "access";
 
 /// The largest `access/check` body read.
 const MAX_CHECK_BYTES: usize = 64 * 1024;
+
+/// The most Attributes one `access/attributes` request asks about.
+pub const MAX_ATTRIBUTES: usize = 200;
 
 /// The surface over one engine: the one the broker decides with.
 pub struct Access {
@@ -51,13 +54,15 @@ impl Surface for Access {
             "/x/views/{view}/access",
             "/x/views/{view}/access/check",
             "/x/views/{view}/access/explain",
+            "/x/views/{view}/access/attributes",
         ]})
     }
 
     fn router(&self, ops: Ops) -> Router {
         let (ops_get, engine_get) = (ops.clone(), self.engine.clone());
         let (ops_check, engine_check) = (ops.clone(), self.engine.clone());
-        let (ops_explain, engine_explain) = (ops, self.engine.clone());
+        let (ops_explain, engine_explain) = (ops.clone(), self.engine.clone());
+        let (ops_attrs, engine_attrs) = (ops, self.engine.clone());
         Router::new()
             .route(
                 "/{view}/access",
@@ -71,7 +76,14 @@ impl Surface for Access {
                 "/{view}/access/check",
                 post(
                     move |Path(view): Path<String>, caller: Caller, body: Bytes| async move {
-                        decide(&ops_check, &engine_check, &view, &caller, &body, check)
+                        decide(
+                            &ops_check,
+                            &engine_check,
+                            &view,
+                            &caller,
+                            &body,
+                            check_answer,
+                        )
                     },
                 )
                 .layer(DefaultBodyLimit::max(MAX_CHECK_BYTES)),
@@ -86,8 +98,17 @@ impl Surface for Access {
                             &view,
                             &caller,
                             &body,
-                            explain,
+                            explain_answer,
                         )
+                    },
+                )
+                .layer(DefaultBodyLimit::max(MAX_CHECK_BYTES)),
+            )
+            .route(
+                "/{view}/access/attributes",
+                post(
+                    move |Path(view): Path<String>, caller: Caller, body: Bytes| async move {
+                        decide(&ops_attrs, &engine_attrs, &view, &caller, &body, table)
                     },
                 )
                 .layer(DefaultBodyLimit::max(MAX_CHECK_BYTES)),
@@ -161,8 +182,76 @@ fn typed(body: &str, media_type: &'static str) -> Response {
     ([(CONTENT_TYPE, media_type)], body.to_owned()).into_response()
 }
 
-/// How one prospective request is answered: [`check`] or [`explain`].
-type Answer = fn(&Grants<'_>, &str, Option<&str>, &dyn Fn(&str) -> bool) -> Value;
+/// How one request of the surface is answered from the caller's grants and
+/// the rows the view serves: the answer, or why the request is malformed.
+type Answer = fn(&Grants<'_>, &Value, &dyn Fn(&str) -> bool) -> Result<Value, &'static str>;
+
+/// `access/check`: [`check`] on the `AuthZEN` request.
+fn check_answer(
+    grants: &Grants<'_>,
+    query: &Value,
+    served: &dyn Fn(&str) -> bool,
+) -> Result<Value, &'static str> {
+    let (action, entity_type) = prospective(query)?;
+    Ok(check(
+        grants,
+        action,
+        entity_type,
+        attribute_of(query),
+        served,
+    ))
+}
+
+/// `access/explain`: [`explain`] on the `AuthZEN` request.
+fn explain_answer(
+    grants: &Grants<'_>,
+    query: &Value,
+    served: &dyn Fn(&str) -> bool,
+) -> Result<Value, &'static str> {
+    let (action, entity_type) = prospective(query)?;
+    Ok(explain(
+        grants,
+        action,
+        entity_type,
+        attribute_of(query),
+        served,
+    ))
+}
+
+/// `action.name` and `resource.type` of an `AuthZEN` request.
+fn prospective(query: &Value) -> Result<(&str, Option<&str>), &'static str> {
+    let action = query
+        .pointer("/action/name")
+        .and_then(Value::as_str)
+        .ok_or("action.name is required")?;
+    Ok((
+        action,
+        query.pointer("/resource/type").and_then(Value::as_str),
+    ))
+}
+
+/// `access/attributes`: [`attributes_of`] for `{type, attributes}`, 1 to
+/// [`MAX_ATTRIBUTES`] names.
+fn table(
+    grants: &Grants<'_>,
+    query: &Value,
+    served: &dyn Fn(&str) -> bool,
+) -> Result<Value, &'static str> {
+    let entity_type = query
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+        .ok_or("type is required: the Entity type the attributes belong to")?;
+    let names: Option<Vec<&str>> = query
+        .get("attributes")
+        .and_then(Value::as_array)
+        .map(|names| names.iter().map(Value::as_str).collect())
+        .unwrap_or_default();
+    let names = names
+        .filter(|n| !n.is_empty() && n.len() <= MAX_ATTRIBUTES && n.iter().all(|a| !a.is_empty()))
+        .ok_or("attributes is required: a list of 1 to 200 attribute names")?;
+    Ok(attributes_of(grants, entity_type, &names, served))
+}
 
 fn decide(
     ops: &Ops,
@@ -178,10 +267,6 @@ fn decide(
     let Ok(query) = serde_json::from_slice::<Value>(body) else {
         return Refusal::Malformed("the request body is not JSON").ngsi_ld();
     };
-    let Some(action) = query.pointer("/action/name").and_then(Value::as_str) else {
-        return Refusal::Malformed("action.name is required").ngsi_ld();
-    };
-    let entity_type = query.pointer("/resource/type").and_then(Value::as_str);
     let table = engine.table(view.tenant());
     let who = caller_of(caller);
     let grants = Grants::of(
@@ -189,8 +274,11 @@ fn decide(
         &who,
         chrono::Utc::now(),
     );
-    let answer = answer(&grants, action, entity_type, &serves(&view));
-    typed(&answer.to_string(), "application/json")
+    let answered = answer(&grants, &query, &serves(&view));
+    match answered {
+        Ok(answer) => typed(&answer.to_string(), "application/json"),
+        Err(why) => Refusal::Malformed(why).ngsi_ld(),
+    }
 }
 
 /// The representations `GET access` serves.
