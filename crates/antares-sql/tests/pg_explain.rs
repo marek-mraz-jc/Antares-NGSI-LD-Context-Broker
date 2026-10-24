@@ -339,7 +339,9 @@ async fn every_query_shape_reads_an_index_under_rls() {
         ),
         ("type", type_page(&w, &[&[&t1]], 21), "i_entities_first_type_id"),
         ("type=A,B", type_page(&w, &[&[&t1], &[&t2]], 21), "i_entities_first_type_id"),
-        ("type=A;B", type_page(&w, &[&[&t(0), "https://x/M"]], 21), "i_entities_multi_type_id"),
+        // either partial index of the multi-type Entities: which one the planner
+        // takes depends on the seed's statistics (CI plans the GIN one)
+        ("type=A;B", type_page(&w, &[&[&t(0), "https://x/M"]], 21), "i_entities_multi_type_id|i_entities_types_multi"),
         ("type=A,B;C", type_page(&w, &[&[&t1], &[&t(0), "https://x/M"]], 21), "i_entities_first_type_id"),
         ("q equality", type_page(&format!("{w} AND {}", speed("== 42")), &[&[&t1]], 21), "i_entities_first_type_id"),
         ("q range", type_page(&format!("{w} AND {}", speed("> 90")), &[&[&t1]], 21), "i_entities_first_type_id"),
@@ -444,7 +446,8 @@ async fn every_query_shape_reads_an_index_under_rls() {
     for (shape, sql, index) in &shapes {
         let plan = plan_of(&pool, RLS_A, sql).await;
         let id_ok = *shape != "id" || plan.contains("id = ANY");
-        if !plan.contains(index) || !id_ok || (*shape != "id" && walks(&plan)) {
+        let named = index.split('|').any(|i| plan.contains(i));
+        if !named || !id_ok || (*shape != "id" && walks(&plan)) {
             bad.push(format!("{shape} (wants {index}):\n{plan}"));
         }
     }
@@ -468,7 +471,8 @@ async fn an_and_group_under_rls_reads_the_multi_type_index() {
     let sql = type_page(&w, &[&["https://x/T0", "https://x/M"]], 21);
     let plan = plan_of(&pool, RLS_A, &sql).await;
     assert!(
-        plan.contains("i_entities_multi_type_id") && !plan.contains("i_entities_first_type_id"),
+        (plan.contains("i_entities_multi_type_id") || plan.contains("i_entities_types_multi"))
+            && !plan.contains("i_entities_first_type_id"),
         "type=A;B reads more than the multi-type Entities:\n{plan}"
     );
     let mut tx = pool.begin().await.expect("tx");
