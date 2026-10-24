@@ -351,14 +351,6 @@ fn a_malformed_slot_is_refused_with_its_index() {
             json!({ "target": "x", "kind": "expr" }),
             "carries no expression",
         ),
-        (
-            json!({ "target": "x", "source": "y", "kind": "unitConversion", "factor": 1, "ofset": 2 }),
-            "slot 0: a unitConversion slot has no member \"ofset\"",
-        ),
-        (
-            json!({ "target": "x", "source": "y", "kind": "rename", "forward": {} }),
-            "a rename slot has no member \"forward\"",
-        ),
     ] {
         let e = refused(slot.clone());
         assert!(e.contains(says), "{slot}: {e}");

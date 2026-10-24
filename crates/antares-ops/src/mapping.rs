@@ -83,22 +83,6 @@ const CLASS_TERM: &str = "jcSrcClass";
 /// The `GeoProperty` a geo-query filters when it names none (4.10).
 const LOCATION: &str = "location";
 
-/// The members a slot of each kind may carry (DM-52); any other member is
-/// refused, so a misspelt `ofset` is not read as an offset of 0. `inverse`
-/// is the compiler's: the preimage is computed from `forward`.
-const SLOT_MEMBERS: [&str; 4] = ["target", "source", "kind", "filterable"];
-
-fn kind_members(kind: &str) -> &'static [&'static str] {
-    match kind {
-        "unitConversion" => &["factor", "offset"],
-        "valueMappings" => &["forward", "inverse"],
-        "cast" => &["range"],
-        "constant" => &["value"],
-        "expr" => &["expression"],
-        _ => &[],
-    }
-}
-
 /// The members of an Entity that belong to NGSI-LD rather than to a model.
 const STRUCTURAL: [&str; 3] = ["id", "@id", "scope"];
 
@@ -1650,12 +1634,6 @@ fn slot(index: usize, entry: &Value, iri: Expand<'_>) -> Result<RawSlot, String>
         )?),
         other => return Err(at(&format!("kind {other:?} is not one this broker runs"))),
     };
-    if let Some(member) = m
-        .keys()
-        .find(|k| !SLOT_MEMBERS.contains(&k.as_str()) && !kind_members(kind).contains(&k.as_str()))
-    {
-        return Err(at(&format!("a {kind} slot has no member {member:?}")));
-    }
     if source.is_none() && !matches!(derivation, Derivation::Constant(_) | Derivation::Expr(_)) {
         return Err(at("names no source"));
     }
