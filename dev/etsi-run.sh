@@ -80,9 +80,10 @@ export SUITE_CONTEXT="${SUITE_CONTEXT:-}"
   # the 058 TPs reach the mosquitto the pipeline starts by its container name, as the vendored
   # suite names it; forge's later commits say 127.0.0.1, where nothing listens (T-3677)
   sed -i "s|^mqtt_broker_host = .*|mqtt_broker_host = 'ngsi-ld-test-suite-mosquitto-container'|" variables.py
-  # the suite context the pipeline serves from this checkout (T-3550)
+  # the suite context the pipeline serves from this checkout (T-3550), appended: the last
+  # assignment wins, and forge integration/all-fixes spells the default over three lines
   [ -z "${SUITE_CONTEXT:-}" ] \
-    || sed -i "s|^ngsild_test_suite_context = .*|ngsild_test_suite_context = '$SUITE_CONTEXT'|" variables.py )
+    || printf "\nngsild_test_suite_context = '%s'\n" "$SUITE_CONTEXT" >> variables.py )
 
 mkdir -p "$RESULTS_DIR"
 EXTRA=()
