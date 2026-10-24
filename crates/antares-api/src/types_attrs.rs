@@ -294,14 +294,16 @@ async fn type_names(
     max: usize,
     view: View<'_>,
 ) -> Result<Option<(Vec<String>, bool)>, NgsiError> {
-    let Some(names) = st.store.entity_type_names(tenant).await? else {
-        return Ok(None);
-    };
     let Some(view) = view else {
-        return Ok(Some((names, false)));
+        return Ok(st
+            .store
+            .entity_type_names(tenant)
+            .await?
+            .map(|n| (n, false)));
     };
+    let rules: Vec<_> = rules_of(view).collect();
     let mut beside = Vec::new();
-    for rule in rules_of(view) {
+    for rule in &rules {
         beside.push(match rule.types.is_empty() {
             true => None,
             false => st
@@ -311,6 +313,17 @@ async fn type_names(
                 .map(|t| t.into_iter().collect::<BTreeSet<String>>()),
         });
     }
+    // A view with rules probes only the names `candidates` lists, and each
+    // probe proves its type live: the Tenant's whole type list, a skip scan
+    // plus a walk of the multi-typed Entities per catalogued type (RLS keeps
+    // `@>` off the GIN), is read only when that set is unknown (T-5325).
+    let names = match candidates(unruled(view), &rules, &beside) {
+        Some(names) => names,
+        None => match st.store.entity_type_names(tenant).await? {
+            Some(names) => names,
+            None => return Ok(None),
+        },
+    };
     let mut shown = Vec::new();
     let mut partial = false;
     for name in names {
@@ -361,12 +374,7 @@ async fn first_visible(
     beside: &[Option<BTreeSet<String>>],
 ) -> Result<Probe, NgsiError> {
     let rules: Vec<_> = rules_of(view).collect();
-    let unruled = view
-        .0
-        .policy_types
-        .as_deref()
-        .is_none_or(|f| f.rules.is_empty());
-    let probes = plan(name, &rules, unruled, beside);
+    let probes = plan(name, &rules, unruled(view), beside);
     let mut cut = false;
     for (groups, q) in &probes {
         match probe(st, tenant, max, name, groups, *q, view).await? {
@@ -376,6 +384,37 @@ async fn first_visible(
         }
     }
     Ok(if cut { Probe::Cut } else { Probe::None })
+}
+
+/// Whether the view narrows without rules: then every type is probed alone.
+fn unruled(view: (&crate::repr::Repr, &antares_jsonld::Context)) -> bool {
+    view.0
+        .policy_types
+        .as_deref()
+        .is_none_or(|f| f.rules.is_empty())
+}
+
+/// Every name [`plan`] can send a probe for under a view with rules: each
+/// rule's types and the types the store found beside them, sorted. `None`
+/// when the view has no rules or a rule's `beside` is unknown, so any
+/// catalogued name may be probed.
+fn candidates(
+    unruled: bool,
+    rules: &[&crate::policy::Rule],
+    beside: &[Option<BTreeSet<String>>],
+) -> Option<Vec<String>> {
+    if unruled {
+        return None;
+    }
+    let mut names = BTreeSet::new();
+    for (rule, beside) in rules.iter().zip(beside) {
+        if rule.types.is_empty() {
+            continue;
+        }
+        names.extend(rule.types.iter().cloned());
+        names.extend(beside.as_ref()?.iter().cloned());
+    }
+    Some(names.into_iter().collect())
 }
 
 type Plan<'a> = Vec<(Vec<Vec<String>>, Option<&'a antares_ql::QNode>)>;
@@ -1349,5 +1388,24 @@ mod probe_plan {
             [vec![vec!["Stop".to_owned()]]]
         );
         assert!(plan("Stop", &[&rule(&[], None)], false, &[None]).is_empty());
+    }
+
+    /// A view with rules lists only the names its probes can show, so the
+    /// Tenant's whole type list goes unread (T-5325); every name `plan`
+    /// probes is among them. No rules, or an unknown `beside`, lists none.
+    #[test]
+    fn a_ruled_view_reads_candidates_instead_of_the_type_list() {
+        let (car, bus, none) = (rule(&["Car"], None), rule(&["Bus"], None), rule(&[], None));
+        let rules = [&car, &bus, &none];
+        let beside = [set(&["Car", "Tree"]), set(&["Bus"]), None];
+        let names = candidates(false, &rules, &beside).expect("known");
+        assert_eq!(names, ["Bus", "Car", "Tree"]);
+        for name in ["Bus", "Car", "Lamp", "Stop", "Tree"] {
+            let probed = !plan(name, &rules, false, &beside).is_empty();
+            assert_eq!(probed, names.contains(&name.to_owned()), "{name}");
+        }
+        assert_eq!(candidates(true, &[], &[]), None);
+        assert_eq!(candidates(false, &[&car], &[None]), None);
+        assert_eq!(candidates(false, &[], &[]), Some(Vec::new()));
     }
 }
