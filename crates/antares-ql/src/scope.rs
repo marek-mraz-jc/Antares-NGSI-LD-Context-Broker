@@ -400,6 +400,9 @@ mod clause_4_19 {
             "/Madrid/+G",
             "/a.b",
             "/a-b",
+            // an empty pattern inside a group
+            "(/a;;/b)",
+            "(/Madrid;)",
         ] {
             let err = check_scope_q(bad).unwrap_err();
             assert_eq!(err.status(), 400, "{bad:?}: {err}");
