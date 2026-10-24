@@ -116,7 +116,14 @@ async fn a_well_formed_scope_q_is_still_answered() {
     }
     for (uri, doc) in bodies(GOOD) {
         let (status, body) = send(&st, "POST", uri, Some(doc)).await;
-        assert!(status.is_success(), "{uri}: {status} {body}");
+        // TS 104 176 7.12.3.1 / 8.x query: a valid query answers 200;
+        // 7.13.3.2: a created Subscription answers 201
+        let want = if uri.ends_with("/subscriptions") {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        };
+        assert_eq!(status, want, "{uri}: {body}");
     }
 }
 
