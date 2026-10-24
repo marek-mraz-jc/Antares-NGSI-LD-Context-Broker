@@ -294,16 +294,148 @@ async fn type_names(
     max: usize,
     view: View<'_>,
 ) -> Result<Option<(Vec<String>, bool)>, NgsiError> {
-    let Some(view) = view else {
+    if view.is_none() {
         return Ok(st
             .store
             .entity_type_names(tenant)
             .await?
             .map(|n| (n, false)));
+    }
+    let beside = besides(st, tenant, view).await?;
+    let Some(names) = probe_names(st, tenant, view, &beside).await? else {
+        return Ok(None);
     };
-    let rules: Vec<_> = rules_of(view).collect();
+    let w = Walk {
+        st,
+        tenant,
+        max,
+        view,
+        beside: &beside,
+    };
+    let mut shown = Vec::new();
+    let mut partial = false;
+    for name in names {
+        match first_visible(&w, &name, None, &mut |_| true).await? {
+            Probe::Seen => shown.push(name),
+            Probe::None => {}
+            Probe::Cut => partial = true,
+        }
+    }
+    Ok(Some((shown, partial)))
+}
+
+/// type IRI → the Attribute names its Entities show the caller
+type Shapes = BTreeMap<String, BTreeSet<String>>;
+
+/// 5.7.6 and 5.7.8/5.7.9 from the store's attribute catalogue (T-4934): per
+/// live type, the first page of Entities the caller sees names most of its
+/// Attributes, and each catalogued name that page lacks is one probe of the
+/// Entities carrying it. A name the view cannot show on that type is never
+/// probed. The answer is the fold's: a type is listed when the caller sees
+/// one of its Entities, an Attribute when such an Entity shows it. `/attributes`
+/// folded every Entity of the Tenant: 13-19 s on dev. `None` when the
+/// backend keeps no catalogue; `true` beside the shapes when a probe stopped
+/// at `max` Entities read.
+/// ponytail: a name no Entity carries any more stays catalogued and costs a
+/// walk over its type per call; prune it with a counted catalogue if that shows up.
+async fn type_shapes(
+    st: &AppState,
+    tenant: &antares_model::TenantId,
+    max: usize,
+    view: View<'_>,
+) -> Result<Option<(Shapes, bool)>, NgsiError> {
+    let Some(pairs) = st.store.entity_attr_pairs(tenant).await? else {
+        return Ok(None);
+    };
+    let mut catalogue = Shapes::new();
+    for (t, a) in pairs {
+        if !is_meta(&a) {
+            catalogue.entry(t).or_default().insert(a);
+        }
+    }
+    let beside = besides(st, tenant, view).await?;
+    let Some(names) = probe_names(st, tenant, view, &beside).await? else {
+        return Ok(None);
+    };
+    let w = Walk {
+        st,
+        tenant,
+        max,
+        view,
+        beside: &beside,
+    };
+    let mut shapes = Shapes::new();
+    let mut partial = false;
+    for name in names {
+        let mut seen = BTreeSet::new();
+        let mut note = |d: &Value| {
+            let keys = d.as_object().into_iter().flat_map(|o| o.keys());
+            seen.extend(keys.filter(|k| !is_meta(k)).cloned());
+            true
+        };
+        match first_visible(&w, &name, None, &mut note).await? {
+            Probe::Seen => {}
+            Probe::None => continue,
+            Probe::Cut => {
+                partial = true;
+                continue;
+            }
+        }
+        let mut wanted = catalogue.remove(&name).unwrap_or_default();
+        wanted.retain(|a| !seen.contains(a) && may_show(view, &name, a));
+        for a in &wanted {
+            let mut shows = |d: &Value| d.get(a).is_some();
+            match first_visible(&w, &name, Some(a), &mut shows).await? {
+                Probe::Seen => {
+                    seen.insert(a.clone());
+                }
+                Probe::None => {}
+                Probe::Cut => partial = true,
+            }
+        }
+        shapes.insert(name, seen);
+    }
+    Ok(Some((shapes, partial)))
+}
+
+/// Whether the narrowing can show Attribute `attr` on an Entity of type
+/// `name` at all: the projection keeps it, a rule shows it and the type does
+/// not omit it. False only where [`visible`] would drop it from every such
+/// Entity, so a probe for it would walk the type for nothing.
+fn may_show(view: View<'_>, name: &str, attr: &str) -> bool {
+    let Some(view) = view else {
+        return true;
+    };
+    let r = view.0;
+    if !crate::repr::policy_projected(r.policy_pick.as_deref(), r.policy_omit.as_deref(), attr) {
+        return false;
+    }
+    let Some(f) = r.policy_types.as_deref() else {
+        return true;
+    };
+    let ruled = f.rules.is_empty()
+        || rules_of(view)
+            .any(|rule| rule.every_attribute || rule.attributes.iter().any(|a| a == attr));
+    ruled
+        && !f
+            .omit_by_type
+            .get(name)
+            .is_some_and(|o| o.iter().any(|a| a == attr))
+}
+
+/// Per rule of the narrowing, the types an Entity of two or more types
+/// carries beside the rule's own (T-4683); `None` for a rule naming no type
+/// or a backend without that read.
+async fn besides(
+    st: &AppState,
+    tenant: &antares_model::TenantId,
+    view: View<'_>,
+) -> Result<Vec<Option<BTreeSet<String>>>, NgsiError> {
     let mut beside = Vec::new();
-    for rule in &rules {
+    let Some(view) = view else {
+        return Ok(beside);
+    };
+    for rule in rules_of(view) {
         beside.push(match rule.types.is_empty() {
             true => None,
             false => st
@@ -313,27 +445,35 @@ async fn type_names(
                 .map(|t| t.into_iter().collect::<BTreeSet<String>>()),
         });
     }
-    // A view with rules probes only the names `candidates` lists, and each
-    // probe proves its type live: the Tenant's whole type list, a skip scan
-    // plus a walk of the multi-typed Entities per catalogued type (RLS keeps
-    // `@>` off the GIN), is read only when that set is unknown (T-5325).
-    let names = match candidates(unruled(view), &rules, &beside) {
-        Some(names) => names,
-        None => match st.store.entity_type_names(tenant).await? {
-            Some(names) => names,
-            None => return Ok(None),
-        },
-    };
-    let mut shown = Vec::new();
-    let mut partial = false;
-    for name in names {
-        match first_visible(st, tenant, max, &name, view, &beside).await? {
-            Probe::Seen => shown.push(name),
-            Probe::None => {}
-            Probe::Cut => partial = true,
-        }
+    Ok(beside)
+}
+
+/// The type names a discovery answer probes. A view with rules probes only
+/// the names `candidates` lists, and each probe proves its type live: the
+/// Tenant's whole type list, a skip scan plus a walk of the multi-typed
+/// Entities per catalogued type (RLS keeps `@>` off the GIN), is read only
+/// when that set is unknown (T-5325). `None` when the backend keeps no type
+/// list.
+async fn probe_names(
+    st: &AppState,
+    tenant: &antares_model::TenantId,
+    view: View<'_>,
+    beside: &[Option<BTreeSet<String>>],
+) -> Result<Option<Vec<String>>, NgsiError> {
+    let rules: Vec<_> = view.map(rules_of).into_iter().flatten().collect();
+    match candidates(unruled(view), &rules, beside) {
+        Some(names) => Ok(Some(names)),
+        None => st.store.entity_type_names(tenant).await,
     }
-    Ok(Some((shown, partial)))
+}
+
+/// What every probe of one discovery answer shares.
+struct Walk<'a> {
+    st: &'a AppState,
+    tenant: &'a antares_model::TenantId,
+    max: usize,
+    view: View<'a>,
+    beside: &'a [Option<BTreeSet<String>>],
 }
 
 /// What a probe of one type found.
@@ -356,28 +496,35 @@ fn rules_of<'a>(
         .filter(|r| r.q.as_deref().is_none_or(|q| !q.has_linked_paths()))
 }
 
-/// Whether the caller sees an Entity of `name`. Each rule of the narrowing
+/// Whether the caller sees an Entity of `name` (carrying `attr`, when
+/// given) that `each` counts; `each` sees every visible Entity of the page
+/// that held the first counted one. Each rule of the narrowing
 /// is one probe, the rule's `q` pushed down, so a condition few Entities meet
 /// reads those few. A rule naming `name` probes `name` alone; a
 /// rule naming other types probes `name` beside each of them, and only when
 /// `beside` (per rule, from the store) says an Entity carries both: on
 /// Postgres such a two-type group with no match walked the Tenant's whole
 /// primary key for its `ORDER BY id LIMIT` (T-4683, 17 s for `list_types`).
-/// A narrowing without rules is one probe of `name`. [`visible`] still judges
-/// every Entity a probe reads.
+/// A narrowing without rules, and no narrowing, is one probe of `name`.
+/// [`visible`] still judges every Entity a probe reads.
 async fn first_visible(
-    st: &AppState,
-    tenant: &antares_model::TenantId,
-    max: usize,
+    w: &Walk<'_>,
     name: &str,
-    view: (&crate::repr::Repr, &antares_jsonld::Context),
-    beside: &[Option<BTreeSet<String>>],
+    attr: Option<&str>,
+    each: &mut impl FnMut(&Value) -> bool,
 ) -> Result<Probe, NgsiError> {
-    let rules: Vec<_> = rules_of(view).collect();
-    let probes = plan(name, &rules, unruled(view), beside);
+    let view = w.view;
+    let rules: Vec<_> = view.map(rules_of).into_iter().flatten().collect();
+    let probes = plan(name, &rules, unruled(view), w.beside);
     let mut cut = false;
     for (groups, q) in &probes {
-        match probe(st, tenant, max, name, groups, *q, view).await? {
+        let one = Probing {
+            name,
+            groups,
+            q: *q,
+            attr,
+        };
+        match probe(w.st, w.tenant, w.max, &one, view, each).await? {
             Probe::Seen => return Ok(Probe::Seen),
             Probe::Cut => cut = true,
             Probe::None => {}
@@ -385,12 +532,10 @@ async fn first_visible(
     }
     Ok(if cut { Probe::Cut } else { Probe::None })
 }
-
 /// Whether the view narrows without rules: then every type is probed alone.
-fn unruled(view: (&crate::repr::Repr, &antares_jsonld::Context)) -> bool {
-    view.0
-        .policy_types
-        .as_deref()
+/// No narrowing counts as unruled.
+fn unruled(view: View<'_>) -> bool {
+    view.and_then(|v| v.0.policy_types.as_deref())
         .is_none_or(|f| f.rules.is_empty())
 }
 
@@ -454,29 +599,48 @@ fn plan<'a>(
     probes
 }
 
-/// One probe of [`first_visible`], read [`PROBE_PAGE`] at a time up to `max`.
+/// One probe's selection: the type, its groups, the rule's `q` and the
+/// Attribute the Entities must carry.
+struct Probing<'a> {
+    name: &'a str,
+    groups: &'a [Vec<String>],
+    q: Option<&'a antares_ql::QNode>,
+    attr: Option<&'a str>,
+}
+
+/// One probe of [`first_visible`] up to `max` Entities read: [`PROBE_PAGE`]
+/// first, then [`SCAN_PAGE`] at a time by keyset, so a walk for an
+/// Attribute few Entities carry reads each Entity once (T-4934).
 async fn probe(
     st: &AppState,
     tenant: &antares_model::TenantId,
     max: usize,
-    name: &str,
-    groups: &[Vec<String>],
-    q: Option<&antares_ql::QNode>,
-    view: (&crate::repr::Repr, &antares_jsonld::Context),
+    one: &Probing<'_>,
+    view: View<'_>,
+    each: &mut impl FnMut(&Value) -> bool,
 ) -> Result<Probe, NgsiError> {
     let ctx = crate::repr::policy_context();
     let expand = |t: &str| ctx.expand_key(t);
-    let only = Narrow::Type(name);
-    let mut offset = 0usize;
-    while offset < max {
-        let want = PROBE_PAGE.min(max.saturating_sub(offset));
+    let attrs: Vec<String> = one.attr.into_iter().map(str::to_owned).collect();
+    let mut read = 0usize;
+    let mut last: Option<String> = None;
+    let mut head: Option<String> = None;
+    let mut keyset = true;
+    while read < max {
+        let page = if read == 0 { PROBE_PAGE } else { SCAN_PAGE };
+        let want = page.min(max.saturating_sub(read));
         let f = EntityFilter {
-            types: Some(groups),
-            q,
+            types: Some(one.groups),
+            attrs: one.attr.map(|_| &attrs[..]),
+            q: one.q,
             expand: &expand,
             ctx: Some(ctx),
+            after_id: last.as_deref().filter(|_| keyset),
             page: Some(Page {
-                offset: i64::try_from(offset).unwrap_or(i64::MAX),
+                offset: match keyset {
+                    true => 0,
+                    false => i64::try_from(read).unwrap_or(i64::MAX),
+                },
                 limit: i64::try_from(want).unwrap_or(i64::MAX),
                 count: false,
             }),
@@ -484,19 +648,36 @@ async fn probe(
         };
         let out = st.store.query_entities(tenant, &f).await?;
         let mut rows = out.rows;
+        let first = rows.first().and_then(|d| d["id"].as_str());
+        // a backend that ignores `after_id` hands page one back again
+        if out.paged && keyset && last.is_some() && first.is_some() && first == head.as_deref() {
+            keyset = false;
+            continue;
+        }
+        if head.is_none() {
+            head = first.map(str::to_owned);
+        }
         if !out.decided {
-            rows.retain(|d| only.matches(d));
+            rows.retain(|d| {
+                Narrow::Type(one.name).matches(d)
+                    && one.attr.is_none_or(|a| Narrow::Attr(a).matches(d))
+            });
         }
         // a backend that ignores the page answered the whole narrowed set
-        let last = !out.paged || rows.len() < want;
-        rows.truncate(max.saturating_sub(offset));
-        offset = offset.saturating_add(if out.paged { want } else { max });
+        let done = !out.paged || rows.len() < want;
+        rows.truncate(max.saturating_sub(read));
+        read = read.saturating_add(if out.paged { want } else { max });
+        last = rows
+            .last()
+            .and_then(|d| d["id"].as_str())
+            .map(str::to_owned)
+            .or(last);
         let mut seen = false;
-        visible(st, tenant, Some(view), rows, &mut |_| seen = true).await;
+        visible(st, tenant, view, rows, &mut |d| seen |= each(&d)).await;
         if seen {
             return Ok(Probe::Seen);
         }
-        if last {
+        if done {
             return Ok(Probe::None);
         }
     }
@@ -550,6 +731,18 @@ async fn attr_stats(
     Ok((map, partial))
 }
 
+/// The Attribute view of per-type shapes: each name with the types whose
+/// Entities show it. 5.7.8/5.7.9 read neither count nor attribute types.
+fn attrs_of(shapes: Shapes) -> AttrStats {
+    let mut map = AttrStats::new();
+    for (t, attrs) in shapes {
+        for a in attrs {
+            map.entry(a).or_default().2.insert(t.clone());
+        }
+    }
+    map
+}
+
 // ---------- GET /types (5.7.5/5.7.6) ----------
 
 /// 4.5.10 Entity Type List Representation, members per Table 5.2.24-1
@@ -572,17 +765,30 @@ pub async fn entity_types(
         let view = view.as_ref().map(|r| (r, &*ctx));
         let details = params.get("details").map(String::as_str) == Some("true");
         let max = *crate::bounds::MAX_FOLD_DOCS;
-        // The names alone come from the store's type list (T-4610); the
-        // details, and a backend without that list, fold the Entities.
-        let names = match details {
-            true => None,
-            false => type_names(&st, &tenant, max, view).await?,
+        // The names come from the store's type list (T-4610), the details
+        // from its attribute catalogue (T-4934); a backend without them
+        // folds the Entities.
+        let listed: Option<(TypeStats, bool)> = match details {
+            true => type_shapes(&st, &tenant, max, view)
+                .await?
+                .map(|(shapes, partial)| {
+                    let stats = shapes.into_iter().map(|(t, attrs)| {
+                        (
+                            t,
+                            (0, attrs.into_iter().map(|a| (a, BTreeSet::new())).collect()),
+                        )
+                    });
+                    (stats.collect(), partial)
+                }),
+            false => type_names(&st, &tenant, max, view)
+                .await?
+                .map(|(names, partial)| {
+                    let stats = names.into_iter().map(|t| (t, Default::default()));
+                    (stats.collect(), partial)
+                }),
         };
-        let (stats, partial) = match names {
-            Some((names, partial)) => (
-                names.into_iter().map(|t| (t, Default::default())).collect(),
-                partial,
-            ),
+        let (stats, partial) = match listed {
+            Some(listed) => listed,
             None => type_stats(&st, &tenant, max, Narrow::Tenant, view).await?,
         };
         let payload = if details {
@@ -701,14 +907,13 @@ pub async fn attributes(
         let ctx = request_context(&st.loader, &headers).await?;
         let filter = gate!(st, &tenant, &headers, "5.7.8").await?;
         let view = view_of(&filter);
-        let (stats, partial) = attr_stats(
-            &st,
-            &tenant,
-            *crate::bounds::MAX_FOLD_DOCS,
-            Narrow::Tenant,
-            view.as_ref().map(|r| (r, &*ctx)),
-        )
-        .await?;
+        let view = view.as_ref().map(|r| (r, &*ctx));
+        let max = *crate::bounds::MAX_FOLD_DOCS;
+        // From the attribute catalogue (T-4934); a backend without one folds.
+        let (stats, partial) = match type_shapes(&st, &tenant, max, view).await? {
+            Some((shapes, partial)) => (attrs_of(shapes), partial),
+            None => attr_stats(&st, &tenant, max, Narrow::Tenant, view).await?,
+        };
         let details = params.get("details").map(String::as_str) == Some("true");
         let payload = if details {
             Value::Array(
@@ -876,6 +1081,129 @@ mod discovery_folds {
         }
         // 5.2.28 attributeTypes: every attribute type an instance carried
         assert!(attrs[V].contains("Property") && attrs[V].contains("GeoProperty"));
+    }
+
+    /// T-4934: the catalogue answer equals the fold for three grant shapes,
+    /// and a hidden Attribute or a refused type never appears in it.
+    #[tokio::test]
+    async fn the_catalogue_answers_what_the_fold_answers() {
+        use crate::policy::{Filter, Rule};
+        let st = AppState::new("test".into());
+        let at = |n: u32| format!("https://uri.etsi.org/ngsi-ld/default-context/a{n}");
+        // Buildings with v (some with r or a rare a1), a Building+Sensor, Sensors with a2
+        for n in 0..60u32 {
+            let id = format!("urn:ngsi-ld:B:{n:03}");
+            let mut doc =
+                json!({"id": id, "type": [BUILDING], V: [{"type": "Property", "value": n}]});
+            if n % 2 == 0 {
+                doc[R] = json!([{"type": "Relationship", "object": "urn:ngsi-ld:B:000"}]);
+            }
+            if n == 57 {
+                doc[at(1)] = json!([{"type": "Property", "value": 1}]);
+            }
+            seed(&st, "tq", &id, doc).await;
+        }
+        seed(
+            &st,
+            "tq",
+            "urn:ngsi-ld:BS:1",
+            json!({"id": "urn:ngsi-ld:BS:1",
+            "type": [BUILDING, SENSOR], V: [{"type": "Property", "value": 99}],
+            at(3): [{"type": "Property", "value": 3}]}),
+        )
+        .await;
+        for n in 0..5u32 {
+            let id = format!("urn:ngsi-ld:S:{n}");
+            seed(
+                &st,
+                "tq",
+                &id,
+                json!({"id": id, "type": [SENSOR],
+                at(2): [{"type": "Property", "value": n}]}),
+            )
+            .await;
+        }
+        let rule = |types: &[&str], q: Option<&str>, attrs: &[&str]| Rule {
+            types: types.iter().map(|t| (*t).to_owned()).collect(),
+            q: q.map(|q| Box::new(antares_ql::parse_q(q).expect("q"))),
+            attributes: attrs.iter().map(|a| (*a).to_owned()).collect(),
+            ..Rule::default()
+        };
+        let a1 = at(1);
+        let a2 = at(2);
+        let a3 = at(3);
+        let shapes = [
+            ("the whole view", None),
+            (
+                "a hidden attribute",
+                Some(Filter {
+                    rules: vec![rule(&[BUILDING, SENSOR], None, &[V, &a1, &a2, &a3])],
+                    ..Filter::default()
+                }),
+            ),
+            (
+                "a refused type",
+                Some(Filter {
+                    rules: vec![rule(&[BUILDING], Some("v>50"), &[V, R, &a1, &a3])],
+                    ..Filter::default()
+                }),
+            ),
+        ];
+        let ctx = antares_jsonld::pinned::core_context();
+        let t = tid("tq");
+        for (shape, filter) in shapes {
+            let repr = filter.as_ref().map(crate::repr::narrowing);
+            let view = repr.as_ref().map(|r| (r, &ctx));
+            let (fold, cut) = type_stats(&st, &t, ALL, Narrow::Tenant, view)
+                .await
+                .expect("fold");
+            let fold: Shapes = fold
+                .into_iter()
+                .map(|(t, (_, attrs))| (t, attrs.into_keys().collect()))
+                .collect();
+            let (got, partial) = type_shapes(&st, &t, ALL, view)
+                .await
+                .expect("shapes")
+                .expect("the memory store keeps a catalogue");
+            assert!(!cut && !partial, "{shape}");
+            assert_eq!(got, fold, "{shape}: /types?details=true");
+            let (fold_attrs, _) = attr_stats(&st, &t, ALL, Narrow::Tenant, view)
+                .await
+                .expect("fold");
+            let fold_attrs: BTreeMap<_, _> = fold_attrs
+                .into_iter()
+                .map(|(a, (_, _, ty))| (a, ty))
+                .collect();
+            let got_attrs: BTreeMap<_, _> = attrs_of(got.clone())
+                .into_iter()
+                .map(|(a, (_, _, ty))| (a, ty))
+                .collect();
+            assert_eq!(got_attrs, fold_attrs, "{shape}: /attributes?details=true");
+            match shape {
+                "the whole view" => {
+                    assert!(got[BUILDING].contains(&a1), "a rare attribute is found");
+                    assert!(got[SENSOR].contains(&a3) && got[SENSOR].contains(&a2));
+                }
+                "a hidden attribute" => {
+                    assert!(
+                        !got_attrs.contains_key(R),
+                        "a hidden attribute never appears"
+                    );
+                    assert!(got_attrs.contains_key(&a1));
+                }
+                _ => {
+                    assert!(
+                        !got_attrs.contains_key(&a2),
+                        "nothing only a Sensor carries"
+                    );
+                    assert_eq!(got[SENSOR].len(), 2, "the Building+Sensor alone: {got:?}");
+                    assert!(
+                        got[BUILDING].contains(&a1),
+                        "a rare attribute of a shown Entity"
+                    );
+                }
+            }
+        }
     }
 
     /// One shared datastore, one tenant per request: an entity of another
