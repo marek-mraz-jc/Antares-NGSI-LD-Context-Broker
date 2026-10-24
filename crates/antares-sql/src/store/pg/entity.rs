@@ -815,6 +815,26 @@ impl PgEntityStore {
         Ok(names)
     }
 
+    /// Every (type, member name) pair the Tenant's Entities ever carried,
+    /// sorted (T-4934): the attribute catalogue the writes keep (migration
+    /// 0025). A pair whose last carrier went stays listed; the reader checks
+    /// each against a live Entity, as it does a catalogued type.
+    pub async fn attr_pairs(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        let mut tx = super::begin(&self.pool).await?;
+        crate::store::pg::set_tenant(&mut tx, tenant).await?;
+        let pairs = sqlx::query_as(
+            "SELECT type, attr FROM entity_attrs WHERE tenant_id = $1 ORDER BY type, attr",
+        )
+        .bind(tenant.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(pairs)
+    }
+
     /// The types of the Tenant's live Entities of two or more types that carry
     /// one of `any_of`, sorted (T-4683): one probe of the multi-type index per
     /// catalogued type.

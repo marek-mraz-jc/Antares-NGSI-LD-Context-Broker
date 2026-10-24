@@ -134,6 +134,17 @@ pub async fn run_current_state_contract(
         );
     }
 
+    // An attribute catalogue, where the driver keeps one, lists every
+    // member a live Entity carries under each of its types (T-4934), the
+    // member a write added included.
+    if let Some(pairs) = d.entity_attr_pairs(a).await.expect("attribute list") {
+        let t = "https://uri.etsi.org/ngsi-ld/default-context/T";
+        assert!(
+            pairs.iter().any(|(ty, attr)| ty == t && attr == "marker"),
+            "the attribute list must name a live Entity's member: {pairs:?}"
+        );
+    }
+
     // Tenant isolation, on every read and every write path.
     assert!(
         d.get(b, Kind::Entity, &e1).await.expect("get").is_none(),

@@ -569,6 +569,19 @@ pub trait CurrentStateDriver: Send + Sync {
         let _ = (tenant, any_of);
         Ok(None)
     }
+    /// The (type, member name) pairs the Tenant's Entities carry, sorted
+    /// (T-4934): `/types` with details and `/attributes` probe these instead
+    /// of folding every Entity. The list may name a pair no live Entity
+    /// carries any more, never miss one a live Entity carries; member names
+    /// include the Entity frame's. `None` when the backend keeps no such
+    /// list, and the caller folds instead.
+    async fn entity_attr_pairs(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Option<Vec<(String, String)>>, NgsiError> {
+        let _ = tenant;
+        Ok(None)
+    }
     /// Read-modify-write under the row lock; `None` = absent (never an
     /// insert), `Some(Err)` = the closure rejected, nothing committed.
     async fn mutate_boxed<'a>(
