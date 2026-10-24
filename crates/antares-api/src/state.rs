@@ -48,6 +48,79 @@ impl std::str::FromStr for TemporalRecord {
     }
 }
 
+/// Behaviour profile (T-5497, docs/conformance/profiles.md): where the two
+/// spec versions or the conformance suites accept two answers, the one this
+/// deployment gives. Startup configuration only, never per request; the
+/// default of every member is the behaviour the pinned ETSI suite asserts.
+/// No member relaxes authorization, tenant isolation or an input limit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Profile {
+    /// `ANTARES_NON_OBJECT_BODY=bad-request-data`: a JSON body that is no
+    /// object (`[]`, `[1,2,3]`) where an object is expected answers
+    /// BadRequestData (TS 104 175 8.2.3 second bullet, forge all-fixes,
+    /// Coraine) instead of InvalidRequest (ETSI 001_02_02).
+    pub non_object_bad_request_data: bool,
+    /// `ANTARES_FED_WRITE_SOURCE_404=ignore`: on a distributed write, a
+    /// source's 404 beside a success counts as "no data" (204, forge
+    /// all-fixes, Coraine) instead of a part of the 207 (ETSI D002_02_*_inc).
+    pub fed_write_ignore_404: bool,
+    /// `ANTARES_IMPLICIT_TENANTS=listed`: only the operations TS 104 175
+    /// 7.8.2 lists create a Tenant; Batch Upsert on an unknown Tenant
+    /// answers NonexistentTenant (Coraine tenant_implicit_create).
+    pub implicit_tenants_listed_only: bool,
+}
+
+impl Profile {
+    /// Reads the profile keys; an unknown value is a startup error.
+    pub fn from_env() -> Result<Self, String> {
+        let get = |k: &str| std::env::var(k).ok();
+        Self::from_vars(
+            get("ANTARES_NON_OBJECT_BODY"),
+            get("ANTARES_FED_WRITE_SOURCE_404"),
+            get("ANTARES_IMPLICIT_TENANTS"),
+        )
+    }
+
+    /// [`Profile::from_env`] over given values (unset = `None`).
+    pub fn from_vars(
+        non_object_body: Option<String>,
+        fed_write_source_404: Option<String>,
+        implicit_tenants: Option<String>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            non_object_bad_request_data: profile_choice(
+                "ANTARES_NON_OBJECT_BODY",
+                non_object_body,
+                ["invalid-request", "bad-request-data"],
+            )?,
+            fed_write_ignore_404: profile_choice(
+                "ANTARES_FED_WRITE_SOURCE_404",
+                fed_write_source_404,
+                ["report", "ignore"],
+            )?,
+            implicit_tenants_listed_only: profile_choice(
+                "ANTARES_IMPLICIT_TENANTS",
+                implicit_tenants,
+                ["with-upsert", "listed"],
+            )?,
+        })
+    }
+}
+
+/// `false` for the default value (or unset/empty), `true` for the other.
+fn profile_choice(
+    key: &str,
+    value: Option<String>,
+    [default, other]: [&str; 2],
+) -> Result<bool, String> {
+    match value.as_deref().map(str::trim) {
+        None | Some("") => Ok(false),
+        Some(v) if v == default => Ok(false),
+        Some(v) if v == other => Ok(true),
+        Some(v) => Err(format!("{key}: unknown value {v:?} ({default}|{other})")),
+    }
+}
+
 /// History gate 3's set (T-4275): the (Tenant, expanded type) pairs that
 /// record no history, shared by every clone of the state.
 pub type HistoryOff = Arc<std::sync::RwLock<HistoryRules>>;
@@ -356,6 +429,8 @@ pub struct Shared {
     /// instances the write path records into history. Default `All`, which
     /// the ETSI temporal suites assume.
     pub temporal_record: TemporalRecord,
+    /// Behaviour profile keys ([`Profile`]); the broker sets it from the env.
+    pub profile: Profile,
     /// The mesh identity of the gateway whose provenance headers the broker
     /// believes (ANTARES_PROVENANCE_FROM, T-4665); `None` believes nobody.
     pub provenance_from: Option<String>,
@@ -673,6 +748,7 @@ impl AppState {
                 csource_notification: None,
                 nats: false,
                 temporal_record: TemporalRecord::All,
+                profile: Profile::default(),
                 provenance_from: None,
                 subject_required: false,
                 history_off: HistoryOff::default(),

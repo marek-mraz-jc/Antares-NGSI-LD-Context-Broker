@@ -1012,7 +1012,7 @@ pub async fn create_registration(
     let go = async {
         let tenant = tenant_from(&headers)?;
         check_params(&params, &["local"])?;
-        let parsed = parse_body(&st.loader, &headers, &body, BodyKind::Standard).await?;
+        let parsed = parse_body(&st, &headers, &body, BodyKind::Standard).await?;
         let obj = parsed.value.as_object().ok_or_else(|| {
             NgsiError::BadRequestData("registration must be a JSON object".into())
         })?;
@@ -1417,7 +1417,7 @@ pub async fn update_registration(
         antares_model::EntityId::new(&id)
             .map_err(|_| NgsiError::BadRequestData(format!("invalid registration id {id:?}")))?;
         check_params(&params, &["local"])?;
-        let parsed = parse_body(&st.loader, &headers, &body, BodyKind::MergePatch).await?;
+        let parsed = parse_body(&st, &headers, &body, BodyKind::MergePatch).await?;
         let obj = parsed.object(NgsiError::BadRequestData(
             "fragment must be a JSON object".into(),
         ))?;

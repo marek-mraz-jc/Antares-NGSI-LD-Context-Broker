@@ -929,7 +929,7 @@ pub async fn create(
 ) -> ApiResult<Response> {
     let tenant = tenant_from(headers)?;
     check_params(params, &["local"])?;
-    let parsed = parse_body(&st.loader, headers, body, BodyKind::Standard).await?;
+    let parsed = parse_body(st, headers, body, BodyKind::Standard).await?;
     let obj = parsed.object(NgsiError::BadRequestData(
         "subscription must be a JSON object".into(),
     ))?;
@@ -1178,7 +1178,7 @@ pub async fn update(
     check_params(params, &["local"])?;
     let clause = clause_on(st, &tenant, kind, id, "5.8.2", "5.11.3").await?;
     gate!(st, &tenant, headers, clause, ids: &[id]).await?;
-    let parsed = parse_body(&st.loader, headers, body, BodyKind::MergePatch).await?;
+    let parsed = parse_body(st, headers, body, BodyKind::MergePatch).await?;
     let obj = parsed.object(NgsiError::BadRequestData(
         "fragment must be a JSON object".into(),
     ))?;

@@ -548,7 +548,7 @@ pub async fn create_snapshot(
         gate!(st, &tenant, &headers, "5.16.1").await?;
         // 6.3.5: the @context rules apply to the snapshot body like to any
         // other POST payload (media type, Link header, body @context)
-        let v = parse_body(&st.loader, &headers, &body, BodyKind::Standard)
+        let v = parse_body(&st, &headers, &body, BodyKind::Standard)
             .await?
             .value;
         let o = validate(&v, Mode::Create)?;
@@ -1060,7 +1060,7 @@ pub async fn update_snapshot(
         gate!(st, &tenant, &headers, "5.16.4", ids: &[&id]).await?;
         let accept = parse_accept(&headers)?;
         // 5.16.4.4 binds this operation to 5.5.4, hence to the 6.3.5 rules
-        let v = parse_body(&st.loader, &headers, &body, BodyKind::Standard)
+        let v = parse_body(&st, &headers, &body, BodyKind::Standard)
             .await?
             .value;
         let frag = validate(&v, Mode::Update)?;
@@ -1147,7 +1147,7 @@ pub async fn clone_snapshot(
         let v: Value = if body.is_empty() {
             json!({})
         } else {
-            parse_body(&st.loader, &headers, &body, BodyKind::Standard)
+            parse_body(&st, &headers, &body, BodyKind::Standard)
                 .await?
                 .value
         };
