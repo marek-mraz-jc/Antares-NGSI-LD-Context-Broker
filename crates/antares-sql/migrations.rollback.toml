@@ -104,3 +104,7 @@ note = "attr_rows becomes a parent partitioned by short (plain mode: the 0020 pa
 [0024]
 rollback = "compatible"
 note = "new entity_values with its statement triggers on entities; an older release names neither, its writes still fire the triggers, so the table stays current for the roll-forward, and it reads q= and attrs= pages by the type, id or location indexes as before"
+
+[0025]
+rollback = "compatible"
+note = "entity_attrs and its trigger stay; an older release never reads them and folds /attributes, while the trigger keeps the catalogue current for the roll-forward"

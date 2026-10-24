@@ -840,6 +840,20 @@ impl AnyStore {
         }
     }
 
+    /// The (type, member name) pairs of the Tenant's attribute catalogue,
+    /// sorted (T-4934): table `entity_attrs` on Postgres, which may still
+    /// list a pair no live Entity carries; the live documents in memory.
+    pub async fn entity_attr_pairs(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Vec<(String, String)>, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => Ok(s.entity_attr_pairs(tenant, &now_utc())),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p.entities.attr_pairs(tenant).await.map_err(db),
+        }
+    }
+
     /// The types of the Tenant's live Entities that carry one of `any_of`,
     /// sorted (T-4683): the types index on Postgres, one pass in memory.
     pub async fn entity_types_beside(
@@ -1283,6 +1297,7 @@ impl AnyStore {
                         "dead_letters",
                         "views",
                         "entity_types",
+                        "entity_attrs",
                         // ADR-0021: `tenant_id` is GENERATED from the row's kind
                         // and owner, so a Cached row's is NULL and this DELETE
                         // takes only what the Tenant stored itself.
@@ -1628,6 +1643,12 @@ impl antares_store::CurrentStateDriver for AnyStore {
     }
     async fn entity_type_names(&self, tenant: &TenantId) -> Result<Option<Vec<String>>, NgsiError> {
         AnyStore::entity_type_names(self, tenant).await.map(Some)
+    }
+    async fn entity_attr_pairs(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Option<Vec<(String, String)>>, NgsiError> {
+        AnyStore::entity_attr_pairs(self, tenant).await.map(Some)
     }
     async fn entity_types_beside(
         &self,
