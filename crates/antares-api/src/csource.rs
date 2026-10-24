@@ -1146,10 +1146,11 @@ pub async fn query_registrations(
                 "omit",
             ],
         )?;
-        // Table 6.8.3.2-1: pick and omit, exclusive as in 4.21
+        // Table 6.8.3.2-1: pick and omit, refused together as for Entities
+        // (repr::check_projection_exclusive; no clause states it)
         if params.contains_key("pick") && params.contains_key("omit") {
             return Err(NgsiError::BadRequestData(
-                "pick and omit are mutually exclusive (4.21)".into(),
+                "pick and omit cannot be combined in one request".into(),
             )
             .into());
         }
