@@ -3,16 +3,9 @@
 # checks every `latest` cell with tests/external/etsi/ratchet.py: a TP not listed that fails is red, a
 # listed TP that passes is red until it is taken off. The list only shrinks: never add a TP to it without
 # its triage row in final-validation.md 4.1 and a reviewer's consent.
-# Source: external-suites run 38860287033 (antares 74b72185, forge 5c398518 and 56e721d0), 98 TPs.
+# Source: external-suites run 38860287033 (antares 74b72185, forge 5c398518 and 56e721d0), 98 TPs; re-run by
+# T-5495 on forge develop cc8711ce (antares 98e7f38 + T-5486, memory store): 13 TPs forge fixed came off, 85 TPs.
 008_01_01  test bug: TS 104 175 11.2.2.4 all instances are added; etsi-raises.md §21
-018_10_01  test bug: TS 104 175 C.2.2.1.2 keeps objectType on an expanded Relationship; forge
-018_10_02  test bug: TS 104 175 C.2.2.1.2 keeps objectType on an expanded Relationship; forge
-018_13_01  test bug: TS 104 175 C.2.2.1.2 keeps objectType on an expanded Relationship; forge
-018_13_02  test bug: TS 104 175 C.2.2.1.2 keeps objectType on an expanded Relationship; forge
-019_13_01  test bug: TS 104 175 C.2.2.1.2 keeps objectType on an expanded Relationship; forge
-019_13_02  test bug: TS 104 175 C.2.2.1.2 keeps objectType on an expanded Relationship; forge
-019_16_01  test bug: TS 104 175 C.2.2.1.2 keeps objectType on an expanded Relationship; forge
-019_16_02  test bug: TS 104 175 C.2.2.1.2 keeps objectType on an expanded Relationship; forge
 020_17_01  test bug: TS 104 175 10.2.7.4 and 5.2.7 (urn:ngsi-ld:null only for deleted scopes); etsi-raises.md §15, §16
 020_17_02  test bug: TS 104 175 10.2.7.4 and 5.2.7 (urn:ngsi-ld:null only for deleted scopes); etsi-raises.md §15, §16
 020_17_03  test bug: TS 104 175 10.2.7.4 and 5.2.7 (urn:ngsi-ld:null only for deleted scopes); etsi-raises.md §15, §16
@@ -32,7 +25,6 @@
 021_23_09  test bug: TS 104 175 11.3.3.4 ordering by a name other than id is BadRequestData; forge
 021_25  test bug: TS 104 175 11.3.3.4 all local Entities; the shared expectation lists one of two; forge
 028_06  test bug: 5.8.1.4 jsonldContext is initialised, the TP compares the whole Subscription; forge
-028_07_02  test bug: TS 104 176 Table 6.3.2-1 LdContextNotAvailable is 504, the TP asserts 503; etsi-raises.md §3
 031_01_01  test bug: TS 104 175 5.2.6.5.2 notificationTrigger default not echoed, quoted ignore pattern never matches; forge
 031_02_02  test bug: TS 104 176 6.4.7.2 RFC 8288 Link whitespace, the TP compares raw text; forge
 033_01_02  test bug: TS 104 175 9.3.3 an exclusive registration relates to one Entity; etsi-raises.md §2
@@ -48,10 +40,6 @@
 041_03_02  test bug: TS 104 176 6.4.7.2 Link type equals the requested media type, the TP sends no Accept; etsi-raises.md §19
 042_02_01  test bug: tooling (missing import, expected_status, unset payload, stub URL, Should Contain on a list); forge
 042_03_01  test bug: tooling (missing import, expected_status, unset payload, stub URL, Should Contain on a list); forge
-043_01_01  test bug: TS 104 176 Table 6.3.2-1 LdContextNotAvailable is 504, the TP asserts 503; etsi-raises.md §3
-043_01_02  test bug: TS 104 176 Table 6.3.2-1 LdContextNotAvailable is 504, the TP asserts 503; etsi-raises.md §3
-043_01_03  test bug: TS 104 176 Table 6.3.2-1 LdContextNotAvailable is 504, the TP asserts 503; etsi-raises.md §3
-043_01_05  test bug: TS 104 176 Table 6.3.2-1 LdContextNotAvailable is 504, the TP asserts 503; etsi-raises.md §3
 046_05_01  test bug: TS 104 175 7.2.3.2 a filter is URI-encoded only in the URI; etsi-raises.md §23
 046_22_08  test bug: TS 104 175 10.5.7 a deleted Attribute with datasetIds is notified per instance; etsi-raises.md §22
 047_01_01  test bug: TS 104 175 5.11.7 the CSR fixture registers other types than the watched Building; forge
