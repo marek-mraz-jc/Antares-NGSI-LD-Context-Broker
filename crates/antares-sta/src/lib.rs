@@ -93,7 +93,7 @@ impl Surface for Sta {
     fn router(&self, ops: Ops) -> Router {
         let handler = any(move |caller: Caller, req: Request| {
             let ops = ops.clone();
-            async move { serve(&ops, &caller, req).await }
+            async move { Box::pin(serve(&ops, &caller, req)).await }
         });
         Router::new()
             .route("/{view}/sta/v1.1", handler.clone())
@@ -379,6 +379,12 @@ struct Cx<'a> {
 }
 
 impl Cx<'_> {
+    /// Whether shown type `t` is one `properties/type eq` names, every one without.
+    fn wanted(&self, t: &str) -> bool {
+        let wanted = &self.ids.types;
+        wanted.is_empty() || wanted.iter().any(|w| w == t || w == local(t))
+    }
+
     /// What every Query Entities names: the types the view shows (NGSI-LD 5.7.2 takes no query
     /// without one), or for a view of every type the local store.
     /// `properties/type eq` narrows it to those types the view shows (T-5205 finding 9): `None`
@@ -390,7 +396,7 @@ impl Cx<'_> {
             named
                 .types
                 .iter()
-                .filter(|t| wanted.is_empty() || wanted.iter().any(|w| w == *t || w == local(t)))
+                .filter(|t| self.wanted(t))
                 .cloned()
                 .collect()
         } else if self.view.shows_every_name() {
@@ -400,10 +406,7 @@ impl Cx<'_> {
             wanted.clone()
         } else {
             let (shown, _) = self.view.shown_names();
-            shown
-                .into_iter()
-                .filter(|t| wanted.is_empty() || wanted.iter().any(|w| w == t || w == local(t)))
-                .collect()
+            shown.into_iter().filter(|t| self.wanted(t)).collect()
         };
         if types.is_empty() {
             return None;

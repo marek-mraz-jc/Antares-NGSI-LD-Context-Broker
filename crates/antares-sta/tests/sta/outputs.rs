@@ -76,6 +76,12 @@ async fn a_filtered_output_never_holds_an_entity_outside_its_filter_by_query_or_
     }
     let (_, by_id) = get(&f, "slow", "/Things?$filter=id%20eq%20'urn:ngsi-ld:Car:2'").await;
     assert_eq!(ids(&by_id), Vec::<String>::new());
+    // `properties/type eq` narrows the output's own types: a type the view shows but the
+    // output does not list stays outside it
+    let (_, car) = get(&f, "slow", "/Things?$filter=properties/type%20eq%20'Car'").await;
+    assert_eq!(ids(&car), vec!["urn:ngsi-ld:Car:1".to_owned()]);
+    let (status, stop) = get(&f, "slow", "/Things?$filter=properties/type%20eq%20'Stop'").await;
+    assert_eq!((status, ids(&stop)), (StatusCode::OK, Vec::<String>::new()));
     let (_, streams) = get(&f, "slow", "/Datastreams").await;
     assert_eq!(ids(&streams), vec!["urn:ngsi-ld:Car:1/speed"]);
     // a numeric Property the role does not name is no Datastream, by key or by its history
