@@ -199,7 +199,11 @@ fn type_page(w: &str, groups: &[&[&str]], limit: i64) -> String {
             ts.iter().map(|t| lit(t)).collect::<Vec<_>>().join(", ")
         )
     };
-    let mut named: Vec<&str> = groups.iter().flat_map(|g| g.iter().copied()).collect();
+    // first-type arms for the one-type groups only (T-5498)
+    let mut named: Vec<&str> = groups
+        .iter()
+        .filter_map(|g| g.first().copied().filter(|f| g.iter().all(|t| t == f)))
+        .collect();
     named.sort_unstable();
     named.dedup();
     let selection = format!(
@@ -218,10 +222,13 @@ fn type_page(w: &str, groups: &[&[&str]], limit: i64) -> String {
             false => format!("{w} AND types[1] = {} AND {selection}", lit(t)),
         })
         .collect();
-    arms.push(format!(
-        "{w} AND cardinality(types) > 1 AND types[1] <> ALL({}) AND {selection}",
-        arr(&named)
-    ));
+    arms.push(match named.is_empty() {
+        true => format!("{w} AND cardinality(types) > 1 AND {selection}"),
+        false => format!(
+            "{w} AND cardinality(types) > 1 AND types[1] <> ALL({}) AND {selection}",
+            arr(&named)
+        ),
+    });
     let parts: Vec<String> = arms
         .iter()
         .map(|a| format!("(SELECT id, entity FROM entities WHERE {a} ORDER BY id LIMIT {limit})"))
@@ -332,7 +339,8 @@ async fn every_query_shape_reads_an_index_under_rls() {
         ),
         ("type", type_page(&w, &[&[&t1]], 21), "i_entities_first_type_id"),
         ("type=A,B", type_page(&w, &[&[&t1], &[&t2]], 21), "i_entities_first_type_id"),
-        ("type=A;B", type_page(&w, &[&[&t(0), "https://x/M"]], 21), "i_entities_first_type_id"),
+        ("type=A;B", type_page(&w, &[&[&t(0), "https://x/M"]], 21), "i_entities_multi_type_id"),
+        ("type=A,B;C", type_page(&w, &[&[&t1], &[&t(0), "https://x/M"]], 21), "i_entities_first_type_id"),
         ("q equality", type_page(&format!("{w} AND {}", speed("== 42")), &[&[&t1]], 21), "i_entities_first_type_id"),
         ("q range", type_page(&format!("{w} AND {}", speed("> 90")), &[&[&t1]], 21), "i_entities_first_type_id"),
         (
@@ -444,6 +452,45 @@ async fn every_query_shape_reads_an_index_under_rls() {
         bad.is_empty(),
         "shapes that walk the Tenant under RLS:\n\n{}",
         bad.join("\n\n")
+    );
+}
+
+/// T-5498: an AND-group (`type=A;B`) reads the multi-type Entities alone.
+/// Its matches have two types, and a first-type arm walked every Entity of
+/// A under RLS to keep none (dev: 795 338 calls, 66 ms and 2 580 buffers
+/// each, 0 rows).
+#[tokio::test]
+async fn an_and_group_under_rls_reads_the_multi_type_index() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    seed_rls(&pool).await;
+    let w = format!("tenant_id = '{RLS_A}' AND (expires_at IS NULL OR expires_at > now())");
+    let sql = type_page(&w, &[&["https://x/T0", "https://x/M"]], 21);
+    let plan = plan_of(&pool, RLS_A, &sql).await;
+    assert!(
+        plan.contains("i_entities_multi_type_id") && !plan.contains("i_entities_first_type_id"),
+        "type=A;B reads more than the multi-type Entities:\n{plan}"
+    );
+    let mut tx = pool.begin().await.expect("tx");
+    for s in [
+        "SET LOCAL ROLE antares_app".to_owned(),
+        format!("SELECT set_config('antares.tenant', '{RLS_A}', true)"),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(s))
+            .execute(&mut *tx)
+            .await
+            .expect("session");
+    }
+    let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF, FORMAT TEXT) {sql}"
+    )))
+    .fetch_all(&mut *tx)
+    .await
+    .expect("explain analyze");
+    let plan = rows.join("\n");
+    assert!(
+        plan.contains("rows=21") && !plan.contains("i_entities_first_type_id"),
+        "type=A;B answers its page from the multi-type index:\n{plan}"
     );
 }
 

@@ -201,6 +201,20 @@ fn entities() -> impl Strategy<Value = Vec<Value>> {
     })
 }
 
+/// Entities of one to three distinct types out of A, B, C, in any order, so
+/// the first type varies: `p0` may be `[B, A]`, `p1` `[A]`.
+fn typed() -> impl Strategy<Value = Vec<Vec<&'static str>>> {
+    let one = prop::sample::subsequence(vec!["A", "B", "C"], 1..=3).prop_shuffle();
+    prop::collection::vec(one, 1..9)
+}
+
+/// A type selection (4.17): one to three OR-ed groups, each an AND of one or
+/// two types (`A`, `A;B`, `A,B;C`), a repeated type (`A;A`) included.
+fn type_groups() -> impl Strategy<Value = Vec<Vec<&'static str>>> {
+    let ty = prop::sample::select(vec!["A", "B", "C"]);
+    prop::collection::vec(prop::collection::vec(ty, 1..=2), 1..=3)
+}
+
 // ----------------------------------------------------------------- queries
 
 /// A single value: the operand every operator takes.
@@ -563,5 +577,44 @@ proptest! {
         let (got, decided) = query(db, &tenant, &EntityFilter { q: Some(&ast), expand: &expand, ..Default::default() });
         prop_assert!(decided, "q={} is in the exact subset and was not decided", q);
         prop_assert_eq!(&got, &want, "q={}", q);
+    }
+
+    /// 4.17, T-5498: a type selection with AND-groups is decided by SQL and
+    /// exact, unpaged and walked in counted pages, over Entities whose first
+    /// type is A and second B as well as the other way round.
+    #[test]
+    fn a_type_selection_is_decided_and_exact(docs in typed(), groups in type_groups()) {
+        let Some(db) = db() else { return Ok(()) };
+        let tenant = TenantId::new("pgparitytypes").expect("tenant");
+        let items: Vec<Value> = docs
+            .iter()
+            .enumerate()
+            .map(|(i, ts)| json!({"id": format!("urn:ngsi-ld:T:p{i}"), "type": ts}))
+            .collect();
+        seed(db, &tenant, &items);
+        let want: BTreeSet<String> = docs
+            .iter()
+            .enumerate()
+            .filter(|(_, ts)| groups.iter().any(|g| g.iter().all(|t| ts.contains(t))))
+            .map(|(i, _)| format!("urn:ngsi-ld:T:p{i}"))
+            .collect();
+        let expanded: Vec<Vec<String>> = groups.iter().map(|g| g.iter().map(|t| expand(t)).collect()).collect();
+        let (got, decided) = query(db, &tenant, &EntityFilter { types: Some(&expanded), expand: &expand, ..Default::default() });
+        prop_assert!(decided, "type={:?} was not decided", groups);
+        prop_assert_eq!(&got, &want, "type={:?}", groups);
+        let (mut paged, mut offset) = (BTreeSet::new(), 0i64);
+        loop {
+            let page = Page { offset, limit: 2, count: true };
+            let f = EntityFilter { types: Some(&expanded), page: Some(page), expand: &expand, ..Default::default() };
+            let out = db.runtime.block_on(db.store.query(&tenant, &f)).expect("page");
+            prop_assert_eq!(out.total.unwrap_or(want.len() as i64), want.len() as i64, "type={:?} total", groups);
+            let n = out.rows.len();
+            paged.extend(ids(&out.rows));
+            if n < 2 {
+                break;
+            }
+            offset += 2;
+        }
+        prop_assert_eq!(&paged, &want, "type={:?} paged", groups);
     }
 }
