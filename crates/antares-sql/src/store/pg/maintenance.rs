@@ -319,7 +319,7 @@ async fn plain_retention(pool: &PgPool, days: i64) -> Result<Vec<String>, sqlx::
          FROM pg_inherits i
          JOIN pg_class c ON c.oid = i.inhrelid
          JOIN pg_class p ON p.oid = i.inhparent
-         WHERE p.relname IN ('attr_instances', 'attr_rows')
+         WHERE p.relname IN ('attr_instances', 'attr_rows_long')
            AND p.relnamespace = 'public'::regnamespace",
     )
     .fetch_all(&mut *tx)
@@ -538,6 +538,14 @@ const ENTITY_ROWS: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instanc
            WHERE a.tenant_id = $1 AND a.entity_id = ANY($2::text[])
              AND a.observed_at < $3::timestamptz
            LIMIT $4";
+/// The same over `attr_rows` (T-5200), its keys mapped through the Tenant's
+/// `iri_ids`; both of its children, the short one included (T-5249).
+const KEYED_ROWS: &str = "SELECT a.tenant_id, a.entity_no, a.attr_no, a.instance_no, a.observed_at
+           FROM attr_rows a
+           WHERE a.tenant_id = $1
+             AND a.entity_no IN (SELECT i.id FROM iri_ids i WHERE i.tenant_id = $1 AND i.iri = ANY($2::text[]))
+             AND a.observed_at < $3::timestamptz
+           LIMIT $4";
 /// The same over the superseded versions (T-4665).
 const VERSION_ROWS: &str =
     "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
@@ -575,14 +583,8 @@ pub async fn retain_history(
              AND a.entity_id <> ALL($5::text[])
              AND a.observed_at < $3::timestamptz
            LIMIT $4";
-    // The same three over `attr_rows` (T-5200), its keys mapped through the
-    // Tenant's `iri_ids`.
-    const R_ENTITY: &str = "SELECT a.tenant_id, a.entity_no, a.attr_no, a.instance_no, a.observed_at
-           FROM attr_rows a
-           WHERE a.tenant_id = $1
-             AND a.entity_no IN (SELECT i.id FROM iri_ids i WHERE i.tenant_id = $1 AND i.iri = ANY($2::text[]))
-             AND a.observed_at < $3::timestamptz
-           LIMIT $4";
+    // The type and rest selections over `attr_rows` (T-5200), its keys mapped
+    // through the Tenant's `iri_ids`; KEYED_ROWS is the Entity one.
     const R_TYPE: &str = "SELECT a.tenant_id, a.entity_no, a.attr_no, a.instance_no, a.observed_at
            FROM attr_rows a
            JOIN iri_ids i ON i.tenant_id = a.tenant_id AND i.id = a.entity_no
@@ -660,7 +662,7 @@ pub async fn retain_history(
     let (rows, keyed, versions, names, except) = match scope {
         HistoryScope::Entity(id) => {
             one = [id.to_owned()];
-            (ENTITY, R_ENTITY, V_ENTITY, &one[..], None)
+            (ENTITY, KEYED_ROWS, V_ENTITY, &one[..], None)
         }
         HistoryScope::Type {
             type_iri,
@@ -762,8 +764,8 @@ impl Walk<'_> {
 /// it holds less than what is left of the batch; the walk goes on for up to
 /// [`WALK_TIME`] and remembers where it stopped, so a type of 50 000
 /// Entities is covered over a few sweeps instead of timing out in one. At
-/// the end it starts over. Returns the instances and versions deleted, at
-/// most `batch`.
+/// the end it starts over. Returns the instances of both history parents
+/// and the versions deleted, at most `batch`.
 async fn walk_history(
     pool: &PgPool,
     tenant: &str,
@@ -786,6 +788,11 @@ async fn walk_history(
                 ENTITY_ROWS,
                 "DELETE FROM attr_instances
              WHERE (tenant_id, entity_id, attr_id, instance_id, observed_at) IN",
+            ),
+            (
+                KEYED_ROWS,
+                "DELETE FROM attr_rows
+             WHERE (tenant_id, entity_no, attr_no, instance_no, observed_at) IN",
             ),
             (
                 VERSION_ROWS,
@@ -950,7 +957,7 @@ async fn drop_partitions(
          JOIN pg_class p ON p.oid = i.inhparent
          CROSS JOIN LATERAL (SELECT substring(pg_get_expr(c.relpartbound, c.oid)
                                     FROM 'TO \(''([^'']+)''\)')::timestamptz AS hi) b
-         WHERE p.relname IN ('attr_instances', 'attr_rows')
+         WHERE p.relname IN ('attr_instances', 'attr_rows_long')
            AND p.relnamespace = 'public'::regnamespace
            AND pg_get_expr(c.relpartbound, c.oid) LIKE 'FOR VALUES FROM%'
            AND b.hi <= GREATEST((SELECT max(x) FROM unnest($1::timestamptz[]) x),
@@ -1049,13 +1056,14 @@ fn drop_partition_sql(name: &str) -> String {
     format!("DROP TABLE public.\"{}\"", name.replace('"', "\"\""))
 }
 
-/// One weekly partition, created directly under the parent: `attr_rows`
-/// when `keyed`, else `attr_instances`. Fails while the parent's DEFAULT
+/// One weekly partition, created directly under the parent: `attr_rows_long`,
+/// the logged child of `attr_rows` (0023, T-5249), when `keyed`, else
+/// `attr_instances`. Fails while the parent's DEFAULT
 /// partition still holds a row in `[lo, hi)`.
 fn create_partition_sql(keyed: bool, suffix: &str, lo: &str, hi: &str) -> String {
     if keyed {
         format!(
-            "CREATE TABLE IF NOT EXISTS attr_rows_{suffix} PARTITION OF attr_rows \
+            "CREATE TABLE IF NOT EXISTS attr_rows_{suffix} PARTITION OF attr_rows_long \
              FOR VALUES FROM ('{lo}') TO ('{hi}')"
         )
     } else {
@@ -1077,7 +1085,7 @@ fn adopt_default_rows_sql(keyed: bool, suffix: &str, lo: &str, hi: &str) -> [Str
         return [
             format!(
                 "CREATE TABLE IF NOT EXISTS attr_rows_{suffix} \
-                 (LIKE attr_rows INCLUDING DEFAULTS INCLUDING CONSTRAINTS)"
+                 (LIKE attr_rows_long INCLUDING DEFAULTS INCLUDING CONSTRAINTS)"
             ),
             format!(
                 "WITH moved AS (DELETE FROM attr_rows_default \
@@ -1085,7 +1093,7 @@ fn adopt_default_rows_sql(keyed: bool, suffix: &str, lo: &str, hi: &str) -> [Str
                  INSERT INTO attr_rows_{suffix} SELECT * FROM moved"
             ),
             format!(
-                "ALTER TABLE attr_rows ATTACH PARTITION attr_rows_{suffix} \
+                "ALTER TABLE attr_rows_long ATTACH PARTITION attr_rows_{suffix} \
                  FOR VALUES FROM ('{lo}') TO ('{hi}')"
             ),
         ];
@@ -1343,21 +1351,22 @@ mod tests {
     }
 
     /// A week from the cut-over on (T-5200) is a week of `attr_rows`, built,
-    /// moved and attached under that parent only.
+    /// moved and attached under its logged child `attr_rows_long` (0023,
+    /// T-5249) only.
     #[test]
     fn a_keyed_week_goes_to_attr_rows() {
         let sql = create_partition_sql(true, "2026w34", LO, HI);
         assert!(
-            sql.contains("attr_rows_2026w34 PARTITION OF attr_rows "),
+            sql.contains("attr_rows_2026w34 PARTITION OF attr_rows_long "),
             "{sql}"
         );
         let [create, mv, attach] = adopt_default_rows_sql(true, "2026w34", LO, HI);
-        assert!(create.contains("(LIKE attr_rows "), "{create}");
+        assert!(create.contains("(LIKE attr_rows_long "), "{create}");
         assert!(mv.contains("DELETE FROM attr_rows_default"), "{mv}");
         assert!(mv.contains("INSERT INTO attr_rows_2026w34"), "{mv}");
         assert!(mv.contains(&format!("observed_at < '{HI}'")), "{mv}");
         assert!(
-            attach.starts_with("ALTER TABLE attr_rows ATTACH PARTITION attr_rows_2026w34"),
+            attach.starts_with("ALTER TABLE attr_rows_long ATTACH PARTITION attr_rows_2026w34"),
             "{attach}"
         );
         assert!(!format!("{sql}{create}{mv}{attach}").contains("attr_instances"));

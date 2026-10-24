@@ -473,7 +473,19 @@ pub(super) async fn tenant_get(
         }
         Err(e) => return ApiError::from(e).into_response(),
     };
-    let instances = st.temporal.attr_instance_count(&tenant).await.unwrap_or(0);
+    // a tenant with a long history counts for seconds: bounded like the
+    // size scans, and a count that did not finish is left out, never 0
+    let instances = match st
+        .temporal
+        .attr_instance_count_within(&tenant, TENANT_COUNT_BOUND)
+        .await
+    {
+        Ok(n) => Some(n),
+        Err(e) => {
+            tracing::warn!(tenant = tenant.as_str(), error = %e, "tenant history not counted");
+            None
+        }
+    };
     let bytes = tenant_bytes(&st, &tenant).await;
     let mut row = serde_json::json!({
         "tenant": stats.tenant,
@@ -485,9 +497,15 @@ pub(super) async fn tenant_get(
             "snapshots": stats.snapshots,
             "entityMaps": stats.entity_maps,
             "distSubs": stats.dist_subs,
-            "attrInstances": instances,
         },
     });
+    if let (Some(n), Some(counts)) = (
+        instances,
+        row.get_mut("counts")
+            .and_then(serde_json::Value::as_object_mut),
+    ) {
+        counts.insert("attrInstances".into(), n.into());
+    }
     if let Some(row) = row.as_object_mut() {
         if let Some(c) = stats.created_at {
             row.insert("createdAt".into(), serde_json::Value::String(c));
@@ -498,6 +516,10 @@ pub(super) async fn tenant_get(
     }
     (StatusCode::OK, axum::Json(row)).into_response()
 }
+
+/// How long `GET /q/tenants/{tenant}` waits for the history count (T-5304),
+/// the same bound as one size scan.
+pub const TENANT_COUNT_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long `GET /q/tenants/{tenant}` reuses a measured size (T-2890).
 pub const TENANT_BYTES_TTL: std::time::Duration = std::time::Duration::from_secs(300);

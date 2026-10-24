@@ -124,6 +124,12 @@ async fn seed_rls(pool: &sqlx::PgPool) {
         .execute(&mut *tx)
         .await
         .expect("no lock timeout: the seed holds the lock for seconds");
+    // the seed's writes key `entity_values` (0024) too: past the pool's
+    // statement timeout, both for the seeder and for a test waiting on it
+    sqlx::query("SET LOCAL statement_timeout = 0")
+        .execute(&mut *tx)
+        .await
+        .expect("no statement timeout for the seed");
     sqlx::query("SELECT pg_advisory_xact_lock(48520)")
         .execute(&mut *tx)
         .await
@@ -149,7 +155,9 @@ async fn seed_rls(pool: &sqlx::PgPool) {
                     jsonb_build_object(
                       'https://x/tenant', $1,
                       'https://x/speed', jsonb_build_array(jsonb_build_object('type', 'Property', 'value', g % 100)),
-                      'https://x/brand', jsonb_build_array(jsonb_build_object('type', 'Property', 'value', 'b' || (g % 50)))),
+                      'https://x/brand', jsonb_build_array(jsonb_build_object('type', 'Property', 'value', 'b' || (g % 50))),
+                      'https://uri.etsi.org/ngsi-ld/default-context/name',
+                        jsonb_build_array(jsonb_build_object('type', 'Property', 'value', 'n' || g))),
                     CASE WHEN g % 100 = 0 THEN ARRAY['https://x/T' || (g % 10), 'https://x/M']
                          ELSE ARRAY['https://x/T' || (g % 10)] END,
                     ST_SetSRID(ST_MakePoint(10 + (g % 1000) / 100.0, 45 + ((g / 1000) % 100) / 100.0), 4326),
@@ -174,7 +182,7 @@ async fn seed_rls(pool: &sqlx::PgPool) {
         }
     }
     // statistics before the lock goes: a test waiting on it plans at once
-    sqlx::query("ANALYZE entities, temporal_entities, attr_instances")
+    sqlx::query("ANALYZE entities, entity_values, temporal_entities, attr_instances")
         .execute(&mut *tx)
         .await
         .expect("analyze");
@@ -276,12 +284,18 @@ async fn every_query_shape_reads_an_index_under_rls() {
     let speed = |cond: &str| {
         format!(r#"entity @? '$."https://x/speed"[*]."value" ? (@ {cond})'::jsonpath"#)
     };
+    let probe = |cond: &str| {
+        format!("SELECT id FROM entity_values WHERE tenant_id = '{RLS_A}' AND {cond} LIMIT 1001")
+    };
     // A walk: a sequential scan, a primary key read with the predicate left
     // as a filter, or any other index whose condition is the Tenant alone,
     // except the partial indexes that hold a sliver of it by construction
-    // (multi-type Entities, unextractable locations).
+    // (multi-type Entities, unextractable locations, Entities without one:
+    // the multi-type arm of `!location` may read the unlocated index by
+    // the Tenant alone).
     let sliver = [
         "i_entities_multi_type_id",
+        "i_entities_type_unlocated",
         "i_entities_types_multi",
         "i_entities_loc_ambiguous",
         "i_temporal_entities_multi_type",
@@ -326,6 +340,13 @@ async fn every_query_shape_reads_an_index_under_rls() {
             type_page(&format!("{w} AND entity ?| ARRAY['https://x/brand']"), &[&[&t1]], 21),
             "i_entities_first_type_id",
         ),
+        // T-5303: the store's `entity_values` probes (`value_probe`,
+        // `attrs_probe`); the page then reads its ids as the `id` shape does
+        ("q equality probe", probe("attr = 'https://x/speed' AND f = ANY(ARRAY[42, 'NaN'::float8])"), "i_entity_values_num"),
+        ("q range probe", probe("attr = 'https://x/speed' AND f >= 98"), "i_entity_values_num"),
+        ("q at most probe", probe("attr = 'https://x/speed' AND (f <= 1 OR f = 'NaN')"), "i_entity_values_num"),
+        ("q string probe", probe("attr = 'https://x/brand' AND (txt = 'b7' OR f = 'NaN')"), "i_entity_values_txt"),
+        ("attrs probe", probe("attr = ANY(ARRAY['https://x/rare'])"), "i_entity_values_num"),
         (
             "geo near",
             format!(
@@ -366,6 +387,17 @@ async fn every_query_shape_reads_an_index_under_rls() {
                 21,
             ),
             "i_entities_type_unlocated",
+        ),
+        (
+            // T-5349: a name filter without a type (STA `Things?$filter=name eq`),
+            // with the store's leakproof `name_key` narrowing
+            "q name, no type",
+            format!(
+                "SELECT entity FROM entities WHERE {w} AND (name_key = 'n4242' OR name_key IS NULL) \
+                 AND entity @? '$.\"https://uri.etsi.org/ngsi-ld/default-context/name\"[*].\"value\" \
+                 ? (@ == \"n4242\")'::jsonpath ORDER BY id LIMIT 101"
+            ),
+            "i_entities_name_key",
         ),
         (
             // a rare type (1 %): for a common one an id-ordered read of the
@@ -1082,7 +1114,12 @@ async fn the_keyed_history_arms_read_their_unique_index_under_rls() {
         let indexed = plan
             .lines()
             .any(|l| l.contains("Index Cond:") && l.contains(cond));
-        if !indexed || plan.contains("Seq Scan on attr_rows") {
+        // Once a cut-over is set, maintenance creates the weeks from it on in
+        // attr_rows; an empty week is read by a free Seq Scan, the right plan.
+        let walks = plan
+            .lines()
+            .any(|l| l.contains("Seq Scan on attr_rows") && !l.contains("(cost=0.00..0.00 "));
+        if !indexed || walks {
             bad.push(format!(
                 "{shape} (wants an index condition {cond}):\n{plan}"
             ));

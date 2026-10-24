@@ -35,7 +35,7 @@ mod write;
 use antares_ops::{Caller, OperationId, Ops, Surface, ViewOps};
 use axum::body::Body;
 use axum::extract::{Query, Request};
-use axum::http::header::{ACCEPT, ALLOW, CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::header::{ACCEPT, ACCEPT_LANGUAGE, ALLOW, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse as _, Response};
@@ -287,15 +287,7 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
         Err(refused) => return refused.reply(),
     };
     let pairs = asked.pairs;
-    let at = Here {
-        view: &view,
-        id,
-        base: &base,
-        caller,
-        collections: &collections,
-        #[cfg(any(feature = "parquet", feature = "tabular"))]
-        budget: export::Budget::of(ops, parts),
-    };
+    let at = Here::new(&view, (id, &base), caller, &collections, (ops, parts));
     match (rest.as_slice(), pairs.is_empty()) {
         ([] | [""], true) => document(JSON, &at.landing()),
         (["conformance"], true) => document(
@@ -406,7 +398,11 @@ fn offered(
     item: Option<(&str, Option<&str>)>,
     collections: &BTreeMap<String, Collection>,
 ) -> Option<Reply> {
-    let item = item.filter(|(c, _)| !collections.get(*c).is_some_and(|c| c.history));
+    let item = item.filter(|(c, _)| {
+        !collections
+            .get(*c)
+            .is_some_and(|c| c.history || c.output.is_some())
+    });
     let writes = [
         (Method::POST, "POST"),
         (Method::PUT, "PUT"),
@@ -484,10 +480,39 @@ fn collections(view: &ViewOps) -> Option<BTreeMap<String, Collection>> {
             all.entry(c.id.clone()).or_insert(c);
         }
     }
+    // T-5216: the view's named outputs, each over its one source's collection; a class keeps
+    // its own id.
+    let named: Vec<Collection> = antares_ops::outputs::listed(view.representation("ogc"), "ogc")
+        .into_iter()
+        .filter_map(|(_, o)| {
+            let o = o.ok()?;
+            model::output(all.get(&o.sources.first()?.entity_type)?, &o)
+        })
+        .collect();
+    for c in named {
+        all.entry(c.id.clone()).or_insert(c);
+    }
     Some(all)
 }
 
 /// No `Accept`, or one that takes some JSON or anything.
+/// The `Accept-Language` ranges as NGSI-LD `lang` reads them (RFC 9110 12.5.4: tags, `*`,
+/// `;q=`), `*` when the header is absent or holds anything else.
+fn language(headers: &HeaderMap) -> String {
+    headers
+        .get(ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| {
+            !v.is_empty()
+                && v.len() <= 200
+                && v.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-*,;=. ".contains(c))
+        })
+        .unwrap_or("*")
+        .to_owned()
+}
+
 fn acceptable(headers: &HeaderMap) -> bool {
     headers.get_all(ACCEPT).iter().next().is_none()
         || headers.get_all(ACCEPT).iter().any(|v| {
@@ -657,12 +682,39 @@ struct Here<'a> {
     view: &'a ViewOps,
     id: &'a str,
     base: &'a str,
+    /// The caller's `Accept-Language`, `*` without one: a `LanguageProperty` is one text in a
+    /// Feature (API/02 §1, EP-37), as NGSI-LD `lang` picks it (TS 104 175 4.15).
+    lang: String,
     caller: &'a Caller,
     collections: &'a BTreeMap<String, Collection>,
     /// The ceiling a file this surface assembles is written under and the files the router is
     /// writing (T-4465).
     #[cfg(any(feature = "parquet", feature = "tabular"))]
     budget: export::Budget,
+}
+
+impl<'a> Here<'a> {
+    /// A request's place: its view, its id and endpoint, its caller and what it accepts.
+    fn new(
+        view: &'a ViewOps,
+        (id, base): (&'a str, &'a str),
+        caller: &'a Caller,
+        collections: &'a BTreeMap<String, Collection>,
+        (ops, parts): (&Ops, &Parts),
+    ) -> Self {
+        // read only by the export budget
+        let _ = ops;
+        Self {
+            view,
+            id,
+            base,
+            lang: language(&parts.headers),
+            caller,
+            collections,
+            #[cfg(any(feature = "parquet", feature = "tabular"))]
+            budget: export::Budget::of(ops, parts),
+        }
+    }
 }
 
 impl Here<'_> {
@@ -720,7 +772,12 @@ impl Here<'_> {
         }
         let fields = [
             ("id", Some(Value::from(c.id.as_str()))),
-            ("title", Some(Value::from(c.id.as_str()))),
+            (
+                "title",
+                Some(Value::from(c.output.as_ref().map_or(c.id.as_str(), |o| {
+                    o.title_in(self.lang.split([',', ';', '-']).next().unwrap_or_default())
+                }))),
+            ),
             ("description", c.description.as_deref().map(Value::from)),
             ("itemType", Some(Value::from("feature"))),
             ("crs", Some(json!([crs::CRS84, crs::CRS84H]))),
@@ -743,7 +800,10 @@ impl Here<'_> {
         query: Option<&str>,
     ) -> Reply {
         let p = match items::params(c, pairs) {
-            Ok(p) => p,
+            Ok(p) => items::Params {
+                lang: Some(self.lang.clone()),
+                ..p
+            },
             Err(refused) => return refused.reply(),
         };
         let digest = items::digest(self.id, &c.id, pairs);
@@ -793,7 +853,10 @@ impl Here<'_> {
     /// C19: one Feature; `properties` and `profile` are its only parameters (S6, S7).
     async fn item(&self, c: &Collection, id: &str, pairs: &[(String, String)]) -> Reply {
         let p = match items::item_params(c, pairs) {
-            Ok(p) => p,
+            Ok(p) => items::Params {
+                lang: Some(self.lang.clone()),
+                ..p
+            },
             Err(refused) => return refused.reply(),
         };
         let refs = self.refs(p.profile);

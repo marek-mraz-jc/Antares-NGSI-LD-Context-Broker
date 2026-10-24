@@ -21,6 +21,173 @@ pub struct PgTemporalStore {
     /// Set when this instance serves only the temporal seam: it never holds
     /// the entities, so the append guard must not look for them here.
     pub temporal_only: bool,
+    keys: Keys,
+}
+
+/// The integer history keys' process state (T-5243, docs/src/storage.md
+/// "Integer history keys").
+#[derive(Default)]
+struct Keys {
+    /// `history_cutover`, read on the first write: only a migration, which
+    /// runs before the store serves, sets it.
+    cutover: tokio::sync::OnceCell<Option<chrono::DateTime<chrono::Utc>>>,
+    /// (Tenant, IRI) pairs a committed `iri_ids` row holds. A write sends the
+    /// dictionary insert only for an IRI missing here, so a warm process
+    /// sends no extra statement. An IRI this process inserted is added only
+    /// when a later write finds it stored: the inserting transaction may still
+    /// roll back. The ids themselves come from `iri_no` inside each
+    /// statement, so a stale entry fails a write (23502) instead of keying a
+    /// row by an id that names nothing.
+    known: std::sync::Mutex<Known>,
+    /// Which writes keep short history (T-5249): their rows go to the
+    /// unlogged child of `attr_rows`, whatever the cut-over.
+    short: std::sync::RwLock<std::sync::Arc<antares_store::ShortHistory>>,
+}
+
+/// Pairs one generation of [`Known`] holds before it ages. Two generations
+/// hold at most twice this: about 150 B per pair (two `String`s with a
+/// 60-byte IRI, the table slot), so ~30 MB per process at the bound.
+const KNOWN_GEN: usize = 100_000;
+
+/// The known (Tenant, IRI) set, bounded as a two-generation LRU: a pair
+/// found in `old` moves to `new`; when `new` is full it becomes `old` and
+/// the previous `old` is dropped. A working set under [`KNOWN_GEN`] pairs
+/// never misses; a pair aged out costs its next write one
+/// `INSERT ... ON CONFLICT DO NOTHING` round trip, after which it is known
+/// again.
+#[derive(Default)]
+struct Known {
+    new: std::collections::HashSet<(String, String)>,
+    old: std::collections::HashSet<(String, String)>,
+}
+
+impl Known {
+    fn contains(&mut self, k: &(String, String)) -> bool {
+        if self.new.contains(k) {
+            return true;
+        }
+        match self.old.take(k) {
+            Some(k) => {
+                self.insert(k);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn insert(&mut self, k: (String, String)) {
+        if self.new.len() >= KNOWN_GEN {
+            self.old = std::mem::take(&mut self.new);
+        }
+        self.new.insert(k);
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&(String, String)) -> bool) {
+        self.new.retain(&mut keep);
+        self.old.retain(keep);
+    }
+}
+
+impl Keys {
+    fn known(&self) -> std::sync::MutexGuard<'_, Known> {
+        self.known
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    async fn cutover(
+        &self,
+        tx: &mut sqlx::PgConnection,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, sqlx::Error> {
+        self.cutover
+            .get_or_try_init(|| async {
+                sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+                    "SELECT at FROM history_cutover",
+                )
+                .fetch_optional(&mut *tx)
+                .await
+                .map(Option::flatten)
+            })
+            .await
+            .copied()
+    }
+
+    /// Writes the `iri_ids` rows of `iris` the dictionary lacks, inside the
+    /// caller's transaction (RLS checks its Tenant), in IRI order so two
+    /// writers wait on each other's first sights in one order. `ensured`
+    /// holds what this transaction already wrote or found.
+    async fn ensure(
+        &self,
+        tx: &mut sqlx::PgConnection,
+        tenant: &TenantId,
+        mut iris: Vec<String>,
+        ensured: &mut std::collections::HashSet<(String, String)>,
+    ) -> Result<(), sqlx::Error> {
+        {
+            let mut known = self.known();
+            iris.retain(|i| {
+                let k = (tenant.as_str().to_owned(), i.clone());
+                !known.contains(&k) && !ensured.contains(&k)
+            });
+        }
+        if iris.is_empty() {
+            return Ok(());
+        }
+        iris.sort_unstable();
+        iris.dedup();
+        let fresh: std::collections::HashSet<String> = sqlx::query_scalar(
+            "INSERT INTO iri_ids (tenant_id, iri) SELECT $1, unnest($2::text[])
+             ON CONFLICT DO NOTHING RETURNING iri",
+        )
+        .bind(tenant.as_str())
+        .bind(&iris)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .collect();
+        let mut known = self.known();
+        for i in iris {
+            let k = (tenant.as_str().to_owned(), i);
+            if !fresh.contains(&k.1) {
+                known.insert(k.clone());
+            }
+            ensured.insert(k);
+        }
+        Ok(())
+    }
+
+    /// Drops what this process knows of `tenant`'s dictionary: its purge, or
+    /// a keyed write that found an IRI gone (another pod's purge).
+    fn forget(&self, tenant: &TenantId) {
+        self.known().retain(|(t, _)| t != tenant.as_str());
+    }
+
+    /// Whether a write of an Entity of `types` whose current state is
+    /// `shell` keeps short history.
+    fn is_short(&self, tenant: &TenantId, types: &[String], shell: &Value) -> bool {
+        self.short
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_short(
+                tenant.as_str(),
+                types,
+                shell.get(antares_store::HISTORY_RETENTION).is_some(),
+            )
+    }
+}
+
+/// The dictionary IRIs a write of `doc` for Entity `id` keys its rows by:
+/// the Entity id and its Attribute names.
+fn iris_of(id: &str, doc: &Value) -> Vec<String> {
+    let mut out = vec![id.to_owned()];
+    if let Some(o) = doc.as_object() {
+        out.extend(
+            o.iter()
+                .filter(|(k, v)| v.is_array() && !DOC_META.contains(&k.as_str()))
+                .map(|(k, _)| k.clone()),
+        );
+    }
+    out
 }
 
 /// 4.22: "expiresAt is defined as the system temporal Property at which a
@@ -296,18 +463,33 @@ fn unseen(rows: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
+/// How [`insert_rows`] writes one batch: `dedup` records new observations
+/// only, `short` writes every row to the unlogged child (T-5249).
+#[derive(Clone, Copy)]
+struct Route {
+    dedup: bool,
+    short: bool,
+}
+
 /// Multi-row instance upsert inside the caller's transaction. With `dedup`
 /// (the auto-recording append) a row is written only when it is a new
 /// observation (T-4507): an instance with an `observedAt` already stored for
 /// its (attribute, datasetId) is updated in place, keeping its instanceId,
 /// and one without is skipped when the newest stored instance holds the same
 /// value. tenant_id is part of every comparison.
+///
+/// A row observed from the cut-over on goes to `attr_rows` (T-5243), any
+/// earlier one to `attr_instances`, a late write included: one observation
+/// always meets its stored instance in the same parent. Every row of a
+/// `short` write goes to `attr_rows` as `short`, its unlogged child (T-5249).
 async fn insert_rows(
     tx: &mut sqlx::PgConnection,
+    keys: &Keys,
+    ensured: &mut std::collections::HashSet<(String, String)>,
     tenant: &TenantId,
     entity_id: &str,
     rows: Vec<Value>,
-    dedup: bool,
+    Route { dedup, short }: Route,
 ) -> Result<(), sqlx::Error> {
     let dedup = dedup && temporal_dedup();
     let rows = if dedup { unseen(rows) } else { rows };
@@ -323,6 +505,86 @@ async fn insert_rows(
         .collect();
     in_dataset.sort_unstable();
     in_dataset.dedup();
+    let (keyed, text): (Vec<Value>, Vec<Value>) = if short {
+        (rows, Vec::new())
+    } else {
+        let cutover = keys.cutover(tx).await?;
+        rows.into_iter().partition(|r| is_keyed(r, cutover))
+    };
+    if !text.is_empty() {
+        insert_text(tx, tenant, entity_id, text, dedup).await?;
+    }
+    if !keyed.is_empty() {
+        let mut iris = vec![entity_id.to_owned()];
+        iris.extend(
+            keyed
+                .iter()
+                .filter_map(|r| r["attr_id"].as_str().map(str::to_owned)),
+        );
+        keys.ensure(tx, tenant, iris, ensured).await?;
+        if let Err(e) = insert_keyed(tx, tenant, entity_id, keyed, dedup, short).await {
+            // an IRI the known set holds is gone: another pod purged the Tenant
+            if matches!(&e, sqlx::Error::Database(d) if d.code().as_deref() == Some("23502")) {
+                keys.forget(tenant);
+            }
+            return Err(e);
+        }
+    }
+    if !in_dataset.is_empty() {
+        // Every caller writes the Entity's temporal row before its instances.
+        sqlx::query(
+            "UPDATE temporal_entities
+             SET dataset_attrs = ARRAY(SELECT DISTINCT x FROM unnest(dataset_attrs || $3) AS x ORDER BY x)
+             WHERE tenant_id = $1 AND id = $2 AND NOT dataset_attrs @> $3",
+        )
+        .bind(tenant.as_str())
+        .bind(entity_id)
+        .bind(&in_dataset)
+        .execute(&mut *tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Whether row `r` is observed at or after `cutover`. A stamp chrono cannot
+/// read stays in the text shape, where its cast judges it as before.
+fn is_keyed(r: &Value, cutover: Option<chrono::DateTime<chrono::Utc>>) -> bool {
+    let Some(cut) = cutover else {
+        return false;
+    };
+    r["observed_at"]
+        .as_str()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .is_some_and(|t| t >= cut)
+}
+
+/// The `attr_rows` key of an instance id and whether it is the broker's own:
+/// the uuid of `urn:ngsi-ld:Instance:<uuid>` in its canonical lowercase form,
+/// which the read side prints back as is; any other id keys by its uuid v5
+/// and stays in `data` as `instanceId` (docs/src/storage.md).
+fn instance_no(id: &str) -> (uuid::Uuid, bool) {
+    let own = id.strip_prefix("urn:ngsi-ld:Instance:").and_then(|s| {
+        uuid::Uuid::try_parse(s)
+            .ok()
+            .filter(|u| u.hyphenated().to_string() == s)
+    });
+    match own {
+        Some(u) => (u, true),
+        None => (
+            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, id.as_bytes()),
+            false,
+        ),
+    }
+}
+
+/// [`insert_rows`] into `attr_instances`, the text shape.
+async fn insert_text(
+    tx: &mut sqlx::PgConnection,
+    tenant: &TenantId,
+    entity_id: &str,
+    rows: Vec<Value>,
+    dedup: bool,
+) -> Result<(), sqlx::Error> {
     let (lo, hi) = observed_range(&rows);
     // geo_value: extracted per instance when the value LOOKS like a GeoJSON
     // geometry; try_geomfromgeojson (0001_init.sql) maps anything PostGIS rejects to
@@ -426,19 +688,125 @@ async fn insert_rows(
     .bind(&hi)
     .execute(&mut *tx)
     .await?;
-    if !in_dataset.is_empty() {
-        // Every caller writes the Entity's temporal row before its instances.
-        sqlx::query(
-            "UPDATE temporal_entities
-             SET dataset_attrs = ARRAY(SELECT DISTINCT x FROM unnest(dataset_attrs || $3) AS x ORDER BY x)
-             WHERE tenant_id = $1 AND id = $2 AND NOT dataset_attrs @> $3",
-        )
+    Ok(())
+}
+
+/// [`insert_rows`] into `attr_rows`: [`insert_text`]'s three statements over
+/// the integer keys. `iri_no` binds the dictionary ids [`Keys::ensure`] wrote;
+/// `instance_no` keys the instance, and a client's own id rides in `data`.
+async fn insert_keyed(
+    tx: &mut sqlx::PgConnection,
+    tenant: &TenantId,
+    entity_id: &str,
+    mut rows: Vec<Value>,
+    dedup: bool,
+    short: bool,
+) -> Result<(), sqlx::Error> {
+    for r in &mut rows {
+        let id = r["instance_id"].as_str().unwrap_or_default().to_owned();
+        let (no, own) = instance_no(&id);
+        r["instance_no"] = Value::String(no.to_string());
+        if !own {
+            if let Some(d) = r["data"].as_object_mut() {
+                d.insert("instanceId".to_owned(), Value::String(id));
+            }
+        }
+    }
+    let (lo, hi) = observed_range(&rows);
+    let rows = Value::Array(rows);
+    // the stored instance of the same (attribute, datasetId) a row of `e` repeats
+    let same = "x.attr_no = iri_no($1, e->>'attr_id')
+                AND x.dataset_id IS NOT DISTINCT FROM e->>'dataset_id'
+                AND x.instance_no <> (e->>'instance_no')::uuid";
+    // attr_versions keeps whole documents in the text shape (ADR-N-054 2.4)
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO attr_versions
+           (tenant_id, entity_id, attr_id, instance_id, dataset_id, observed_at, version, data, provenance)
+         SELECT x.tenant_id, x.entity_id, x.attr_id, x.instance_id, x.dataset_id, x.observed_at,
+                x.version, {x_data}, x.provenance
+         FROM jsonb_array_elements($3::jsonb) AS e
+         CROSS JOIN LATERAL attr_rows_at($1, $2, e->>'attr_id') x
+         WHERE x.observed_at = (e->>'observed_at')::timestamptz
+           AND x.observed_at BETWEEN $5::timestamptz AND $6::timestamptz
+           AND (x.instance_id = e->>'instance_id'
+                OR ($4 AND e->'data' ? 'observedAt'
+                    AND x.dataset_id IS NOT DISTINCT FROM e->>'dataset_id'))
+           AND x.data - {STAMPS} IS DISTINCT FROM (e->'data') - {STAMPS}
+         ON CONFLICT DO NOTHING",
+        x_data = restamp("x")
+    )))
+    .bind(tenant.as_str())
+    .bind(entity_id)
+    .bind(&rows)
+    .bind(dedup)
+    .bind(&lo)
+    .bind(&hi)
+    .execute(&mut *tx)
+    .await?;
+    if dedup {
+        // Same observedAt, another value: corrected in place, keeping the
+        // stored instance's id (a client's one in `data`).
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE attr_rows x
+             SET data = ((e->'data') - 'instanceId')
+                        || CASE WHEN x.data ? 'instanceId'
+                                THEN jsonb_build_object('instanceId', x.data->'instanceId')
+                                ELSE '{{}}'::jsonb END,
+                 version = x.version + 1, provenance = {CORRECTED},
+                 modified_at = (e->>'modified_at')::timestamptz,
+                 deleted_at = (e->>'deleted_at')::timestamptz, geo_value = {GEO_VALUE}
+             FROM jsonb_array_elements($3::jsonb) AS e
+             WHERE x.tenant_id = $1 AND x.entity_no = iri_no($1, $2)
+               AND e->'data' ? 'observedAt' AND {same}
+               AND x.observed_at = (e->>'observed_at')::timestamptz
+               AND x.observed_at BETWEEN $4::timestamptz AND $5::timestamptz
+               AND x.data - {STAMPS} IS DISTINCT FROM (e->'data') - {STAMPS}"
+        )))
         .bind(tenant.as_str())
         .bind(entity_id)
-        .bind(&in_dataset)
+        .bind(&rows)
+        .bind(&lo)
+        .bind(&hi)
         .execute(&mut *tx)
         .await?;
     }
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO attr_rows
+           (tenant_id, entity_no, attr_no, instance_no, dataset_id, observed_at,
+            created_at, modified_at, deleted_at, data, geo_value, provenance, short)
+         SELECT $1, iri_no($1, $2), iri_no($1, e->>'attr_id'), (e->>'instance_no')::uuid,
+                e->>'dataset_id',
+                (e->>'observed_at')::timestamptz, (e->>'created_at')::timestamptz,
+                (e->>'modified_at')::timestamptz, (e->>'deleted_at')::timestamptz,
+                e->'data', {GEO_VALUE}, NULLIF(e->'provenance', 'null'::jsonb), $7
+         FROM jsonb_array_elements($3::jsonb) AS e
+         WHERE NOT $4 OR NOT CASE
+           WHEN e->'data' ? 'observedAt' THEN EXISTS (
+             SELECT 1 FROM attr_rows x
+             WHERE x.tenant_id = $1 AND x.entity_no = iri_no($1, $2) AND {same}
+               AND x.observed_at = (e->>'observed_at')::timestamptz
+               AND x.observed_at BETWEEN $5::timestamptz AND $6::timestamptz)
+           ELSE {NEWEST_REPEATS}
+         END
+         ON CONFLICT (tenant_id, entity_no, attr_no, observed_at, instance_no, short)
+           DO UPDATE SET data = EXCLUDED.data, modified_at = EXCLUDED.modified_at,
+                         dataset_id = EXCLUDED.dataset_id,
+                         deleted_at = EXCLUDED.deleted_at,
+                         geo_value = EXCLUDED.geo_value,
+                         version = attr_rows.version + 1,
+                         provenance = jsonb_set(COALESCE(EXCLUDED.provenance, '{{}}'::jsonb),
+                                                '{{operation}}', '\"correct\"')
+           WHERE attr_rows.data - {STAMPS} IS DISTINCT FROM EXCLUDED.data - {STAMPS}"
+    )))
+    .bind(tenant.as_str())
+    .bind(entity_id)
+    .bind(&rows)
+    .bind(dedup)
+    .bind(&lo)
+    .bind(&hi)
+    .bind(short)
+    .execute(&mut *tx)
+    .await?;
     Ok(())
 }
 
@@ -776,7 +1144,31 @@ impl PgTemporalStore {
         Self {
             pool,
             temporal_only: false,
+            keys: Keys::default(),
         }
+    }
+
+    /// A store that routes by `cutover` instead of `history_cutover`, so a
+    /// test sets its own cut-over without moving every other test's rows.
+    #[cfg(any(test, feature = "test-kit"))]
+    pub fn with_cutover(pool: PgPool, cutover: Option<chrono::DateTime<chrono::Utc>>) -> Self {
+        let mut s = Self::new(pool);
+        s.keys.cutover = tokio::sync::OnceCell::new_with(Some(cutover));
+        s
+    }
+
+    /// Replaces which writes keep short history (T-5249) with `short`.
+    pub fn set_short_history(&self, short: antares_store::ShortHistory) {
+        *self
+            .keys
+            .short
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::sync::Arc::new(short);
+    }
+
+    /// Forgets the dictionary entries of `tenant` after its purge.
+    pub fn forget_tenant(&self, tenant: &TenantId) {
+        self.keys.forget(tenant);
     }
 
     /// `false` when the id already exists (create semantics, like the memory
@@ -829,7 +1221,21 @@ impl PgTemporalStore {
         .await?
         .rows_affected();
         if n == 1 {
-            insert_rows(&mut tx, tenant, id, rows, false).await?;
+            let mut ensured = std::collections::HashSet::new();
+            let short = self.keys.is_short(tenant, &types, doc);
+            insert_rows(
+                &mut tx,
+                &self.keys,
+                &mut ensured,
+                tenant,
+                id,
+                rows,
+                Route {
+                    dedup: false,
+                    short,
+                },
+            )
+            .await?;
         }
         tx.commit().await?;
         Ok(n == 1)
@@ -854,7 +1260,8 @@ impl PgTemporalStore {
         additions: &Value,
     ) -> Result<(), sqlx::Error> {
         let mut tx = super::begin(&self.pool).await?;
-        self.append_in(&mut tx, tenant, id, shell, additions)
+        let mut ensured = std::collections::HashSet::new();
+        self.append_in(&mut tx, &mut ensured, tenant, id, shell, additions)
             .await?;
         tx.commit().await?;
         Ok(())
@@ -871,17 +1278,79 @@ impl PgTemporalStore {
             return Ok(());
         }
         let mut tx = super::begin(&self.pool).await?;
+        let mut ensured = std::collections::HashSet::new();
+        // After the cut-over or for a short write, the batch's first sights go
+        // in first, in one order: an Entity at a time, two batches could each
+        // wait on an IRI the other wrote first. Only live Entities count:
+        // append_in skips the others, and their IRIs would stay in iri_ids
+        // naming nothing. The FOR KEY SHARE taken here holds until commit, so
+        // append_in's own check finds the same Entities.
+        let short = appends
+            .iter()
+            .any(|(tenant, _, shell, _)| self.keys.is_short(tenant, &extract(shell).0, shell));
+        if short || self.keys.cutover(&mut tx).await?.is_some() {
+            // the batch's Entities per Tenant, as (id, additions)
+            type Docs<'a> = Vec<(&'a str, &'a Value)>;
+            let mut by_tenant: std::collections::BTreeMap<&str, (&TenantId, Docs)> =
+                std::collections::BTreeMap::new();
+            for (tenant, id, _, additions) in appends {
+                by_tenant
+                    .entry(tenant.as_str())
+                    .or_insert_with(|| (tenant, Vec::new()))
+                    .1
+                    .push((id, additions));
+            }
+            for (tenant, docs) in by_tenant.into_values() {
+                crate::store::pg::set_tenant(&mut tx, tenant).await?;
+                let live = self.live_of(&mut tx, tenant, &docs).await?;
+                let iris = docs
+                    .into_iter()
+                    .filter(|(id, _)| live.contains(*id))
+                    .flat_map(|(id, additions)| iris_of(id, additions))
+                    .collect();
+                self.keys
+                    .ensure(&mut tx, tenant, iris, &mut ensured)
+                    .await?;
+            }
+        }
         for (tenant, id, shell, additions) in appends {
-            self.append_in(&mut tx, tenant, id, shell, additions)
+            self.append_in(&mut tx, &mut ensured, tenant, id, shell, additions)
                 .await?;
         }
         tx.commit().await?;
         Ok(())
     }
 
+    /// The ids of `docs` stored in `entities` (all of them when this store
+    /// serves only the temporal seam), each locked FOR KEY SHARE until the
+    /// caller's commit.
+    async fn live_of(
+        &self,
+        tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+        tenant: &TenantId,
+        docs: &[(&str, &Value)],
+    ) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+        let mut ids: Vec<&str> = docs.iter().map(|(id, _)| *id).collect();
+        if self.temporal_only {
+            return Ok(ids.into_iter().map(str::to_owned).collect());
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let live = sqlx::query_scalar(
+            "SELECT id FROM entities WHERE tenant_id = $1 AND id = ANY($2)
+             ORDER BY id FOR KEY SHARE",
+        )
+        .bind(tenant.as_str())
+        .bind(&ids)
+        .fetch_all(&mut **tx)
+        .await?;
+        Ok(live.into_iter().collect())
+    }
+
     async fn append_in(
         &self,
         tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+        ensured: &mut std::collections::HashSet<(String, String)>,
         tenant: &TenantId,
         id: &str,
         shell: &Value,
@@ -930,7 +1399,9 @@ impl PgTemporalStore {
         .bind(&modified)
         .execute(&mut **tx)
         .await?;
-        insert_rows(tx, tenant, id, rows, true).await
+        let short = self.keys.is_short(tenant, &types, shell);
+        let route = Route { dedup: true, short };
+        insert_rows(tx, &self.keys, ensured, tenant, id, rows, route).await
     }
 
     pub async fn get(&self, tenant: &TenantId, id: &str) -> Result<Option<Value>, sqlx::Error> {
@@ -1515,7 +1986,20 @@ impl PgTemporalStore {
                             .await?;
                     }
                 }
-                insert_rows(&mut tx, tenant, id, upserts, false).await?;
+                let mut ensured = std::collections::HashSet::new();
+                insert_rows(
+                    &mut tx,
+                    &self.keys,
+                    &mut ensured,
+                    tenant,
+                    id,
+                    upserts,
+                    Route {
+                        dedup: false,
+                        short: self.keys.is_short(tenant, &types, &doc),
+                    },
+                )
+                .await?;
                 sqlx::query(
                     "UPDATE temporal_entities SET meta = $3, types = $4, scopes = $5,
                        modified_at = $6::timestamptz
@@ -1544,6 +2028,88 @@ impl PgTemporalStore {
 mod tests {
     use super::*;
     use crate::compile::temporal::InstanceRange;
+
+    fn pair(n: usize) -> (String, String) {
+        ("t".to_owned(), format!("urn:ngsi-ld:E:{n}"))
+    }
+
+    /// T-5243: the known set holds at most two generations; a pair read
+    /// while old survives the next ageing, one never read again is dropped.
+    #[test]
+    fn known_ages_by_generation_and_keeps_what_it_reads() {
+        let mut k = Known::default();
+        for n in 0..KNOWN_GEN {
+            k.insert(pair(n));
+        }
+        k.insert(pair(KNOWN_GEN));
+        assert_eq!(k.old.len(), KNOWN_GEN);
+        assert_eq!(k.new.len(), 1);
+        assert!(k.contains(&pair(0)));
+        assert!(!k.old.contains(&pair(0)));
+        for n in 1..KNOWN_GEN {
+            k.insert(pair(KNOWN_GEN.saturating_add(n)));
+        }
+        k.insert(pair(KNOWN_GEN.saturating_mul(3)));
+        assert!(k.contains(&pair(0)));
+        assert!(!k.contains(&pair(1)));
+        assert!(!k.contains(&pair(KNOWN_GEN.saturating_mul(4))));
+        k.retain(|(t, _)| t != "t");
+        assert!(k.new.is_empty());
+        assert!(k.old.is_empty());
+    }
+
+    /// T-5243: the broker's own canonical id keys by its uuid; any other id,
+    /// an upper-case uuid included, keys by its v5 and stays in data.
+    #[test]
+    fn instance_no_keys_own_ids_by_their_uuid_and_others_by_v5() {
+        let own = "urn:ngsi-ld:Instance:0f8fad5b-d9cb-469f-a165-70867728950e";
+        let (no, is_own) = instance_no(own);
+        assert_eq!(
+            (no.to_string(), is_own),
+            ("0f8fad5b-d9cb-469f-a165-70867728950e".to_owned(), true)
+        );
+        let upper = "urn:ngsi-ld:Instance:0F8FAD5B-D9CB-469F-A165-70867728950E";
+        for other in [upper, "urn:client:speed:thirty", "urn:ngsi-ld:Instance:x"] {
+            let (no, is_own) = instance_no(other);
+            assert_eq!((no.get_version_num(), is_own), (5, false), "{other}");
+            assert_eq!(no, instance_no(other).0, "{other}: stable");
+        }
+        assert_ne!(
+            instance_no(upper).0,
+            no,
+            "a v5 never equals the uuid it spells"
+        );
+    }
+
+    /// T-5243: a row from the cut-over on is keyed; an earlier one, an
+    /// unreadable stamp and no cut-over stay in the text shape.
+    #[test]
+    fn is_keyed_routes_by_observed_at_against_the_cut_over() {
+        let cut = chrono::DateTime::parse_from_rfc3339("2026-10-26T00:00:00Z")
+            .ok()
+            .map(|t| t.to_utc());
+        let row = |at: &str| serde_json::json!({"observed_at": at});
+        let got = [
+            is_keyed(&row("2026-10-26T00:00:00Z"), cut),
+            is_keyed(&row("2026-10-26T01:00:00+02:00"), cut),
+            is_keyed(&row("2026-10-25T23:59:59Z"), cut),
+            is_keyed(&row("not a stamp"), cut),
+            is_keyed(&row("2027-01-01T00:00:00Z"), None),
+        ];
+        assert_eq!(got, [true, false, false, false, false]);
+    }
+
+    /// T-5243: the IRIs a batch append writes first are the Entity id and its
+    /// Attribute names, never a meta member.
+    #[test]
+    fn iris_of_names_the_entity_and_its_attributes() {
+        let doc = serde_json::json!({"id": "x", "type": "T", "createdAt": "2026-01-01T00:00:00Z",
+                                     "https://a": [{}], "https://b": {"not": "instances"}});
+        assert_eq!(
+            iris_of("urn:e", &doc),
+            vec!["urn:e".to_owned(), "https://a".to_owned()]
+        );
+    }
 
     /// T-5131: a row's instanceId lives in its column; `unpack` puts it back
     /// and leaves stored instances and meta members alone.

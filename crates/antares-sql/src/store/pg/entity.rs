@@ -12,7 +12,7 @@
 //! travels as a bind).
 
 use antares_model::{NgsiError, TenantId};
-use antares_ql::QNode;
+use antares_ql::{CmpOp, QNode, QValue};
 use serde_json::Value;
 use sqlx::postgres::PgPool;
 use sqlx::Row;
@@ -278,6 +278,175 @@ fn unlocated(q: &QNode, expand: &dyn Fn(&str) -> String) -> bool {
         QNode::And(all) => all.iter().any(|n| unlocated(n, expand)),
         _ => false,
     }
+}
+
+/// The `name` the core @context gives an Entity (`@vocab` + `name`), the one
+/// attribute `entities.name_key` (0020) keys.
+/// ponytail: one IRI; a `name` another @context maps elsewhere filters as before.
+const NAME_IRI: &str = "https://uri.etsi.org/ngsi-ld/default-context/name";
+
+/// The string a top-level `name=="…"` term of `q` requires. Every match then
+/// has `name_key` equal to it or NULL (0020: NULL is each shape the key
+/// cannot hold), so `(name_key = $n OR name_key IS NULL)` narrows by a
+/// leakproof btree under RLS where the `@?` read the whole Tenant (T-5349);
+/// the `@?` stays and decides. A NUL is no Postgres text: no narrowing.
+fn named<'q>(q: &'q QNode, expand: &dyn Fn(&str) -> String) -> Option<&'q str> {
+    match q {
+        QNode::Cmp {
+            path,
+            op: CmpOp::Eq,
+            value: QValue::Str(want),
+        } if path.links.is_empty()
+            && path.bracket.is_none()
+            && !want.contains('\0')
+            && matches!(path.path.as_slice(), [term] if expand(term) == NAME_IRI) =>
+        {
+            Some(want)
+        }
+        QNode::And(all) => all.iter().find_map(|n| named(n, expand)),
+        _ => None,
+    }
+}
+
+/// The Entity's own members, which `entity_value_rows` (0024) gives no row:
+/// an `attrs=` naming one is not narrowed.
+const OWN_MEMBERS: &[&str] = &[
+    "id",
+    "type",
+    "scope",
+    "@context",
+    "createdAt",
+    "modifiedAt",
+    "deletedAt",
+    "expiresAt",
+];
+
+/// The longest string `entity_values.txt` (0024) keys, in bytes.
+const MAX_KEYED_TEXT: usize = 1024;
+
+/// What a top-level `q` term requires of its Attribute's `entity_values`
+/// rows (0024). Every bound is non-strict: a stored number is rounded to
+/// float8, monotonically, and the query's f64 is the literal's own value.
+#[derive(Debug, PartialEq)]
+enum ValueKey<'q> {
+    Eq(f64),
+    AtLeast(f64),
+    AtMost(f64),
+    Between(f64, f64),
+    Text(&'q str),
+}
+
+fn value_key(op: CmpOp, want: &QValue) -> Option<ValueKey<'_>> {
+    Some(match (op, want) {
+        (CmpOp::Eq, QValue::Num(n)) => ValueKey::Eq(*n),
+        (CmpOp::Gt | CmpOp::Ge, QValue::Num(n)) => ValueKey::AtLeast(*n),
+        (CmpOp::Lt | CmpOp::Le, QValue::Num(n)) => ValueKey::AtMost(*n),
+        (CmpOp::Eq, QValue::Range(lo, hi)) => match (lo.as_ref(), hi.as_ref()) {
+            (QValue::Num(a), QValue::Num(b)) => ValueKey::Between(*a, *b),
+            _ => return None,
+        },
+        (CmpOp::Eq, QValue::Str(s)) if !s.contains('\0') => ValueKey::Text(s),
+        _ => return None,
+    })
+}
+
+/// The first top-level `q` term `entity_values` keys: its Attribute's IRI
+/// and the rows a match holds. Call it only for a `q` that compiled: then
+/// the term's `@?` is exact and every row it matches has such a row.
+fn valued<'q>(q: &'q QNode, expand: &dyn Fn(&str) -> String) -> Option<(String, ValueKey<'q>)> {
+    match q {
+        QNode::Cmp { path, op, value } if path.links.is_empty() && path.bracket.is_none() => {
+            let [term] = path.path.as_slice() else {
+                return None;
+            };
+            Some((expand(term), value_key(*op, value)?)).filter(|(iri, _)| !iri.contains('\0'))
+        }
+        QNode::And(all) => all.iter().find_map(|n| valued(n, expand)),
+        _ => None,
+    }
+}
+
+/// One past the most Entity ids an `entity_values` probe (0024) hands the
+/// page as `id = ANY(...)` (T-5303). A term matching more is no narrowing
+/// worth its primary key reads (about 7 µs each under RLS): the page reads
+/// as before, and the probe cost at most this many index entries.
+const PROBE_ROWS: i64 = 1001;
+
+/// A read of `entity_values` (0024) for the ids a term's matches are among,
+/// `$1` the Tenant: its statement and binds.
+struct Probe {
+    sql: String,
+    binds: Vec<Bind>,
+}
+
+impl Probe {
+    fn new(tenant: &TenantId, attr: Bind, cond: &str, mut binds: Vec<Bind>) -> Self {
+        binds.splice(0..0, [Bind::Text(tenant.as_str().to_owned()), attr]);
+        binds.push(Bind::Int(PROBE_ROWS));
+        let sql = format!(
+            "SELECT id FROM entity_values WHERE tenant_id = $1 AND {cond} LIMIT ${}",
+            binds.len()
+        );
+        Self { sql, binds }
+    }
+}
+
+/// `valued`'s term as a probe: the rows that satisfy it, or hold 'NaN', the
+/// mark of an Attribute whose values were not keyed (0024). `f >= x` keeps
+/// 'NaN', which sorts above every number.
+fn value_probe(tenant: &TenantId, iri: String, key: ValueKey<'_>) -> Probe {
+    let (cond, binds) = match key {
+        ValueKey::Eq(n) => ("f = ANY(ARRAY[$3, 'NaN'::float8])", vec![Bind::Num(n)]),
+        ValueKey::AtLeast(n) => ("f >= $3", vec![Bind::Num(n)]),
+        ValueKey::AtMost(n) => ("(f <= $3 OR f = 'NaN')", vec![Bind::Num(n)]),
+        ValueKey::Between(a, b) => (
+            "(f BETWEEN $3 AND $4 OR f = 'NaN')",
+            vec![Bind::Num(a), Bind::Num(b)],
+        ),
+        ValueKey::Text(s) if s.len() > MAX_KEYED_TEXT => ("f = 'NaN'", vec![]),
+        ValueKey::Text(s) => ("(txt = $3 OR f = 'NaN')", vec![Bind::Text(s.to_owned())]),
+    };
+    Probe::new(
+        tenant,
+        Bind::Text(iri),
+        &format!("attr = $2 AND {cond}"),
+        binds,
+    )
+}
+
+/// `attrs=` as a probe of presence rows (0024), `None` when it names one of
+/// the Entity's own members, which have none.
+fn attrs_probe(tenant: &TenantId, attrs: &[String]) -> Option<Probe> {
+    if attrs.iter().any(|a| OWN_MEMBERS.contains(&a.as_str())) {
+        return None;
+    }
+    let names = Bind::TextArr(super::storable(attrs));
+    Some(Probe::new(tenant, names, "attr = ANY($2)", vec![]))
+}
+
+/// The distinct ids `p` reads, `None` when there are `PROBE_ROWS` rows or
+/// more. Unprepared, as the page statement.
+async fn probe_ids(
+    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    p: &Probe,
+) -> Result<Option<Vec<String>>, sqlx::Error> {
+    let mut qy =
+        sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(p.sql.clone())).persistent(false);
+    for b in &p.binds {
+        qy = match b {
+            Bind::Text(s) | Bind::Path(s) => qy.bind(s),
+            Bind::TextArr(v) => qy.bind(v),
+            Bind::Num(n) => qy.bind(n),
+            Bind::Int(n) => qy.bind(n),
+        };
+    }
+    let mut ids = qy.fetch_all(&mut **tx).await?;
+    if i64::try_from(ids.len()).map_or(true, |n| n >= PROBE_ROWS) {
+        return Ok(None);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(Some(ids))
 }
 
 /// The type selection's binds and SQL: `Ok(split)` for at most
@@ -854,6 +1023,7 @@ impl PgEntityStore {
         // (`near` geography vs haversine) — both therefore forfeit
         // `decided`, they only narrow.
         let mut decided = true;
+        let mut probes = Vec::new();
 
         if let Some(ids) = f.ids {
             binds.push(Bind::TextArr(super::storable(ids)));
@@ -894,6 +1064,7 @@ impl PgEntityStore {
         if let Some(attrs) = f.attrs {
             binds.push(Bind::TextArr(super::storable(attrs)));
             wheres.push(format!("entity ?| ${}", binds.len()));
+            probes.extend(attrs_probe(tenant, attrs));
         }
         if let Some(node) = f.q {
             match crate::compile::q::compile_q(
@@ -905,11 +1076,18 @@ impl PgEntityStore {
                 Some(c) => {
                     wheres.push(c.sql);
                     binds.extend(c.binds.into_iter().map(Bind::Path));
+                    if let Some((iri, key)) = valued(node, f.expand) {
+                        probes.push(value_probe(tenant, iri, key));
+                    }
                 }
                 None => decided = false,
             }
             if unlocated(node, f.expand) {
                 wheres.push("location IS NULL".to_owned());
+            }
+            if let Some(name) = named(node, f.expand) {
+                binds.push(Bind::Text(name.to_owned()));
+                wheres.push(format!("(name_key = ${} OR name_key IS NULL)", binds.len()));
             }
         }
         if let Some(sq) = f.scope_q {
@@ -944,6 +1122,10 @@ impl PgEntityStore {
                 }
             }
         }
+
+        let mut tx = self
+            .begin_probed(tenant, &probes, &mut wheres, &mut binds)
+            .await?;
 
         // every bind up to here belongs to the WHERE clause — the count-only
         // fallback statement below reuses exactly this prefix
@@ -992,8 +1174,6 @@ impl PgEntityStore {
             decided || candidates,
             &mut binds,
         );
-        let mut tx = super::begin(&self.pool).await?;
-        crate::store::pg::set_tenant(&mut tx, tenant).await?;
         // sqlx 0.9 makes dynamic SQL opt-in. The assertion holds by
         // construction: `sql` is built from this function's own literals
         // plus `$n` placeholders — no caller-supplied text reaches it.
@@ -1063,6 +1243,33 @@ impl PgEntityStore {
             paged,
             total,
         })
+    }
+
+    /// The page's transaction with the Tenant set, and each probe's ids
+    /// ANDed to `wheres` as `id = ANY(...)` (T-5303). A probed page reads in
+    /// one snapshot (repeatable read), so no write between the probe and the
+    /// page drops a match.
+    async fn begin_probed(
+        &self,
+        tenant: &TenantId,
+        probes: &[Probe],
+        wheres: &mut Vec<String>,
+        binds: &mut Vec<Bind>,
+    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
+        let mut tx = super::begin(&self.pool).await?;
+        if !probes.is_empty() {
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                .execute(&mut *tx)
+                .await?;
+        }
+        crate::store::pg::set_tenant(&mut tx, tenant).await?;
+        for p in probes {
+            if let Some(ids) = probe_ids(&mut tx, p).await? {
+                binds.push(Bind::TextArr(ids));
+                wheres.push(format!("id = ANY(${})", binds.len()));
+            }
+        }
+        Ok(tx)
     }
 
     /// One cheap probe: is the client's query geometry OGC-valid? Unparseable
@@ -1770,6 +1977,163 @@ mod tests {
             "!location[x]",
         ] {
             assert!(!narrows(q), "{q}");
+        }
+    }
+
+    /// T-5349: only a `name=="…"` string every match must equal narrows to
+    /// `name_key`; an alternative, another operator or value, a sub-path or
+    /// another attribute does not.
+    /// T-5303: the top-level terms `entity_values` keys, each probing the
+    /// rows a match must hold; everything else is left to the `@?`.
+    #[test]
+    fn a_top_level_value_term_probes_entity_values() {
+        let expand = |t: &str| format!("https://x/{t}");
+        let tenant = TenantId::new("t").expect("tenant");
+        let long = "é".repeat(600);
+        let long_q = format!(r#"b=="{long}""#);
+        for (q, attr, cond, nums, text) in [
+            (
+                "a==42",
+                "https://x/a",
+                "f = ANY(ARRAY[$3, 'NaN'::float8])",
+                vec![42.0],
+                None,
+            ),
+            ("a>1.5", "https://x/a", "f >= $3", vec![1.5], None),
+            (
+                "x==1;a>=2",
+                "https://x/x",
+                "f = ANY(ARRAY[$3, 'NaN'::float8])",
+                vec![1.0],
+                None,
+            ),
+            (
+                "a<0",
+                "https://x/a",
+                "(f <= $3 OR f = 'NaN')",
+                vec![0.0],
+                None,
+            ),
+            (
+                "a<=-1",
+                "https://x/a",
+                "(f <= $3 OR f = 'NaN')",
+                vec![-1.0],
+                None,
+            ),
+            (
+                "a==1..3",
+                "https://x/a",
+                "(f BETWEEN $3 AND $4 OR f = 'NaN')",
+                vec![1.0, 3.0],
+                None,
+            ),
+            (
+                r#"a=="x""#,
+                "https://x/a",
+                "(txt = $3 OR f = 'NaN')",
+                vec![],
+                Some("x"),
+            ),
+            (long_q.as_str(), "https://x/b", "f = 'NaN'", vec![], None),
+        ] {
+            let node = antares_ql::parse_q(q).expect("q parses");
+            let (iri, key) = valued(&node, &expand).expect(q);
+            assert_eq!(iri, attr, "{q}");
+            let p = value_probe(&tenant, iri, key);
+            let limit = p.binds.len();
+            assert_eq!(
+                p.sql,
+                format!("SELECT id FROM entity_values WHERE tenant_id = $1 AND attr = $2 AND {cond} LIMIT ${limit}"),
+                "{q}"
+            );
+            let texts: Vec<&str> = p
+                .binds
+                .iter()
+                .filter_map(|b| match b {
+                    Bind::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                texts,
+                ["t", attr].into_iter().chain(text).collect::<Vec<_>>(),
+                "{q}"
+            );
+            let got_nums: Vec<f64> = p
+                .binds
+                .iter()
+                .filter_map(|b| match b {
+                    Bind::Num(n) => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(got_nums, nums, "{q}");
+            assert!(matches!(p.binds.last(), Some(Bind::Int(PROBE_ROWS))), "{q}");
+        }
+        for q in [
+            "a",
+            "!a",
+            "a!=1",
+            "a==1|b==2",
+            "a==true",
+            "a==1,2",
+            r#"a=="x".."y""#,
+            r#"a~="x""#,
+            "a.sub==1",
+            "a[k]==1",
+            r#"a>"x""#,
+        ] {
+            let node = antares_ql::parse_q(q).expect("q parses");
+            assert_eq!(valued(&node, &expand), None, "{q}");
+        }
+    }
+
+    /// T-5303: `attrs=` probes presence rows unless it names one of the
+    /// Entity's own members, which have none.
+    #[test]
+    fn attrs_probe_presence_rows_unless_they_name_an_own_member() {
+        let tenant = TenantId::new("t").expect("tenant");
+        let attrs = ["https://x/a".to_owned(), "https://x/b".to_owned()];
+        let p = attrs_probe(&tenant, &attrs).expect("probe");
+        assert_eq!(
+            p.sql,
+            "SELECT id FROM entity_values WHERE tenant_id = $1 AND attr = ANY($2) LIMIT $3"
+        );
+        assert!(matches!(p.binds.get(1), Some(Bind::TextArr(v)) if v.as_slice() == attrs));
+        for own in OWN_MEMBERS {
+            let attrs = ["https://x/a".to_owned(), (*own).to_owned()];
+            assert!(attrs_probe(&tenant, &attrs).is_none(), "{own}");
+        }
+    }
+
+    #[test]
+    fn only_a_required_name_string_narrows_to_the_name_key() {
+        let expand = |t: &str| match t {
+            "name" => NAME_IRI.to_owned(),
+            t => format!("https://x/{t}"),
+        };
+        let wants =
+            |q: &str| named(&antares_ql::parse_q(q).expect("q parses"), &expand).map(str::to_owned);
+        for (q, want) in [
+            (r#"name=="Bratislavský""#, "Bratislavský"),
+            (r#"a>1;name=="x""#, "x"),
+            (r#"(a==1;name=="");b"#, ""),
+        ] {
+            assert_eq!(wants(q).as_deref(), Some(want), "{q}");
+        }
+        for q in [
+            "name",
+            r#"name!="x""#,
+            r#"name=="x"|a==1"#,
+            "name==1",
+            r#"name=="x","y""#,
+            r#"name~="x""#,
+            r#"name.sub=="x""#,
+            r#"name[x]=="x""#,
+            r#"title=="x""#,
+        ] {
+            assert_eq!(wants(q), None, "{q}");
         }
     }
 

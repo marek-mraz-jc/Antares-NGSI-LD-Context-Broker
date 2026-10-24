@@ -475,6 +475,111 @@ impl MqttSink {
     }
 }
 
+/// One message an inbound subscription received: the topic it was
+/// published on and its payload, as sent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Inbound {
+    pub topic: String,
+    pub payload: Vec<u8>,
+}
+
+/// Subscribe to `ep.topic` and hand every message published there to `tx`,
+/// for an inbound bridge Channel (ADR-0031). MQTT 5 only, at QoS 1, under the
+/// shared subscription `$share/{group}/{topic}` (MQTT 5.0 4.8.2): every
+/// broker replica binds the same Channels, and the server hands each message
+/// to one of them, so a sample is written once whatever the replica count.
+///
+/// The destination is judged by the egress policy before the first connect
+/// and the checked address is dialled, as for a notification. The event loop
+/// runs on the returned task: it reconnects after a dropped connection and
+/// subscribes again on every ConnAck (a clean start keeps no subscription).
+/// A full `tx` drops the message rather than stalling the event loop's
+/// keep-alive. Aborting the task closes the subscription.
+///
+/// # Errors
+/// The egress denial, or a broker that does not ConnAck within `timeout`.
+pub async fn listen(
+    ep: &MqttEndpoint,
+    group: &str,
+    tx: tokio::sync::mpsc::Sender<Inbound>,
+    timeout: Duration,
+) -> Result<tokio::task::JoinHandle<()>, NgsiError> {
+    use rumqttc::v5::mqttbytes::v5::Packet;
+    use rumqttc::v5::mqttbytes::QoS;
+    use rumqttc::v5::Event;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = format!(
+        "antares-in-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let addr = checked_addr(&ep.host, ep.port, egress_policy(), timeout).await?;
+    let mut opts = rumqttc::v5::MqttOptions::new(id, dial_host(ep, addr), addr.port());
+    opts.set_keep_alive(Duration::from_secs(30));
+    if let Some(u) = &ep.username {
+        opts.set_credentials(u, ep.password.as_deref().unwrap_or(""));
+    }
+    if ep.secure {
+        opts.set_transport(rumqttc::Transport::Tls(shared_tls_config()?));
+    }
+    let (client, mut eventloop) = rumqttc::v5::AsyncClient::new(opts, 16);
+    let filter = format!("$share/{group}/{}", ep.topic);
+    let refused =
+        |e: String| NgsiError::InternalError(format!("mqtt connect {}:{}: {e}", ep.host, ep.port));
+    tokio::time::timeout(timeout, async {
+        loop {
+            match eventloop.poll().await {
+                Ok(Event::Incoming(Packet::ConnAck(_))) => return Ok(()),
+                Ok(_) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+    })
+    .await
+    .map_err(|_| refused("connect timeout".into()))?
+    .map_err(refused)?;
+    client
+        .subscribe(filter.clone(), QoS::AtLeastOnce)
+        .await
+        .map_err(|e| refused(e.to_string()))?;
+    let (host, port) = (ep.host.clone(), ep.port);
+    Ok(tokio::spawn(async move {
+        loop {
+            match eventloop.poll().await {
+                Ok(Event::Incoming(Packet::Publish(p))) => {
+                    let msg = Inbound {
+                        topic: String::from_utf8_lossy(&p.topic).into_owned(),
+                        payload: p.payload.to_vec(),
+                    };
+                    match tx.try_send(msg) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            tracing::debug!(
+                                "mqtt inbound {host}:{port}: queue full, message dropped"
+                            );
+                        }
+                    }
+                }
+                Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                    if client
+                        .subscribe(filter.clone(), QoS::AtLeastOnce)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("mqtt inbound {host}:{port}: {e}; reconnecting in 5 s");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }))
+}
+
 /// Clause 7: the mqtt(s) binding. `parse_endpoint` holds Table 7.2-1 (the
 /// endpoint URI syntax and the notifier parameters) at subscription
 /// creation; `deliver` publishes the 7.2 message — `{"metadata": …,

@@ -4,7 +4,7 @@
 # antares_app under the tables' forced RLS, beside a second Tenant of the
 # same size. Seeds Tenants bench-a and bench-b with N Entities each (same
 # data as the pg_explain RLS seed), then runs every shape in its statement
-# form before T-4852 and after, R times through pgbench, and prints
+# form before T-4852 (T-5303 for q and attrs) and after, R times through pgbench, and prints
 # shape, form, p50 ms, p99 ms and the plan's scan nodes.
 #
 #   dev/rls-plan-bench.sh <superuser-url> <N> [R] [R_BEFORE]
@@ -57,6 +57,7 @@ SELECT t, 'urn:ngsi-ld:T' || (g % 10) || ':' || lpad(g::text, 8, '0'), 'https://
   FROM (VALUES ('bench-a'), ('bench-b')) v(t), generate_series(1, least(:n, 1000)) g,
        generate_series(1, 50) k;
 VACUUM ANALYZE entities;
+VACUUM ANALYZE entity_values;
 VACUUM ANALYZE temporal_entities;
 ANALYZE attr_instances;
 SQL
@@ -88,6 +89,24 @@ within_cell="((((location_cell >= 'u24dv' AND location_cell < 'u24dv~') OR (loca
 temporal() { # the paged temporal query's entity selection, $1 its type predicate
   echo "SELECT m.meta, count(*) OVER () FROM temporal_entities m WHERE m.tenant_id = 'bench-a' AND $1 AND EXISTS (SELECT 1 FROM attr_instances ai WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id) ORDER BY m.id LIMIT 20"
 }
+# store::pg::entity::value_probe and attrs_probe (T-5303): the probe, then
+# the page with the ids it found as `id = ANY(...)`, or the page as before
+# when 1 001 rows or more answer it. $1 the probe's condition, $2 the page
+# form taking the extra WHERE as its argument, $3 the term's own WHERE.
+probed() {
+  local probe="SELECT id FROM entity_values WHERE tenant_id = 'bench-a' AND $1 LIMIT 1001"
+  local ids n
+  ids=$(PGOPTIONS="-c antares.tenant=bench-a" psql "$app" -Atc "$probe" | sort -u)
+  n=$(printf '%s' "$ids" | grep -c . || true)
+  if [ "$n" -ge 1001 ]; then
+    printf '%s;\n%s\n' "$probe" "$($2 " AND $3")"
+  else
+    ids=$(printf '%s' "$ids" | sed "s/.*/'&'/" | paste -sd, -)
+    printf '%s;\n%s\n' "$probe" "$($2 " AND $3 AND id = ANY(ARRAY[${ids}]::text[])")"
+  fi
+}
+spd="attr = 'https://x/speed'"
+plain() { echo "SELECT entity FROM entities WHERE $w$1 ORDER BY id LIMIT 21"; }
 inst="FROM attr_instances WHERE tenant_id = 'bench-a' AND entity_id = 'urn:ngsi-ld:T1:00000001' AND attr_id = 'https://x/speed'"
 
 shape() { printf '%s\n' "$3" > "$work/$1.$2.sql"; echo "$1 $2"; }
@@ -96,9 +115,20 @@ shape() { printf '%s\n' "$3" > "$work/$1.$2.sql"; echo "$1 $2"; }
   shape type same "$(one '')"
   shape type=A,B before "SELECT entity FROM entities WHERE $w AND (types @> ARRAY['https://x/T1'] OR types @> ARRAY['https://x/T2']) ORDER BY id LIMIT 21"
   shape type=A,B after "$(arms '' https://x/T1 https://x/T2)"
-  shape q-equality same "$(one " AND $(speed '== 42')")"
-  shape q-range same "$(one " AND $(speed '> 90')")"
-  shape attrs same "$(one " AND entity ?| ARRAY['https://x/brand']")"
+  shape q-equality before "$(one " AND $(speed '== 42')")"
+  shape q-equality after "$(probed "$spd AND f = ANY(ARRAY[42, 'NaN'::float8])" one "$(speed '== 42')")"
+  shape q-range before "$(one " AND $(speed '> 98')")"
+  shape q-range after "$(probed "$spd AND f >= 98" one "$(speed '> 98')")"
+  shape q-range-all before "$(one " AND $(speed '>= 0')")"
+  shape q-range-all after "$(probed "$spd AND f >= 0" one "$(speed '>= 0')")"
+  shape attrs before "$(one " AND entity ?| ARRAY['https://x/brand']")"
+  shape attrs after "$(probed "attr = ANY(ARRAY['https://x/brand'])" one "entity ?| ARRAY['https://x/brand']")"
+  shape q-eq-untyped before "$(plain " AND $(speed '== 42')")"
+  shape q-eq-untyped after "$(probed "$spd AND f = ANY(ARRAY[42, 'NaN'::float8])" plain "$(speed '== 42')")"
+  shape q-all-untyped before "$(plain " AND $(speed '>= 0')")"
+  shape q-all-untyped after "$(probed "$spd AND f >= 0" plain "$(speed '>= 0')")"
+  shape attrs-untyped before "$(plain " AND entity ?| ARRAY['https://x/rare']")"
+  shape attrs-untyped after "$(probed "attr = ANY(ARRAY['https://x/rare'])" plain "entity ?| ARRAY['https://x/rare']")"
   shape geo-near before "SELECT entity FROM entities WHERE $w AND (($near) OR location_ambiguous) ORDER BY id LIMIT 10000"
   shape geo-near after "SELECT entity FROM entities WHERE $w AND $near_cell ORDER BY id LIMIT 10000"
   shape geo-within before "SELECT entity FROM entities WHERE $w AND (($within) OR location_ambiguous) ORDER BY id LIMIT 10000"
@@ -113,7 +143,10 @@ printf '%-17s %-7s %9s %9s  %s\n' shape form p50_ms p99_ms plan
 while read -r name form; do
   f="$work/$name.$form.sql"
   runs=$r; [ "$form" != before ] || runs=$r_before
-  plan=$(PGOPTIONS="-c antares.tenant=bench-a" psql "$app" -Atc "EXPLAIN $(cat "$f")" \
+  # one statement a line; a probed shape has two
+  plan=$(while IFS= read -r stmt; do
+           PGOPTIONS="-c antares.tenant=bench-a" psql "$app" -Atc "EXPLAIN ${stmt%;}"
+         done < "$f" \
     | { grep -oE '(Seq Scan|Index Only Scan|Index Scan|Bitmap Index Scan)( Backward)? (using|on) [a-z_]+' || true; } \
     | sed -E 's/ (using|on) / /' | sort | uniq | paste -sd, -)
   ( cd "$work" && PGOPTIONS="-c antares.tenant=bench-a" pgbench "$app" -n -c 1 -t "$runs" \

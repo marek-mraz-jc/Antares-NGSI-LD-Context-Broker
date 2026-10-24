@@ -12,9 +12,10 @@ rust-version.workspace = true
 [package.metadata.antares]
 role = "surface"
 feature = "geojson"
-protocols = []
+protocols = ["antares-export"]
 
 [dependencies]
+antares-export = { workspace = true, features = ["csv"] }
 antares-ops = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["query"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }

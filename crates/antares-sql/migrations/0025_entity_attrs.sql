@@ -17,7 +17,7 @@
 -- Entity leaves its pairs; the read checks each against a live Entity.
 -- The member names are the document's keys, the Entity frame (id, type,
 -- createdAt...) included: the reader drops those, as the fold does.
--- Numbered 0023: 0021-0022 are claimed by T-5349.
+-- Numbered 0025: 0021-0024 landed first.
 CREATE TABLE entity_attrs (
   tenant_id text NOT NULL,
   type      text NOT NULL,

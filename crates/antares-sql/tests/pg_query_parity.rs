@@ -94,6 +94,7 @@ fn db() -> Option<&'static Db> {
             "pgparitygeo",
             "pgparitygeo2",
             "pgparitygeowalk",
+            "pgparityattrs",
         ] {
             let tenant = TenantId::new(name).expect("tenant");
             runtime
@@ -142,6 +143,14 @@ fn attribute() -> impl Strategy<Value = Value> {
         ])),
         1 => (prop::sample::select(WORDS.to_vec()), -3i64..=3)
             .prop_map(|(city, n)| json!({"type": "Property", "value": {"city": city, "n": n}})),
+        // T-5303: the shapes `entity_values` (0024) keys at depth, or marks
+        // 'NaN' (more than 32 scalars, a string past 1 024 bytes)
+        1 => (scalar(), scalar())
+            .prop_map(|(a, b)| json!({"type": "Property", "value": [[a], [b, 1]]})),
+        1 => (-3i64..=3)
+            .prop_map(|n| json!({"type": "Property", "value": (n..n + 33).collect::<Vec<_>>()})),
+        1 => prop::sample::select(VALUES.to_vec())
+            .prop_map(|v| json!({"type": "Property", "value": [v, "\u{e9}".repeat(600)]})),
     ]
 }
 
@@ -413,6 +422,28 @@ proptest! {
         let (got, decided) = query(db, &tenant, &EntityFilter { q: Some(&ast), expand: &expand, ..Default::default() });
         prop_assert!(decided, "q={} is in the exact subset and was not decided", q);
         prop_assert_eq!(&got, &want, "q={}", q);
+    }
+
+    /// `attrs=` keeps exactly the entities carrying one of the names, now
+    /// also through `entity_values` (T-5303), and a member of the Entity
+    /// itself in the list leaves that narrowing out.
+    #[test]
+    fn attrs_pushdown_is_decided_and_exact(
+        docs in entities(),
+        names in prop::collection::btree_set(prop::sample::select(vec!["speed", "name", "tags", "location", "id"]), 1..3),
+    ) {
+        let Some(db) = db() else { return Ok(()) };
+        let tenant = TenantId::new("pgparityattrs").expect("tenant");
+        let stored = seed(db, &tenant, &docs);
+        let attrs: Vec<String> = names.iter().map(|n| if *n == "id" { "id".to_owned() } else { expand(n) }).collect();
+        let want: BTreeSet<String> = stored
+            .iter()
+            .filter(|doc| attrs.iter().any(|a| doc.get(a).is_some()))
+            .filter_map(|doc| doc["id"].as_str().map(str::to_owned))
+            .collect();
+        let (got, decided) = query(db, &tenant, &EntityFilter { attrs: Some(&attrs), expand: &expand, ..Default::default() });
+        prop_assert!(decided, "attrs={:?}", attrs);
+        prop_assert_eq!(&got, &want, "attrs={:?}", attrs);
     }
 
     /// TS 104 175 7.2.5: the `scopeQ` narrowing never drops an entity the

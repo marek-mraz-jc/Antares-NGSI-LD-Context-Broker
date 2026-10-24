@@ -105,6 +105,20 @@ A view without a schema, or with one the build cannot read, has no
 endpoint (`404`). The collections carry no `extent`, and the
 `FeatureCollection` no `timeStamp` (both optional in Part 1).
 
+A view's `representations.ogc` list ([Views](views.md)) adds a collection per
+named output (T-5216): its id is the output's `name`, its `title` and
+`description` the output's in the caller's `Accept-Language`, over the
+collection of its one source class. The source's roles give the primary
+geometry (`geometry`, the first path: `location` or a GeoProperty slot), the
+temporal geometry (`instant`, or `start` and `end`) and the properties
+(`properties`, with the time Attributes, which `datetime` reads). The
+output's `filter` `q` and `scopeQ` are a conjunct of every read of the
+collection, its items and its tiles; a geo-query is the caller's `bbox`, so an
+OGC output names none. An output collection is read only (`405`), and one whose
+roles name an Attribute the collection does not show, or a geometry that is no
+GeoProperty, is not served. A class keeps its own id when an output is named
+like it.
+
 ## 2. Items
 
 `/items` is a Query Entities of the collection's type through the view,

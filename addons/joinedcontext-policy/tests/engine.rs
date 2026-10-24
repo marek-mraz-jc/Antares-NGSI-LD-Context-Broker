@@ -875,6 +875,65 @@ async fn a_call_without_a_subject_reaches_registrations_only() -> Res {
     Ok(())
 }
 
+/// T-5032: where the deployment requires a subject, a call without one
+/// answers 401 on every Context Source write unless it carries the broker's
+/// admin bearer (the Portal reconciler's credential), which then reaches the
+/// registrations as M22 says; a caller with a subject and no grant for them
+/// is refused 403 by the engine.
+#[tokio::test]
+async fn a_registration_without_a_subject_needs_the_admin_bearer() -> Res {
+    const SECRET: &str = "a-test-secret-of-at-least-32-bytes!";
+    let (st, _) = broker(doc(&[])).await?;
+    let mut st = st.with_admin_auth(antares_api::admin_auth::AdminAuth::new(SECRET, false)?);
+    st.subject_required = true;
+    let id = "urn:ngsi-ld:ContextSourceRegistration:t5032";
+    let csr = json!({"id": id, "type": "ContextSourceRegistration",
+                     "information": [{"entities": [{"type": "Car"}]}],
+                     "endpoint": "http://127.0.0.1:9/ngsi-ld"});
+    let one = format!("/ngsi-ld/v1/csourceRegistrations/{id}");
+    let patch = json!({"endpoint": "http://127.0.0.1:9/other"});
+    let bearer = format!("Bearer {SECRET}");
+    let calls: [(&str, &str, Option<&Value>); 4] = [
+        ("POST", "/ngsi-ld/v1/csourceRegistrations", Some(&csr)),
+        ("PATCH", &one, Some(&patch)),
+        ("DELETE", &one, None),
+        ("GET", "/ngsi-ld/v1/csourceRegistrations?type=Car", None),
+    ];
+    for (method, uri, body) in calls {
+        for who in [
+            &[][..],
+            &[("authorization", "Bearer not-the-admin-secret-of-32-bytes")][..],
+        ] {
+            let (code, problem) = send(&st, method, uri, who, body).await?;
+            assert_eq!(code, StatusCode::UNAUTHORIZED, "{method} {uri}: {problem}");
+            assert_eq!(
+                problem.get("type"),
+                Some(&json!(antares_api::admin_auth::UNAUTHORIZED_TYPE))
+            );
+        }
+        let (code, problem) = send(&st, method, uri, &ANA, body).await?;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{method} {uri}: {problem}");
+    }
+    let admin = [("authorization", bearer.as_str())];
+    let (code, body) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/csourceRegistrations",
+        &admin,
+        Some(&csr),
+    )
+    .await?;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    let (code, body) = send(&st, "PATCH", &one, &admin, Some(&patch)).await?;
+    assert_eq!(code, StatusCode::NO_CONTENT, "{body}");
+    let (code, body) = send(&st, "DELETE", &one, &admin, None).await?;
+    assert_eq!(code, StatusCode::NO_CONTENT, "{body}");
+    // The bearer is no subject: it reaches the Context Source operations only.
+    let (code, _) = send(&st, "GET", QUERY, &admin, None).await?;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_document_the_engine_refuses_keeps_the_previous_one() -> Res {
     let (st, engine) = broker(doc(&[grant(

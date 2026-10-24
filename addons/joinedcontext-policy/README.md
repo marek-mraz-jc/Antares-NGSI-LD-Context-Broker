@@ -50,6 +50,10 @@ owner may override): such a request is allowed on the Context Source
 clauses `5.9.*`, `5.10.*` and `5.11.*` and denied on every other one, so a gateway
 that forgot the subject fails closed. Options: deny it everywhere (breaks
 M22), allow it everywhere (a forgotten header opens the tenant).
+The broker serves such a request at all only with its admin bearer token
+(`ANTARES_ADMIN_TOKEN_FILE`, the one the Portal already sends to `/q`):
+without it the NGSI-LD API answers `401` before the engine is asked
+(T-5032), so a pod that only reaches the broker port registers nothing.
 
 ## 2. The rule document
 

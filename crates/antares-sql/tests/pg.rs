@@ -130,6 +130,119 @@ async fn tenant_upsert_is_idempotent() {
     b.expect("second");
 }
 
+/// T-5303: `entity_values` (0024) follows every write of an Entity: a
+/// create keys its values, a read-modify-write and a replace re-key them, a
+/// delete drops them, and a q= read finds the Entity by the new value only.
+#[tokio::test]
+async fn entity_values_follow_create_update_replace_and_delete() {
+    use antares_sql::store::pg::entity::{EntityFilter, PgEntityStore};
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let t = TenantId::new("pg_entity_values").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let store = PgEntityStore::new(pool.clone());
+    let id = "urn:ngsi-ld:V:1";
+    let _ = store.delete(&t, id).await.expect("clear");
+    let doc = |speed: i64| serde_json::json!({"id": id, "type": "V", "speed": [{"type": "Property", "value": speed}]});
+    assert!(store.create(&t, id, &doc(1)).await.expect("create"));
+    let keyed = || async {
+        let rows: Vec<(String, Option<f64>)> = sqlx::query_as(
+            "SELECT attr, f FROM entity_values WHERE tenant_id = $1 AND id = $2 ORDER BY f NULLS FIRST",
+        )
+        .bind(t.as_str())
+        .bind(id)
+        .fetch_all(&pool)
+        .await
+        .expect("rows");
+        rows
+    };
+    let finds = |q: &'static str| {
+        let (store, t) = (&store, &t);
+        async move {
+            let ast = antares_ql::parse_q(q).expect("q");
+            let expand = |term: &str| term.to_owned();
+            let f = EntityFilter {
+                q: Some(&ast),
+                expand: &expand,
+                ..Default::default()
+            };
+            store.query(t, &f).await.expect("query").rows.len()
+        }
+    };
+    assert_eq!(keyed().await, [("speed".to_owned(), Some(1.0))]);
+    store
+        .mutate(&t, id, |d| {
+            d["speed"][0]["value"] = serde_json::json!(2);
+            Ok::<_, ()>(())
+        })
+        .await
+        .expect("mutate")
+        .expect("present")
+        .expect("applied");
+    assert_eq!(keyed().await, [("speed".to_owned(), Some(2.0))]);
+    assert_eq!((finds("speed==1").await, finds("speed==2").await), (0, 1));
+    store
+        .batch_upsert_replace(&t, &[(id.to_owned(), doc(3))])
+        .await
+        .expect("replace");
+    assert_eq!(keyed().await, [("speed".to_owned(), Some(3.0))]);
+    assert_eq!((finds("speed==2").await, finds("speed>=3").await), (0, 1));
+    assert!(store.delete(&t, id).await.expect("delete").is_some());
+    assert!(keyed().await.is_empty(), "a deleted Entity leaves no row");
+}
+
+/// T-5303: a term more than 1 000 Entities match probes no id list and the
+/// page reads as before; one that fewer match reads only those. Both count
+/// exactly.
+#[tokio::test]
+async fn a_probe_past_its_cap_leaves_the_page_unnarrowed() {
+    use antares_sql::store::pg::entity::{EntityFilter, Page, PgEntityStore};
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let t = TenantId::new("pg_entity_values_cap").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    sqlx::query("DELETE FROM entities WHERE tenant_id = $1")
+        .bind(t.as_str())
+        .execute(&pool)
+        .await
+        .expect("clear");
+    sqlx::query(
+        "INSERT INTO entities (tenant_id, id, entity, types, created_at, modified_at)
+         SELECT $1, 'urn:ngsi-ld:V:' || g,
+                jsonb_build_object('id', 'urn:ngsi-ld:V:' || g, 'type', 'V',
+                  'speed', jsonb_build_array(jsonb_build_object('type', 'Property', 'value', least(g, 2) - 1))),
+                ARRAY['V'], now(), now()
+           FROM generate_series(1, 1200) g",
+    )
+    .bind(t.as_str())
+    .execute(&pool)
+    .await
+    .expect("seed");
+    let store = PgEntityStore::new(pool.clone());
+    let total = |q: &'static str| {
+        let (store, t) = (&store, &t);
+        async move {
+            let ast = antares_ql::parse_q(q).expect("q");
+            let expand = |term: &str| term.to_owned();
+            let f = EntityFilter {
+                q: Some(&ast),
+                expand: &expand,
+                page: Some(Page {
+                    offset: 0,
+                    limit: 5,
+                    count: true,
+                }),
+                ..Default::default()
+            };
+            let out = store.query(t, &f).await.expect("query");
+            (out.rows.len(), out.total)
+        }
+    };
+    assert_eq!(total("speed==1").await, (5, Some(1199)), "past the cap");
+    assert_eq!(total("speed==0").await, (1, Some(1)), "under the cap");
+    assert_eq!(total("speed==7").await, (0, Some(0)), "no candidate");
+}
+
 /// The non-superuser role the RLS tests connect as (idempotent). Two tests of this binary
 /// run it at once, and two concurrent GRANTs on one schema fail with "tuple concurrently
 /// updated" (strict run 38884915143, T-4334): one transaction-scoped advisory lock queues them.
@@ -485,6 +598,7 @@ async fn purge_tenant_empties_every_tenant_table() {
     }
     const TABLES: [&str; 19] = [
         "entities",
+        "entity_values",
         "entity_types",
         "entity_attrs",
         "jsonld_contexts",
@@ -1169,4 +1283,52 @@ async fn a_write_passes_an_in_flight_history_append_and_a_delete_waits() {
         .execute(&pool)
         .await
         .expect("cleanup");
+}
+
+/// T-5304: the history count of `GET /q/tenants/{tenant}` holds to its
+/// bound. A table the count must read is held by another session, so the
+/// count waits; with a bound under the session's 5 s lock_timeout it gives
+/// up as a statement timeout, and without the hold it answers what the
+/// unbounded count answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn history_count_within_gives_up_at_its_bound() {
+    use antares_store::TemporalDriver;
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect+migrate");
+    let store = antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(
+        pool.clone(),
+    ));
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let t = TenantId::new(&format!("pgcount{run}")).expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let bound = std::time::Duration::from_millis(300);
+    assert_eq!(
+        TemporalDriver::attr_instance_count_within(&store, &t, bound)
+            .await
+            .expect("bounded count"),
+        TemporalDriver::attr_instance_count(&store, &t)
+            .await
+            .expect("count"),
+    );
+
+    let mut hold = pool.begin().await.expect("begin");
+    sqlx::query("LOCK TABLE attr_rows IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *hold)
+        .await
+        .expect("hold attr_rows");
+    let started = std::time::Instant::now();
+    let cut = TemporalDriver::attr_instance_count_within(&store, &t, bound).await;
+    let waited = started.elapsed();
+    hold.rollback().await.expect("release");
+    assert_eq!(
+        cut.map_err(|e| e.to_string()),
+        Err(
+            antares_model::NgsiError::InternalError("database statement timeout".into())
+                .to_string()
+        )
+    );
+    assert!(waited < std::time::Duration::from_secs(3), "{waited:?}");
 }

@@ -86,6 +86,7 @@ dependencies = [
  "ngsild-ql",
  "reqwest",
  "send_wrapper",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "sonic-rs",
@@ -106,9 +107,12 @@ dependencies = [
  "antares-api",
  "antares-bus",
  "antares-feed",
+ "antares-gbfs",
  "antares-geojson",
+ "antares-gtfsrt",
  "antares-ical",
  "antares-icsr",
+ "antares-jsonstat",
  "antares-linkml",
  "antares-mcp",
  "antares-odata",
@@ -188,12 +192,43 @@ dependencies = [
 ]
 
 [[package]]
-name = "antares-geojson"
+name = "antares-gbfs"
 version = "0.3.0"
 dependencies = [
  "antares-ops",
  "axum",
+ "chrono",
  "http-body-util",
+ "metrics",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+]
+
+[[package]]
+name = "antares-geojson"
+version = "0.3.0"
+dependencies = [
+ "antares-export",
+ "antares-ops",
+ "axum",
+ "http-body-util",
+ "serde_json",
+ "tokio",
+ "tower",
+]
+
+[[package]]
+name = "antares-gtfsrt"
+version = "0.3.0"
+dependencies = [
+ "antares-ops",
+ "axum",
+ "chrono",
+ "http-body-util",
+ "metrics",
+ "prost",
  "serde_json",
  "tokio",
  "tower",
@@ -212,6 +247,7 @@ dependencies = [
  "metrics",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tower",
  "tracing",
@@ -231,6 +267,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "antares-jsonstat"
+version = "0.3.0"
+dependencies = [
+ "antares-ops",
+ "axum",
+ "http-body-util",
+ "metrics",
+ "serde_json",
+ "tokio",
+ "tower",
 ]
 
 [[package]]
@@ -384,6 +433,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -4385,9 +4435,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",

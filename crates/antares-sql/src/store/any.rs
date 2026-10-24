@@ -182,6 +182,23 @@ fn row_id(v: &Value) -> &str {
 #[cfg(feature = "postgres")]
 const SIZE_SCAN_TIMEOUT: &str = "SET LOCAL statement_timeout = '5s'";
 
+/// The attribute instances of one tenant, both history tables.
+#[cfg(feature = "postgres")]
+async fn count_instances(
+    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    tenant: &TenantId,
+) -> Result<u64, NgsiError> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM attr_instances WHERE tenant_id = $1)
+              + (SELECT count(*) FROM attr_rows WHERE tenant_id = $1)",
+    )
+    .bind(tenant.as_str())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(db)?;
+    Ok(n.max(0) as u64)
+}
+
 impl AnyStore {
     /// Readiness ping: can the store answer a trivial request
     /// RIGHT NOW? Memory/file are in-process (always ready); the Pg arm runs
@@ -1267,6 +1284,8 @@ impl AnyStore {
                     }
                     for table in [
                         "entities",
+                        // emptied by the delete trigger of `entities` (0024)
+                        "entity_values",
                         "subscriptions",
                         "csource_subscriptions",
                         "csource_registrations",
@@ -1685,6 +1704,41 @@ impl antares_store::CurrentStateDriver for AnyStore {
         }
         antares_store::record_delivery_via_mutate(self, tenant, kind, id, now).await
     }
+    /// The Postgres arm books every attempt in ONE statement (see
+    /// `pg::doc::record_deliveries`); every other arm books them one by one.
+    async fn record_deliveries(
+        &self,
+        tenant: &TenantId,
+        kind: Kind,
+        attempts: &[(&str, &str)],
+    ) -> Result<Vec<Option<antares_store::Delivery>>, NgsiError> {
+        #[cfg(feature = "postgres")]
+        {
+            if let (AnyStore::Pg(p), Ok(dk)) = (self, doc_kind(kind)) {
+                let mut found = p
+                    .docs
+                    .record_deliveries(tenant, dk, attempts)
+                    .await
+                    .map_err(db)?;
+                return Ok(attempts
+                    .iter()
+                    .map(|(id, _)| {
+                        found
+                            .remove(*id)
+                            .map(|(doc, prev_success)| antares_store::Delivery {
+                                doc,
+                                prev_success,
+                            })
+                    })
+                    .collect());
+            }
+        }
+        let mut out = Vec::with_capacity(attempts.len());
+        for (id, now) in attempts {
+            out.push(antares_store::record_delivery_via_mutate(self, tenant, kind, id, now).await?);
+        }
+        Ok(out)
+    }
     async fn sweep_expired(&self) -> usize {
         AnyStore::sweep_expired(self)
     }
@@ -1807,6 +1861,14 @@ impl antares_store::CurrentStateDriver for AnyStore {
 impl antares_store::TemporalDriver for AnyStore {
     async fn close(&self) {
         AnyStore::close(self).await;
+    }
+    fn set_short_history(&self, short: antares_store::ShortHistory) {
+        match self {
+            // ponytail: memory has no WAL to save
+            AnyStore::Mem(_) => drop(short),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p.temporal.set_short_history(short),
+        }
     }
     async fn versions(
         &self,
@@ -1941,15 +2003,34 @@ impl antares_store::TemporalDriver for AnyStore {
             AnyStore::Pg(p) => {
                 async {
                     let mut tx = tenant_tx(p, tenant).await?;
-                    let n: i64 = sqlx::query_scalar(
-                        "SELECT (SELECT count(*) FROM attr_instances WHERE tenant_id = $1)
-                              + (SELECT count(*) FROM attr_rows WHERE tenant_id = $1)",
-                    )
-                    .bind(tenant.as_str())
-                    .fetch_one(&mut *tx)
-                    .await
-                    .map_err(db)?;
-                    Ok(n as u64)
+                    count_instances(&mut tx, tenant).await
+                }
+                .await
+            }
+        }
+    }
+    async fn attr_instance_count_within(
+        &self,
+        tenant: &TenantId,
+        bound: std::time::Duration,
+    ) -> Result<u64, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => {
+                // the memory store counts at once: no bound to apply
+                let _ = bound;
+                Ok(s.attr_instance_count(tenant))
+            }
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => {
+                async {
+                    let mut tx = tenant_tx(p, tenant).await?;
+                    // a scan of the tenant's history: a slow one answers no count
+                    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+                        .bind(format!("{}ms", bound.as_millis().max(1)))
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db)?;
+                    count_instances(&mut tx, tenant).await
                 }
                 .await
             }
@@ -2007,7 +2088,9 @@ impl antares_store::TemporalDriver for AnyStore {
                             .await
                             .map_err(db)?;
                     }
-                    tx.commit().await.map_err(db)
+                    tx.commit().await.map_err(db)?;
+                    p.temporal.forget_tenant(tenant);
+                    Ok(())
                 }
                 .await
             }

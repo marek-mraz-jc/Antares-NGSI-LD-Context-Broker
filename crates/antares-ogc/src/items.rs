@@ -40,6 +40,8 @@ pub(crate) struct Params {
     pub ngsild: Vec<(&'static str, String)>,
     /// `filter` and the queryables named as parameters (F1, F2), names checked.
     pub filter: Option<ogc_cql2::Expr>,
+    /// The NGSI-LD `lang` a `LanguageProperty` is read in: the caller's `Accept-Language`.
+    pub lang: Option<String>,
 }
 
 /// The `ngsild.` options a collection's `items` declares (ADR-0028 rule 6): each narrows.
@@ -192,6 +194,12 @@ pub(crate) fn params(c: &Collection, pairs: &[(String, String)]) -> Result<Param
         return Err(bad(
             "ngsild.pick and ngsild.omit both select the properties; name one",
         ));
+    }
+    if let Some(o) = &c.output {
+        if let (Some(_), Some(q)) = (&o.filter.q, p.option("q")) {
+            antares_ops::outputs::one_q(q).map_err(bad)?;
+        }
+        o.filter.scope_with(p.option("scopeQ")).map_err(bad)?;
     }
     p.filter = crate::filter::read(c, &raw)?;
     if p.properties.is_some() && p.option("pick").is_some() {
@@ -393,11 +401,31 @@ fn shape(c: &Collection, terms: &Terms, p: &Params) -> String {
         format!("&pick={}", encode(&names.join(",")))
     });
     let omit = if pick.is_some() { None } else { Some("omit") };
-    let options = ["pick", "scopeQ"]
+    let options = ["pick"]
         .into_iter()
         .chain(omit)
-        .filter_map(|name| p.option(name).map(|v| format!("&{name}={}", encode(v))));
-    pick.into_iter().chain(options).collect()
+        .filter_map(|name| p.option(name).map(|v| format!("&{name}={}", encode(v))))
+        .chain(scope_q(c, p).map(|v| format!("&scopeQ={}", encode(&v))));
+    let lang = p.lang.iter().map(|l| format!("&lang={}", encode(l)));
+    pick.into_iter().chain(options).chain(lang).collect()
+}
+
+/// The `q` of the collection's output filter (T-5216), a conjunct of every read of it.
+fn output_q(c: &Collection) -> Option<String> {
+    let q = c.output.as_ref()?.filter.q.as_ref()?;
+    Some(format!("({q})"))
+}
+
+/// The `scopeQ` of a read: the output filter's (T-5216) joined with the request's, which
+/// [`params`] has checked can be joined; the filter's alone otherwise, never wider.
+fn scope_q(c: &Collection, p: &Params) -> Option<String> {
+    match &c.output {
+        Some(o) => o
+            .filter
+            .scope_with(p.option("scopeQ"))
+            .unwrap_or(o.filter.scope_q.clone()),
+        None => p.option("scopeQ").map(str::to_owned),
+    }
 }
 
 /// One Query Entities an `items` request reads: the store's pushdown and the residual the
@@ -430,8 +458,8 @@ pub(crate) fn targets(c: &Collection, terms: &Terms, p: &Params, f: &Lowered) ->
         .map_or((None, None), |d| time_q(c.time.as_ref(), terms, d));
     let residual = !f.residual.is_empty() || when.is_some() || (bbox.is_some() && p.ngsild_geo());
     let projection = if residual {
-        p.option("scopeQ")
-            .map(|v| format!("&scopeQ={}", encode(v)))
+        scope_q(c, p)
+            .map(|v| format!("&scopeQ={}", encode(&v)))
             .unwrap_or_default()
     } else {
         shape(c, terms, p)
@@ -469,6 +497,7 @@ pub(crate) fn targets(c: &Collection, terms: &Terms, p: &Params, f: &Lowered) ->
             .cloned()
             .chain(extra)
             .chain(theirs.clone())
+            .chain(output_q(c))
             .chain(f.q.iter().map(|q| format!("({q})")))
             .collect();
         if q.is_empty() {
@@ -821,7 +850,9 @@ pub(crate) fn feature(
         .geometry
         .as_ref()
         .and_then(|g| doc.get(terms.term(g)))
-        .map_or(Value::Null, |g| served("GeoProperty", g));
+        .map_or(Value::Null, |g| {
+            antares_ops::rewound(served("GeoProperty", g))
+        });
     let properties: Map<String, Value> = c
         .properties
         .iter()
@@ -952,10 +983,13 @@ pub(crate) async fn one(
     let terms = Terms::of(c);
     let pushdown = Pushdown {
         query: format!(
-            "id={}&type={}&format=simplified{}",
+            "id={}&type={}&format=simplified{}{}",
             encode(id),
             encode(&c.type_iri),
-            shape(c, &terms, p)
+            shape(c, &terms, p),
+            output_q(c)
+                .map(|q| format!("&q={}", encode(&q)))
+                .unwrap_or_default()
         ),
         context: terms.context(),
         ..Pushdown::default()
@@ -998,6 +1032,7 @@ mod tests {
     fn car() -> Collection {
         Collection {
             history: false,
+            output: None,
             id: "Car".into(),
             description: None,
             type_iri: "https://e.org/Car".into(),
@@ -1011,6 +1046,20 @@ mod tests {
         q.iter()
             .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn a_q_that_closes_its_group_is_refused_beside_an_output_filter() {
+        let output = serde_json::from_value(json!({"name": "fast", "filter": {"q": "speed>9"},
+                                                   "sources": [{"type": "Car"}]}));
+        let filtered = Collection {
+            output: output.ok(),
+            ..car()
+        };
+        let escape = pairs(&[("ngsild.q", "speed<1)|(speed>0")]);
+        assert!(params(&filtered, &escape).is_err());
+        assert!(params(&filtered, &pairs(&[("ngsild.q", "speed<1")])).is_ok());
+        assert!(params(&car(), &escape).is_ok());
     }
 
     #[test]
@@ -1364,6 +1413,7 @@ mod tests {
     fn core_attributes_keep_their_name_and_others_get_a_context_term() {
         let c = Collection {
             history: false,
+            output: None,
             id: "Car".into(),
             description: None,
             type_iri: "https://e.org/Car".into(),
@@ -1389,6 +1439,7 @@ mod tests {
         assert_eq!(t.context.len(), 4);
         let long = Terms::of(&Collection {
             history: false,
+            output: None,
             properties: vec![prop(&"x".repeat(257), false), prop("1st", false)],
             ..c.clone()
         });
@@ -1399,6 +1450,7 @@ mod tests {
         assert_eq!(long.term("https://e.org/1st"), "p1");
         let only_core = Terms::of(&Collection {
             history: false,
+            output: None,
             properties: Vec::new(),
             ..c
         });
