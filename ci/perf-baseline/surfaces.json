@@ -113,6 +113,12 @@
         "rps": 100.0,
         "error_pct": 0.0
       },
+      "view-attributes": {
+        "p95_ms": 49.24,
+        "p99_ms": 66.67,
+        "rps": 20.0,
+        "error_pct": 0.0
+      },
       "sta-things": {
         "p95_ms": 128.28,
         "p99_ms": 166.76,

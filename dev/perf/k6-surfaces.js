@@ -116,7 +116,7 @@ function seed() {
     put("/q/views/load", {
       id: "load", tenant: "default", selector: TYPES,
       rules: [{ types: TYPES, attributes: ["name", "level", "category", "lane", "sentAt", "pm25", "startDate", "endDate", "location"] }],
-      operations: ["query_entities", "retrieve_entity", "retrieve_entity_types", "temporal_query", "temporal_retrieve", "create_subscription", "delete_subscription"],
+      operations: ["query_entities", "retrieve_entity", "retrieve_entity_types", "retrieve_attributes", "temporal_query", "temporal_retrieve", "create_subscription", "delete_subscription"],
     });
   }
   for (const type of TYPES) {
@@ -199,6 +199,8 @@ export function request(shape, i) {
       return ["POST", `${BASE}/entityOperations/upsert`, JSON.stringify(batch)];
     }
     case "view-type": return ["GET", `${VIEW}/ngsi-ld/v1/entities?type=${type}&limit=20&offset=${page}`];
+    // every attribute name the view shows (T-4934: answered from the attribute catalogue, 13-19 s on dev as a fold)
+    case "view-attributes": return ["GET", `${VIEW}/ngsi-ld/v1/attributes`];
     case "odata":
       return ["GET", `${VIEW}/odata/v4/${type}?$filter=${q(`level ge ${i % 90} and level lt ${(i % 90) + 10}`)}&$orderby=level%20desc&$top=20&$count=true`];
     case "ogc-items": {

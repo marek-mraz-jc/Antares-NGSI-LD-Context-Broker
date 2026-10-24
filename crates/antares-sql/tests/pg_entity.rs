@@ -1203,6 +1203,130 @@ async fn the_type_catalogue_follows_every_write() {
     assert!(s.type_names(&t).await.expect("types").is_empty());
 }
 
+/// T-4934: the attribute catalogue keeps up with the writes. A create lists
+/// its pairs, a patch adding a member or a type lists the new pairs, an
+/// upsert lists its own, and a write that keeps the shape adds none. A pair
+/// whose carrier went stays listed: the reader checks it against a live
+/// Entity.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_attribute_catalogue_follows_every_write() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let s = PgEntityStore::new(pool.clone());
+    let t = TenantId::new("pgattrcatalogue").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let pairs = || async {
+        s.attr_pairs(&t)
+            .await
+            .expect("pairs")
+            .into_iter()
+            .filter(|(_, a)| a.starts_with("urn:a:"))
+            .map(|(ty, a)| format!("{ty} {a}"))
+            .collect::<Vec<_>>()
+    };
+    for id in ["urn:ngsi-ld:X:1", "urn:ngsi-ld:W:1"] {
+        let _ = s.delete(&t, id).await;
+    }
+    let mut tx = pool.begin().await.expect("tx");
+    sqlx::query("SELECT set_config('antares.tenant', $1, true)")
+        .bind(t.as_str())
+        .execute(&mut *tx)
+        .await
+        .expect("tenant");
+    sqlx::query("DELETE FROM entity_attrs WHERE tenant_id = $1")
+        .bind(t.as_str())
+        .execute(&mut *tx)
+        .await
+        .expect("clear");
+    tx.commit().await.expect("commit");
+    let prop = json!([{"type": "Property", "value": 1}]);
+    let doc = |id: &str, types: serde_json::Value, attr: &str| {
+        let mut d = json!({"id": id, "type": types, "createdAt": "2026-10-22T00:00:00Z",
+                           "modifiedAt": "2026-10-22T00:00:00Z"});
+        d[attr] = prop.clone();
+        d
+    };
+
+    assert!(s
+        .create(
+            &t,
+            "urn:ngsi-ld:X:1",
+            &doc("urn:ngsi-ld:X:1", json!(["X"]), "urn:a:a")
+        )
+        .await
+        .expect("create"));
+    assert_eq!(pairs().await, ["X urn:a:a"]);
+    let all = s.attr_pairs(&t).await.expect("pairs");
+    assert!(
+        all.contains(&("X".into(), "id".into())),
+        "the frame's members are listed too: {all:?}"
+    );
+
+    let patched = s
+        .mutate(&t, "urn:ngsi-ld:X:1", |d| {
+            d["urn:a:b"] = prop.clone();
+            Ok::<(), ()>(())
+        })
+        .await
+        .expect("mutate");
+    assert!(matches!(patched, Some(Ok(()))));
+    assert_eq!(pairs().await, ["X urn:a:a", "X urn:a:b"]);
+
+    let retyped = s
+        .mutate(&t, "urn:ngsi-ld:X:1", |d| {
+            d["type"] = json!(["X", "Y"]);
+            d.as_object_mut().map(|o| o.remove("urn:a:a"));
+            Ok::<(), ()>(())
+        })
+        .await
+        .expect("mutate");
+    assert!(matches!(retyped, Some(Ok(()))));
+    assert_eq!(
+        pairs().await,
+        ["X urn:a:a", "X urn:a:b", "Y urn:a:b"],
+        "a new type lists the members it arrives with; a removed member stays listed"
+    );
+
+    s.batch_upsert_replace(
+        &t,
+        &[(
+            "urn:ngsi-ld:W:1".into(),
+            doc("urn:ngsi-ld:W:1", json!(["W"]), "urn:a:c"),
+        )],
+    )
+    .await
+    .expect("upsert");
+    assert_eq!(
+        pairs().await,
+        ["W urn:a:c", "X urn:a:a", "X urn:a:b", "Y urn:a:b"]
+    );
+
+    // the same batch again over the stored Entity: ON CONFLICT DO UPDATE
+    // fires the update trigger from an INSERT statement
+    s.batch_upsert_replace(
+        &t,
+        &[(
+            "urn:ngsi-ld:W:1".into(),
+            doc("urn:ngsi-ld:W:1", json!(["W"]), "urn:a:d"),
+        )],
+    )
+    .await
+    .expect("upsert over");
+    assert_eq!(
+        pairs().await,
+        [
+            "W urn:a:c",
+            "W urn:a:d",
+            "X urn:a:a",
+            "X urn:a:b",
+            "Y urn:a:b"
+        ]
+    );
+    for id in ["urn:ngsi-ld:X:1", "urn:ngsi-ld:W:1"] {
+        let _ = s.delete(&t, id).await;
+    }
+}
+
 /// T-4610: a type list the caller stops waiting for (an MCP call cancelled
 /// at its timeout) hands its connection back: on a pool of one, the next
 /// read still gets it, again and again.
