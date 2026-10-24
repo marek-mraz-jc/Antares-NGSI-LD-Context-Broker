@@ -93,6 +93,10 @@ const KNOWN_KEYS: &[&str] = &[
     // The HTTP surfaces mounted beside the NGSI-LD API root, comma-separated;
     // default `admin` (/q). An unknown name is fatal and names the shelf.
     "ANTARES_API_SURFACES",
+    // The bridges inbound Channels bind on (ADR-0031, feature `channels`):
+    // `name=uri` pairs, `uri` being `loopback` or an mqtt(s) base whose
+    // credential stays in this variable. A malformed list is fatal.
+    "ANTARES_CHANNEL_BROKERS",
     // The /q admin credential (T-3569): a file holding the bearer secret,
     // and whether /q/metrics answers without it (token | open).
     "ANTARES_ADMIN_TOKEN_FILE",
@@ -601,6 +605,14 @@ const SURFACE_SHELF: &[(&str, SurfaceCtor)] = &[
     ("ws-views", || {
         antares_ops::mount(antares_ws::ViewWs::process())
     }),
+    #[cfg(feature = "channels")]
+    ("channels", || {
+        // `ANTARES_CHANNEL_BROKERS` was checked before the shelf is built
+        Box::new(
+            antares_api::channels::Channels::from_env()
+                .unwrap_or_else(|_| antares_api::channels::Channels::new(Default::default())),
+        )
+    }),
     #[cfg(feature = "plugin-example")]
     ("example", || {
         Box::new(antares_plugin_example::ExampleSurface)
@@ -1048,6 +1060,12 @@ async fn run(
     // rather than from a hard-wired list: the selection replaces what the
     // default mounting put there, before the state is shared.
     let selected = api_surfaces(std::env::var("ANTARES_API_SURFACES").ok().as_deref())?;
+    #[cfg(feature = "channels")]
+    if selected.iter().any(|(n, _)| *n == "channels") {
+        antares_api::channels::bridges_from(
+            &std::env::var("ANTARES_CHANNEL_BROKERS").unwrap_or_default(),
+        )?;
+    }
     state = state.with_surfaces(selected.iter().map(|(_, build)| build()).collect())?;
     // The policy engine, from configuration and from the shelf this binary
     // was built with. Without one the broker asks `allow-all` and behaves
@@ -2042,7 +2060,12 @@ mod api_surface_tests {
     /// surface feature the shelf is the admin surface alone, and a path of
     /// every surface prefix (ADR-0023 to ADR-0027) is unrouted. A surface
     /// that lands without its feature gate turns this red.
-    #[cfg(not(any(feature = "plugin-example", feature = "views", feature = "ws")))]
+    #[cfg(not(any(
+        feature = "plugin-example",
+        feature = "views",
+        feature = "ws",
+        feature = "channels"
+    )))]
     #[tokio::test]
     async fn the_vanilla_shelf_is_admin_alone() {
         use tower::ServiceExt;

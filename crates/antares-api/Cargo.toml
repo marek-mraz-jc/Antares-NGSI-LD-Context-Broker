@@ -38,6 +38,8 @@ icu_collator = { workspace = true }
 icu_locale_core = { workspace = true }
 uuid = { workspace = true }
 serde_json = { workspace = true }
+# the Channel document (feature `channels`)
+serde = { workspace = true, optional = true }
 tracing = { workspace = true }
 # The metrics facade only — a no-op unless the broker installs a recorder,
 # so tests and wasm builds cost nothing.
@@ -90,6 +92,10 @@ views = []
 # the vanilla build: there every write is `channel: api` whatever its
 # headers say, and `versions` is an unknown query parameter (400).
 jc = []
+# Inbound bridge Channels (ADR-0031, T-5079): `/x/channels` binds a topic of
+# a message bridge (loopback, or MQTT 5 with `mqtt`) to one Attribute. Off
+# in the vanilla build.
+channels = ["dep:serde"]
 
 [dev-dependencies]
 # the storage seams are object-safe AND asynchronous: a test double
