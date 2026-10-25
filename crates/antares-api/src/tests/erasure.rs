@@ -174,17 +174,23 @@ async fn named_attributes_go_by_their_own_stamp() {
         .expect("erase again");
     assert_eq!(again["entities"], 0);
 
-    // no `before`: every named Attribute goes, whatever its stamp; a
-    // `before` that is no instant cuts nothing either
-    let all = erase(
+    // a `before` that is no instant erases nothing: read as no cut it
+    // would take what was written after the erasure
+    let refused = erase(
         &st,
         &tenant(),
         &ids(&[id]),
         Some(&ids(&[SPEED])),
         Some("yesterday"),
     )
-    .await
-    .expect("erase all");
+    .await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert!(stored(&st, id).await.expect("stays").get(SPEED).is_some());
+
+    // no `before`: every named Attribute goes, whatever its stamp
+    let all = erase(&st, &tenant(), &ids(&[id]), Some(&ids(&[SPEED])), None)
+        .await
+        .expect("erase all");
     assert_eq!(all["entities"], 1);
     assert!(stored(&st, id).await.expect("stays").get(SPEED).is_none());
 
