@@ -7,7 +7,6 @@
 //! answered. A view the caller may not read contributes nothing.
 
 use antares_ops::{Caller, OperationId, Ops, OpsRequest, Refusal, ViewOps};
-use axum::body::to_bytes;
 use axum::extract::Request;
 use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
@@ -15,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use futures_util::stream::{self, StreamExt};
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex, PoisonError};
 
 /// Where the union answers, below the view root. `_` is no view-id
 /// character, so no view shadows it.
@@ -31,6 +30,12 @@ const ROWS_HELD: usize = 2000;
 const WIDTH: usize = 16;
 /// The largest page one view may answer.
 const PAGE_BYTES: usize = 32 * 1024 * 1024;
+/// What a read across views answers once its view pages pass the broker's
+/// `max_answer_bytes` together (F-ANT1-001).
+const OVER_BUDGET: &str =
+    "the views' pages of a read across views are over the broker's max_answer_bytes (64 MiB by default) together: name fewer views or narrow the query";
+/// What a read across views answers for a view page past [`PAGE_BYTES`].
+const PAGE_TOO_LARGE: &str = "a view's page is over the 32 MiB a read across views takes";
 /// The parameters the union reads itself; every other one goes to each view.
 const OWN: [&str; 5] = ["views", "cursor", "limit", "offset", "count"];
 const LD: &str = "application/ld+json";
@@ -63,7 +68,8 @@ pub async fn serve(ops: &Ops, caller: &Caller, req: Request) -> Response {
     let Some(json) = wants_json(&parts.headers) else {
         return not_acceptable();
     };
-    match run(ops, caller, &parts.headers, &ask).await {
+    let budget = Budget::new(ops.max_answer_bytes());
+    match run(ops, caller, &parts.headers, &ask, &budget).await {
         Ok(page) => page.answer(&ask, json),
         Err(Stop::Refused(refusal)) => refusal.ngsi_ld(),
         Err(Stop::Answer(answer)) => *answer,
@@ -250,10 +256,39 @@ impl From<Refusal> for Stop {
     }
 }
 
+/// The bytes of view pages one union request may still read: every view read
+/// of the request takes from the one budget, frame by frame, so the pages it
+/// holds at once stay under the broker's `max_answer_bytes` (F-ANT1-001).
+struct Budget(Mutex<usize>);
+
+impl Budget {
+    fn new(bytes: usize) -> Self {
+        Self(Mutex::new(bytes))
+    }
+
+    /// Takes the `n` bytes of a frame that follows `read` bytes of one
+    /// view's page; the bound passed, taking nothing, when the page would
+    /// pass [`PAGE_BYTES`] or fewer are left.
+    fn take(&self, read: usize, n: usize) -> Result<(), &'static str> {
+        if read.saturating_add(n) > PAGE_BYTES {
+            return Err(PAGE_TOO_LARGE);
+        }
+        let mut left = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        *left = left.checked_sub(n).ok_or(OVER_BUDGET)?;
+        Ok(())
+    }
+}
+
 /// One view's page: its Entities and count, `None` when it gives nothing.
 type Fetched = Result<Option<(Vec<Value>, u64)>, Stop>;
 
-async fn run(ops: &Ops, caller: &Caller, headers: &HeaderMap, ask: &Ask) -> Result<Page, Stop> {
+async fn run(
+    ops: &Ops,
+    caller: &Caller,
+    headers: &HeaderMap,
+    ask: &Ask,
+    budget: &Budget,
+) -> Result<Page, Stop> {
     let mut parts: Vec<Part> = ask
         .views
         .iter()
@@ -278,14 +313,23 @@ async fn run(ops: &Ops, caller: &Caller, headers: &HeaderMap, ask: &Ask) -> Resu
     let first = if ask.limit == 0 { 0 } else { chunk };
     let mut total = 0u64;
     if ask.limit > 0 || ask.count {
-        refill(
-            &mut parts, caller, headers, ask, first, ask.count, &mut total,
-        )
-        .await?;
+        let r = Read {
+            caller,
+            headers,
+            ask,
+            budget,
+        };
+        refill(&mut parts, &r, first, ask.count, &mut total).await?;
     }
     let mut docs = Vec::new();
     while docs.len() < ask.limit {
-        refill(&mut parts, caller, headers, ask, chunk, false, &mut total).await?;
+        let r = Read {
+            caller,
+            headers,
+            ask,
+            budget,
+        };
+        refill(&mut parts, &r, chunk, false, &mut total).await?;
         let head = parts
             .iter_mut()
             .enumerate()
@@ -321,11 +365,17 @@ fn id_of(doc: &Value) -> &str {
 
 /// Read the next `limit` Entities of every part whose buffer ran out, at
 /// most [`WIDTH`] views at a time. A limit of 0 reads counts alone.
+/// What every view read of one union request shares.
+struct Read<'a> {
+    caller: &'a Caller,
+    headers: &'a HeaderMap,
+    ask: &'a Ask,
+    budget: &'a Budget,
+}
+
 async fn refill(
     parts: &mut [Part],
-    caller: &Caller,
-    headers: &HeaderMap,
-    ask: &Ask,
+    r: &Read<'_>,
     limit: usize,
     count: bool,
     total: &mut u64,
@@ -337,13 +387,14 @@ async fn refill(
         .filter(|p| empty(p))
         .filter_map(|p| p.view.clone().map(|v| (v, p.read)))
         .collect();
-    let answers: Vec<Fetched> = stream::iter(jobs)
-        .map(|(view, offset)| async move {
-            read(&view, caller, headers, ask.target(offset, limit, count)).await
-        })
-        .buffered(WIDTH)
-        .collect()
-        .await;
+    let answers: Vec<Fetched> =
+        stream::iter(jobs)
+            .map(|(view, offset)| async move {
+                read(&view, r, r.ask.target(offset, limit, count)).await
+            })
+            .buffered(WIDTH)
+            .collect()
+            .await;
     for (part, answer) in parts.iter_mut().filter(|p| empty(p)).zip(answers) {
         match answer? {
             Some((docs, n)) => {
@@ -361,9 +412,9 @@ async fn refill(
 /// count, `None` when the view gives the caller nothing (unknown, refused,
 /// out of reach: no sign which), or the answer that ends the union (a
 /// request every view refuses alike, a failure inside the broker).
-async fn read(view: &ViewOps, caller: &Caller, headers: &HeaderMap, target: String) -> Fetched {
+async fn read(view: &ViewOps, r: &Read<'_>, target: String) -> Fetched {
     let mut req = OpsRequest::new(Method::GET, target);
-    for (name, value) in headers {
+    for (name, value) in r.headers {
         if name != header::ACCEPT {
             req = req.header(name.clone(), value.clone());
         }
@@ -371,7 +422,7 @@ async fn read(view: &ViewOps, caller: &Caller, headers: &HeaderMap, target: Stri
     let req = req.header(header::ACCEPT, HeaderValue::from_static(LD));
     // the union asks each view only for an operation it allows, without a
     // Tenant, so what the layer refuses it refuses for every view alike
-    let answer = view.run(OperationId::QueryEntities, caller, req).await?;
+    let answer = view.run(OperationId::QueryEntities, r.caller, req).await?;
     match answer.status() {
         StatusCode::OK => {}
         // the view's Policy refuses the caller: no sign which view it was
@@ -386,13 +437,16 @@ async fn read(view: &ViewOps, caller: &Caller, headers: &HeaderMap, target: Stri
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    let docs = to_bytes(answer.into_body(), PAGE_BYTES)
-        .await
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .ok_or(Refusal::Limit(
-            "a view's page is over the 32 MiB a read across views takes",
-        ))?;
+    let mut body = answer.into_body().into_data_stream();
+    let mut bytes = Vec::new();
+    while let Some(frame) = body.next().await {
+        let frame = frame.map_err(|_| Refusal::Limit(PAGE_TOO_LARGE))?;
+        r.budget
+            .take(bytes.len(), frame.len())
+            .map_err(Refusal::Limit)?;
+        bytes.extend_from_slice(&frame);
+    }
+    let docs = serde_json::from_slice(&bytes).map_err(|_| Refusal::Limit(PAGE_TOO_LARGE))?;
     Ok(Some((docs, count)))
 }
 
@@ -460,6 +514,19 @@ impl Page {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_budget_is_taken_until_it_is_spent() {
+        let budget = Budget::new(10);
+        assert_eq!(budget.take(0, 6), Ok(()));
+        assert_eq!(budget.take(6, 5), Err(OVER_BUDGET), "5 of 4 left");
+        assert_eq!(budget.take(6, 4), Ok(()));
+        assert_eq!(budget.take(10, 1), Err(OVER_BUDGET), "nothing left");
+        assert_eq!(budget.take(10, 0), Ok(()));
+        let pages = Budget::new(PAGE_BYTES.saturating_mul(2));
+        assert_eq!(pages.take(PAGE_BYTES, 1), Err(PAGE_TOO_LARGE));
+        assert_eq!(pages.take(0, PAGE_BYTES), Ok(()));
+    }
 
     fn ask(query: &str) -> Option<Ask> {
         let req = axum::http::Request::builder()

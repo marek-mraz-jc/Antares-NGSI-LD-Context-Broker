@@ -351,3 +351,24 @@ async fn a_type_selection_outside_the_4_17_grammar_is_refused() {
         assert_eq!(send(&st, req).await, StatusCode::BAD_REQUEST, "{uri}");
     }
 }
+
+/// F-ANT4-005: an Entity id past 2048 bytes is BadRequestData (400), never a
+/// store failure on the index key; one at the bound is created.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_overlong_entity_id_is_400() {
+    let st = AppState::new("test".into());
+    let create = |id: String| {
+        let body = serde_json::json!({"id": id, "type": "T"}).to_string();
+        Request::builder()
+            .method("POST")
+            .uri("/ngsi-ld/v1/entities")
+            .header("Content-Type", "application/json")
+            .header("Content-Length", body.len())
+            .body(Body::from(body))
+            .expect("request")
+    };
+    let long = format!("urn:ngsi-ld:T:{}", "a".repeat(10_000));
+    assert_eq!(send(&st, create(long)).await, StatusCode::BAD_REQUEST);
+    let at = format!("urn:ngsi-ld:T:{}", "a".repeat(2048 - 14));
+    assert_eq!(send(&st, create(at)).await, StatusCode::CREATED);
+}

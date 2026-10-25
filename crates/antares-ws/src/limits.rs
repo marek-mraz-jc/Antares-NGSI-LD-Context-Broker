@@ -13,6 +13,8 @@ pub const MAX_NOTIFICATION_BYTES: usize = 1024 * 1024;
 /// The variable of the bound of the same name (the broker knows it as a config key).
 pub const QUEUE_ENV: &str = "ANTARES_WS_QUEUE";
 /// The variable of the bound of the same name (the broker knows it as a config key).
+pub const QUEUE_BYTES_ENV: &str = "ANTARES_WS_QUEUE_BYTES";
+/// The variable of the bound of the same name (the broker knows it as a config key).
 pub const RESUME_GRACE_ENV: &str = "ANTARES_WS_RESUME_GRACE_SECS";
 /// The variable of the bound of the same name (the broker knows it as a config key).
 pub const SUBSCRIPTION_LEASE_ENV: &str = "ANTARES_WS_SUBSCRIPTION_LEASE_SECS";
@@ -31,6 +33,7 @@ pub const ALLOWED_ORIGINS_ENV: &str = "ANTARES_WS_ALLOWED_ORIGINS";
 /// from here, so a new one is added in this crate alone (T-3766).
 pub const ENV_KEYS: &[&str] = &[
     QUEUE_ENV,
+    QUEUE_BYTES_ENV,
     RESUME_GRACE_ENV,
     SUBSCRIPTION_LEASE_ENV,
     MAX_LIFETIME_ENV,
@@ -46,6 +49,11 @@ pub struct Limits {
     /// `ANTARES_WS_QUEUE`: queued notifications per connection, and the
     /// length of its resume ring (W4).
     pub queue: usize,
+    /// `ANTARES_WS_QUEUE_BYTES`: the bytes one connection's queue and resume
+    /// ring hold together (F-ANT3-001); the ring's oldest leave first, and a
+    /// queue past it overflows as one past `queue` does. At least
+    /// [`MAX_NOTIFICATION_BYTES`].
+    pub queue_bytes: usize,
     /// `ANTARES_WS_RESUME_GRACE_SECS`: how long a closed connection's
     /// Subscriptions and ring wait for a resume.
     pub resume_grace: Duration,
@@ -82,6 +90,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             queue: 256,
+            queue_bytes: 16 * 1024 * 1024,
             resume_grace: Duration::from_secs(30),
             subscription_lease: Duration::from_secs(300),
             max_lifetime: Duration::from_secs(300),
@@ -137,8 +146,15 @@ impl Limits {
                 floor.as_secs()
             ));
         }
+        let queue_bytes = count(QUEUE_BYTES_ENV, d.queue_bytes)?;
+        if queue_bytes < MAX_NOTIFICATION_BYTES {
+            return Err(format!(
+                "{QUEUE_BYTES_ENV}={queue_bytes} must be at least {MAX_NOTIFICATION_BYTES} (one notification at its cap)"
+            ));
+        }
         Ok(Self {
             queue: count(QUEUE_ENV, d.queue)?,
+            queue_bytes,
             resume_grace,
             subscription_lease,
             max_lifetime: secs(MAX_LIFETIME_ENV, d.max_lifetime)?,
@@ -166,6 +182,7 @@ impl Limits {
     pub fn health(&self) -> Value {
         json!({
             "queue": self.queue,
+            "queueBytes": self.queue_bytes,
             "resumeGraceSecs": self.resume_grace.as_secs(),
             "subscriptionLeaseSecs": self.subscription_lease.as_secs(),
             "maxLifetimeSecs": self.max_lifetime.as_secs(),
@@ -208,6 +225,14 @@ mod tests {
             assert!(e.is_err(), "{bad}");
         }
         assert_eq!(Limits::default().health().get("queue"), Some(&json!(256)));
+        assert_eq!(
+            Limits::default().health().get("queueBytes"),
+            Some(&json!(16 * 1024 * 1024))
+        );
+        let bytes = Limits::from_env(|k| (k == QUEUE_BYTES_ENV).then(|| "2097152".to_owned()))?;
+        assert_eq!(bytes.queue_bytes, 2_097_152);
+        let tiny = Limits::from_env(|k| (k == QUEUE_BYTES_ENV).then(|| "1000".to_owned()));
+        assert!(tiny.is_err(), "under one notification at its cap");
         // a lease the grace could outlast stops the broker
         let short = Limits::from_env(|k| (k == SUBSCRIPTION_LEASE_ENV).then(|| "120".to_owned()));
         assert!(short.is_err(), "{short:?}");

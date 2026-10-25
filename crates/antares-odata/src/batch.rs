@@ -129,31 +129,17 @@ pub(crate) async fn serve(
     let mut answers: Vec<odata_batch::Response> = Vec::with_capacity(checked.len());
     // Whether each member that ran failed; `dependsOn` names earlier ones.
     let mut failed: Vec<bool> = Vec::with_capacity(checked.len());
+    // the member answers buffered so far share `max_answer_bytes` (F-ANT4-004)
+    let mut left = ops.max_answer_bytes();
     for (member, (target, headers)) in batch.requests.into_iter().zip(checked) {
         let id = member.id.clone();
-        if member
-            .depends_on
-            .iter()
-            .any(|&d| failed.get(d) == Some(&true))
-        {
-            answers.push(odata_batch::Response {
-                id,
-                status: 424,
-                headers: Vec::new(),
-                body: Vec::new(),
-            });
-            failed.push(true);
-            continue;
-        }
-        let answer = run(
-            routed,
-            ops,
-            &parts,
-            member,
-            (&target, headers),
-            max_query_len,
-        )
-        .await;
+        let skip = skipped(ops, &member.depends_on, &failed, left).await;
+        let answer = if let Some(answer) = skip {
+            answer
+        } else {
+            let budget = (max_query_len, &mut left);
+            run(routed, ops, &parts, member, (&target, headers), budget).await
+        };
         let failure = answer.status >= 400;
         answers.push(odata_batch::Response { id, ..answer });
         failed.push(failure);
@@ -162,6 +148,29 @@ pub(crate) async fn serve(
         }
     }
     written(&answers, json, preference == Some(true), version)
+}
+
+/// The answer of a member that is not run: 413 once the batch's answer bound
+/// is spent (F-ANT4-004), 424 when a member it depends on failed. Either is
+/// reached only under `continue-on-error`: a failure stops the batch otherwise.
+async fn skipped(
+    ops: &Ops,
+    depends_on: &[usize],
+    failed: &[bool],
+    left: usize,
+) -> Option<odata_batch::Response> {
+    if left == 0 {
+        return Some(too_large(ops).await);
+    }
+    depends_on
+        .iter()
+        .any(|&d| failed.get(d) == Some(&true))
+        .then(|| odata_batch::Response {
+            id: None,
+            status: 424,
+            headers: Vec::new(),
+            body: Vec::new(),
+        })
 }
 
 /// One member as a request of its own: the outer request's headers (the
@@ -173,7 +182,7 @@ async fn run(
     outer: &axum::http::request::Parts,
     member: odata_batch::Request,
     (target, own): (&str, Vec<(HeaderName, HeaderValue)>),
-    max_query_len: usize,
+    (max_query_len, left): (usize, &mut usize),
 ) -> odata_batch::Response {
     let mut headers = outer.headers.clone();
     for name in BATCH_ONLY {
@@ -212,20 +221,36 @@ async fn run(
         Err(_) => bad("a batch member URL is not a URL").into_response(),
     };
     // A member's answer is buffered to be framed; past the broker's bound
-    // the member answers 413 instead.
+    // the member answers 413 instead (T-3773) and buffers nothing. One that
+    // fits alone but passes what the batch's bound has left answers 413 and
+    // spends the bound, so every later member answers 413 too.
     let (parts, body) = answer.into_parts();
-    let (parts, body) = if let Ok(body) = ops.read_answer(body).await {
-        (parts, body)
-    } else {
-        let (parts, body) = ODataErrorResponse::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "PayloadTooLarge",
-            antares_ops::bounds::ANSWER_TOO_LARGE,
-        )
-        .into_response()
-        .into_parts();
-        (parts, ops.read_answer(body).await.unwrap_or_default())
+    let Ok(body) = ops.read_answer(body).await else {
+        return too_large(ops).await;
     };
+    let Some(rest) = left.checked_sub(body.len()) else {
+        *left = 0;
+        return too_large(ops).await;
+    };
+    *left = rest;
+    framed(&parts, &body)
+}
+
+/// The 413 a member answers past the buffer bound.
+async fn too_large(ops: &Ops) -> odata_batch::Response {
+    let (parts, body) = ODataErrorResponse::new(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "PayloadTooLarge",
+        antares_ops::bounds::ANSWER_TOO_LARGE,
+    )
+    .into_response()
+    .into_parts();
+    let body = ops.read_answer(body).await.unwrap_or_default();
+    framed(&parts, &body)
+}
+
+/// A member's answer as the batch frames it.
+fn framed(parts: &axum::http::response::Parts, body: &[u8]) -> odata_batch::Response {
     let status = parts.status.as_u16();
     let headers = parts
         .headers
