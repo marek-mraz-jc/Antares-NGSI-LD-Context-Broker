@@ -182,6 +182,9 @@ pub struct Set {
     /// Each Property that keys the target of a navigation (R6, T-3761), by
     /// its CSDL name: the target's EntitySet.
     pub references: BTreeMap<String, String>,
+    /// The filter of the named output this set serves (docs API/11 EP-159, T-5225), a conjunct
+    /// of every read of it; `None` for a class's own set.
+    pub output: Option<antares_ops::outputs::Filter>,
 }
 
 /// A key taken from the model (E2a): its value `v` names the Entity
@@ -240,8 +243,7 @@ pub fn build(
     for (class, (name, attrs)) in &visible {
         let mut ty = EntityType::new(name.clone());
         ty.base_type = Some(BASE.into());
-        let mut identifier = None;
-        let mut required = Vec::new();
+        let (mut identifier, mut required) = (None, Vec::new());
         ty.annotations.push(iri(&schema.class_iri(class)));
         let own = schema.schema().classes.get(*class);
         ty.annotations
@@ -301,6 +303,7 @@ pub fn build(
             members,
             identifier,
             writable,
+            output: None,
         };
         types.push(ty);
         sets.insert(name.clone(), set);
@@ -319,6 +322,49 @@ pub fn build(
         sets,
         schema_version,
     })
+}
+
+/// `edm` with one EntitySet per output of the view's `representations.odata` (docs API/11
+/// EP-159, T-5225): the set of its one source's class under the output's name (`-` written `_`),
+/// read only, its filter a conjunct of every read. An output whose class the model does not
+/// show, or whose name a class's set holds, serves nobody.
+#[must_use]
+pub fn outputs(mut edm: Edm, outputs: &[antares_ops::outputs::Output]) -> Edm {
+    let Some(container) = edm
+        .csdl
+        .schemas
+        .iter_mut()
+        .find_map(|s| s.entity_container.as_mut())
+    else {
+        return edm;
+    };
+    for o in outputs {
+        let name = mangle(&o.name.replace('-', "_"));
+        let class = o.sources.first().and_then(|s| mangle(&s.entity_type));
+        let (Some(name), Some(class)) = (name, class) else {
+            continue;
+        };
+        let own = container.entity_sets.iter().find(|s| s.name == class);
+        let (Some(own), Some(set), false) =
+            (own, edm.sets.get(&class), edm.sets.contains_key(&name))
+        else {
+            continue;
+        };
+        let mut entity_set = own.clone();
+        entity_set.name.clone_from(&name);
+        entity_set.annotations = capabilities(&set.members, Writable::default(), Vec::new());
+        entity_set.annotations.push(description(
+            o.description_in("en").unwrap_or(o.title_in("en")),
+        ));
+        let set = Set {
+            writable: Writable::default(),
+            output: Some(o.filter.clone()),
+            ..set.clone()
+        };
+        container.entity_sets.push(entity_set);
+        edm.sets.insert(name, set);
+    }
+    edm
 }
 
 /// The view's own CSDL schema, annotated with its `Core.SchemaVersion` (T-5207), and that
@@ -1365,6 +1411,48 @@ mod tests {
         for set in ["Car", "Person"] {
             assert!(xml.contains(&format!("<EntitySet Name=\"{set}\"")), "{xml}");
         }
+    }
+
+    #[test]
+    fn an_output_is_a_read_only_set_of_its_class_and_one_without_a_class_is_none() {
+        let s = schema();
+        let edm = build(
+            "city",
+            &s,
+            &shown(&s, &[("Car", CAR_ALL)]),
+            Writable::default(),
+            CsdlVersion::V4_01,
+        )
+        .unwrap();
+        let long = "a".repeat(129);
+        let list = serde_json::json!([
+            {"name": "fast-cars", "filter": {"q": "speed>2"}, "sources": [{"type": "Car"}]},
+            {"name": "people", "sources": [{"type": "Person"}]},
+            {"name": "long", "sources": [{"type": long}]}
+        ]);
+        let listed: Vec<_> = antares_ops::outputs::listed(Some(&list), "odata")
+            .into_iter()
+            .filter_map(|(_, o)| o.ok())
+            .collect();
+        assert_eq!(listed.len(), 3);
+        let named = outputs(edm.clone(), &listed);
+        assert_eq!(
+            named.sets.keys().collect::<Vec<_>>(),
+            vec!["Car", "fast_cars"]
+        );
+        let fast = &named.sets["fast_cars"];
+        assert_eq!(fast.writable, Writable::default());
+        assert_eq!(
+            fast.output.as_ref().and_then(|f| f.q.as_deref()),
+            Some("speed>2")
+        );
+        assert_eq!(fast.members, edm.sets["Car"].members);
+        // a model without a container takes no output
+        let mut bare = edm;
+        for schema in &mut bare.csdl.schemas {
+            schema.entity_container = None;
+        }
+        assert_eq!(outputs(bare.clone(), &listed), bare);
     }
 
     #[test]

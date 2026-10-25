@@ -843,6 +843,7 @@ async fn split_merge(
             None,
             origin_reg,
             &mut warnings,
+            &mut None,
         )
         .await?;
         for aux_pass in [false, true] {

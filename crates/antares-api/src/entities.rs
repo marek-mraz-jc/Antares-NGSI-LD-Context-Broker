@@ -139,7 +139,7 @@ async fn create_entity_inner(
             // are never contacted); an inclusive one is simply not forwarded.
             if !reg.supports("createEntity") {
                 if reg.is_proxy() {
-                    conflicts.push(crate::federation::conflict_part("createEntity"));
+                    conflicts.push(crate::federation::conflict_part("createEntity", reg));
                 }
                 continue;
             }
@@ -160,15 +160,12 @@ async fn create_entity_inner(
                 .create(&tenant, Kind::Entity, &id, local_exp.clone())
                 .await?
             {
-                parts.push(crate::federation::Part {
-                    status: 201,
-                    detail: "created locally".into(),
-                });
+                parts.push(crate::federation::Part::local(201, "created locally"));
             } else {
-                parts.push(crate::federation::Part {
-                    status: 409,
-                    detail: format!("entity {id} already exists"),
-                });
+                parts.push(crate::federation::Part::local(
+                    409,
+                    format!("entity {id} already exists"),
+                ));
             }
         }
         parts.extend(conflicts);
@@ -191,6 +188,7 @@ async fn create_entity_inner(
         }
         return Ok(crate::federation::combine(
             st.profile,
+            Some(&id),
             parts,
             created(entity_location(&id), &tenant),
             &tenant,
@@ -318,6 +316,7 @@ async fn retrieve_entity_inner(
         }
     }
     let doc = if fed_on {
+        let mut sole_failure = None;
         let fed = crate::federation::fed_retrieve(
             st,
             &tenant,
@@ -327,6 +326,7 @@ async fn retrieve_entity_inner(
             map,
             None,
             &mut warnings,
+            &mut sole_failure,
         )
         .await?;
         match local_doc {
@@ -347,6 +347,18 @@ async fn retrieve_entity_inner(
                     .map(|(_, d)| d.clone())
                     .or_else(|| fed.first().map(|(_, d)| d.clone()));
                 let Some(mut base) = first else {
+                    // 6.3.17 p.278: "In the case of an exclusive or redirect
+                    // registration, where all of the data is held outside of
+                    // the Context Broker and held in a single registered
+                    // source, the following errors shall be returned": 504
+                    // when it "fails to respond in time", 502 when "the
+                    // single forwarded request fails for any other reason".
+                    // Its 404 stays the plain 404 below.
+                    if let Some(p) = sole_failure.filter(|p| p.status != 404) {
+                        let mut resp = crate::federation::source_error(&p, &tenant);
+                        attach_warnings(&mut resp, &warnings);
+                        return Ok(resp);
+                    }
                     // 6.3.17: abnormal distributed outcomes surface as
                     // NGSILD-Warning even when the retrieve ends 404
                     let mut resp = ApiError::from(NgsiError::ResourceNotFound(format!(
@@ -420,6 +432,7 @@ async fn retrieve_entity_inner(
                     *level,
                     &held,
                     &mut { MAX_JOIN_LOOKUPS },
+                    fed_on.then_some(headers),
                 )
                 .await
             }
@@ -988,9 +1001,18 @@ async fn query_entities_inner(
         match mode.as_str() {
             "inline" => {
                 for p in &mut payload {
-                    complete &=
-                        inline_join_beyond(st, &tenant, &ctx, &repr, p, *level, &held, &mut budget)
-                            .await;
+                    complete &= inline_join_beyond(
+                        st,
+                        &tenant,
+                        &ctx,
+                        &repr,
+                        p,
+                        *level,
+                        &held,
+                        &mut budget,
+                        crate::federation::active(params).then_some(headers),
+                    )
+                    .await;
                 }
             }
             "flat" => {
@@ -1938,17 +1960,14 @@ pub async fn delete_entity(
             let mut parts = Vec::new();
             if st.store.delete_entity_if(&tenant, &id, &keep).await? {
                 mirror_delete_entity(&st, &tenant, &id).await;
-                parts.push(crate::federation::Part {
-                    status: 204,
-                    detail: "deleted locally".into(),
-                });
+                parts.push(crate::federation::Part::local(204, "deleted locally"));
             } else if !proxy_match {
                 // nothing local to delete, and no proxy that owns it: the
                 // local half of this operation is the 404
-                parts.push(crate::federation::Part {
-                    status: 404,
-                    detail: format!("entity {id} not found locally"),
-                });
+                parts.push(crate::federation::Part::local(
+                    404,
+                    format!("entity {id} not found locally"),
+                ));
             }
             let ctx_url = crate::federation::ctx_link_url(&headers, &ctx.source);
             let seg = crate::federation::path_segment(&id);
@@ -1958,7 +1977,7 @@ pub async fn delete_entity(
                 // error of type Conflict; inclusive ones are not forwarded.
                 if !reg.supports("deleteEntity") {
                     if reg.is_proxy() {
-                        parts.push(crate::federation::conflict_part("deleteEntity"));
+                        parts.push(crate::federation::conflict_part("deleteEntity", reg));
                     }
                     continue;
                 }
@@ -1979,6 +1998,7 @@ pub async fn delete_entity(
             }
             return Ok(crate::federation::combine(
                 st.profile,
+                Some(&id),
                 parts,
                 no_content(&tenant),
                 &tenant,
@@ -2289,10 +2309,7 @@ async fn purge_inner(
         };
     purge_locally(st, &tenant, params, &ctx, &keep, &drop).await?;
     if !regs.is_empty() {
-        let mut parts = vec![crate::federation::Part {
-            status: 204,
-            detail: "purged locally".into(),
-        }];
+        let mut parts = vec![crate::federation::Part::local(204, "purged locally")];
         let ctx_url = crate::federation::ctx_link_url(headers, &ctx.source);
         let query = forwarded_purge_query(params);
         for reg in &regs {
@@ -2301,7 +2318,7 @@ async fn purge_inner(
             // registration — any mode — is an error of type Conflict
             // (partial success when other parts succeeded).
             if !reg.supports("purgeEntity") {
-                parts.push(crate::federation::conflict_part("purgeEntity"));
+                parts.push(crate::federation::conflict_part("purgeEntity", reg));
                 continue;
             }
             parts.push(
@@ -2321,6 +2338,7 @@ async fn purge_inner(
         }
         return Ok(crate::federation::combine(
             st.profile,
+            None,
             parts,
             no_content(&tenant),
             &tenant,
@@ -2475,14 +2493,8 @@ async fn merge_entity_inner(
                 })
                 .await?;
             parts.push(match res {
-                Some(Ok(())) => crate::federation::Part {
-                    status: 204,
-                    detail: "merged locally".into(),
-                },
-                _ => crate::federation::Part {
-                    status: 404,
-                    detail: format!("entity {id} not found locally"),
-                },
+                Some(Ok(())) => crate::federation::Part::local(204, "merged locally"),
+                _ => crate::federation::Part::local(404, format!("entity {id} not found locally")),
             });
         }
         let ctx_url = crate::federation::ctx_link_url(headers, &parsed.ctx.source);
@@ -2493,7 +2505,7 @@ async fn merge_entity_inner(
             // error of type Conflict; inclusive ones are not forwarded.
             if !reg.supports("mergeEntity") {
                 if reg.is_proxy() {
-                    parts.push(crate::federation::conflict_part("mergeEntity"));
+                    parts.push(crate::federation::conflict_part("mergeEntity", reg));
                 }
                 continue;
             }
@@ -2517,6 +2529,7 @@ async fn merge_entity_inner(
         }
         return Ok(crate::federation::combine(
             st.profile,
+            Some(id),
             parts,
             no_content(&tenant),
             &tenant,
@@ -3101,10 +3114,8 @@ pub async fn replace_entity(
             regs.iter().filter(|r| r.is_proxy()).collect();
         let proxy_match = !proxies.is_empty();
         if local_doc.is_some() || !proxy_match {
-            let gone = crate::federation::Part {
-                status: 404,
-                detail: format!("entity {id} not found locally"),
-            };
+            let gone =
+                crate::federation::Part::local(404, format!("entity {id} not found locally"));
             if local_doc.is_none() {
                 parts.push(gone);
             } else {
@@ -3132,10 +3143,9 @@ pub async fn replace_entity(
                     })
                     .await?;
                 match res {
-                    Some(Ok(())) => parts.push(crate::federation::Part {
-                        status: 204,
-                        detail: "replaced locally".into(),
-                    }),
+                    Some(Ok(())) => {
+                        parts.push(crate::federation::Part::local(204, "replaced locally"))
+                    }
                     _ => parts.push(gone),
                 }
             }
@@ -3148,7 +3158,7 @@ pub async fn replace_entity(
             // error of type Conflict; inclusive ones are not forwarded.
             if !reg.supports("replaceEntity") {
                 if reg.is_proxy() {
-                    parts.push(crate::federation::conflict_part("replaceEntity"));
+                    parts.push(crate::federation::conflict_part("replaceEntity", reg));
                 }
                 continue;
             }
@@ -3172,6 +3182,7 @@ pub async fn replace_entity(
         }
         Ok(crate::federation::combine(
             st.profile,
+            Some(&id),
             parts,
             no_content(&tenant),
             &tenant,

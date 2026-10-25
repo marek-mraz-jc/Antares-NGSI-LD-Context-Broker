@@ -1064,18 +1064,23 @@ fn expand_instance(
             out.insert("languageMap".into(), lm.clone());
         }
         "JsonProperty" => {
-            // 4.5.24.2: json is "a raw JSON object (or array of objects)" —
-            // never expanded or compacted; kept verbatim. The bare NGSI-LD
-            // Null deletion form passes through under allow_null.
+            // TS 104 175 5.2.6.4.10 types json by the NGSI-LD Value of 3.1:
+            // "JSON value (i.e. a string, a number, true or false, an object,
+            // an array)" — CIM 009 4.5.24.2's object-only rule is lifted
+            // (T-5580). Never expanded or compacted; kept verbatim. JSON null
+            // is no NGSI-LD Value; the bare NGSI-LD Null is the deletion form
+            // and passes only under allow_null.
             let j = obj
                 .get("json")
                 .ok_or_else(|| bad(format!("attribute {name}: needs json")))?;
-            let ok = j.is_object()
-                || j.as_array().is_some_and(|a| a.iter().all(Value::is_object))
-                || (opts.allow_null && is_ngsi_null(j));
+            let ok = if is_ngsi_null(j) {
+                opts.allow_null
+            } else {
+                !j.is_null()
+            };
             if !ok {
                 return Err(bad(format!(
-                    "attribute {name}: json must be an object or array of objects"
+                    "attribute {name}: json must be a JSON value (string, number, boolean, object or array), not null"
                 )));
             }
             out.insert("json".into(), j.clone());
@@ -2927,8 +2932,8 @@ mod tests {
         ty(json!("Škola")).expect("unicode-letter type");
     }
 
-    /// 4.5.24.2/4.5.24.3: JsonProperty — json is a raw object or array of
-    /// objects (kept verbatim), unitCode and value prohibited, concise
+    /// 4.5.24.2/4.5.24.3, TS 104 175 5.2.6.4.10: JsonProperty — json is any
+    /// NGSI-LD Value (kept verbatim), unitCode and value prohibited, concise
     /// inference from json.
     #[test]
     fn json_property_rules() {
@@ -2954,8 +2959,26 @@ mod tests {
             out["https://uri.etsi.org/ngsi-ld/default-context/tickets"][0]["type"],
             "JsonProperty"
         );
-        // scalar json rejected
-        let doc = mk(json!({"type": "JsonProperty", "json": 5}));
+        // TS 104 175 5.2.6.4.10: every NGSI-LD Value kind, kept verbatim
+        for j in [
+            json!(5),
+            json!("x"),
+            json!(true),
+            json!(["a"]),
+            json!([1, {"a": 1}]),
+        ] {
+            let doc = mk(json!({"type": "JsonProperty", "json": j}));
+            let out = expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default())
+                .expect("any JSON value");
+            assert_eq!(
+                out["https://uri.etsi.org/ngsi-ld/default-context/tickets"][0]["json"],
+                j
+            );
+        }
+        // JSON null is no NGSI-LD Value; the NGSI-LD Null only deletes
+        let doc = mk(json!({"type": "JsonProperty", "json": null}));
+        assert!(expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default()).is_err());
+        let doc = mk(json!({"type": "JsonProperty", "json": "urn:ngsi-ld:null"}));
         assert!(expand_entity(doc.as_object().unwrap(), &core(), ExpandOpts::default()).is_err());
         // unitCode prohibited
         let doc = mk(json!({"type": "JsonProperty", "json": {"a": 1}, "unitCode": "MTR"}));
@@ -3756,8 +3779,8 @@ mod clause_5_2_38 {
         json!({"id": "urn:x", "type": "T", "payload": jp})
     }
 
-    /// Table 5.2.38-1: json is a mandatory raw JSON object or array of
-    /// objects, never expanded; unitCode prohibited (4.5.24.2); concise form
+    /// Table 5.2.38-1 / TS 104 175 Table 5.2.6.4.10-1: json is a mandatory
+    /// NGSI-LD Value, never expanded; unitCode prohibited (4.5.24.2); concise form
     /// infers JsonProperty from the json member.
     #[test]
     fn json_property_member_table_restrictions() {
@@ -3777,13 +3800,15 @@ mod clause_5_2_38 {
         .expect("array-of-objects form");
         let attr = &ok["https://uri.etsi.org/ngsi-ld/default-context/payload"][0];
         assert_eq!(attr["json"].as_array().map(Vec::len), Some(2));
-        assert!(
-            expand(with_jp(json!({"type": "JsonProperty", "json": 5}))).is_err(),
-            "json must be an object or array of objects"
+        let ok = expand(with_jp(json!({"type": "JsonProperty", "json": [1, 2]})))
+            .expect("TS 104 175 5.2.6.4.10: any JSON value");
+        assert_eq!(
+            ok["https://uri.etsi.org/ngsi-ld/default-context/payload"][0]["json"],
+            json!([1, 2])
         );
         assert!(
-            expand(with_jp(json!({"type": "JsonProperty", "json": [1, 2]}))).is_err(),
-            "array entries must be objects"
+            expand(with_jp(json!({"type": "JsonProperty", "json": null}))).is_err(),
+            "JSON null is no NGSI-LD Value"
         );
         assert!(
             expand(with_jp(json!({"type": "JsonProperty"}))).is_err(),

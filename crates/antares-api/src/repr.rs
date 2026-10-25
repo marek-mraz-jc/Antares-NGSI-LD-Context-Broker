@@ -1082,6 +1082,9 @@ struct JoinWalk {
     seen: std::collections::BTreeSet<String>,
     budget: usize,
     complete: bool,
+    /// The request's headers when distributed operations are on: a target
+    /// held by a registered source is then read through its registration.
+    remote: Option<axum::http::HeaderMap>,
 }
 
 impl JoinWalk {
@@ -1100,6 +1103,7 @@ impl JoinWalk {
             seen,
             budget,
             complete: true,
+            remote: None,
         }
     }
 }
@@ -1116,14 +1120,24 @@ pub async fn inline_join(
     compacted: &mut Value,
     level: usize,
 ) -> bool {
-    inline_join_beyond(st, tenant, ctx, repr, compacted, level, &[], &mut {
-        MAX_JOIN_LOOKUPS
-    })
+    inline_join_beyond(
+        st,
+        tenant,
+        ctx,
+        repr,
+        compacted,
+        level,
+        &[],
+        &mut { MAX_JOIN_LOOKUPS },
+        None,
+    )
     .await
 }
 
 /// Same, continuing an Entity Graph the client is already holding: the
-/// `containedBy` ids count as encountered (Table 6.4.3.2-1).
+/// `containedBy` ids count as encountered (Table 6.4.3.2-1). `remote` (the
+/// request's headers, `None` with distributed operations off) lets a target
+/// held by a registered source join too.
 #[allow(clippy::too_many_arguments)] // one param per piece of the traversal's state
 pub async fn inline_join_beyond(
     st: &AppState,
@@ -1134,12 +1148,14 @@ pub async fn inline_join_beyond(
     level: usize,
     contained_by: &[String],
     budget: &mut usize,
+    remote: Option<&axum::http::HeaderMap>,
 ) -> bool {
     let mut walk = JoinWalk::rooted(
         compacted.get("id").and_then(Value::as_str),
         contained_by,
         *budget,
     );
+    walk.remote = remote.cloned();
     inline_join_walk(st, tenant, ctx, repr, compacted, level, &mut walk).await;
     *budget = walk.budget;
     walk.complete
@@ -1153,6 +1169,8 @@ struct Slot {
     child: crate::repr::Repr,
     kind: SlotKind,
     targets: Vec<String>,
+    /// The Relationship's objectType (4.5.23.1), as written.
+    object_type: Option<String>,
 }
 
 enum SlotKind {
@@ -1198,11 +1216,12 @@ fn slots_in(
     at: String,
     out: &mut Vec<Slot>,
 ) {
-    let slot = |kind, targets| Slot {
+    let slot = |kind, targets, object_type| Slot {
         at: at.clone(),
         child: child.clone(),
         kind,
         targets,
+        object_type,
     };
     match v {
         Value::Array(items) => {
@@ -1225,7 +1244,7 @@ fn slots_in(
                         _ => None,
                     })
                     .collect();
-                out.push(slot(SlotKind::EntityList, targets));
+                out.push(slot(SlotKind::EntityList, targets, None));
                 return;
             }
             let targets = match inst.get("object") {
@@ -1237,9 +1256,15 @@ fn slots_in(
                     .collect(),
                 _ => return,
             };
-            out.push(slot(SlotKind::Entity, targets));
+            let object_type = match inst.get("objectType") {
+                Some(Value::String(t)) => Some(t.clone()),
+                _ => None,
+            };
+            out.push(slot(SlotKind::Entity, targets, object_type));
         }
-        Value::String(id) if repr.key_values => out.push(slot(SlotKind::Replace, vec![id.clone()])),
+        Value::String(id) if repr.key_values => {
+            out.push(slot(SlotKind::Replace, vec![id.clone()], None));
+        }
         _ => {}
     }
 }
@@ -1271,7 +1296,7 @@ async fn inline_join_walk(
                 let mut joined = Vec::new();
                 for id in &slot.targets {
                     if let Some(found) =
-                        lookup_joined(st, tenant, ctx, &slot.child, id, level, walk).await
+                        lookup_joined(st, tenant, ctx, &slot, id, level, walk).await
                     {
                         joined.push(found);
                     }
@@ -1336,7 +1361,7 @@ async fn lookup_joined(
     st: &AppState,
     tenant: &TenantId,
     ctx: &antares_jsonld::Context,
-    child: &crate::repr::Repr,
+    slot: &Slot,
     id: &str,
     level: usize,
     walk: &mut JoinWalk,
@@ -1346,12 +1371,12 @@ async fn lookup_joined(
         return None;
     }
     walk.budget = walk.budget.saturating_sub(1);
-    let target = st
-        .store
-        .get(tenant, Kind::Entity, id)
-        .await
-        .ok()
-        .flatten()?;
+    let child = &slot.child;
+    let local = st.store.get(tenant, Kind::Entity, id).await.ok().flatten();
+    let target = match local {
+        Some(t) => t,
+        None => remote_target(st, tenant, ctx, slot, id, walk).await?,
+    };
     if !policy_admits(st, tenant, ctx, child.policy_reach.as_deref(), &target).await {
         return None;
     }
@@ -1368,6 +1393,61 @@ async fn lookup_joined(
         }
     }
     Some((c, expand))
+}
+
+/// 4.5.23.1 (TS 104 175 7.7.1): "Only Relationships targeting a locally
+/// stored Entity or Relationships annotated with an objectType whose object
+/// is an Internal Linked Entity are considered to be retrievable in this
+/// manner." A target not stored here joins only when the Relationship names
+/// its objectType and a registration holds that id under that type; it is
+/// then read as a distributed Retrieve Entity.
+async fn remote_target(
+    st: &AppState,
+    tenant: &TenantId,
+    ctx: &antares_jsonld::Context,
+    slot: &Slot,
+    id: &str,
+    walk: &JoinWalk,
+) -> Option<Value> {
+    let (headers, object_type) = (walk.remote.as_ref()?, slot.object_type.as_ref()?);
+    let spec = crate::registry::CsrSpec {
+        ids: Some(vec![id.to_owned()]),
+        types: Some(vec![ctx.expand_key(object_type)]),
+        ..Default::default()
+    };
+    let regs = crate::federation::matching_regs(st, tenant, &spec, ctx, headers)
+        .await
+        .ok()?;
+    if regs.is_empty() {
+        return None;
+    }
+    let mut warnings = Vec::new();
+    let fed = crate::federation::fed_retrieve(
+        st,
+        tenant,
+        headers,
+        ctx,
+        id,
+        None,
+        None,
+        &mut warnings,
+        &mut None,
+    )
+    .await
+    .ok()?;
+    let mut base = fed
+        .iter()
+        .find(|(aux, _)| !aux)
+        .or_else(|| fed.first())
+        .map(|(_, d)| d.clone())?;
+    for aux_pass in [false, true] {
+        for (aux, d) in &fed {
+            if *aux == aux_pass {
+                crate::federation::merge_docs(&mut base, d, *aux);
+            }
+        }
+    }
+    Some(base)
 }
 
 /// Linked Entity Retrieval, flattened form (4.5.23.3): collect targets with
