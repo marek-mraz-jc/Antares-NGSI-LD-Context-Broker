@@ -249,36 +249,40 @@ async fn each_read_shape_sends_its_pinned_statements() {
     // Counted per read (sqlx logs no event for BEGIN, so each transaction
     // shows as set_config ... COMMIT; on dev BEGIN ran as often as
     // set_config):
-    // (a) a page by type: the Tenant probe of tenant_exists_layer
-    // (`SELECT 1 FROM tenants`), the Tenant's set_config, the page SELECT,
-    // COMMIT. The Tenant cache of T-5500 removes the probe here and in (b)
-    // to (d); no registration lookup reaches Postgres on a warm read.
+    // (a) a page by type: the Tenant's set_config, the page SELECT, COMMIT.
+    // tenant_exists_layer's probe (`SELECT 1 FROM tenants`) ran on the
+    // warm-up only: the router remembers a Tenant the store said exists
+    // (T-5500), so no warm read in (a) to (d) probes it; no registration
+    // lookup reaches Postgres on a warm read.
     let (body, a) = counted(&st, &log, page, &tenant, None).await;
     assert_eq!(body.as_array().map(Vec::len), Some(20), "{body}");
-    assert_eq!(a.len(), 4, "statements: {a:#?}");
+    assert_eq!(a.len(), 3, "statements: {a:#?}");
+    assert!(
+        !a.iter().any(|q| q.contains("FROM tenants")),
+        "a warm read probed the Tenant: {a:#?}"
+    );
 
     // (b) the same page through a view: the view adds no statement.
     let (body, b) = counted(&viewed, &log, page, &tenant, None).await;
     assert_eq!(body.as_array().map(Vec::len), Some(20), "{body}");
-    assert_eq!(b.len(), 4, "statements: {b:#?}");
+    assert_eq!(b.len(), 3, "statements: {b:#?}");
     assert_eq!(a, b, "a view must not change what a page reads");
 
-    // (c) one Entity by id: the Tenant probe, set_config, the SELECT by
-    // id, COMMIT.
+    // (c) one Entity by id: set_config, the SELECT by id, COMMIT.
     let (body, c) = counted(&st, &log, one, &tenant, None).await;
     assert_eq!(body["id"], "urn:ngsi-ld:Car:007", "{body}");
-    assert_eq!(c.len(), 4, "statements: {c:#?}");
+    assert_eq!(c.len(), 3, "statements: {c:#?}");
 
     // (d) the page with a Link to the Cached @context the warm-up fetched:
-    // the Tenant probe, then two transactions of the @context write-through
+    // two transactions of the @context write-through
     // the hit still runs (state.rs `set_cache_writer`: `hosted_row_id`'s
     // SELECT on jsonld_contexts, then `context_put`'s INSERT ... ON
-    // CONFLICT), each set_config ... COMMIT, then the page's own four. A
+    // CONFLICT), each set_config ... COMMIT, then the page's own three. A
     // warm hit should write nothing; pinned here as today's cost, the
     // change that stops the rewrite lowers both numbers.
     let (body, d) = counted(&st, &log, page, &tenant, Some(&link)).await;
     assert_eq!(body.as_array().map(Vec::len), Some(20), "{body}");
-    assert_eq!(d.len(), 10, "statements: {d:#?}");
+    assert_eq!(d.len(), 9, "statements: {d:#?}");
     let context_writes: Vec<&String> = d
         .iter()
         .filter(|q| q.contains("jsonld_contexts") && !q.starts_with("SELECT"))
