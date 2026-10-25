@@ -1256,6 +1256,33 @@ pub async fn update(
         }
         norm
     };
+    // F-ANT3-002: the engine decides the Subscription as it will be, as
+    // create does, so a fragment cannot move a permitted Subscription onto
+    // types, attributes or a q the engine refuses.
+    // ponytail: decided on the stored document read here; an update racing
+    // between this read and the write below is decided on its own merge.
+    if st.policy.is_some() {
+        if let Some(mut stored) = st.store.get(&tenant, kind, id).await? {
+            let merged = antares_store::stored_object(&mut stored)?;
+            crate::apply_doc_fragment(merged, &norm, &now_iso());
+            let shown = sub_members(merged);
+            let decided = if clause == WATCH && !watch {
+                "5.8.2"
+            } else {
+                clause
+            };
+            gate!(
+                st, &tenant, headers, decided,
+                ids: &[id],
+                types: &shown.types,
+                attrs: &shown.attrs,
+                q: shown.q.as_ref(),
+                scope_q: merged.get("scopeQ").and_then(Value::as_str),
+                geo: shown.geo.as_ref(),
+            )
+            .await?;
+        }
+    }
     let ts = now_iso();
     let res = st
         .store

@@ -427,3 +427,100 @@ async fn a_create_that_names_its_own_id_tells_the_engine_that_id() {
         );
     }
 }
+
+/// Refuses every operation that names the type `Secret`.
+struct NoSecrets;
+
+impl PolicyEngine for NoSecrets {
+    fn name(&self) -> &str {
+        "no-secrets"
+    }
+
+    fn decide<'a>(&'a self, _s: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
+        let answer = if op.types.iter().any(|t| t.ends_with("/Secret")) {
+            Decision::Deny("Secret is not for you".into())
+        } else {
+            Decision::Allow
+        };
+        Box::pin(std::future::ready(answer))
+    }
+
+    fn pre_notify(&self, _s: &Subject, _sub: &Value, _n: &mut Value) -> NotifyDecision {
+        NotifyDecision::Deliver
+    }
+}
+
+/// F-ANT3-002: Update Subscription asks the engine about the Subscription
+/// as the fragment leaves it, so a Subscription made on a permitted type
+/// cannot be moved onto one the engine refuses at create.
+#[tokio::test]
+async fn an_update_cannot_move_a_subscription_onto_a_refused_type() {
+    let st = AppState::new("me".into()).with_policy(Arc::new(NoSecrets));
+    let id = "urn:ngsi-ld:Subscription:policy:moved";
+    let send = |method: &str, uri: String, doc: Option<Value>| {
+        let mut req = Request::builder().method(method).uri(uri);
+        let body = match doc {
+            Some(d) => {
+                let payload = d.to_string();
+                req = req
+                    .header("Content-Type", "application/json")
+                    .header("Content-Length", payload.len());
+                Body::from(payload)
+            }
+            None => Body::empty(),
+        };
+        antares_api::router(st.clone()).oneshot(req.body(body).expect("request"))
+    };
+    let made = send(
+        "POST",
+        "/ngsi-ld/v1/subscriptions".into(),
+        Some(
+            json!({"id": id, "type": "Subscription", "entities": [{"type": "Car"}],
+                    "notification": {"endpoint": {"uri": "http://sink.invalid/n"}}}),
+        ),
+    )
+    .await
+    .expect("response");
+    assert_eq!(made.status(), StatusCode::CREATED);
+    let refused = send(
+        "POST",
+        "/ngsi-ld/v1/subscriptions".into(),
+        Some(
+            json!({"type": "Subscription", "entities": [{"type": "Secret"}],
+                    "notification": {"endpoint": {"uri": "http://sink.invalid/n"}}}),
+        ),
+    )
+    .await
+    .expect("response");
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN, "create is refused");
+    let moved = send(
+        "PATCH",
+        format!("/ngsi-ld/v1/subscriptions/{id}"),
+        Some(json!({"entities": [{"type": "Secret"}]})),
+    )
+    .await
+    .expect("response");
+    assert_eq!(
+        moved.status(),
+        StatusCode::FORBIDDEN,
+        "update is refused too"
+    );
+    let renamed = send(
+        "PATCH",
+        format!("/ngsi-ld/v1/subscriptions/{id}"),
+        Some(json!({"description": "still on cars"})),
+    )
+    .await
+    .expect("response");
+    assert_eq!(
+        renamed.status(),
+        StatusCode::NO_CONTENT,
+        "a permitted update"
+    );
+    let stored = send("GET", format!("/ngsi-ld/v1/subscriptions/{id}"), None)
+        .await
+        .expect("response");
+    let bytes = stored.into_body().collect().await.expect("body").to_bytes();
+    let doc: Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(doc["entities"], json!([{"type": "Car"}]), "{doc}");
+}
