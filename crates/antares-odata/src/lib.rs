@@ -296,15 +296,15 @@ type Built = (Arc<edm::Edm>, Arc<odata_csdl::Model>, Option<String>);
 /// describes. A view offering none of them, or an engine refusing, leaves
 /// the caller a model that names nothing (fail closed).
 async fn model_visible(view: &ViewOps, caller: &Caller) -> antares_ops::Visible {
-    let Some(op) = [
+    // a view offering none is refused by `visible` and gets the empty model
+    let op = [
         OperationId::RetrieveEntityTypeDetails,
         OperationId::QueryEntities,
         OperationId::RetrieveEntity,
     ]
     .into_iter()
-    .find(|op| view.allows(*op)) else {
-        return antares_ops::Visible::default();
-    };
+    .find(|op| view.allows(*op))
+    .unwrap_or(OperationId::RetrieveEntityTypeDetails);
     view.visible(caller, op, &[], &[]).await.unwrap_or_default()
 }
 
