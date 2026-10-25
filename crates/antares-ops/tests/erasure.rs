@@ -122,13 +122,17 @@ where
         assert_eq!(s, StatusCode::NO_CONTENT, "{b}");
     }
     let tid = TenantId::new(tenant).expect("tenant");
+    // dl-c notified another trip that only points at A: it stays
     for (letter, about) in [("dl-a", A), ("dl-c", "urn:ngsi-ld:BikeTrip:c")] {
+        let data = json!([{"id": about, RIDER: "r-17",
+                           "https://example.org/follows": {"type": "Relationship", "object": A}}]);
         store
             .upsert(
                 &tid,
                 Kind::DeadLetter,
                 letter,
-                json!({"id": letter, "notification": {"data": [{"id": about, RIDER: "r-17"}]}}),
+                json!({"id": letter, "accept": "application/json",
+                       "payload": {"type": "Notification", "data": data}}),
             )
             .await
             .expect("dead letter");
@@ -339,4 +343,35 @@ async fn a_bad_request_is_refused_and_a_broken_record_is_skipped() {
     let (s, log) = send(&app, Method::GET, &erasures, None, None).await;
     assert_eq!(s, StatusCode::OK, "{log}");
     assert_eq!(log.as_array().map(Vec::len), Some(2), "{log}");
+}
+
+/// A re-applied erasure whose own time does not parse erases nothing: read
+/// as no cut, it would take what was written after the erasure.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_erasure_time_that_does_not_parse_erases_nothing() {
+    let store = Arc::new(AnyStore::Mem(antares_sql::store::Store::default()));
+    let (_b, app) = broker(&store, "memory").await;
+    let tenant = format!("er{}", run_id());
+    let doc = json!({"id": A, "type": TRIP, RIDER: prop("r-17", T1)});
+    let (s, b) = send(
+        &app,
+        Method::POST,
+        "/ngsi-ld/v1/entities",
+        Some(&tenant),
+        Some(doc),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let st = AppState::with_drivers(
+        "antares-test".into(),
+        store.clone(),
+        store.clone(),
+        "memory",
+    );
+    let tid = TenantId::new(&tenant).expect("tenant");
+    let ids = [A.to_owned()];
+    let out = antares_api::erasure::erase(&st, &tid, &ids, None, Some("yesterday")).await;
+    assert!(out.is_err(), "{out:?}");
+    let kept = store.get(&tid, Kind::Entity, A).await.expect("read");
+    assert!(kept.is_some());
 }
