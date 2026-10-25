@@ -108,6 +108,7 @@ mod sub_index;
 mod subscription_jsonld_context_5_8_1_4;
 mod subscription_listing_5_8_4;
 mod subscription_status_5_2_12;
+mod subscriptions_secrets;
 mod temporal_aggregated_query_4_5_19;
 mod temporal_attr_writes_5_6_13;
 mod temporal_autorecord;
