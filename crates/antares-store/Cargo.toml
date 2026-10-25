@@ -18,6 +18,8 @@ antares-ql = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
+# the literal a policy rule's id pattern forces (`id_pattern_required`)
+regex-syntax = { workspace = true }
 
 [features]
 # The driver contract as a runnable function (`contract.rs`), for the

@@ -578,6 +578,35 @@ async fn deep_and_keyset_pages_read_ids_from_the_type_index() {
     );
 }
 
+/// T-5661: the type probe of a view with one `idPattern` adds the literal
+/// the pattern forces (`position(.. in id) > 0`) to its one-type page; the
+/// page still reads its type through the type index under RLS, at the start
+/// and past a keyset, and no Seq Scan sweeps the Tenant for it.
+#[tokio::test]
+async fn an_id_pattern_probe_reads_its_type_through_the_type_index() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    seed_rls(&pool).await;
+    let w = format!(
+        "tenant_id = '{RLS_A}' AND (expires_at IS NULL OR expires_at > now()) \
+         AND position(':T1:0005' in id) > 0"
+    );
+    for page in [
+        type_page(&w, &[&["https://x/T1"]], 20),
+        type_page(
+            &format!("{w} AND id > 'urn:ngsi-ld:T1:00050001'"),
+            &[&["https://x/T1"]],
+            500,
+        ),
+    ] {
+        let plan = plan_of(&pool, RLS_A, &page).await;
+        assert!(
+            !plan.contains("Seq Scan") && plan.contains("i_entities_first_type_id"),
+            "an idPattern probe leaves the type index:\n{plan}"
+        );
+    }
+}
+
 /// T-4852 Security: the new arms and the geohash cover isolate Tenants as
 /// the policy does. Both Tenants hold the same ids at the same places; the
 /// broker's role, set to Tenant A, gets only A's rows for a type list, a

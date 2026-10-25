@@ -517,11 +517,11 @@ async fn first_visible(
     let rules: Vec<_> = view.map(rules_of).into_iter().flatten().collect();
     let probes = plan(name, &rules, unruled(view), w.beside);
     let mut cut = false;
-    for (groups, q) in &probes {
+    for (groups, rule) in &probes {
         let one = Probing {
             name,
             groups,
-            q: *q,
+            rule: *rule,
             attr,
         };
         match probe(w.st, w.tenant, w.max, &one, view, each).await? {
@@ -562,10 +562,10 @@ fn candidates(
     Some(names.into_iter().collect())
 }
 
-type Plan<'a> = Vec<(Vec<Vec<String>>, Option<&'a antares_ql::QNode>)>;
+type Plan<'a> = Vec<(Vec<Vec<String>>, Option<&'a crate::policy::Rule>)>;
 
 /// The probes [`first_visible`] sends for `name`: the type groups of each
-/// one and the `q` it pushes down. A type no rule shows and no Entity
+/// one and the rule whose `q` and id selection it pushes down. A type no rule shows and no Entity
 /// carries beside a rule's type gets none, so it reads nothing (T-4683).
 fn plan<'a>(
     name: &str,
@@ -591,7 +591,7 @@ fn plan<'a>(
                 .map(|t| vec![name.to_owned(), t.clone()])
                 .collect()
         };
-        probes.push((groups, r.q.as_deref()));
+        probes.push((groups, Some(*r)));
     }
     if unruled {
         probes.push((alone(), None));
@@ -599,13 +599,35 @@ fn plan<'a>(
     probes
 }
 
-/// One probe's selection: the type, its groups, the rule's `q` and the
-/// Attribute the Entities must carry.
+/// One probe's selection: the type, its groups, the rule it follows and
+/// the Attribute the Entities must carry.
 struct Probing<'a> {
     name: &'a str,
     groups: &'a [Vec<String>],
-    q: Option<&'a antares_ql::QNode>,
+    rule: Option<&'a crate::policy::Rule>,
     attr: Option<&'a str>,
+}
+
+/// What a rule's id selection narrows a probe's read to: its ids, or the
+/// literal its one id pattern forces (T-5661). A view of one type and one
+/// `idPattern` that few of the type's Entities match walked every Entity of
+/// the type to the fold ceiling, the regex judged in [`visible`] only: 9-10 s
+/// for `/types` on dev, the gateway's 503. Both are necessary conditions of
+/// `Rule::selects_id`, which still decides; a rule with ids and patterns, or
+/// with several patterns, selects by OR and narrows nothing here.
+fn id_narrowing(rule: Option<&crate::policy::Rule>) -> (Option<Vec<&str>>, Option<(String, bool)>) {
+    match rule {
+        Some(r) if r.id_patterns.is_empty() && !r.ids.is_empty() => {
+            (Some(r.ids.iter().map(String::as_str).collect()), None)
+        }
+        Some(r) if r.ids.is_empty() && r.id_patterns.len() == 1 => (
+            None,
+            r.id_patterns
+                .first()
+                .and_then(|p| antares_store::filter::id_pattern_required(p)),
+        ),
+        _ => (None, None),
+    }
 }
 
 /// One probe of [`first_visible`] up to `max` Entities read: [`PROBE_PAGE`]
@@ -622,6 +644,7 @@ async fn probe(
     let ctx = crate::repr::policy_context();
     let expand = |t: &str| ctx.expand_key(t);
     let attrs: Vec<String> = one.attr.into_iter().map(str::to_owned).collect();
+    let (ids, literal) = id_narrowing(one.rule);
     let mut read = 0usize;
     let mut last: Option<String> = None;
     let mut head: Option<String> = None;
@@ -630,9 +653,16 @@ async fn probe(
         let page = if read == 0 { PROBE_PAGE } else { SCAN_PAGE };
         let want = page.min(max.saturating_sub(read));
         let f = EntityFilter {
+            ids: ids.as_deref(),
+            id_literal: literal
+                .as_ref()
+                .map(|(text, anchored)| antares_store::filter::IdLiteral {
+                    text,
+                    anchored: *anchored,
+                }),
             types: Some(one.groups),
             attrs: one.attr.map(|_| &attrs[..]),
-            q: one.q,
+            q: one.rule.and_then(|r| r.q.as_deref()),
             expand: &expand,
             ctx: Some(ctx),
             after_id: last.as_deref().filter(|_| keyset),
@@ -1691,7 +1721,10 @@ mod probe_plan {
         }
         let car_plan = plan("Car", &rules, false, &beside);
         assert_eq!(groups(&car_plan), [vec![vec!["Car".to_owned()]]]);
-        assert!(car_plan[0].1.is_some(), "the rule's q is pushed down");
+        assert!(
+            car_plan[0].1.and_then(|r| r.q.as_deref()).is_some(),
+            "the rule's q is pushed down"
+        );
         assert_eq!(
             groups(&plan("Tree", &rules, false, &beside)),
             [vec![vec!["Tree".to_owned(), "Car".to_owned()]]]
@@ -1700,6 +1733,36 @@ mod probe_plan {
             groups(&plan("Bus", &rules, false, &beside)),
             [vec![vec!["Bus".to_owned()]]]
         );
+    }
+
+    /// T-5661: a rule's ids, or its one id pattern's literal, narrow the
+    /// probe's read; ids beside patterns, or two patterns, select by OR and
+    /// narrow nothing.
+    #[test]
+    fn a_rules_id_selection_narrows_its_probe() {
+        let by = |ids: &[&str], patterns: &[&str]| Rule {
+            ids: ids.iter().map(|i| (*i).to_owned()).collect(),
+            id_patterns: patterns.iter().map(|p| (*p).to_owned()).collect(),
+            ..rule(&["KPI"], None)
+        };
+        let kpi = by(&[], &["^urn:ngsi-ld:KPI:[a-z]+:helsinki:stat-[a-z]+$"]);
+        assert_eq!(
+            id_narrowing(Some(&kpi)),
+            (None, Some((":helsinki:stat-".to_owned(), false)))
+        );
+        let two = by(&["urn:a", "urn:b"], &[]);
+        assert_eq!(
+            id_narrowing(Some(&two)),
+            (Some(vec!["urn:a", "urn:b"]), None)
+        );
+        for wide in [
+            by(&["urn:a"], &["urn:b.*"]),
+            by(&[], &["urn:a.*", "urn:b.*"]),
+            by(&[], &[]),
+        ] {
+            assert_eq!(id_narrowing(Some(&wide)), (None, None));
+        }
+        assert_eq!(id_narrowing(None), (None, None));
     }
 
     /// A store without the `beside` read still probes beside each rule's
