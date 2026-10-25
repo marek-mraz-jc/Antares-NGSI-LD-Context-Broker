@@ -347,3 +347,27 @@ async fn policy_sits_behind_the_admin_secret() {
     let (s, _) = send(&app, Method::GET, "/q/policy", None, Some(SECRET)).await;
     assert_eq!(s, StatusCode::OK);
 }
+
+/// T-5717: a space that 600 Pipelines write holds 600 derived write grants
+/// (PL-20), about 140 KiB and 10,000 values; the 64 KiB bound refused the
+/// slovensko-podujatia document at 302 and left every newer pipeline 403.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_document_of_six_hundred_pipeline_grants_is_taken() {
+    let rules = Arc::new(Rules::default());
+    let (_state, _reload, app) = pod(Some(rules.clone()), false, None).await.expect("pod");
+    let policies: Vec<Value> = (0..600)
+        .map(|n| {
+            json!({
+                "id": format!("slovensko/pl-podujatia-source-{n:03}-w-1"),
+                "effect": "permit",
+                "assignee": {"kind": "serviceAccount", "id": format!("pl-podujatia-source-{n:03}")},
+                "operations": ["5.6.8", "5.6.7", "5.7.2"],
+                "information": [{"entities": [{"type": "Event"}]}],
+            })
+        })
+        .collect();
+    let doc = json!({ "policies": policies });
+    assert!(doc.to_string().len() > 128 * 1024);
+    assert_eq!(put(&app, "city", &doc).await.0, StatusCode::CREATED);
+    assert_eq!(rules.held("city"), Some(doc));
+}
