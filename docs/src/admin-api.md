@@ -279,7 +279,10 @@ validate it, store it under the reserved tenant `antares-views` and reload
 the pod's view table before they answer; every other pod reloads within
 `ANTARES_VIEWS_RELOAD_MS` (default 5000). `/q/health` lists each view
 (`loaded` with its tenant, operation count and loader notes, or `invalid`
-with the reason) under `views`, and each surface that serves through views
+with the reason) under `views` to a caller with the admin bearer (or to
+everyone when no admin token is configured); an open caller gets
+`{"count": n}` there, under `schemas` and under `policy.documents`, since
+the reports name Tenants (F-ANT2-005). Each surface that serves through views
 as `open` or `closed` under `surfaces`: no view loaded, every route of such
 a surface answers `404`. `viewsRevision` is sixteen hex digits, a digest of
 the stored view documents the table was loaded from: every pod over one
