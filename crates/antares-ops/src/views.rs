@@ -1429,11 +1429,11 @@ mod tests {
             "{:?}",
             loaded.notes
         );
-        let q = [("q".to_owned(), "velocity>1".to_owned())];
+        let sort = [("orderBy".to_owned(), "velocity".to_owned())];
         assert_eq!(
-            loaded.mapping.as_deref().map(|m| m.invert(&q).err()),
+            loaded.mapping.as_deref().map(|m| m.invert(&sort).err()),
             Some(Some(crate::mapping::NOT_FILTERABLE)),
-            "no filter reads a hidden slot"
+            "no sort reads a hidden slot"
         );
     }
 

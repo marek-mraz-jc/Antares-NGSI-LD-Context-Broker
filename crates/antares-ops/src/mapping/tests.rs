@@ -1590,11 +1590,7 @@ fn a_slot_the_rules_hide_is_read_by_no_filter() {
         Some(NOT_FILTERABLE),
         "a default geo-query would filter the hidden source"
     );
-    for asked in [
-        [("geoproperty", "location")],
-        [("q", "location==\"x\"")],
-        [("orderBy", "location")],
-    ] {
+    for asked in [[("geoproperty", "location")], [("orderBy", "location")]] {
         assert_eq!(
             m.invert(&pairs(&asked)).err(),
             Some(NOT_FILTERABLE),
@@ -1602,6 +1598,20 @@ fn a_slot_the_rules_hide_is_read_by_no_filter() {
         );
     }
     assert!(m.invert(&pairs(&[("q", "t==1"), ("orderBy", "t")])).is_ok());
+    // a term on the hidden slot holds for nobody, as in the native view:
+    // its source is read for presence only, never compared
+    for (q, inner) in [
+        ("location==\"x\"", "jcSrc0;!jcSrc0"),
+        ("location", "jcSrc0;!jcSrc0"),
+        ("!location", "jcSrc0|!jcSrc0"),
+        ("t==1;location~=\"a\"", "jcSrc1==1;(jcSrc0;!jcSrc0)"),
+    ] {
+        assert_eq!(
+            m.invert(&pairs(&[("q", q)])).map(|i| i.pairs),
+            Ok(vec![("q".to_owned(), inner.to_owned())]),
+            "{q}"
+        );
+    }
 }
 
 #[test]

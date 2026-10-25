@@ -665,6 +665,15 @@ impl Mapping {
                 .map(|n| self.invert_node(n))
                 .collect::<Result<_, _>>()
                 .map(QNode::Or),
+            // ADR-0023 rule 2, as the native view answers: a term on a slot
+            // the rules hide holds for nobody (`!slot` for everybody), so
+            // the hidden source value is never compared
+            QNode::Exists { path, negated } if self.hidden_source(&path).is_some() => {
+                Ok(hidden_term(self.hidden_source(&path), negated))
+            }
+            QNode::Cmp { path, .. } if self.hidden_source(&path).is_some() => {
+                Ok(hidden_term(self.hidden_source(&path), false))
+            }
             // a constant or a computed slot has no source: `source_path`
             // refuses it
             QNode::Exists { path, negated } => Ok(QNode::Exists {
@@ -681,6 +690,14 @@ impl Mapping {
                 invert_comparison(&slot.derivation, path, op, value)
             }
         }
+    }
+
+    /// The source term of the slot the term's top segment names, when the
+    /// view's rules hide that slot.
+    fn hidden_source(&self, path: &QPath) -> Option<&str> {
+        let (i, slot) = self.slot_named(path.path.first()?)?;
+        let source = slot.source.as_ref()?;
+        self.hidden.contains(&i).then_some(source.term.as_str())
     }
 
     /// The source path of a term: its first segment renamed, the tail kept.
@@ -1188,6 +1205,23 @@ fn compare(op: Comparison, l: &Value, r: &Value) -> Option<Value> {
         Comparison::Greater => ord.is_gt(),
         Comparison::GreaterOrEqual => ord.is_ge(),
     }))
+}
+
+/// A term that holds for nobody (`negated`: for everybody) whatever the
+/// Entity carries: `a;!a` or `a|!a` on the hidden source term, which reads
+/// its presence as a constant and never its value.
+fn hidden_term(source: Option<&str>, negated: bool) -> QNode {
+    let top = source.unwrap_or_default().to_owned();
+    let is = |negated| QNode::Exists {
+        path: QPath::dotted(vec![top.clone()]),
+        negated,
+    };
+    let pair = vec![is(false), is(true)];
+    if negated {
+        QNode::Or(pair)
+    } else {
+        QNode::And(pair)
+    }
 }
 
 /// One comparison of 4.2 in the source model.
