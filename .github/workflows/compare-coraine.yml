@@ -9,13 +9,19 @@ name: compare-coraine
 # host is loaded.
 #
 # Runs when the rig changes, and by hand (another Coraine tag via input).
+# The pin is the immutable build tag: Seamware re-pointed `0.5.0` five times on
+# 2026-10-10..12 (T-5210). Weekly, `pin` checks that the pinned digest is still
+# served, so a deleted image is a red run before a comparison needs it.
+# 0.6.0-dev-2026-10-22-030122be is eligible under the 7-day cooldown from 2026-10-29.
 
 on:
   workflow_dispatch:
     inputs:
       coraine_image:
         description: Coraine image to compare against (pinned tag, no latest exists)
-        default: quay.io/seamware/coraine:0.5.0@sha256:5e2e519a7d0c9c4bfea6cb75113c8de5e8bc892fc281c06125cd67c4004fcaff
+        default: quay.io/seamware/coraine:0.5.0-2026-10-10-7ad9140f@sha256:5e2e519a7d0c9c4bfea6cb75113c8de5e8bc892fc281c06125cd67c4004fcaff
+  schedule:
+    - cron: '17 4 * * 1'
   push:
     # dev only: a worker branch's push queued hours of runners ahead of ci.yml (2026-10-10)
     branches: [dev]
@@ -32,12 +38,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  pin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: The pinned Coraine digest is still served
+        env:
+          CORAINE_IMAGE: quay.io/seamware/coraine:0.5.0-2026-10-10-7ad9140f@sha256:5e2e519a7d0c9c4bfea6cb75113c8de5e8bc892fc281c06125cd67c4004fcaff
+        run: docker manifest inspect "$CORAINE_IMAGE" > /dev/null
   compare:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
       CARGO_TERM_COLOR: always
-      CORAINE_IMAGE: ${{ inputs.coraine_image || 'quay.io/seamware/coraine:0.5.0@sha256:5e2e519a7d0c9c4bfea6cb75113c8de5e8bc892fc281c06125cd67c4004fcaff' }}
+      CORAINE_IMAGE: ${{ inputs.coraine_image || 'quay.io/seamware/coraine:0.5.0-2026-10-10-7ad9140f@sha256:5e2e519a7d0c9c4bfea6cb75113c8de5e8bc892fc281c06125cd67c4004fcaff' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
