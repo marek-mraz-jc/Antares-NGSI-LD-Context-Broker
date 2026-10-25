@@ -130,7 +130,7 @@ fn instance_instant(inst: &Value) -> Option<&str> {
 
 /// `a` before `b`, compared as instants (4.6.3 allows a comma fraction), by
 /// bytes when either does not parse.
-fn earlier(a: &str, b: &str) -> bool {
+pub(crate) fn earlier(a: &str, b: &str) -> bool {
     let instant =
         |s: &str| chrono::DateTime::parse_from_rfc3339(&filter::canonical_datetime(s)).ok();
     match (instant(a), instant(b)) {

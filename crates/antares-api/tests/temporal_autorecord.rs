@@ -685,3 +685,142 @@ async fn temporal_query_keeps_only_the_instances_that_meet_q() {
     assert_eq!(s, StatusCode::OK, "{b}");
     assert_eq!(values(&b, "speed"), [80, 100, 120], "{b}");
 }
+
+async fn temporal_doc(st: &AppState, uri: &str) -> serde_json::Value {
+    let (s, b) = send(st, req("GET", uri, None)).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    serde_json::from_str(&b).expect("json")
+}
+
+/// TS 104 175 5.2.4 (CIM 009 4.8): "modifiedAt" is "the temporal Property
+/// at which the Entity or Attribute was last modified". An Attribute update
+/// modifies the Entity, so the temporal representation's Entity modifiedAt
+/// is the newest instance's, not the create's (Coraine
+/// troe_entity_modifiedat_attr_update).
+#[tokio::test(flavor = "multi_thread")]
+async fn temporal_entity_modified_at_follows_attribute_updates() {
+    let mut st = AppState::new("test".into());
+    antares_api::wire(&mut st).await;
+    let body = r#"{"id":"urn:ngsi-ld:Rec:m1","type":"Rec","a":{"type":"Property","value":1}}"#;
+    let (s, b) = send(&st, req("POST", "/ngsi-ld/v1/entities", Some(body))).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    for v in [2, 3] {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let patch = format!(r#"{{"type":"Property","value":{v}}}"#);
+        let (s, b) = send(
+            &st,
+            req(
+                "PATCH",
+                "/ngsi-ld/v1/entities/urn:ngsi-ld:Rec:m1/attrs/a",
+                Some(&patch),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::NO_CONTENT, "{b}");
+    }
+    for uri in [
+        "/ngsi-ld/v1/temporal/entities/urn:ngsi-ld:Rec:m1?options=sysAttrs",
+        "/ngsi-ld/v1/temporal/entities?type=Rec&timerel=after&timeAt=2000-01-01T00:00:00Z\
+         &timeproperty=modifiedAt&options=sysAttrs",
+    ] {
+        let doc = temporal_doc(&st, uri).await;
+        let e = doc.as_array().and_then(|a| a.first()).unwrap_or(&doc);
+        let newest = e["a"]
+            .as_array()
+            .expect("a instances")
+            .iter()
+            .filter_map(|i| i["modifiedAt"].as_str())
+            .max()
+            .expect("instance modifiedAt");
+        assert_eq!(e["modifiedAt"].as_str(), Some(newest), "{uri}: {e}");
+        assert_ne!(e["modifiedAt"], e["createdAt"], "{uri}: {e}");
+    }
+}
+
+/// CIM 009 4.5.7 (TS 104 175 5.3.2.5): "In case the Property is deleted, an
+/// instance of the Property is recorded with its value set to the URI
+/// "urn:ngsi-ld:null" and the deletedAt Temporal Property set." A replace
+/// upsert that drops an instance (urn:ds:1) and an Attribute (P2) deletes
+/// them, and a timeproperty=modifiedAt read finds the record (Coraine
+/// troe_timescale_routes_batch step 02).
+#[tokio::test(flavor = "multi_thread")]
+async fn replace_upsert_records_each_removed_instance_as_deleted() {
+    let mut st = AppState::new("test".into());
+    antares_api::wire(&mut st).await;
+    let body = r#"{"id":"urn:ngsi-ld:Rec:u1","type":"Rec",
+        "P1":[{"type":"Property","value":1},
+              {"type":"Property","value":2,"datasetId":"urn:ds:1"}],
+        "P2":{"type":"Property","value":9}}"#;
+    let (s, b) = send(&st, req("POST", "/ngsi-ld/v1/entities", Some(body))).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let upsert = r#"[{"id":"urn:ngsi-ld:Rec:u1","type":"Rec",
+        "P1":{"type":"Property","value":10}}]"#;
+    let (s, b) = send(
+        &st,
+        req("POST", "/ngsi-ld/v1/entityOperations/upsert", Some(upsert)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{b}");
+    let doc = temporal_doc(
+        &st,
+        "/ngsi-ld/v1/temporal/entities/urn:ngsi-ld:Rec:u1?timerel=after\
+         &timeAt=2020-01-01T00:00:00Z&timeproperty=modifiedAt",
+    )
+    .await;
+    let deleted = |attr: &str| -> Vec<serde_json::Value> {
+        doc[attr]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|i| i.get("deletedAt").is_some())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let p1 = deleted("P1");
+    assert_eq!(p1.len(), 1, "{doc}");
+    assert_eq!(p1[0]["datasetId"], "urn:ds:1", "{doc}");
+    assert_eq!(p1[0]["value"], "urn:ngsi-ld:null", "{doc}");
+    let p2 = deleted("P2");
+    assert_eq!(p2.len(), 1, "{doc}");
+    assert_eq!(p2[0]["value"], "urn:ngsi-ld:null", "{doc}");
+    assert_eq!(p2[0].get("datasetId"), None, "{doc}");
+}
+
+/// CIM 009 4.5.8 (TS 104 175 5.3.2.5): "In case the Relationship is deleted,
+/// an instance of the Relationship is recorded with its object set to the
+/// URI "urn:ngsi-ld:null" and the deletedAt Temporal Property set." A
+/// Merge Entity NGSI-LD Null deletes the Relationship as Delete Attribute
+/// does (Coraine troe_timescale_temporal_deleted_kinds step 04).
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_patch_null_records_the_relationship_as_deleted() {
+    let mut st = AppState::new("test".into());
+    antares_api::wire(&mut st).await;
+    let body = r#"{"id":"urn:ngsi-ld:Rec:n1","type":"Rec",
+        "locatedAt":{"type":"Relationship","object":"urn:ngsi-ld:Place:1",
+                     "observedAt":"2026-06-01T09:00:00Z"}}"#;
+    let (s, b) = send(&st, req("POST", "/ngsi-ld/v1/entities", Some(body))).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let (s, b) = send(
+        &st,
+        req(
+            "PATCH",
+            "/ngsi-ld/v1/entities/urn:ngsi-ld:Rec:n1",
+            Some(r#"{"locatedAt":"urn:ngsi-ld:null"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{b}");
+    let doc = temporal_doc(
+        &st,
+        "/ngsi-ld/v1/temporal/entities/urn:ngsi-ld:Rec:n1?timeproperty=deletedAt",
+    )
+    .await;
+    let inst = doc["locatedAt"]
+        .as_array()
+        .and_then(|a| a.iter().find(|i| i.get("deletedAt").is_some()))
+        .unwrap_or_else(|| panic!("no deletion recorded: {doc}"));
+    assert_eq!(inst["type"], "Relationship", "{doc}");
+    assert_eq!(inst["object"], "urn:ngsi-ld:null", "{doc}");
+}

@@ -929,6 +929,17 @@ impl AnyStore {
                 }
                 s.mutate(tenant, Kind::Temporal, id, |doc| {
                     let target = doc.as_object_mut().ok_or(())?;
+                    // 4.8: the Entity's modifiedAt is its last write, an
+                    // Attribute's update included; never moved backwards
+                    if let Some(m) = shell.get("modifiedAt").and_then(Value::as_str) {
+                        let stale = target
+                            .get("modifiedAt")
+                            .and_then(Value::as_str)
+                            .is_none_or(|cur| super::mem::earlier(cur, m));
+                        if stale {
+                            target.insert("modifiedAt".into(), Value::String(m.to_owned()));
+                        }
+                    }
                     if let Some(adds) = additions.as_object() {
                         for (k, v) in adds {
                             let mut incoming: Vec<Value> =

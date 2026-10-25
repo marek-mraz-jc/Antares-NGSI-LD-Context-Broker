@@ -335,10 +335,10 @@ where
 ///
 /// Append-only, instance-precise: only the instances that are new or changed
 /// (by datasetId, ignoring volatile members) are appended, so a multi-instance
-/// attribute does not re-record unchanged datasets. Entity and attribute
-/// DELETIONS keep their dedicated typed-null mirrors (`mirror_delete_entity` /
-/// `mirror_delete_attr`), which the delete handlers still call — their deletion
-/// shape is not derivable from a plain append.
+/// attribute does not re-record unchanged datasets. An attribute or instance
+/// the write removed is recorded here through `mirror_delete_attr` (the typed
+/// null shape is not a plain append); entity DELETION keeps
+/// `mirror_delete_entity`, which the delete handlers call.
 pub async fn record_temporal_change(
     st: &AppState,
     tenant: &TenantId,
@@ -377,13 +377,20 @@ pub async fn record_temporal_change(
     // modifiedAt, deletedAt and observedAt; when it "is updated as the result
     // of a change from the Core API, the observedAt sub-Property should be
     // set as a copy of the modifiedAt sub-Property".
+    let ts = || {
+        after
+            .get("modifiedAt")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .unwrap_or_else(now_iso)
+    };
     if before.is_some_and(|b| b.get("scope") != after.get("scope")) {
+        // 4.18: a deleted scope reads as the NGSI-LD Null
+        if after.get("scope").is_none() {
+            crate::history::mirror_delete_attr(st, tenant, id, "scope", None, &ts()).await;
+        }
         if let Some(scope) = after.get("scope") {
-            let ts = after
-                .get("modifiedAt")
-                .and_then(Value::as_str)
-                .map(String::from)
-                .unwrap_or_else(now_iso);
+            let ts = ts();
             let inst = json!({
                 "type": "Property",
                 "value": scope.clone(),
@@ -397,7 +404,17 @@ pub async fn record_temporal_change(
         let op = match class {
             ChangeClass::Created => TemporalOp::AttrCreated,
             ChangeClass::Updated => TemporalOp::AttrModified,
-            ChangeClass::Deleted => continue, // handled by mirror_delete_attr
+            ChangeClass::Deleted => {
+                // 4.5.7/4.5.8: each instance the write removed is recorded
+                // as the NGSI-LD Null with deletedAt, whichever route
+                // removed it (Delete Attribute, a replace, a merge-patch Null)
+                let ts = ts();
+                for ds in removed_datasets(before.and_then(|b| b.get(&k)), after.get(&k)) {
+                    crate::history::mirror_delete_attr(st, tenant, id, &k, ds.as_deref(), &ts)
+                        .await;
+                }
+                continue;
+            }
         };
         let Some(av) = after.get(&k) else { continue };
         // gate 1, value-change: an unchanged instance produces no event
@@ -465,6 +482,25 @@ pub(crate) fn instance_id(
         None => uuid::Uuid::new_v4(),
     };
     format!("urn:ngsi-ld:Instance:{u}")
+}
+
+/// The datasetIds (None: the default instance) of the instances in `before`
+/// that `after` no longer holds; every one of them when the Attribute went.
+fn removed_datasets(before: Option<&Value>, after: Option<&Value>) -> Vec<Option<String>> {
+    let after_arr = after.and_then(Value::as_array);
+    before
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|bi| {
+            !after_arr.is_some_and(|a| a.iter().any(|ai| instance_ds(ai) == instance_ds(bi)))
+        })
+        .map(|bi| {
+            bi.get("datasetId")
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
+        .collect()
 }
 
 /// The instances in `after` that are new or changed vs `before` — matched by
