@@ -74,8 +74,9 @@ review closes on. A green `fast` run starts `ci` on the same commit
 (`workflow_run`): the ETSI matrix and the arm64 build at once, no second
 workspace run, and a green run publishes the `:dev` image. A `fast` run
 that is not green starts nothing (its `ci` run cancels itself). A
-dispatch of `ci` by hand runs the workspace gate first unless
-`with_workspace` is false.
+scheduled or dispatched `ci` run skips the workspace gate when a green
+`fast` run already passed it on the same commit, and runs it otherwise;
+`with_workspace: true` forces it.
 Work that will stay red for more than a day
 lives on a topic branch and comes in by pull request like a fork's.
 

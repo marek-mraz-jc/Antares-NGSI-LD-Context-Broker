@@ -32,8 +32,9 @@ name: ci
 # run on dev (T-3717): fast.yml already ran workspace.yml on that commit, so
 # this run checks out the fast run's head_sha and starts the ETSI matrix and
 # the arm64 build at once, without a second workspace run. A red fast run
-# starts nothing here. A dispatch runs workspace first unless
-# `with_workspace` is false. NOT on every push: cancel-in-progress meant a
+# starts nothing here. A schedule or dispatch runs workspace first unless a
+# green fast run already passed workspace.yml on the same sha (the `proven`
+# job, T-5573); `with_workspace` true forces it anyway. NOT on every push: cancel-in-progress meant a
 # 40 min run never finished under a stream of fix commits. Tags run full.yml.
 #
 # T-4721 (owner order 2026-10-19): the ETSI matrix and the views differential
@@ -48,9 +49,9 @@ on:
   workflow_dispatch:
     inputs:
       with_workspace:
-        description: "run workspace.yml first (false: a green fast run already gated this commit)"
+        description: "run workspace.yml even when a green fast run already passed it on this sha"
         type: boolean
-        default: true
+        default: false
 
 # A newer commit supersedes a running pipeline.
 concurrency:
@@ -82,10 +83,35 @@ jobs:
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/cancel"
           sleep 120
 
+  proven:
+    # T-5573: the train dispatches this run on a dev sha whose fast run
+    # already passed workspace.yml; the same query as fast.yml's `proven`.
+    name: Already green in fast on this sha
+    if: github.event_name != 'workflow_run'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      actions: read
+    outputs:
+      green: ${{ steps.ask.outputs.green }}
+    steps:
+      - id: ask
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          green=false
+          # a failed question runs everything: the answer must prove the sha, never assume it
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$HEAD_SHA&status=success&per_page=30" \
+            --jq '[.workflow_runs[] | select(.path == ".github/workflows/fast.yml") | .id] | join(" ")') || runs=
+          [ -n "$runs" ] && green=true && echo "green fast run(s) on $HEAD_SHA: $runs"
+          echo "green=$green" | tee -a "$GITHUB_OUTPUT"
+
   workspace:
-    # skipped under workflow_run (fast ran it on this commit) and on a
-    # dispatch with with_workspace false
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.with_workspace)
+    # skipped under workflow_run (fast ran it on this commit) and when a
+    # green fast run proved this sha, unless with_workspace forces it. A
+    # failed `proven` job leaves green empty, so the workspace runs.
+    needs: proven
+    if: ${{ !cancelled() && github.event_name != 'workflow_run' && (inputs.with_workspace || needs.proven.outputs.green != 'true') }}
     permissions:
       contents: read
     # The shared workspace-test gate (workflow_call) — one definition for
