@@ -133,6 +133,14 @@ impl PgBackend {
         }
     }
 
+    /// Give the batch writes their own pool (`ANTARES_PG_WRITE_RESERVE`,
+    /// T-5150): reads keep the main pool, so a flood of them cannot queue
+    /// ahead of a pipeline's batch upsert.
+    pub fn with_write_reserve(mut self, reserve: sqlx::postgres::PgPool) -> Self {
+        self.entities = self.entities.with_batch_pool(reserve);
+        self
+    }
+
     /// Attach what the startup probe read from the server
     /// (`pg::version_info`), so `/q/health` can answer it without a query.
     pub fn with_version(mut self, version: Value) -> Self {
