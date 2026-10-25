@@ -2411,6 +2411,7 @@ async fn merge_entity_inner(
         }
     }
     let lang = params.get("lang").map(String::as_str);
+    let simplified = simplified_input(params)?;
     apply_common_observed_at(&mut fragment, observed_at);
     let ts = now_iso();
 
@@ -2460,6 +2461,14 @@ async fn merge_entity_inner(
                         )));
                     }
                     let mut frag = local_frag.clone();
+                    let raw = KeptTypes {
+                        raw: &rest,
+                        ctx: &parsed.ctx,
+                        simplified,
+                        lang,
+                        observed_at,
+                    };
+                    raw.apply(doc, &mut frag)?;
                     apply_common_lang(doc, &mut frag, lang);
                     merge_into(doc, &frag, &ts);
                     Ok::<(), NgsiError>(())
@@ -2529,6 +2538,14 @@ async fn merge_entity_inner(
                 )));
             }
             let mut frag = fragment.clone();
+            let raw = KeptTypes {
+                raw: obj,
+                ctx: &parsed.ctx,
+                simplified,
+                lang,
+                observed_at,
+            };
+            raw.apply(doc, &mut frag)?;
             apply_common_lang(doc, &mut frag, lang);
             merge_into(doc, &frag, &ts);
             #[cfg(feature = "views")]
@@ -2616,6 +2633,151 @@ fn apply_common_lang(target: &Value, fragment: &mut Value, lang: Option<&str>) {
             map.insert(lang.to_owned(), Value::String(s));
             o.insert("languageMap".into(), Value::Object(map));
         }
+    }
+}
+
+/// TS 104 176 7.3.3.2 Table 7.3.3.2-1: `format` "shall be one of:
+/// "simplified" (or its synonym "keyValues")", and so is the deprecated
+/// `options=keyValues` spelling (6.3.7). Either says the Fragment holds the
+/// simplified representation of ETSI TS 104 175 clause 5.3.2.4.
+fn simplified_input(params: &HashMap<String, String>) -> Result<bool, NgsiError> {
+    let by_options = params.get("options").is_some_and(|o| {
+        o.split(',')
+            .any(|o| matches!(o.trim(), "keyValues" | "simplified"))
+    });
+    match params.get("format").map(String::as_str) {
+        None => Ok(by_options),
+        Some("simplified" | "keyValues") => Ok(true),
+        Some("normalized" | "concise") => Ok(by_options),
+        Some(f) => Err(NgsiError::BadRequestData(format!(
+            "format {f:?}: Merge Entity takes only \"simplified\" or \"keyValues\" \
+             (TS 104 176 7.3.3.2)"
+        ))),
+    }
+}
+
+/// The Fragment members a Merge Entity reads by the type of the Attribute it
+/// lands on, re-expanded inside the store transaction against the stored
+/// Entity:
+/// - 10.2.9.4: "If the Attribute to be merged is represented in a simplified
+///   representation, the type of any pre-existing Attribute in the target
+///   entity shall be preserved" (TS 104 176 7.3.3.2: "any attempt to modify
+///   the type of an Attribute shall result in a BadRequest error"). A bare
+///   value goes into the member the stored type holds it in, and a value
+///   that type cannot hold is BadRequestData from the same expansion a
+///   normalized write runs.
+/// - 4.7.1: a GeoProperty's Value "shall be a GeoJSON Geometry". A type-less
+///   `{"value": ...}` onto a stored GeoProperty is validated as one; read as
+///   a plain Property it stored `{"type":"Polygon"}` with no coordinates.
+struct KeptTypes<'a> {
+    raw: &'a Map<String, Value>,
+    ctx: &'a antares_jsonld::Context,
+    simplified: bool,
+    lang: Option<&'a str>,
+    observed_at: Option<&'a str>,
+}
+
+impl KeptTypes<'_> {
+    fn apply(&self, doc: &Value, frag: &mut Value) -> Result<(), NgsiError> {
+        let mut kept = Map::new();
+        let mut iris = Vec::new();
+        for (k, v) in self.raw {
+            if k == "@context" || is_meta(k) || is_ngsi_null(v) {
+                continue;
+            }
+            let iri = antares_jsonld::expand_attr_name(k, self.ctx)?;
+            let Some(stored) = doc
+                .get(&iri)
+                .and_then(Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(|i| i.get("type"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let typeless = v
+                .as_object()
+                .filter(|o| !o.contains_key("type") && !o.contains_key("@type"));
+            let normalized = if self.simplified {
+                self.simplified_as(&iri, stored, v)?
+            } else if let Some(o) =
+                typeless.filter(|o| stored == "GeoProperty" && o.contains_key("value"))
+            {
+                let mut o = o.clone();
+                o.insert("type".into(), Value::String(stored.to_owned()));
+                Value::Object(o)
+            } else {
+                continue;
+            };
+            kept.insert(k.clone(), normalized);
+            iris.push(iri);
+        }
+        if kept.is_empty() {
+            return Ok(());
+        }
+        let mut expanded = expand_entity(
+            &kept,
+            self.ctx,
+            ExpandOpts {
+                fragment: true,
+                allow_null: true,
+                merge: true,
+                temporal: false,
+                ..Default::default()
+            },
+        )?;
+        apply_common_observed_at(&mut expanded, self.observed_at);
+        if let (Some(f), Some(e)) = (frag.as_object_mut(), expanded.as_object_mut()) {
+            for iri in iris {
+                if let Some(v) = e.remove(&iri) {
+                    f.insert(iri, v);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The normalized Attribute a simplified value of a stored `stored`
+    /// Attribute stands for (TS 104 175 5.3.2.4: a LanguageProperty,
+    /// JsonProperty or VocabProperty may arrive as `{"languageMap": ...}`,
+    /// `{"json": ...}` or `{"vocab": ...}`; every other type as its bare
+    /// value). 10.2.9.4: a LanguageProperty sent "as a string" updates the
+    /// key of the common language tag, so without `lang` there is no key.
+    fn simplified_as(&self, iri: &str, stored: &str, v: &Value) -> Result<Value, NgsiError> {
+        let member = match stored {
+            "Relationship" => "object",
+            "ListProperty" => "valueList",
+            "ListRelationship" => "objectList",
+            "LanguageProperty" => "languageMap",
+            "VocabProperty" => "vocab",
+            "JsonProperty" => "json",
+            _ => "value",
+        };
+        let self_described = matches!(
+            stored,
+            "LanguageProperty" | "VocabProperty" | "JsonProperty"
+        ) && v
+            .as_object()
+            .is_some_and(|o| o.len() == 1 && o.contains_key(member));
+        let mut out = if self_described {
+            v.as_object().cloned().unwrap_or_default()
+        } else if stored == "LanguageProperty" {
+            let Some(tag) = self.lang else {
+                return Err(NgsiError::BadRequestData(format!(
+                    "attribute {iri}: a simplified value for a LanguageProperty needs the \
+                     lang URL parameter to name its languageMap key (TS 104 176 7.3.3.2)"
+                )));
+            };
+            let mut m = Map::new();
+            m.insert(member.into(), json!({ tag: v }));
+            m
+        } else {
+            let mut m = Map::new();
+            m.insert(member.into(), v.clone());
+            m
+        };
+        out.insert("type".into(), Value::String(stored.to_owned()));
+        Ok(Value::Object(out))
     }
 }
 

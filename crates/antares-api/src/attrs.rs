@@ -983,6 +983,14 @@ async fn partial_update_inner(
                                     t.insert(k.clone(), v.clone());
                                 }
                             }
+                            // 4.7.1: a GeoProperty's Value "shall be a GeoJSON
+                            // Geometry"; the fragment carries no type, so its value
+                            // is checked here, against the type it lands on.
+                            if t.get("type").and_then(Value::as_str) == Some("GeoProperty") {
+                                if let Some(g) = t.get("value") {
+                                    antares_jsonld::expand::validate_geojson(attr, g)?;
+                                }
+                            }
                             t.insert("modifiedAt".into(), Value::String(ts.clone()));
                         }
                     }

@@ -895,6 +895,14 @@ fn expand_instance(
         }
         None => obj,
     };
+    let core;
+    let obj = match core_members(name, obj, ctx)? {
+        Some(m) => {
+            core = m;
+            &core
+        }
+        None => obj,
+    };
 
     let declared = match obj.get("type") {
         None => None,
@@ -1218,6 +1226,54 @@ fn expand_instance(
     }
 
     Ok(Value::Object(out))
+}
+
+/// 5.5.7: "The term to URI expansion or compaction shall be performed using a
+/// @context as described by the JSON-LD specification", so a core member
+/// written as its full IRI (`https://uri.etsi.org/ngsi-ld/observedAt`,
+/// `.../hasValue`) or an Attribute type written as one
+/// (`https://uri.etsi.org/ngsi-ld/Property`) is the same document as the one
+/// using the term. Matched by the short key alone, the IRI spelling became a
+/// sub-Property. `None` when nothing is spelled out.
+fn core_members(
+    name: &str,
+    obj: &Map<String, Value>,
+    ctx: &Context,
+) -> Result<Option<Map<String, Value>>, NgsiError> {
+    let core = |k: &str| -> Option<&'static str> {
+        if !k.starts_with(crate::context::NGSI_LD_BASE) {
+            return None;
+        }
+        RESERVED_MEMBERS
+            .iter()
+            .copied()
+            .find(|r| *r != "type" && ctx.expand_key(r) == k)
+    };
+    let type_iri = obj
+        .get("type")
+        .and_then(Value::as_str)
+        .and_then(|t| t.strip_prefix(crate::context::NGSI_LD_BASE))
+        .filter(|t| ATTR_TYPES.contains(t));
+    if type_iri.is_none() && !obj.keys().any(|k| core(k).is_some()) {
+        return Ok(None);
+    }
+    let mut out = Map::new();
+    for (k, v) in obj {
+        let (key, v) = match (k.as_str(), core(k)) {
+            ("type", _) => (
+                "type",
+                type_iri.map_or_else(|| v.clone(), |t| Value::String(t.into())),
+            ),
+            (_, Some(term)) => (term, v.clone()),
+            (k, None) => (k, v.clone()),
+        };
+        if out.insert(key.to_owned(), v).is_some() {
+            return Err(NgsiError::BadRequestData(format!(
+                "attribute {name}: {key} given both as a term and as its IRI (5.5.7)"
+            )));
+        }
+    }
+    Ok(Some(out))
 }
 
 /// 4.5.18.2: "a JSON object consisting of a set of non-empty language tags
@@ -2005,6 +2061,43 @@ mod tests {
         }
         let ok = json!({"id": "urn:x", "type": "T", "p": {"type": "Property", "value": 1, "valueType": "Integer"}});
         assert!(expand_entity(ok.as_object().unwrap(), &core(), ExpandOpts::default()).is_ok());
+    }
+
+    /// 5.5.7: a core member or Attribute type spelled as its full IRI
+    /// expands to the same document as the term (T-5466).
+    #[test]
+    fn a_core_member_iri_is_the_member() {
+        let iri = |t: &str| format!("{}{t}", crate::context::NGSI_LD_BASE);
+        let pairs = [
+            (
+                json!({"type": "Property", "value": 1, iri("observedAt"): "2026-01-01T00:00:00Z"}),
+                json!({"type": "Property", "value": 1, "observedAt": "2026-01-01T00:00:00Z"}),
+            ),
+            (
+                json!({"type": iri("Relationship"), iri("hasObject"): "urn:o"}),
+                json!({"type": "Relationship", "object": "urn:o"}),
+            ),
+            (
+                json!({"type": iri("Unknown"), "value": 1}),
+                json!({"type": iri("Unknown"), "value": 1}),
+            ),
+        ];
+        for (sent, same) in pairs {
+            let a = json!({"id": "urn:x", "type": "T", "p": sent});
+            let b = json!({"id": "urn:x", "type": "T", "p": same});
+            let got = expand_entity(a.as_object().unwrap(), &core(), ExpandOpts::default())
+                .map_err(|e| e.to_string());
+            let want = expand_entity(b.as_object().unwrap(), &core(), ExpandOpts::default())
+                .map_err(|e| e.to_string());
+            assert_eq!(got, want);
+        }
+        let both = json!({"id": "urn:x", "type": "T", "p": {"type": "Property", "value": 1, iri("hasValue"): 2}});
+        let err = expand_entity(both.as_object().unwrap(), &core(), ExpandOpts::default())
+            .map_err(|e| e.to_string());
+        let refused = err
+            .err()
+            .map(|e| e.contains("given both as a term and as its IRI"));
+        assert_eq!(refused, Some(true));
     }
 
     fn core() -> std::sync::Arc<Context> {
