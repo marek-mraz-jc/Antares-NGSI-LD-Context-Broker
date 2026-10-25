@@ -445,17 +445,18 @@ pub(super) async fn tenant_exists_layer(
         }
     }
     let path = req.uri().path().trim_start_matches(API_ROOT);
+    // 7.8.2 lists the creating operations; Batch Upsert creates Entities too
+    // and joins them unless ANTARES_IMPLICIT_TENANTS=listed (T-5497).
     let implicit_create = req.method() == axum::http::Method::POST
-        && matches!(
+        && (matches!(
             path,
             "/entities"
                 | "/entityOperations/create"
-                | "/entityOperations/upsert"
                 | "/temporal/entities"
                 | "/subscriptions"
                 | "/csourceRegistrations"
                 | "/csourceSubscriptions"
-        );
+        ) || (path == "/entityOperations/upsert" && !st.profile.implicit_tenants_listed_only));
     // tenant-independent resources: broker identity (6.33) answers for any
     // tenant (the per-tenant alias exists before any data does), and the
     // @context resources are keyed by local id across tenants (5.13) — a

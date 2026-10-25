@@ -42,6 +42,10 @@ const KNOWN_KEYS: &[&str] = &[
     // `observed` records only instances carrying observedAt; `none`
     // auto-records nothing (temporal API + reads stay on).
     "ANTARES_TEMPORAL_RECORD",
+    // behaviour profile (T-5497, docs/conformance/profiles.md)
+    "ANTARES_NON_OBJECT_BODY",
+    "ANTARES_FED_WRITE_SOURCE_404",
+    "ANTARES_IMPLICIT_TENANTS",
     // History dedup on append (T-4507): `off` records an instance equal to the
     // newest one again; anything else (default) skips it.
     "ANTARES_TEMPORAL_DEDUP",
@@ -1047,6 +1051,7 @@ async fn run(
         .as_deref()
         .unwrap_or("all")
         .parse()?;
+    state.profile = antares_api::Profile::from_env()?;
     #[cfg(feature = "jc")]
     {
         state.provenance_from = std::env::var("ANTARES_PROVENANCE_FROM")

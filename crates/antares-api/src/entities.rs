@@ -84,7 +84,7 @@ async fn create_entity_inner(
 ) -> ApiResult<Response> {
     let tenant = tenant_from(headers)?;
     check_params(params, &["local"])?;
-    let parsed = parse_body(&st.loader, headers, body, BodyKind::Standard).await?;
+    let parsed = parse_body(st, headers, body, BodyKind::Standard).await?;
     let obj = parsed.object(NgsiError::InvalidRequest(
         "entity document must be a JSON object".into(),
     ))?;
@@ -190,6 +190,7 @@ async fn create_entity_inner(
             );
         }
         return Ok(crate::federation::combine(
+            st.profile,
             parts,
             created(entity_location(&id), &tenant),
             &tenant,
@@ -1977,6 +1978,7 @@ pub async fn delete_entity(
                 );
             }
             return Ok(crate::federation::combine(
+                st.profile,
                 parts,
                 no_content(&tenant),
                 &tenant,
@@ -2318,6 +2320,7 @@ async fn purge_inner(
             );
         }
         return Ok(crate::federation::combine(
+            st.profile,
             parts,
             no_content(&tenant),
             &tenant,
@@ -2354,7 +2357,7 @@ async fn merge_entity_inner(
         params,
         &["options", "format", "observedAt", "lang", "local", "type"],
     )?;
-    let parsed = parse_body(&st.loader, headers, body, BodyKind::MergePatch).await?;
+    let parsed = parse_body(st, headers, body, BodyKind::MergePatch).await?;
     let obj = parsed.object(NgsiError::BadRequestData(
         "fragment must be a JSON object".into(),
     ))?;
@@ -2504,6 +2507,7 @@ async fn merge_entity_inner(
             );
         }
         return Ok(crate::federation::combine(
+            st.profile,
             parts,
             no_content(&tenant),
             &tenant,
@@ -2797,7 +2801,7 @@ pub async fn replace_entity(
         // judge, and the replace below refuses it as before, after the
         // 404 an unknown target answers first (057_03).
         let shown = match &st.policy {
-            Some(_) => parse_body(&st.loader, &headers, &body, BodyKind::Standard)
+            Some(_) => parse_body(&st, &headers, &body, BodyKind::Standard)
                 .await
                 .ok()
                 .and_then(|p| {
@@ -2858,7 +2862,7 @@ pub async fn replace_entity(
                 }
                 return Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into());
             }
-            let parsed = parse_body(&st.loader, &headers, &body, BodyKind::Standard).await?;
+            let parsed = parse_body(&st, &headers, &body, BodyKind::Standard).await?;
             let obj = parsed.object(NgsiError::BadRequestData(
                 "entity must be a JSON object".into(),
             ))?;
@@ -2922,7 +2926,7 @@ pub async fn replace_entity(
                 Some(Ok(())) => Ok::<_, ApiError>(no_content(&tenant)),
             };
         }
-        let parsed = parse_body(&st.loader, &headers, &body, BodyKind::Standard).await?;
+        let parsed = parse_body(&st, &headers, &body, BodyKind::Standard).await?;
         let obj = parsed.object(NgsiError::BadRequestData(
             "entity must be a JSON object".into(),
         ))?;
@@ -3005,6 +3009,7 @@ pub async fn replace_entity(
             );
         }
         Ok(crate::federation::combine(
+            st.profile,
             parts,
             no_content(&tenant),
             &tenant,
