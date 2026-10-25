@@ -80,6 +80,9 @@ entity ids. The semantics of every test are preserved. An extension TP
 
 ## 3. [suite] LdContextNotAvailable fixtures assert 503; V1.9.1 mandates 504
 
+Status: resolved. Forge develop `b3bb243f` asserts 504; 043_01_01/02/03/05 and
+028_07_02 pass on forge `cc8711ce` (T-5495).
+
 **Title:** 043_01 / 028_07 / 051_05_01 / 053_05_01 assert 503 for
 LdContextNotAvailable — V1.8-era expectation
 
@@ -340,6 +343,11 @@ Suggest either extending `OrScopeQ` with an unparenthesized
 `ScopeQ *(andOp ScopeQ)` alternative and stating that `andOp` binds tighter
 than `orOp`, or parenthesizing the conjunction in `019_01_06`.
 
+Status: resolved on the suite side. Forge develop `cc8711ce` (2026-10-21)
+parenthesizes `019_01_06_05` and adds `019_03_07_05`, which expects
+BadRequestData for the bare `/Madrid;/CompanyA`; TS 104 175 V1.1.1 clause 7.2.5
+keeps the V1.9.1 grammar. Antares refuses the bare form since T-5495.
+
 ## 13. [spec] TS 104 175 Table 5.2.6.5.2-1 calls `timeInterval` not applicable to CSR subscriptions; 12.4.2.4 and 12.4.7 define periodic CSR notification on it
 
 **Title:** TS 104 175: Table 5.2.6.5.2-1 and clauses 12.4.2.4/12.4.7 disagree on
@@ -590,3 +598,38 @@ Antares serves POST for create and GET for query on
 `/ngsi-ld/v1/csourceSubscriptions` (`crates/antares-api/src/lib.rs`); the
 operation matrix records the swap (docs/analysis/operation-matrix.md,
 open question 9, T-3674).
+
+## 25. [suite] 054_02_02 and 056_02_02 expect 400 for PUT and PATCH on /entities
+
+TS 104 176 clause 6.3.2: "Method Not Allowed" (405) "shall be raised when a client invokes a recognized but unsupported
+HTTP verb over a resource". With an empty entity id the request reaches the collection `/entities`, which offers GET,
+POST and DELETE (Purge Entities) and no PUT or PATCH. Forge develop `cc8711ce` expects 400; the `integration/all-fixes`
+branch already expects 405 (`b8914530`). Antares answers 400 until forge develop moves (T-5584).
+
+## 26. [suite] 003_06_01 and 003_08_01 expect 207 for a batch whose Content-Type and @context disagree
+
+TS 104 176 clause 6.2.4: "if the request payload body (as JSON) contains a @context term, then an HTTP error response of
+type BadRequestData shall be raised". The clause answers the request with one error response; a 207 is a partial success.
+Forge develop `cc8711ce` expects 207 with the error in `errors[0]`; `integration/all-fixes` expects 400 (`65ab7516`).
+Antares answers 207 until forge develop moves (T-5584).
+
+## 27. [suite] the 047 TPs do not consume the initial csource notification
+
+TS 104 175 clause 12.4.7: "If a subscription does not define a timeInterval term, the csource notification shall be sent
+on initial subscription and whenever there is a change in a matching csource registration." Forge develop's 047 TPs
+create the Subscription before any matching registration and take the first notification they receive as the one the
+registration triggers, so a broker that sends the initial notification fails them. `integration/all-fixes` waits for the
+initial notification first. Antares skips it while nothing matches until forge develop moves (T-5584).
+
+## 28. [suite] integration/all-fixes TPs that over-specify (found by T-5495, for the branch's maintainers)
+
+- 020_13, 021_15, 021_16 `Check Temporal Pagination Link` matches `>;rel="..."` with no whitespace; RFC 8288 clause 3
+  writes `link-value = "<" URI-Reference ">" *( OWS ";" OWS link-param )` (TS 104 176 6.4.7.3 mandates RFC 8288 section 3).
+- 019_26_01..06 send `langProperties`, a Coraine extension; TS 104 175 7.2.3.2 defines q, expandValues and jsonKeys only.
+- 019_02_08_05 and 019_27_05 expect `jsonProperty[id]` to miss without `jsonKeys`; TS 104 175 5.2.6.4.10 calls a
+  JsonProperty's `json` "Raw unexpandable JSON which shall not be interpreted as JSON-LD using the supplied @context".
+- D011_01_exc, D011_01_03_inc, D011_02_exc_01 stub the forwarded query only as `pick=...`; TS 104 176 7.2.3.1 still
+  defines `attrs`, so the stub has to accept either.
+- 020_13_05, 020_14_01/02, 021_15_05 expect 200 for lastN=20 over 20 instances; TS 104 176 6.4.7.3 pages at "the value
+  assigned to lastN or the maximum limit configured, whichever is smaller", so the TP needs a configured limit of at
+  least 20 (Antares' ETSI stack sets 9 for the vendored pagination TPs).
