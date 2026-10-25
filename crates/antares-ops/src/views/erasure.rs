@@ -86,7 +86,10 @@ fn invalid(req: &Request) -> Option<String> {
             return Some("attrs, when given, names at least one Attribute".into())
         }
         Some(a) => {
-            if let Some(bad) = a.iter().find(|n| !n.contains("://") || !plain(n, 2048)) {
+            if let Some(bad) = a
+                .iter()
+                .find(|n| !antares_jsonld::context::is_absolute_iri(n) || !plain(n, 2048))
+            {
                 return Some(format!("{bad:?} is no expanded Attribute name"));
             }
         }
@@ -243,6 +246,7 @@ mod tests {
         assert!(with("entities", json!(many)).is_some());
         assert!(with("attrs", json!(["https://e.org/a\u{7}"])).is_some());
         assert!(with("attrs", json!(["https://e.org/rider"])).is_none());
+        assert!(with("attrs", json!(["urn:x:rider"])).is_none(), "urn IRI");
         assert!(with("actor", json!("a".repeat(MAX_ACTOR + 1))).is_some());
         assert!(with("reason", json!("a".repeat(MAX_REASON + 1))).is_some());
         assert!(with("subject", json!(null)).is_none());
