@@ -200,7 +200,8 @@ fn id(entity: &Value) -> Option<&str> {
 }
 
 /// The instances of one Attribute: the array of a multi-instance one, else the one.
-fn instances(member: &Value) -> &[Value] {
+#[must_use]
+pub fn instances(member: &Value) -> &[Value] {
     match member {
         Value::Array(items) => items,
         one => std::slice::from_ref(one),

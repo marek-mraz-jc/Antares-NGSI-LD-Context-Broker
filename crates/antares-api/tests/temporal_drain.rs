@@ -271,6 +271,29 @@ async fn a_failing_drain_keeps_the_2xx_and_is_counted() {
     );
     let (status, body) = req(&st, "GET", "/ngsi-ld/v1/entities/urn:ngsi-ld:D:9", None).await;
     assert_eq!(status, 200, "current state is intact: {body}");
+    // temporal.md "When the history store is down": a history read fails
+    // closed, never an empty or partial history
+    let (status, body) = req(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/temporal/entities/urn:ngsi-ld:D:9",
+        None,
+    )
+    .await;
+    assert_eq!(status, 500, "{body}");
+    assert_eq!(
+        body["type"],
+        json!("https://uri.etsi.org/ngsi-ld/errors/InternalError"),
+        "{body}"
+    );
+    let (status, body) = req(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/temporal/entities?type=D&timerel=after&timeAt=2020-01-01T00:00:00Z",
+        None,
+    )
+    .await;
+    assert_eq!(status, 500, "a history query fails closed too: {body}");
     let (status, health) = req(&st, "GET", "/q/health", None).await;
     assert_eq!(status, 200);
     assert!(

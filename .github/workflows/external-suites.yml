@@ -56,7 +56,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: |
           python3 -m unittest discover -s tests/external/coraine
           python3 -m unittest discover -s tests/external/etsi
@@ -93,26 +93,26 @@ jobs:
     # Coraine's own CI image: the C toolchain corLibs builds corTest's tools
     # with, psql, socat, mosquitto (Coraine's .github/workflows/ci.yml)
     container:
-      image: quay.io/seamware/coraine-ci:2026-09-22-f5a4eb4
+      image: quay.io/seamware/coraine-ci:2026-09-22-f5a4eb4@sha256:dd16d7484b8a6132ff32a4479b4ba1f763a043a76e637560060f504d3773406c
     services:
       db:
         image: timescale/timescaledb-ha:pg17
         env:
           POSTGRES_PASSWORD: postgres
       context-server:
-        image: quay.io/seamware/coraine-ci:mirror-context-server-0.2.0
+        image: quay.io/seamware/coraine-ci:mirror-context-server-0.2.0@sha256:7bf0993751c4f69179b1d959de5f9976a0f8698bb7f041610e6a7e7337178d44
         env:
           MEMORY_ENABLED: "true"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: antares
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: SEAMWARE/coraine
           ref: ${{ env.CORAINE_REF }}
           path: stack/coraine
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: SEAMWARE/corLibs
           # the commit the first green smoke run built corTest from; bump on purpose
@@ -133,8 +133,8 @@ jobs:
             git -C "$d" checkout --quiet "$c" && echo "$d $c"
           done
           make -j"$(nproc)" di
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: antares
           key: ${{ matrix.variant }}
@@ -177,7 +177,7 @@ jobs:
           cd stack/coraine/test/funcTests/cases
           for d in *.diff *.stderr; do [ -s "$d" ] && cp "${d%%.*}".* "$OLDPWD/$out/cases/" 2>/dev/null; done
           cp /tmp/coraine.*.log "$OLDPWD/$out/" 2>/dev/null || true
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: coraine-${{ matrix.variant }}-${{ matrix.store }}
@@ -193,12 +193,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: |
           f=""; [ "${{ matrix.variant }}" = full ] && f="$FULL_FEATURES"
           docker build --build-arg FEATURES="$f" -t antares-local:latest .
           docker save antares-local:latest | gzip > antares-image.tgz
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: image-${{ matrix.variant }}
           path: antares-image.tgz
@@ -220,8 +220,8 @@ jobs:
     env:
       OUT: results/etsi-${{ matrix.suite }}-${{ matrix.variant }}-${{ matrix.store }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: image-${{ matrix.variant }}
       - run: docker load < antares-image.tgz
@@ -287,7 +287,7 @@ jobs:
           partial=""; [ "$SMOKE" = true ] && partial=--partial
           python3 tests/external/etsi/ratchet.py tests/external/etsi/forge-latest-ratchet.txt "$OUT/tp-status.csv" $partial \
             | tee -a "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: etsi-${{ matrix.suite }}-${{ matrix.variant }}-${{ matrix.store }}
@@ -306,9 +306,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: |
           mkdir -p results/oracle
           if [ -f crates/antares-broker/tests/surfaces_equivalence.rs ]; then
@@ -317,7 +317,7 @@ jobs:
           else
             echo "not built yet: crates/antares-broker/tests/surfaces_equivalence.rs (T-3522)" | tee results/oracle/oracle.log
           fi
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: oracle
@@ -330,8 +330,8 @@ jobs:
     needs: [coraine, etsi, oracle]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           path: in
       - name: Fold every cell into one summary
@@ -362,7 +362,7 @@ jobs:
             echo; tail -3 in/oracle/oracle/oracle.log 2>/dev/null || echo "(no log)"
           } > out/summary.md
           cat out/summary.md >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: final-validation
           path: out

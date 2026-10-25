@@ -1182,3 +1182,122 @@ async fn the_keyed_history_arms_read_their_unique_index_under_rls() {
         bad.join("\n\n")
     );
 }
+
+/// T-5616: a paged temporal query qualifies each Entity by "has a row in the
+/// window" ([`pg::temporal::has_history`]). The old EXISTS read an Entity's
+/// rows oldest first from the 48 h widened column bound and fetched every row
+/// the text predicate then refused: on the helsinki-bikes history (577
+/// stations) that passed the 30 s statement timeout. Seeded here at the
+/// bikes' size, a station every 25 minutes for two weeks, in two weeks of
+/// their own: the probe reads only the window's week, backwards along the
+/// btree, and refuses less than one row a station.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_temporal_page_qualification_reads_each_station_newest_first() {
+    use antares_sql::compile::temporal::{
+        column_range_bound, compile_instance_range, InstanceRange,
+    };
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    if pg::maintenance::detect_temporal_backend(&pool).await
+        != Ok(pg::maintenance::TemporalBackend::Partitioned)
+    {
+        eprintln!("SKIP: attr_instances is not natively partitioned here");
+        return;
+    }
+    const T: &str = "pgexplain-bikes";
+    const STATIONS: i64 = 577;
+    // A new week locks the parent against every open write, and seed_rls
+    // writes history for seconds under lock 48520: the weeks and the seed
+    // wait for that lock, never queue an exclusive lock behind its writes.
+    let mut tx = pool.begin().await.expect("tx");
+    for stmt in [
+        "SET LOCAL lock_timeout = 0",
+        // the seed writes ~100 000 rows: past the pool's statement timeout
+        "SET LOCAL statement_timeout = 0",
+        "SELECT pg_advisory_xact_lock(48520)",
+        "CREATE TABLE IF NOT EXISTS attr_instances_2004w10 PARTITION OF attr_instances FOR VALUES FROM ('2004-03-01') TO ('2004-03-08')",
+        "CREATE TABLE IF NOT EXISTS attr_instances_2004w11 PARTITION OF attr_instances FOR VALUES FROM ('2004-03-08') TO ('2004-03-15')",
+        "DELETE FROM temporal_entities WHERE tenant_id = 'pgexplain-bikes'",
+        "DELETE FROM attr_instances WHERE tenant_id = 'pgexplain-bikes'",
+        "INSERT INTO tenants (tenant_id) VALUES ('pgexplain-bikes') ON CONFLICT DO NOTHING",
+        "INSERT INTO temporal_entities (tenant_id, id, types, meta, created_at, modified_at)
+         SELECT 'pgexplain-bikes', 'urn:ngsi-ld:BikeHireDockingStation:' || g, ARRAY['https://x/Bikes'],
+                jsonb_build_object('id', 'urn:ngsi-ld:BikeHireDockingStation:' || g), now(), now()
+           FROM generate_series(1, 577) g",
+        // a row each 25 minutes over the last three days of 2004w11 and one
+        // a day in 2004w10
+        "INSERT INTO attr_instances (tenant_id, entity_id, attr_id, instance_id, observed_at,
+                                     created_at, modified_at, data)
+         SELECT 'pgexplain-bikes', 'urn:ngsi-ld:BikeHireDockingStation:' || g, a, 'urn:i:' || g || a || ts,
+                ts, ts, ts,
+                jsonb_build_object('type', 'Property', 'value', g % 30,
+                                   'observedAt', to_char(ts AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'))
+           FROM generate_series(1, 577) g, (VALUES ('https://x/bikes')) v(a),
+                (SELECT timestamptz '2004-03-12 00:00Z' + make_interval(mins => k * 25) AS ts
+                   FROM generate_series(0, 3 * 24 * 60 / 25 - 1) k
+                 UNION ALL
+                 SELECT timestamptz '2004-03-01 12:00Z' + make_interval(days => d)
+                   FROM generate_series(0, 6) d) s",
+        "ANALYZE temporal_entities, attr_instances_2004w10, attr_instances_2004w11",
+    ] {
+        sqlx::query(stmt).execute(&mut *tx).await.expect(stmt);
+    }
+    tx.commit().await.expect("seed");
+    app_role(&pool).await;
+    let range = InstanceRange {
+        timerel: "after",
+        time_at: "2004-03-13T12:00:00Z",
+        end_time_at: None,
+        timeproperty: "observedAt",
+    };
+    let text = compile_instance_range(&range, "ai.data", 2).expect("after compiles");
+    let column = column_range_bound(&range, "ai", 3).expect("observedAt has a column");
+    let qual = pg::temporal::has_history(&format!(" AND {} AND {column}", text.sql), "DESC");
+    let mut tx = pool.begin().await.expect("tx");
+    for s in [
+        "SET LOCAL plan_cache_mode = force_generic_plan",
+        "SET LOCAL ROLE antares_app",
+        "SELECT set_config('antares.tenant', 'pgexplain-bikes', true)",
+    ] {
+        sqlx::query(s).execute(&mut *tx).await.expect(s);
+    }
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "PREPARE t5616_qual(text, text, text) AS \
+         SELECT count(*) FROM temporal_entities m WHERE m.tenant_id = $1 AND {qual}"
+    )))
+    .execute(&mut *tx)
+    .await
+    .expect("prepare");
+    let args = format!("('{T}', 'observedAt', '2004-03-13T12:00:00Z')");
+    let qualified: i64 =
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXECUTE t5616_qual{args}")))
+            .fetch_one(&mut *tx)
+            .await
+            .expect("execute");
+    let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, FORMAT TEXT) EXECUTE t5616_qual{args}"
+    )))
+    .fetch_all(&mut *tx)
+    .await
+    .expect("explain");
+    tx.rollback().await.expect("rollback");
+    let plan = plan.join("\n");
+    let refused: i64 = plan
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("Rows Removed by Filter: "))
+        .filter_map(|n| n.trim().parse::<i64>().ok())
+        .sum();
+    assert!(
+        plan.contains("Index Scan Backward using attr_instances_2004w11"),
+        "the probe reads the window's week backwards — plan:\n{plan}"
+    );
+    assert!(
+        !plan.contains("attr_instances_2004w10_"),
+        "the probe reads a week before the window — plan:\n{plan}"
+    );
+    assert!(
+        refused < STATIONS,
+        "the probe fetched {refused} rows the window refused for {STATIONS} stations — plan:\n{plan}"
+    );
+    assert_eq!(qualified, STATIONS, "every station has rows in the window");
+}

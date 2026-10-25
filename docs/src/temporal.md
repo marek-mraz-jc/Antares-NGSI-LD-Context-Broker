@@ -300,6 +300,27 @@ Instances the entity endpoints record with an `observedAt` are keyed on
 (entity, attribute, `datasetId`, `observedAt`), so a sensor re-sending
 the same measurement replaces the instance instead of duplicating it.
 
+## When the history store is down
+
+History may live in a second store (`ANTARES_TEMPORAL` naming another
+backend than `ANTARES_STORE`, [storage](storage.md)). The broker treats
+that store as a part it can lose for a while without losing the current
+state. Decided (T-5210, owner may override): it serves the current state
+and fails history closed, and it does not exit, because an exit would take
+the current state down with the history.
+
+| When | What happens |
+|---|---|
+| at start | the broker retries the connection 30 times, then exits with the reason; it never starts without the history store it was told to use |
+| an entity write | the write commits and answers as usual (201, 204); the history events of that request are lost, logged as `temporal drain failed` and counted in `/q/health` `temporalDrainErrors` and the metric `antares_temporal_drain_errors_total` |
+| a temporal read (11.3.2, 11.3.3) | `500` `InternalError` with a request id; never an empty or partial history |
+| a temporal write (5.6.11 to 5.6.16) | `500` `InternalError`; nothing is written |
+| the store comes back | the pool reconnects; history resumes with the next write. The lost window is not replayed |
+
+An alert on `antares_temporal_drain_errors_total` rising is the signal
+that history has a gap. The test is `a_failing_drain_keeps_the_2xx_and_is_counted`
+in `crates/antares-api/tests/temporal_drain.rs`.
+
 ## Retention and `none`
 
 `ANTARES_TEMPORAL_RETENTION_DAYS` starts a sweep on the postgres or

@@ -475,6 +475,7 @@ mod tests {
             written: crate::edm::Written::Always,
         };
         let set = Set {
+            output: None,
             type_iri: "https://e.org/T".into(),
             identifier: None,
             references: BTreeMap::new(),
