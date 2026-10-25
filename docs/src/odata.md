@@ -165,6 +165,22 @@ A page may hold fewer rows than asked and still carry a next link, when the
 surface read its budget before it filled (section 4). A query in a Tenant that holds
 nothing yet answers an empty set.
 
+### 2.1 Named outputs
+
+A view's `representations.odata` lists named outputs (docs API/11 EP-159,
+T-5225). Each output is one more EntitySet, named after the output with `-`
+written `_` (`in-a` is `in_a`), over the EntityType of its one source class,
+with the class's members and navigation bindings. It is read only: every
+write to it is refused, as on a set without the view's write operations. Its
+`filter` takes `q` and `scopeQ`; a geo-query stays the caller's, so an output
+naming one serves nobody. The filter's `q` is AND-ed with the `$filter`,
+`$search` and `ngsild.q` of every collection, `$count` and `$apply` read, and
+its `scopeQ` with the request's `ngsild.scopeQ`. A read by key, of a member or
+of a `$ref` first asks Query Entities for the id under the filter, so an
+Entity outside it answers the 404 of an absent one. The class's own set and an
+Entity's `_types` stay as they were. An output whose class the model does not
+show, or whose name a class's set already takes, serves nobody.
+
 ## 3. Writes
 
 Each write is one NGSI-LD operation of the view, gated like a read, and
