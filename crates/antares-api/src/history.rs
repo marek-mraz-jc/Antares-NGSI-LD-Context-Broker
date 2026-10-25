@@ -710,7 +710,7 @@ pub(crate) async fn mirror_delete_attr(
                     "type": "Property",
                     "value": "urn:ngsi-ld:null",
                     "instanceId": format!("urn:ngsi-ld:Instance:{}", uuid::Uuid::new_v4()),
-                    "deletedAt": ts,
+                    "deletedAt": ts, "createdAt": ts, "modifiedAt": ts,
                 });
                 match target.get_mut("scope").and_then(Value::as_array_mut) {
                     Some(arr) if arr.first().is_some_and(|i| i.is_object()) => arr.push(inst),
@@ -767,6 +767,10 @@ pub(crate) async fn mirror_delete_attr(
                     Value::String(format!("urn:ngsi-ld:Instance:{}", uuid::Uuid::new_v4())),
                 );
                 inst.insert("deletedAt".into(), Value::String(ts.to_owned()));
+                // the tombstone instance is written at the deletion: a
+                // timeproperty=createdAt|modifiedAt window finds it there
+                inst.insert("createdAt".into(), Value::String(ts.to_owned()));
+                inst.insert("modifiedAt".into(), Value::String(ts.to_owned()));
                 inst.insert(antares_store::PROVENANCE_KEY.into(), provenance("delete"));
                 arr.push(Value::Object(inst));
             }
