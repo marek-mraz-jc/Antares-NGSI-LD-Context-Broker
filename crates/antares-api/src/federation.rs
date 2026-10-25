@@ -764,6 +764,10 @@ fn merge_same_source(regs: Vec<FedReg>) -> Vec<FedReg> {
 /// contentType, jsonldContext, ngsildConformance) are TRANSFORMED by
 /// `forward` rather than passed through raw, which would corrupt
 /// negotiation instead.
+/// Headers that carry the triggering caller's own credential: never copied
+/// from the request by a `urn:ngsi-ld:request` contextSourceInfo entry.
+const REQUEST_CREDENTIALS: &[&str] = &["authorization", "proxy-authorization", "cookie"];
+
 const CSI_SKIP: &[&str] = &[
     "ngsild-tenant",
     "content-length",
@@ -1395,6 +1399,17 @@ async fn build_forward<'a>(
             continue;
         }
         let val = if v == "urn:ngsi-ld:request" {
+            // F-ANT3-003: the triggering request's own credential is the
+            // caller's, not the registrant's: copying it would hand every
+            // caller's token or session to whoever registered the source.
+            // A value the registration states itself is its own and goes.
+            if REQUEST_CREDENTIALS.contains(&lower.as_str()) {
+                tracing::warn!(
+                    "registration {} asks for the request's credential header {k:?}; not forwarded",
+                    reg.reg_id
+                );
+                continue;
+            }
             match headers.get(k.as_str()).and_then(|h| h.to_str().ok()) {
                 Some(h) => h.to_owned(),
                 None => continue,
