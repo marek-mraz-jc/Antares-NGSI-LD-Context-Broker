@@ -811,6 +811,7 @@ async fn federate_temporal(
     if !crate::federation::active(req.params) || looped {
         return Ok(all);
     }
+    let mut proxies = Vec::new();
     let fed = crate::federation::fed_query_temporal(
         req.st,
         req.tenant,
@@ -818,8 +819,13 @@ async fn federate_temporal(
         req.ctx,
         req.params,
         warnings,
+        &mut proxies,
     )
     .await?;
+    let mut all = all;
+    for doc in &mut all {
+        crate::federation::drop_proxied_local(doc, &proxies, req.ctx);
+    }
     Ok(merge_federated(all, &fed, timeprop))
 }
 

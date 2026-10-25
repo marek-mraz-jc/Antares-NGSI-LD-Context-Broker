@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 /// The `requestState` of an `InputRequiredResult`, and its question.
-fn asked(a: &Answer) -> Result<(String, String), String> {
+pub(crate) fn asked(a: &Answer) -> Result<(String, String), String> {
     let r = a.result();
     if r.get("resultType") != Some(&json!("input_required")) {
         return Err(format!("not asked: {}", a.text));

@@ -110,7 +110,7 @@ pub async fn upsert_temporal(
             for reg in &regs {
                 if !reg.supports("upsertTemporal") {
                     if reg.is_proxy() {
-                        parts.push(crate::federation::conflict_part("upsertTemporal"));
+                        parts.push(crate::federation::conflict_part("upsertTemporal", reg));
                     }
                     continue;
                 }
@@ -124,10 +124,10 @@ pub async fn upsert_temporal(
             if has_attrs || proxies.is_empty() {
                 let local = expand_entity(&rest, &parsed.ctx, TEMPORAL_OPTS)?;
                 let status = upsert_temporal_local(&st, &tenant, &id, local).await?;
-                parts.push(crate::federation::Part {
-                    status: status.as_u16(),
-                    detail: "local temporal upsert".into(),
-                });
+                parts.push(crate::federation::Part::local(
+                    status.as_u16(),
+                    "local temporal upsert",
+                ));
             }
             let ctx_url = crate::federation::ctx_link_url(&headers, &parsed.ctx.source);
             for (reg, frag) in fwd {
@@ -148,6 +148,7 @@ pub async fn upsert_temporal(
             }
             return Ok(crate::federation::combine(
                 st.profile,
+                Some(&id),
                 parts,
                 created(
                     format!(
@@ -359,7 +360,7 @@ pub async fn add_temporal_attrs(
             for reg in &regs {
                 if !reg.supports("appendAttrsTemporal") {
                     if reg.is_proxy() {
-                        parts.push(crate::federation::conflict_part("appendAttrsTemporal"));
+                        parts.push(crate::federation::conflict_part("appendAttrsTemporal", reg));
                     }
                     continue;
                 }
@@ -391,14 +392,11 @@ pub async fn add_temporal_attrs(
                     })
                     .await?;
                 parts.push(match res {
-                    Some(Ok(())) => crate::federation::Part {
-                        status: 204,
-                        detail: "added locally".into(),
-                    },
-                    _ => crate::federation::Part {
-                        status: 404,
-                        detail: format!("temporal entity {id} not found locally"),
-                    },
+                    Some(Ok(())) => crate::federation::Part::local(204, "added locally"),
+                    _ => crate::federation::Part::local(
+                        404,
+                        format!("temporal entity {id} not found locally"),
+                    ),
                 });
             }
             let ctx_url = crate::federation::ctx_link_url(&headers, &parsed.ctx.source);
@@ -424,6 +422,7 @@ pub async fn add_temporal_attrs(
             }
             return Ok(crate::federation::combine(
                 st.profile,
+                Some(&id),
                 parts,
                 no_content(&tenant),
                 &tenant,
@@ -641,25 +640,20 @@ pub(super) async fn answer_temporal_attr_write(
         };
     }
     let local_part = match &local.res {
-        None => crate::federation::Part {
-            status: 404,
-            detail: format!("temporal entity {id} not found locally"),
-        },
-        Some(_) if local.found => crate::federation::Part {
-            status: 204,
-            detail: local.applied.into(),
-        },
-        Some(_) => crate::federation::Part {
-            status: 404,
-            detail: format!("{} not found locally", local.missing),
-        },
+        None => {
+            crate::federation::Part::local(404, format!("temporal entity {id} not found locally"))
+        }
+        Some(_) if local.found => crate::federation::Part::local(204, local.applied),
+        Some(_) => {
+            crate::federation::Part::local(404, format!("{} not found locally", local.missing))
+        }
     };
     let mut parts = vec![local_part];
     let ctx_url = crate::federation::ctx_link_url(headers, &ctx.source);
     for reg in &regs {
         if !reg.supports(op) {
             if reg.is_proxy() {
-                parts.push(crate::federation::conflict_part(op));
+                parts.push(crate::federation::conflict_part(op, reg));
             }
             continue;
         }
@@ -684,6 +678,7 @@ pub(super) async fn answer_temporal_attr_write(
     }
     Ok(crate::federation::combine(
         st.profile,
+        Some(id),
         parts,
         no_content(tenant),
         tenant,

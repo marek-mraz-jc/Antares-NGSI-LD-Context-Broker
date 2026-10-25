@@ -367,3 +367,82 @@ async fn the_views_own_refusals_pass() {
     let a = get(&app, &entities).await;
     assert_eq!(a.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", a.text);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_geoquery_without_geoproperty_filters_the_target_location() {
+    let b = TestBroker::new().await.expect("broker");
+    let app = b.serve(Probe).expect("serve");
+    // the source `location` of each Car lies where the other Car's
+    // `position` is: filtering the source `location` answers the wrong Car
+    for (id, position, location) in [
+        ("urn:ngsi-ld:Car:1", [17.10, 48.10], [19.10, 48.70]),
+        ("urn:ngsi-ld:Car:2", [19.10, 48.70], [17.10, 48.10]),
+    ] {
+        let car = json!({"id": id, "type": "Car",
+            "position": {"type": "GeoProperty", "value": {"type": "Point", "coordinates": position}},
+            "location": {"type": "GeoProperty", "value": {"type": "Point", "coordinates": location}}});
+        let a = send(
+            &app,
+            Method::POST,
+            "/ngsi-ld/v1/entities",
+            &[("NGSILD-Tenant", "city")],
+            Some(&car),
+        )
+        .await;
+        assert_eq!(a.status, StatusCode::CREATED, "{}", a.text);
+    }
+    let view = json!({
+        "id": "vehicles", "tenant": "city", "selector": ["Car"],
+        "rules": [{"types": ["Car"], "attributes": ["position", "location"]}],
+        "operations": ["query_entities"],
+        "mapping": {"version": 2, "sourceClass": "Car", "targetClass": "Vehicle", "slots": [
+            {"target": "location", "source": "position", "kind": "rename", "filterable": true},
+            {"target": "registeredAt", "source": "location", "kind": "rename", "filterable": true}
+        ]}
+    });
+    let a = send(&app, Method::PUT, "/q/views/vehicles", &[], Some(&view)).await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.text);
+    let near = "georel=near%3BmaxDistance%3D%3D1000&geometry=Point&coordinates=%5B17.1%2C48.1%5D";
+    let ids = |a: &Answer| -> Vec<Value> {
+        a.json
+            .as_array()
+            .map(|e| e.iter().map(|e| e["id"].clone()).collect())
+            .unwrap_or_default()
+    };
+    let a = get(&app, &format!("{ROOT}/entities?type=Vehicle&{near}")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.text);
+    assert_eq!(ids(&a), vec![json!("urn:ngsi-ld:Car:1")], "{}", a.text);
+    let a = get(
+        &app,
+        &format!("{ROOT}/entities?type=Vehicle&{near}&geoproperty=registeredAt"),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.text);
+    assert_eq!(ids(&a), vec![json!("urn:ngsi-ld:Car:2")], "{}", a.text);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_value_a_slot_cannot_translate_is_not_served() {
+    let (_b, app) = fixture().await.expect("fixture");
+    let car = json!({"id": "urn:ngsi-ld:Car:3", "type": "Car",
+        "colour": {"type": "LanguageProperty", "languageMap": {"sk": "červená"}}});
+    let a = send(
+        &app,
+        Method::POST,
+        "/ngsi-ld/v1/entities",
+        &[("NGSILD-Tenant", "city")],
+        Some(&car),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.text);
+    let a = get(
+        &app,
+        &format!("{ROOT}/entities/urn:ngsi-ld:Car:3/attrs/paint"),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND, "{}", a.text);
+    let a = get(&app, &format!("{ROOT}/entities/urn:ngsi-ld:Car:3")).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.text);
+    assert_eq!(a.json.get("paint"), None, "{}", a.text);
+    in_the_target_model(&a);
+}

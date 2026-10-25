@@ -687,6 +687,7 @@ pub fn present_subscription(doc: &Value, ctx: &Context, sys_attrs: bool, csource
                         .collect();
                     n.insert("attributes".into(), Value::Array(na));
                 }
+                mask_receiver_info(&mut n);
                 out.insert("notification".into(), Value::Object(n));
             }
             "geoQ" => {
@@ -728,6 +729,57 @@ pub fn present_subscription(doc: &Value, ctx: &Context, sys_attrs: bool, csource
     };
     out.insert("status".into(), Value::String(status.into()));
     Value::Object(out)
+}
+
+/// What a read answers in place of each `endpoint.receiverInfo` value.
+const MASKED: &str = "***";
+
+/// `receiverInfo` carries the credentials a notification is sent with (6.3.8: each pair is a
+/// header, the Authorization header the example). No read answers them: the keys stay, the
+/// values are [`MASKED`] (T-5565, CC-06).
+fn mask_receiver_info(notification: &mut Map<String, Value>) {
+    let pairs = notification
+        .get_mut("endpoint")
+        .and_then(|e| e.get_mut("receiverInfo"))
+        .and_then(Value::as_array_mut);
+    for pair in pairs.into_iter().flatten() {
+        if let Some(v) = pair.get_mut("value") {
+            *v = Value::String(MASKED.into());
+        }
+    }
+}
+
+/// A client that reads a Subscription and writes its `notification` back sends the
+/// [`MASKED`] values it was answered. Such a value keeps the credential stored under the same
+/// key instead of overwriting it; a key the stored endpoint lacks keeps the literal value.
+fn keep_masked_receiver_info(fragment: &mut Map<String, Value>, stored: &Map<String, Value>) {
+    let held = stored
+        .get("notification")
+        .and_then(|n| n.get("endpoint"))
+        .and_then(|e| e.get("receiverInfo"))
+        .and_then(Value::as_array);
+    let Some(held) = held else {
+        return;
+    };
+    let pairs = fragment
+        .get_mut("notification")
+        .and_then(|n| n.get_mut("endpoint"))
+        .and_then(|e| e.get_mut("receiverInfo"))
+        .and_then(Value::as_array_mut);
+    for pair in pairs.into_iter().flatten() {
+        if pair.get("value").and_then(Value::as_str) != Some(MASKED) {
+            continue;
+        }
+        let key = pair.get("key").cloned();
+        let previous = held
+            .iter()
+            .find(|h| h.get("key") == key.as_ref())
+            .and_then(|h| h.get("value"))
+            .cloned();
+        if let (Some(previous), Some(v)) = (previous, pair.get_mut("value")) {
+            *v = previous;
+        }
+    }
 }
 
 // ---------- handlers (parameterized by Kind) ----------
@@ -1216,6 +1268,8 @@ pub async fn update(
                 )));
             }
             let target = antares_store::stored_object(doc)?;
+            let mut norm = norm.clone();
+            keep_masked_receiver_info(&mut norm, target);
             crate::apply_doc_fragment(target, &norm, &ts);
             // 5.2.12 holds for the updated Subscription too: deleting both
             // selectors is refused and nothing is written
@@ -1424,6 +1478,32 @@ mod tests {
     use super::*;
     use antares_jsonld::Loader;
     use serde_json::json;
+
+    fn receiver_info(pairs: Value) -> Map<String, Value> {
+        let doc =
+            json!({"notification": {"endpoint": {"uri": "http://h/n", "receiverInfo": pairs}}});
+        doc.as_object().cloned().unwrap_or_default()
+    }
+
+    /// T-5565: a masked value keeps the stored one only under the same key;
+    /// with nothing stored, or a key the stored endpoint lacks, the literal
+    /// value is what the client wrote.
+    #[test]
+    fn a_masked_value_keeps_only_a_credential_stored_under_its_key() {
+        let written = json!([{"key": "X-New", "value": MASKED}, {"key": "A", "value": MASKED}]);
+        let mut fragment = receiver_info(written.clone());
+        keep_masked_receiver_info(&mut fragment, &Map::new());
+        assert_eq!(fragment, receiver_info(written));
+
+        let stored = receiver_info(json!([{"key": "A", "value": "Bearer s"}]));
+        let mut fragment = receiver_info(
+            json!([{"key": "X-New", "value": MASKED}, {"key": "A", "value": MASKED}]),
+        );
+        keep_masked_receiver_info(&mut fragment, &stored);
+        let expected =
+            json!([{"key": "X-New", "value": MASKED}, {"key": "A", "value": "Bearer s"}]);
+        assert_eq!(fragment, receiver_info(expected));
+    }
 
     /// Table 5.2.33-1 `type`: "To indicate a request for all Entities (with
     /// implied local scope), \"*\" is also allowed as a value." It is neither

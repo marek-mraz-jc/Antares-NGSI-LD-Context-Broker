@@ -116,14 +116,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: surfaces-conformance
           save-if: ${{ github.event_name != 'pull_request' }}
       - run: cargo build --locked -p antares-broker --features full,linkml
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: broker-surfaces
           path: target/debug/antares
@@ -139,8 +139,8 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: broker-surfaces
       - name: Start the broker and load the views
@@ -162,7 +162,7 @@ jobs:
               --url http://localhost:8080/x/views/all/mcp --spec-version "$version" \
               --expected-failures ci/mcp-baseline.yaml -o "results/$version"
           done
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: mcp-conformance
@@ -188,13 +188,13 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: marek-mraz-jc/joinedcontext-conformance
           ref: ${{ env.CONFORMANCE_REF }}
           path: conformance
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: broker-surfaces
       - name: Install the suites' pinned Python
@@ -228,7 +228,7 @@ jobs:
           # shellcheck disable=SC2086 # one word per suite file
           ../../../.venv/bin/python -m pytest -q -m "not platform_only" \
             --junitxml=../../../reports/mcp-suites.xml $suites
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: mcp-suites
@@ -253,13 +253,13 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: marek-mraz-jc/joinedcontext-conformance
           ref: ${{ env.CONFORMANCE_REF }}
           path: conformance
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: broker-surfaces
       - name: Install the suite's pinned Python and xmllint
@@ -287,7 +287,7 @@ jobs:
           else
             conformance/tests/odata/run.sh -k "abnf or metadata"
           fi
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: odata-conformance
@@ -316,8 +316,8 @@ jobs:
       OCS_SHA256: c89dd48bf58623b2b651a750a4c8ba7d1179cf4257b23464dbf508afe0a7cec6
       ROOT: /x/views/compliance/odata/v4
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: broker-surfaces
       - name: Fetch the pinned suite
@@ -358,7 +358,7 @@ jobs:
           { echo "## OData compliance (NLstn odata-compliance-suite v1.0.3)"; cat gate.md; } >> "$GITHUB_STEP_SUMMARY"
           cat gate.md
           exit $rc
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: odata-compliance-external
@@ -401,8 +401,8 @@ jobs:
       IUT: http://localhost:9090/x/views/${{ matrix.view }}/ogc/features
       BASELINE: ci/ogc-compliance/${{ matrix.view }}.json
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: broker-surfaces
       - name: Start TEAM Engine, the broker and the views
@@ -435,7 +435,7 @@ jobs:
       - name: TEAM Engine log
         if: always()
         run: docker logs teamengine > teamengine.log 2>&1 || true
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: ogc-compliance-external-${{ matrix.view }}
@@ -469,8 +469,8 @@ jobs:
       IUT: http://localhost:9090/x/views/sta/sta/v1.1
       BASELINE: ci/sta-compliance-baseline.json
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: broker-surfaces
       - name: Start TEAM Engine, the broker and the view
@@ -502,7 +502,7 @@ jobs:
       - name: TEAM Engine log
         if: always()
         run: docker logs teamengine > teamengine.log 2>&1 || true
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: sta-compliance-external
@@ -530,13 +530,13 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: marek-mraz-jc/joinedcontext-conformance
           ref: ${{ env.CONFORMANCE_REF }}
           path: conformance
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: broker-surfaces
       - name: The AsyncAPI document is valid (ADR-0026 rule 11)
@@ -566,7 +566,7 @@ jobs:
         run: |
           export PATH="$PWD/.venv/bin:$PATH"
           conformance/tests/ws/run.sh
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: ws-conformance
@@ -592,13 +592,13 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: marek-mraz-jc/joinedcontext-conformance
           ref: ${{ env.CONFORMANCE_REF }}
           path: conformance
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: broker-surfaces
       - name: Install the suite's pinned Python (linkml, pyshacl)
@@ -620,7 +620,7 @@ jobs:
         run: |
           export PATH="$PWD/.venv/bin:$PATH"
           conformance/tests/linkml/run.sh
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: linkml-conformance
@@ -652,21 +652,21 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: marek-mraz-jc/joinedcontext-conformance
           ref: ${{ env.CONFORMANCE_REF }}
           path: conformance
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: broker-surfaces
       - if: matrix.client == 'dotnet'
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
         with:
           dotnet-version: "10.0.x"
       - if: matrix.client == 'sap'
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
       - name: Start the broker and load the views
@@ -681,7 +681,7 @@ jobs:
           ODATA_URL: http://localhost:8080/x/views/all/odata/v4
           ODATA_RESTRICTED_URL: http://localhost:8080/x/views/parity-restricted/odata/v4
         run: conformance/tests/odata/clients/${{ matrix.client }}/run.sh
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: odata-clients-${{ matrix.client }}
@@ -711,7 +711,7 @@ jobs:
     env:
       OUT: results/iop-${{ matrix.variant }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build the ${{ matrix.variant }} image
         run: |
           f=""; [ "${{ matrix.variant }}" = full ] && f=mqtt,views,mcp,odata,ws
@@ -726,7 +726,7 @@ jobs:
           CALLBACK_HOST: localhost
           API_SURFACES: ${{ matrix.variant == 'full' && 'admin,views,mcp,odata,ws' || 'admin' }}
         run: ./dev/etsi-pipeline.sh || true
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: etsi-iop-${{ matrix.variant }}
@@ -748,8 +748,8 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: etsi-iop-*
           path: in
@@ -784,7 +784,7 @@ jobs:
     env:
       OUT: results/icsr-${{ matrix.variant }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build the ${{ matrix.variant }} image
         run: |
           f=""; [ "${{ matrix.variant }}" = full ] && f=internal-csr,mqtt,views,mcp,odata,ws
@@ -799,7 +799,7 @@ jobs:
           CALLBACK_HOST: localhost
           SELF_URLS: ${{ matrix.variant == 'full' && 'http://localhost:9090' || '' }}
         run: ./dev/etsi-pipeline.sh || true
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: etsi-icsr-${{ matrix.variant }}
@@ -821,8 +821,8 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: etsi-icsr-*
           path: in
@@ -856,7 +856,7 @@ jobs:
     env:
       OUT: results/etsi-${{ matrix.run }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build the full image
         run: docker build --build-arg FEATURES=mqtt,views,mcp,odata,ws -t antares-local:latest .
       - name: The serial suites (${{ matrix.run }})
@@ -871,7 +871,7 @@ jobs:
           VIEWS: ${{ matrix.run == 'e2' && 'ci/views/etsi' || '' }}
           NGSILD_BASE: ${{ matrix.run == 'e2' && '/x/views/all/ngsi-ld/v1' || '/ngsi-ld/v1' }}
         run: ./dev/etsi-pipeline.sh || true
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: etsi-full-all-${{ matrix.run }}
@@ -892,7 +892,7 @@ jobs:
     env:
       OUT: results/etsi-e4
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build the full image
         run: docker build --build-arg FEATURES=mqtt,views,mcp,odata,ws -t antares-local:latest .
       - name: The serial suites through view etsi-restricted
@@ -907,7 +907,7 @@ jobs:
           VIEWS: ci/views/etsi
           NGSILD_BASE: /x/views/etsi-restricted/ngsi-ld/v1
         run: ./dev/etsi-pipeline.sh || true
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: etsi-full-restricted-e4
@@ -930,12 +930,12 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: etsi-full-all-e1
           path: in/e1
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: etsi-full-restricted-e4
           path: in/e4
@@ -945,7 +945,7 @@ jobs:
         run: |
           pip install --quiet pyyaml
           python3 dev/etsi-view-diff.py ci/views/etsi/etsi-restricted.json in/e1 in/e4 | tee view-diff.txt
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: etsi-full-restricted-diff
@@ -971,8 +971,8 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: etsi-full-all-*
           path: in
@@ -982,7 +982,7 @@ jobs:
         run: |
           pip install --quiet pyyaml
           python3 dev/etsi-view-diff.py ci/views/etsi/all.json in/etsi-full-all-e1 in/etsi-full-all-e2 | tee view-diff.txt
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: etsi-full-all-diff

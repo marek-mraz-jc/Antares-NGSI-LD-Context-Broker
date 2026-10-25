@@ -25,6 +25,19 @@ Every case that fails or errors in the Coraine reference cell (vanilla binary, f
 | harness | 18 |
 | total | 335 |
 
+### 2.1 Follow-up of the "Antares bug" cases
+
+Since T-5210 (2026-10-22) each of the 45 cases has a task: `T-5213` (parked in `tasks/later/`), one group per cause.
+Re-run on the current Coraine ref before fixing: this table is the run of 74b72185, and later commits may have fixed a case.
+
+| group | cases | task |
+|---|---:|---|
+| A output form: array reduction, concise multi-instance, Link vs inline `@context` | 9 | T-5213 A |
+| B distributed operations: every `csource-reg-distops-*`, `distop_*`, `entity_*_local_reg_conflict`, `entity_batch_upsert_distops_*`, `linked_entities_objecttype_*`, `troe_timescale_temporal_distop_*` | 19 | T-5213 B |
+| C temporal history: `troe_entity_modifiedat_attr_update` and the other `troe_timescale_*` | 6 | T-5213 C |
+| D input validation: `context_embedded`, `duplicate_id_type_alias_every_level`, `entity_patch_geoproperty_validation`, `expanded_core_terms_input`, `jsonld_json_typed_is_verbatim`, `patch_entity_url_params`, `post_query_errors`, `simplified_input_matrix`, `value_type_subattr` | 9 | T-5213 D |
+| E tenants and subscriptions: `tenant_implicit_create`, `subscription_periodic_other_tenant` | 2 | T-5213 E |
+
 ## 3. Cases
 
 Rows with the same cause and clause share one line; the cases are in alphabetical order.
@@ -204,7 +217,7 @@ Rows with the same cause and clause share one line; the cases are in alphabetica
 | Antares per spec | entitymap_paginate_with_filter | page by ?entityMap=<id> omitting bound params: too wide | 5.7.2.4 too wide query |
 | Antares per spec | entitymap_patch | Antares caps the requested expiresAt at its maximum EntityMap lifetime | Table 6.4.3.2-1 expiresAt: "possibly overriding the requested duration" |
 | Antares per spec | http_error_207_always_json | batch merge of a missing id -> 207 (Coraine 404) | 5.6.20.4: failures go to the BatchOperationResult errors; binding answers 207 |
-| Antares per spec | json_property | JsonProperty json must be an object or array of objects | 4.5.24.2: json is "a raw JSON object (or array of objects)"; "abc" refused |
+| Antares per spec | json_property | JsonProperty json must be an object or array of objects | 4.5.24.2: json is "a raw JSON object (or array of objects)"; "abc" refused. T-5580 accepts it (TS 104 175 5.2.6.4.10: any NGSI-LD Value) |
 | Antares per spec | langprop_create_errors | empty string as a languageMap value accepted | 4.5.18.2: "non-empty language tags ... mapping to a single string or array of strings" (the tag must be non-empty, the string need not) |
 | Antares per spec | langprop_create_get_entity | attribute name Sub-P refused by the name grammar | 4.6.2: name = unicodeLetter *nameChar, nameChar = unicodeNumber / unicodeLetter / "_"; "implementations should raise an error of type BadRequestData" |
 | Antares per spec | linked_entities_distop | merge of type-less {objectType} fragment read as a new Property value, so join has nothing to follow | 4.5.2.3: concise Property "value" Mandatory; Merge of a type-less fragment without value (decided per spec) |
@@ -337,7 +350,7 @@ Changes against section 3: `entity_create_local_reg_conflict` and `entity_update
 | case | group | now | first difference | CIM 009 V1.9.1 | TS 104 175 V1.1.1 | Antares code (dev 98e7f381) | verdict |
 |---|---|---|---|---|---|---|---|
 | append_scope_union_single | A T-5463 | fail | step 3 GET options=keyValues after a noOverwrite scope union: scope returned as ["/x"] (one-element array), expected "/x" | 4.5.1 p.47-48: "scope" whose value shall be a Scope as defined in clause 4.18 or an unordered JSON array with multiple Scopes in case of an Entity that has multiple Scopes. | 5.2.7 p.92: The value of scope is represented as a JSON array in case there is more than one Scope. | attrs.rs:339-351 stores Array(cur) for the union; compact.rs:163 (compact_entity_shallow, keyValues) copies scope verbatim while compact.rs:53-55 (compact_entity) unwraps a one-element scope | Antares wrong (both versions) |
-| array_reduction_entity_data | A T-5463 | fail | step 1 create answered 400 instead of 201 (JsonProperty json ["a"] refused); later steps also expect one-element arrays reduced (second difference, spec unclear as in attr_single_element_array_reduction) | 4.5.24.2 p.78-79: "json": a raw JSON object (or array of objects) which contains data which is not available for JSON-LD | 5.2.6.4.10 p.65-67: json (see note 1) JSON See NGSI-LD Value definition in clause 3.1 | expand.rs:1059-1073 refuses a json that is not an object or array of objects (json must be an object or array of objects) | spec-upgrade |
+| array_reduction_entity_data | A T-5463 | fail | step 1 create answered 400 instead of 201 (JsonProperty json ["a"] refused); later steps also expect one-element arrays reduced (second difference, spec unclear as in attr_single_element_array_reduction) | 4.5.24.2 p.78-79: "json": a raw JSON object (or array of objects) which contains data which is not available for JSON-LD | 5.2.6.4.10 p.65-67: json (see note 1) JSON See NGSI-LD Value definition in clause 3.1 | expand.rs:1059-1073 refuses a json that is not an object or array of objects (json must be an object or array of objects); step 01 fixed by T-5580 | spec-upgrade |
 | attr_single_element_array_reduction | A T-5463 | fail | step 2 GET: A1 [1], A2 value [2], A3 value ["x"] come back as value [1] / [2] / ["x"], expected the bare element (A4 [1,2] kept) | 4.5.0 p.47: For the use with the API, the compacted JSON-LD representation is used, i.e. short terms are used (no sentence on one-element arrays; 3.1 p.23-26 lists "an array" as an NGSI-LD Value) | 3.1 p.20-23: NGSI-LD Value: JSON value (i.e. a string, a number, true or false, an object, an array), or JSON-LD typed value | compact.rs:10-14 VERBATIM holds "value", so compact_instance keeps the stored array; expand.rs:875-878 stores a concise array value unchanged | spec unclear (both) |
 | context_embedded | re-bucketed T-5213 | fail | step 4 batch create where one element embeds an @context: 207 (V4 success, V5 error BadRequestData), Coraine expects 400 for the whole request (steps 1-3 now pass) | 5.6.7.4 p.169-170: Let E be an array which shall contain a list of BatchEntityError as defined by clause 5.2.17, one for each NGSI-LD Entity which resulted in error. | 10.3.2.4 p.189-190: Let E be an array which shall contain a list of BatchEntityError as defined by clause 5.2.6.8.2, one for each NGSI-LD Entity which resulted in error. (8.2.4 p.148-149: Parts of user @context that are not following the two points above should result in an error of type BadRequestData) | expand.rs:955,986,1159 raise BadRequestData per attribute; batch create reports it per entity (207) | spec unclear (both) |
 | context_remote_parkingspot_complex_payload | A T-5463 | fail | step 2 GET: category value ["onstreet"] returned as an array, expected "onstreet" | 4.5.0 p.47: For the use with the API, the compacted JSON-LD representation is used, i.e. short terms are used | 3.1 p.20-23: NGSI-LD Value: JSON value (i.e. a string, a number, true or false, an object, an array), or JSON-LD typed value | compact.rs:10-14 VERBATIM includes "value" (kept as stored) | spec unclear (both) |
@@ -381,6 +394,25 @@ Changes against section 3: `entity_create_local_reg_conflict` and `entity_update
 | troe_timescale_temporal_linked_projection | fixed T-5213 | pass | none now (was: attrs with a Linked Entity projection accepted on temporal reads) | 5.7.3.4 p.205-206: "If projection attributes are present and indicate the use of Linked Entity retrieval, an error of type BadRequestData shall be raised." | 11.3.2.4 p.235-237: "If projection attributes are present and indicate the use of Linked Entity retrieval, an error of type BadRequestData shall be raised." (11.3.3.4 same for query) | crates/antares-api/src/temporal.rs:1054-1070 reject_linked_projection (pick/omit depth or attrs with brace) | Antares right |
 | value_type_subattr | fixed T-5213 | pass | none now (was: valueType accepted on a Relationship / ListRelationship) | 4.5.3.2 p.52-53: "An NGSI-LD Relationship in normalized representation shall be represented by a member whose key is the" Relationship name; its member list has no valueType, which 4.5.2.2 defines for a Property: "\"valueType\": a string value which shall be type coerced into a datatype URI." | 5.2.6.4.4 p.52-54: "The supported JSON members shall comply with the requirements provided in Table 5.2.6.4.4-1." (table has no valueType; valueType is in Property table 5.2.6.4.3 p.49-52) | crates/antares-jsonld/src/expand.rs:664-670 (valueType on Relationship/ListRelationship is BadRequestData) | Antares right |
 | vocab_property | A T-5463 | fail | step 34 GET: concise V2 {"vocab": ["test"]} returned with vocab ["test"], expected "test" | 4.5.20.2 p.74: "vocab": a JSON object consisting of a single string or array of strings | 5.2.6.4.7 p.59-61: vocab (see note 1) String or String[] | compact.rs:103-117 compacts a vocab array element by element and keeps the array | spec unclear (both) |
+
+### 4.1.1 Fixed by T-5464 (group B)
+
+Each `Antares wrong (both versions)` row of group B has a broker test in `crates/antares-api/tests/federation_loop.rs` that asserts the clause quoted in 4.1 and failed on dev `b3f454da`:
+
+| case | test | change |
+|---|---|---|
+| csource-reg-distops-create-207, csource-reg-distops-create-409 | `clause_5_2_17_distributed_create_207_is_a_batch_operation_result`, `inclusive_partial_failure_is_207` | the 207 is a BatchOperationResult: `success` holds the Entity id, each error carries `entityId`, `registrationId` and the source's own status (`federation::combine`) |
+| csource-reg-distops-create-excl-no-op | `clause_5_6_1_4_unsupported_part_is_a_conflict_inside_the_207` | an unsupported operation stays type Conflict inside the 207 |
+| csource-reg-distops-append-exclusive | `clause_5_6_3_4_append_forwards_only_the_registered_attributes` | Append and Update Attributes forward to each registration only the Attributes it covers (`fed_attr_parts`) |
+| csource-reg-distops-updated-dedup | `clause_5_2_18_a_source_update_result_is_unfolded` | a source's 207 UpdateResult is read: its `updated` names count as updated, its `notUpdated` reasons pass through |
+| csource-reg-distops-retrieve-upstream-error | `clause_6_3_17_single_source_read_failure_is_502` | a single exclusive or redirect source failing a Retrieve Entity answers 502 with `registrationId`; its 404 stays 404 |
+| distop_retrieve_timeout_504 | `clause_6_3_17_single_source_read_timeout_is_504` | the same source timing out answers 504, a refused connection 502 |
+| linked_entities_objecttype_gate | `clause_4_5_23_1_object_typed_link_joins_a_registered_entity` | an inline join reads a target not stored locally through a registration holding its id under the Relationship's objectType |
+| troe_timescale_temporal_distop_query_exclusive | `clause_4_3_6_3_exclusive_temporal_reads_drop_the_local_history` | temporal query and retrieve drop the local history of an Attribute an exclusive or redirect registration claims |
+
+In the local vanilla file-store cell (Coraine `d313d87`, branch build) 6 of the 9 pass: append-exclusive, create-207, create-409, create-excl-no-op, distop_retrieve_timeout_504 and linked_entities_objecttype_gate.
+
+Differences left in these Coraine cases after the fix, none of them a broker defect: `statusCode` in NotUpdatedDetails and ProblemDetails (csource-reg-distops-updated-dedup, -retrieve-upstream-error; no such member in 5.2.19 or 5.5.2), `updated` and `attributeName` as expanded IRIs (5.5.7), urn:V3 listed by Coraine although the registration does not name it (4.3.6.1), and the flattened join form, which does not read registered targets yet.
 
 ### 4.2 Sample of "spec unclear" against TS 104 175
 

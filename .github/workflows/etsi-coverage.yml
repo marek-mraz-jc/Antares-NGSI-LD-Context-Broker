@@ -39,18 +39,18 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # instrument-coverage RUSTFLAGS produce artifacts incompatible with
           # the other workflows' caches — keep a separate one.
           key: etsi-coverage
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-llvm-cov
 
@@ -110,7 +110,7 @@ jobs:
 
       - name: Upload coverage results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: etsi-coverage-${{ matrix.store }}
           path: results/coverage-${{ matrix.store }}
@@ -125,8 +125,8 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           pattern: etsi-coverage-*
           path: cells
@@ -201,7 +201,7 @@ jobs:
           [ -f merged-unit.info ] && genhtml merged-unit.info -o html/unit --ignore-errors inconsistent
           [ -f merged-robot.info ] && genhtml merged-robot.info -o html/robot --ignore-errors inconsistent
           true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: etsi-coverage-merged
           path: |
@@ -227,7 +227,7 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/failure-issue
         with:
           title: ETSI coverage run failed

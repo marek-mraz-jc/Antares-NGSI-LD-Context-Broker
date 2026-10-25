@@ -19,6 +19,7 @@
 //! let everything = antares_ops::views::View::default();
 //! ```
 
+use crate::mapping::Mapping;
 use crate::OperationId;
 use antares_api::policy::Rule;
 use antares_api::views::{CompiledView, Schema, ViewEntry, SCHEMA_ID_PREFIX};
@@ -32,7 +33,7 @@ use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Weak};
 
 mod preview;
@@ -133,7 +134,9 @@ pub struct View {
 }
 
 /// The surfaces a view's `representations` may name.
-pub const REPRESENTATIONS: &[&str] = &["ical", "feed", "ogc", "geojson", "csv", "gbfs"];
+pub const REPRESENTATIONS: &[&str] = &[
+    "ical", "feed", "ogc", "geojson", "csv", "gbfs", "sta", "odata",
+];
 
 pub use crate::outputs::MAX_OUTPUTS;
 
@@ -275,7 +278,7 @@ impl View {
             geo_q("geoQ", self.geo_q.as_ref())?,
         );
         let operations = operations(&self.operations)?;
-        let (view, notes, selector) = if self.is_every()? {
+        let (view, mut notes, selector) = if self.is_every()? {
             (
                 CompiledView::every(q, scope, geo),
                 Vec::new(),
@@ -301,13 +304,11 @@ impl View {
         };
         let mapping = match &self.mapping {
             None => None,
-            Some(ir) => Some(Arc::new(mapped(
-                ir,
-                &ctx,
-                self.context.as_ref(),
-                &selector,
-                &operations,
-            )?)),
+            Some(ir) => {
+                let mut mapping = mapped(ir, &ctx, self.context.as_ref(), &selector, &operations)?;
+                notes.extend(hidden_slots_note(&mut mapping, &view));
+                Some(Arc::new(mapping))
+            }
         };
         if let Some(named) = &self.representations {
             if let Some((name, _)) = named.iter().find(|(name, member)| {
@@ -349,6 +350,27 @@ impl View {
         }
         Ok(loaded)
     }
+}
+
+/// The note of a mapped view whose rules hide what some slots read: such a
+/// slot is never served nor read by a filter (T-5210).
+fn hidden_slots_note(mapping: &mut Mapping, view: &CompiledView) -> Option<String> {
+    let shown: BTreeSet<String> = view
+        .narrowing()
+        .rules
+        .iter()
+        .filter(|rule| rule.types.iter().any(|t| t == mapping.source_class()))
+        .flat_map(|rule| rule.attributes.iter().cloned())
+        .collect();
+    let hidden = mapping.hide(&shown);
+    (!hidden.is_empty()).then(|| {
+        format!(
+            "the mapping serves {} from source Attributes no rule of the view shows: they are \
+             never served (a source Attribute renamed or removed in the model, or hidden by a \
+             Policy)",
+            hidden.join(", ")
+        )
+    })
 }
 
 /// Section 3 and 7: the IR compiles, the view selects its source class
@@ -1391,6 +1413,30 @@ mod tests {
         let mut v = mapped();
         v["mapping"]["version"] = json!(1);
         assert!(load(&v).err().unwrap_or_default().contains("version 1"));
+    }
+
+    #[test]
+    fn a_slot_whose_source_the_rules_do_not_show_is_noted_and_not_served() {
+        assert!(load(&mapped()).is_ok_and(|l| l.notes.is_empty()));
+        // the model renamed `speed`: the rules show the new name only
+        let mut v = mapped();
+        v["rules"] = json!([{"types": ["Car"], "attributes": ["velocityKmh"]}]);
+        let loaded = load(&v).expect("a hidden slot does not refuse the view");
+        assert_eq!(loaded.notes.len(), 1, "{:?}", loaded.notes);
+        assert!(
+            loaded
+                .notes
+                .iter()
+                .any(|n| n.contains("serves velocity from")),
+            "{:?}",
+            loaded.notes
+        );
+        let sort = [("orderBy".to_owned(), "velocity".to_owned())];
+        assert_eq!(
+            loaded.mapping.as_deref().map(|m| m.invert(&sort).err()),
+            Some(Some(crate::mapping::NOT_FILTERABLE)),
+            "no sort reads a hidden slot"
+        );
     }
 
     #[test]

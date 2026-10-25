@@ -64,7 +64,7 @@ async fn describe_type_answers_the_guide_text_first_and_nothing_for_a_hidden_typ
         .and_then(Value::as_str)
         .unwrap_or_default();
     assert!(
-        first.starts_with("Event: time startDate..endDate (a range)"),
+        first.contains("\n```text\nEvent: time startDate..endDate (a range)"),
         "{}",
         a.text
     );

@@ -254,6 +254,7 @@ async fn load_evolution(
             NgsiError::ResourceNotFound(format!("temporal entity {id} not found"))
         })?);
     }
+    let mut proxies = Vec::new();
     let fed = crate::federation::fed_retrieve_temporal(
         st,
         tenant,
@@ -263,8 +264,13 @@ async fn load_evolution(
         req.params,
         req.map,
         warnings,
+        &mut proxies,
     )
     .await?;
+    let mut local = local;
+    if let Some(b) = local.as_mut() {
+        crate::federation::drop_proxied_local(b, &proxies, req.ctx);
+    }
     Ok(merge_retrieved(local, &fed, id, timeprop)?)
 }
 

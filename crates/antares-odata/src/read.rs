@@ -687,7 +687,7 @@ pub(crate) async fn collection(
     filter.annotate = annotated(headers);
     let picked = selected_of(set, options.select.as_ref(), &filter.computed)
         .map_err(|()| not_implemented(version))?;
-    let projection = ngsild(&reads.view, options, &mut filter, version)?;
+    let projection = ngsild(&reads.view, options, &mut filter, set, version)?;
     let picked = projected(set, picked, &projection);
     let digest = digest(&reads.state.service_root, path, options);
     let (cursor, skip, top, page) = position(reads, options, digest, headers, version)?;
@@ -773,7 +773,7 @@ pub(crate) async fn count(
         return Err(not_implemented(version));
     }
     let mut filter = filtered(set, &reads.edm.sets, options, version)?;
-    ngsild(&reads.view, options, &mut filter, version)?;
+    ngsild(&reads.view, options, &mut filter, set, version)?;
     let total = match residual_of(&filter, version)? {
         None => {
             let target = format!(
@@ -838,7 +838,7 @@ pub(crate) async fn entity(
         .map_err(|()| not_implemented(version))?;
     let expansions =
         expanded(&reads.edm, set, options, version).map_err(|()| not_implemented(version))?;
-    let id = key_id(set, key, options).ok_or_else(|| not_found(version))?;
+    let id = admitted(reads, caller, set, key, options, version).await?;
     let target = format!(
         "/ngsi-ld/v1/entities/{}?{}",
         encode(&id),
@@ -1116,6 +1116,48 @@ pub(crate) fn key_id(set: &Set, key: &Key, options: &QueryOptions) -> Option<Str
         (_, Literal::String(s)) => Some(s.clone()),
         _ => None,
     }
+}
+
+/// The id `key` names in `set`, as [`key_id`] reads it; in an output's set (T-5225) only when
+/// the output's filter selects that Entity: one Query Entities of the id under the filter, the
+/// 404 of an absent one otherwise.
+pub(crate) async fn admitted(
+    reads: &Reads,
+    caller: &Caller,
+    set: &Set,
+    key: &Key,
+    options: &QueryOptions,
+    version: ODataVersion,
+) -> Result<String, ODataErrorResponse> {
+    let id = key_id(set, key, options).ok_or_else(|| not_found(version))?;
+    if set.output.is_none() {
+        return Ok(id);
+    }
+    let mut filter = Translated {
+        ids: Some(vec![id.clone()]),
+        ..Translated::default()
+    };
+    ngsild(
+        &reads.view,
+        &QueryOptions::default(),
+        &mut filter,
+        set,
+        version,
+    )?;
+    let target = format!("/ngsi-ld/v1/entities?{}&limit=1", selection(set, &filter));
+    let (docs, _) = run(
+        reads,
+        caller,
+        OperationId::QueryEntities,
+        target,
+        &filter,
+        version,
+    )
+    .await?;
+    if docs.is_empty() {
+        return Err(not_found(version));
+    }
+    Ok(id)
 }
 
 /// The canonical key predicate of Entity `urn` in `set`: its identifier's
@@ -1407,7 +1449,7 @@ fn visible_types(edm: &Edm, doc: &Value) -> Vec<String> {
     let types = types_of(doc);
     edm.sets
         .iter()
-        .filter(|(_, s)| types.contains(&core_name(&s.type_iri).as_str()))
+        .filter(|(_, s)| s.output.is_none() && types.contains(&core_name(&s.type_iri).as_str()))
         .map(|(name, _)| name.clone())
         .collect()
 }
@@ -1514,12 +1556,42 @@ pub(crate) fn ngsild(
     view: &ViewOps,
     options: &QueryOptions,
     filter: &mut Translated,
+    set: &Set,
     version: ODataVersion,
 ) -> Result<Projection, ODataErrorResponse> {
     let bad = |message: &str| {
         ODataErrorResponse::new(StatusCode::BAD_REQUEST, "BadRequest", message)
             .with_version(version)
     };
+    // an output's set (T-5225): its filter's `q` a conjunct of the request's, its `scopeQ`
+    // joined with the request's `ngsild.scopeQ` below
+    let ours = set.output.as_ref();
+    if let Some(q) = ours.and_then(|o| o.q.as_deref()) {
+        let q = view
+            .rename_q(q, &mut |iri| mint(&mut filter.context, iri))
+            .map_err(|_| bad("this EntitySet's filter is not an NGSI-LD query"))?;
+        filter.q = Some(match filter.q.take() {
+            Some(theirs) => format!("({q});({theirs})"),
+            None => format!("({q})"),
+        });
+    }
+    let theirs_scope = options
+        .custom
+        .iter()
+        .find(|(name, _)| name == "ngsild.scopeQ")
+        .and_then(|(_, v)| v.as_deref());
+    if let Some(o) = ours {
+        let theirs = theirs_scope
+            .map(|v| {
+                antares_ops::percent::decoded(v)
+                    .ok_or_else(|| bad("ngsild.scopeQ is not percent-encoded"))
+            })
+            .transpose()?;
+        if let Some(scope) = o.scope_with(theirs.as_deref()).map_err(bad)? {
+            filter.ngsild.push_str("&scopeQ=");
+            filter.ngsild.push_str(&encode(&scope));
+        }
+    }
     let mut projection = Projection::default();
     let mut geo = false;
     for (i, (name, value)) in options.custom.iter().enumerate() {
@@ -1557,6 +1629,7 @@ pub(crate) fn ngsild(
                 filter.ngsild.push_str(&encode(&term));
                 geo = true;
             }
+            "ngsild.scopeQ" if ours.is_some() => {}
             // checked by `lang_of`: the broker serves each LanguageProperty in it
             "ngsild.lang" => {
                 filter.ngsild.push_str("&lang=");
@@ -1941,6 +2014,7 @@ mod tests {
             written: crate::edm::Written::Always,
         };
         Set {
+            output: None,
             type_iri: "https://e.org/T".into(),
             identifier: None,
             references: BTreeMap::new(),

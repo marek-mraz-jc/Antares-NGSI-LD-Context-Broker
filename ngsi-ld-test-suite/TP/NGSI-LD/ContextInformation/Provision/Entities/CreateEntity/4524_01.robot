@@ -1,7 +1,8 @@
 *** Settings ***
 Documentation       Verify the 4.5.24 JsonProperty representations.
 ...
-...                 4.5.24.2/3: "json" is a raw JSON object (or array of objects)
+...                 4.5.24.2/3: "json" is raw JSON (TS 104 175 5.2.6.4.10: any
+...                 NGSI-LD Value, CIM 009 said a raw object or array of objects)
 ...                 "never subject to JSON-LD term expansion or compaction";
 ...                 "unitCode: shall never be present, as raw JSON objects are
 ...                 unitless"; "value ... shall never be present, as value is a
@@ -70,15 +71,19 @@ Resource            ${EXECDIR}/resources/JsonUtils.resource
     ...    ${response.json()}
     ...    ${ERROR_TYPE_BAD_REQUEST_DATA}
 
-4524_01_04 Scalar Json Member Is Rejected
-    [Documentation]    4.5.24.2: json is "a raw JSON object (or array of objects)" —
-    ...    a scalar is invalid content → 400 BadRequestData.
-    [Tags]    e-create    4_5_24_2    since_v1.9.1
+4524_01_04 Scalar Json Member Is Kept Verbatim
+    [Documentation]    TS 104 175 5.2.6.4.10: json is typed by the NGSI-LD Value
+    ...    of clause 3.1, a "JSON value (i.e. a string, a number, true or false,
+    ...    an object, an array)"; CIM 009 4.5.24.2's object-only rule is lifted
+    ...    (T-5580). A scalar json is created and read back unchanged.
+    [Tags]    e-create    e-retrieve    4_5_24_2    since_v1.9.1
     ${entity_id}=    Generate Random Vehicle Entity Id
     ${payload}=    Evaluate
     ...    {"id": $entity_id, "type": "Vehicle", "@context": [$ngsild_test_suite_context], "tickets": {"type": "JsonProperty", "json": 5}}
     ${response}=    Create Entity From JSON-LD Content    ${payload}
-    Check Response Status Code    400    ${response.status_code}
-    Check Response Body Containing ProblemDetails Element Containing Type Element set to
-    ...    ${response.json()}
-    ...    ${ERROR_TYPE_BAD_REQUEST_DATA}
+    Check Response Status Code    201    ${response.status_code}
+    ${response}=    Retrieve Entity    ${entity_id}    context=${ngsild_test_suite_context}
+    Check Response Status Code    200    ${response.status_code}
+    ${json}=    Evaluate    $response.json()['tickets']['json']
+    Should Be Equal As Integers    ${json}    5
+    [Teardown]    Delete Entity    ${entity_id}
