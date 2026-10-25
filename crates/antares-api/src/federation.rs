@@ -431,16 +431,26 @@ async fn reg_docs(
     // match that pattern, so narrowing to the id list alone would drop a
     // Context Source 5.12 matches — the one thing a prefilter may never do.
     let ids = spec.ids.as_deref().filter(|_| spec.id_pattern.is_none());
-    match &st.reg_mirror {
-        Some(m) => Ok(m.matching(tenant.as_str(), ids, types.as_deref())),
-        None => Ok(st
+    let mut docs: Vec<std::sync::Arc<Value>> = match &st.reg_mirror {
+        Some(m) => m.matching(tenant.as_str(), ids, types.as_deref()),
+        None => st
             .store
             .matching_registrations(tenant, ids, types.as_deref())
             .await?
             .into_iter()
             .map(std::sync::Arc::new)
-            .collect()),
-    }
+            .collect(),
+    };
+    // The mirror answers in hash order, Postgres in its collation's id order
+    // and the memory store by its own keys: one order for all of them (id,
+    // bytewise) keeps forwards, 207 reasons and the first failing
+    // registration the same whichever one answered (T-5499).
+    docs.sort_by(|a, b| doc_id(a).cmp(doc_id(b)));
+    Ok(docs)
+}
+
+fn doc_id(doc: &Value) -> &str {
+    doc.get("id").and_then(Value::as_str).unwrap_or_default()
 }
 
 /// Does one stored registration take part in this operation, and through
@@ -3542,6 +3552,50 @@ mod tests {
             2,
             "an unvisited peer and a registration with no alias still match"
         );
+    }
+
+    /// T-5499: the registration mirror (hash order) and the store yield the
+    /// matching registrations in one order, by id, so a 207 names the same
+    /// registration whichever of the two answered.
+    #[tokio::test]
+    async fn matching_registrations_come_in_id_order_from_mirror_and_store() {
+        let mut st = AppState::new("me".into());
+        let tenant = antares_model::TenantId::new("default").expect("tenant");
+        let ctx = st.loader.core();
+        let mirror = crate::mirror::DocMirror::default();
+        for n in (0..12).rev() {
+            let id = format!("urn:ngsi-ld:ContextSourceRegistration:r{n:02}");
+            let doc = json!({
+                "id": id,
+                "type": "ContextSourceRegistration",
+                "endpoint": format!("http://peer{n}:9090"),
+                "information": [{"entities": [{"type": "https://uri.etsi.org/ngsi-ld/default-context/Vehicle"}]}],
+            });
+            mirror.apply("default", &id, Some(doc.clone()));
+            st.store
+                .create(&tenant, Kind::Registration, &id, doc)
+                .await
+                .expect("seed registration");
+        }
+        let spec = crate::registry::CsrSpec::default();
+        let want: Vec<String> = (0..12)
+            .map(|n| format!("urn:ngsi-ld:ContextSourceRegistration:r{n:02}"))
+            .collect();
+        let from_store: Vec<String> = matching_regs(&st, &tenant, &spec, &ctx, &hdrs(None))
+            .await
+            .expect("store")
+            .into_iter()
+            .map(|r| r.reg_id)
+            .collect();
+        assert_eq!(from_store, want, "the store answers by id");
+        st.reg_mirror = Some(std::sync::Arc::new(mirror));
+        let from_mirror: Vec<String> = matching_regs(&st, &tenant, &spec, &ctx, &hdrs(None))
+            .await
+            .expect("mirror")
+            .into_iter()
+            .map(|r| r.reg_id)
+            .collect();
+        assert_eq!(from_mirror, want, "the mirror answers in the store's order");
     }
 
     /// TS 104 175 9.7 (T-3459): a write whose Via names this broker is a

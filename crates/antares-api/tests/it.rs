@@ -89,6 +89,7 @@ mod projection_absolute_iri_4_21;
 mod query_binding_parity_5_7_2;
 mod query_json_keys_4_9;
 mod reg_index;
+mod reg_mirror_local_bus;
 mod reg_narrowing_5_12;
 mod registration_counters_5_2_9;
 mod registration_expiry_5_9;

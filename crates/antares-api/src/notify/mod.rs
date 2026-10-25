@@ -188,6 +188,25 @@ pub(crate) async fn wire_matcher(state: &mut AppState) {
         },
     ));
 
+    // bus=local: the registration mirror the nats wiring builds, fed in
+    // process by the registration CUD hook, so a federated query no longer
+    // reads `csource_registrations` per request. Installed only when the
+    // hydrate is whole, by the rule the subscription mirror follows above:
+    // `reg_docs` reads a present mirror as the truth.
+    let regs = Arc::new(crate::mirror::DocMirror::default());
+    match seed_mirror(state.store.as_ref(), regs.as_ref(), Kind::Registration).await {
+        Ok(()) => {
+            state.reg_mirror = Some(regs.clone());
+            state.reg_sync = Some(Arc::new(move |tenant: &TenantId, id: &str, doc| {
+                regs.apply(tenant.as_str(), id, doc.cloned());
+            }));
+        }
+        Err(e) => tracing::error!(
+            "registration mirror hydrate failed ({e}); \
+             federation matching falls back to a store read per request"
+        ),
+    }
+
     // The queue carries whole before+after payloads and is drained one
     // inline delivery at a time, so behind one slow subscriber an unbounded
     // queue grows until the process dies. Bounded instead: a full queue drops

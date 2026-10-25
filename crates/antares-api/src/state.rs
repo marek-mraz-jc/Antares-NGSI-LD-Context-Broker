@@ -392,15 +392,17 @@ pub struct Shared {
     /// layer hands them over after the handler) so the matcher sees a batch
     /// request as one unit. `None` until the local pipeline is wired.
     pub change_flush: Option<Arc<dyn Fn(Vec<crate::mirror::Change>) + Send + Sync>>,
-    /// bus=nats: called after every Registration CUD so the wiring can
-    /// publish the delta on `ANTARES_REGISTRY`. `None` in local mode.
+    /// Called after every Registration CUD: bus=nats publishes the delta on
+    /// `ANTARES_REGISTRY`, bus=local applies it to `reg_mirror` in process.
+    /// `None` while no mirror is wired.
     #[allow(clippy::type_complexity)] // a boxed callback, named where it is installed
     pub reg_sync: Option<
         Arc<dyn Fn(&antares_model::TenantId, &str, Option<&serde_json::Value>) + Send + Sync>,
     >,
-    /// bus=nats: the ONE per-process compiled registration mirror,
-    /// delta-fed from `ANTARES_REGISTRY`; expiry stays filtered at the single
-    /// yield point (`federation::matching_regs`). `None` in local mode.
+    /// The ONE per-process compiled registration mirror, delta-fed from
+    /// `ANTARES_REGISTRY` (bus=nats) or by `reg_sync` (bus=local); expiry
+    /// stays filtered at the single yield point (`federation::matching_regs`).
+    /// `None` until wired or when its hydrate failed: the store is read then.
     pub reg_mirror: Option<Arc<crate::mirror::DocMirror>>,
     /// 5.2.34 (bus=nats): shares a cooldown stamp with the other api pods —
     /// a per-process stamp re-dials a failed source from every pod behind

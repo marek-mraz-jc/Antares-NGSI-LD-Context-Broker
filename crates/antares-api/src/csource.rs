@@ -741,7 +741,9 @@ async fn take_live_registration(
 ) -> Result<Option<Value>, NgsiError> {
     match st.store.get(tenant, Kind::Registration, id).await? {
         Some(doc) if reg_expired(&doc) => {
-            st.store.delete(tenant, Kind::Registration, id).await?;
+            if st.store.delete(tenant, Kind::Registration, id).await? {
+                st.reg_changed(tenant, id, None);
+            }
             Ok(None)
         }
         live => Ok(live),
@@ -779,6 +781,7 @@ pub(crate) async fn sweep_expired_registrations(st: &AppState, tenant: &TenantId
             .await
             .unwrap_or(false)
         {
+            st.reg_changed(tenant, &id, None);
             n = n.saturating_add(1);
         }
     }

@@ -32,6 +32,7 @@ pub struct Double {
     unpaged_queries: AtomicUsize,
     geo_paged: AtomicUsize,
     rows_read: AtomicUsize,
+    registration_reads: AtomicUsize,
 }
 
 impl Double {
@@ -52,6 +53,7 @@ impl Double {
             unpaged_queries: AtomicUsize::new(0),
             geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
+            registration_reads: AtomicUsize::new(0),
         }
     }
 
@@ -73,6 +75,7 @@ impl Double {
             unpaged_queries: AtomicUsize::new(0),
             geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
+            registration_reads: AtomicUsize::new(0),
         }
     }
 
@@ -94,6 +97,7 @@ impl Double {
             unpaged_queries: AtomicUsize::new(0),
             geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
+            registration_reads: AtomicUsize::new(0),
         }
     }
 
@@ -117,6 +121,7 @@ impl Double {
             unpaged_queries: AtomicUsize::new(0),
             geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
+            registration_reads: AtomicUsize::new(0),
         }
     }
 
@@ -152,6 +157,7 @@ impl Double {
             unpaged_queries: AtomicUsize::new(0),
             geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
+            registration_reads: AtomicUsize::new(0),
         }
     }
 
@@ -173,6 +179,7 @@ impl Double {
             unpaged_queries: AtomicUsize::new(0),
             geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
+            registration_reads: AtomicUsize::new(0),
         }
     }
 
@@ -194,6 +201,7 @@ impl Double {
             unpaged_queries: AtomicUsize::new(0),
             geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
+            registration_reads: AtomicUsize::new(0),
         }
     }
 
@@ -219,6 +227,12 @@ impl Double {
     /// was built for: what a read costs the store (T-4610).
     pub fn rows_read(&self) -> usize {
         self.rows_read.load(Ordering::SeqCst)
+    }
+
+    /// `matching_registrations` calls: one per federated request while no
+    /// registration mirror is installed (T-5499).
+    pub fn registration_reads(&self) -> usize {
+        self.registration_reads.load(Ordering::SeqCst)
     }
 
     fn refused_create(&self, kind: Kind, id: &str) -> Result<(), NgsiError> {
@@ -390,6 +404,7 @@ impl CurrentStateDriver for Double {
         ids: Option<&[String]>,
         types: Option<&[String]>,
     ) -> Result<Vec<Value>, NgsiError> {
+        self.registration_reads.fetch_add(1, Ordering::SeqCst);
         self.pool_wall()?;
         if self.refuse_registrations {
             return Err(NgsiError::InternalError("registrations unreadable".into()));
