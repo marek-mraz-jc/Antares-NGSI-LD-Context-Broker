@@ -108,3 +108,7 @@ note = "new entity_values with its statement triggers on entities; an older rele
 [0025]
 rollback = "compatible"
 note = "entity_attrs and its trigger stay; an older release never reads them and folds /attributes, while the trigger keeps the catalogue current for the roll-forward"
+
+[0026]
+rollback = "compatible"
+note = "drops the unused tenant_update policy on attr_versions; an older release never updates a version row, so it runs unchanged without it"

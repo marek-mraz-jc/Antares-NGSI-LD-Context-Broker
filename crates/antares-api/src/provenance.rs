@@ -4,7 +4,8 @@
 //! The platform's gateway verifies the caller and names it in
 //! `JC-Provenance-Channel`, `JC-Provenance-Actor`, `JC-Reason` and
 //! `X-Request-Id`, the writer's Organization and kind in
-//! `JC-Provenance-Organization` and `JC-Provenance-Actor-Kind`, and an audited
+//! `JC-Provenance-Organization` and `JC-Provenance-Actor-Kind`, the Keycloak
+//! client the token came through in `JC-Provenance-Client` (T-5570), and an audited
 //! Endpoint's write in `JC-Provenance-Audit: changes` (ADR-N-054 2.8). Those headers are believed only from the gateway itself:
 //! the request must carry the mesh identity `ANTARES_PROVENANCE_FROM` names in
 //! `l5d-client-id`, the header the Linkerd proxy in front of the broker sets
@@ -56,6 +57,13 @@ pub fn of_request(headers: &HeaderMap, gateway: Option<&str>) -> Value {
         .filter(|o| plain(o, MAX_ACTOR))
     {
         out.insert("organization".into(), json!(organization));
+    }
+    // The MCP client, CLI or App a person's write came through (T-5570).
+    if let Some(client) = header("jc-provenance-client")
+        .and_then(percent_decoded)
+        .filter(|c| plain(c, MAX_ACTOR))
+    {
+        out.insert("client".into(), json!(client));
     }
     if let Some(kind) = header("jc-provenance-actor-kind").filter(|k| ACTOR_KINDS.contains(k)) {
         out.insert("actorKind".into(), json!(kind));
@@ -244,6 +252,7 @@ mod tests {
             ("jc-provenance-actor", "user%3Ajana"),
             ("jc-provenance-organization", "banska-bystrica"),
             ("jc-provenance-actor-kind", "agent"),
+            ("jc-provenance-client", "claude%20desktop"),
             ("jc-provenance-audit", "changes"),
         ];
         let mut from_gateway = named.to_vec();
@@ -252,7 +261,7 @@ mod tests {
         assert_eq!(
             stored,
             json!({"channel": "api", "actor": "user:jana", "organization": "banska-bystrica",
-                   "actorKind": "agent", "audit": true})
+                   "client": "claude desktop", "actorKind": "agent", "audit": true})
         );
         assert!(audited(&stored));
         // Forged by anyone else: nothing of it is kept, no audit row forced.
@@ -263,6 +272,7 @@ mod tests {
         let odd = headers(&[
             ("l5d-client-id", GATEWAY),
             ("jc-provenance-organization", "hel%0Afi"),
+            ("jc-provenance-client", "claude%0Adesktop"),
             ("jc-provenance-actor-kind", "robot"),
             ("jc-provenance-audit", "all"),
         ]);
