@@ -227,8 +227,8 @@ pub(crate) async fn map_put(
 /// for the EntityMap ID, then an error of type ResourceNotFound shall be
 /// raised." What the endpoint knows about is what [`map_get`] serves, so the
 /// delete reads through it: an expired map is beyond access (5.5.14) for the
-/// retrieve and for the delete alike, and `map_get` prunes the row on the way
-/// past, which leaves nothing for a later sweep to collect.
+/// retrieve and for the delete alike; the expired row is left for
+/// `sweep_expired_maps` to collect.
 pub(crate) async fn map_delete(
     st: &AppState,
     tenant: &TenantId,

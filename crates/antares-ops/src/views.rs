@@ -717,15 +717,22 @@ fn log_entry(id: &str, e: &ViewEntry) {
 
 /// The digest of the view documents, in id order (threat V26): a pure
 /// function of what the store holds, so pods over one store agree without
-/// coordination.
+/// coordination. FNV-1a 64 is specified, so two builds of the broker agree
+/// too; std's `DefaultHasher` promises no stable output across releases.
 fn revision<'a>(docs: impl Iterator<Item = (&'a str, &'a Value)>) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for (id, doc) in docs {
-        id.hash(&mut h);
-        doc.to_string().hash(&mut h);
+        // A 0 byte ends each part: `("ab", doc)` and `("a", "b" + doc)` differ.
+        for b in id
+            .bytes()
+            .chain([0])
+            .chain(doc.to_string().into_bytes())
+            .chain([0])
+        {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
     }
-    h.finish()
+    h
 }
 
 /// [`SCHEMA_MAX_ENV`]: `None` unset; a value that is no positive byte count
@@ -1310,6 +1317,19 @@ fn problem(status: StatusCode, title: &str, detail: &str) -> Response {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// F-ANT4-029: the revision is FNV-1a 64 over the documents' bytes, the
+    /// same number in every build and on every pod.
+    #[test]
+    fn the_revision_is_a_specified_hash_of_the_documents() {
+        let doc = json!({"a": 1});
+        assert_eq!(revision([("v1", &doc)].into_iter()), 0x8343_8375_8cd1_bbf2);
+        let (ab, b) = (json!("b"), json!("ab"));
+        assert_ne!(
+            revision([("a", &ab)].into_iter()),
+            revision([("", &b)].into_iter())
+        );
+    }
 
     fn base() -> Value {
         json!({

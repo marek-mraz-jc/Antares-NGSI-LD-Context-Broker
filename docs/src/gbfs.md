@@ -51,7 +51,7 @@ The stations are the view's `BikeHireDockingStation` Entities (SDM
 through the view. What an Entity does not carry stays out of the file; a
 station without a field GBFS requires is left out of that file, counted in
 the `antares-skipped-records` header and in
-`antares_surface_records_skipped_total{surface="gbfs",reason=<file>}`.
+`antares_surface_records_skipped_total{surface="gbfs",reason="unmapped"}`.
 
 | GBFS field | From | Absent when |
 |---|---|---|

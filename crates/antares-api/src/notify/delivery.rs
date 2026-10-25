@@ -531,7 +531,7 @@ pub(super) async fn record_failure(
 /// A `KeyValuePair[]` member of `endpoint` (Table 5.2.15-1) as owned pairs.
 /// A member that is not an array of well-formed pairs contributes nothing:
 /// 5.2.12 validation at creation already refused a malformed one.
-pub(super) fn kv_pairs(v: Option<&Value>) -> Vec<(String, String)> {
+pub(crate) fn kv_pairs(v: Option<&Value>) -> Vec<(String, String)> {
     v.and_then(Value::as_array)
         .map(|a| {
             a.iter()
