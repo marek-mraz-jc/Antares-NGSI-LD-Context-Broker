@@ -51,6 +51,7 @@ mod forward_context_4_3_6_6;
 mod id_routing_5_12;
 mod internal_tenant_leaks;
 mod join_budget_4_5_23;
+mod json_property_value_5_2_6_4_10;
 mod module_boundaries;
 mod narrowing_through_proxies_5_7_2;
 mod no_change_no_notify_5_6;
