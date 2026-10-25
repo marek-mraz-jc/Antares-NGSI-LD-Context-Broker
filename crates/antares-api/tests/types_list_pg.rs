@@ -365,6 +365,12 @@ async fn a_views_id_pattern_narrows_the_type_probe() {
                 .execute(&mut *tx)
                 .await
                 .expect("tenant setting");
+            // the seed is setup, not the read under test: a slow CI runner
+            // took over the pool's 30 s statement_timeout writing 200 000 rows
+            antares_sql::sqlx::query("SET LOCAL statement_timeout = 0")
+                .execute(&mut *tx)
+                .await
+                .expect("seed timeout");
             antares_sql::sqlx::query(
                 "INSERT INTO entities (tenant_id, id, entity, types, created_at, modified_at)
                  SELECT $1, i, jsonb_build_object('id', i, 'type', jsonb_build_array($2 || t),
