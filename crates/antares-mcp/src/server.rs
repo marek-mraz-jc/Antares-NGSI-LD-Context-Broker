@@ -1304,6 +1304,19 @@ mod tests {
     }
 
     #[test]
+    fn a_block_that_is_no_text_is_kept_as_it_is() {
+        let image = ContentBlock::image("AAAA", "image/png");
+        let text = ContentBlock::text("a ```` b");
+        let result = marked(CallToolResult::success(vec![image.clone(), text]));
+        assert_eq!(result.content.first(), Some(&image));
+        let fenced = result.content.get(1).and_then(ContentBlock::as_text);
+        assert_eq!(
+            fenced.map(|t| t.text.as_str()),
+            Some(format!("{UNTRUSTED_PREFACE}\n`````text\na ```` b\n`````").as_str())
+        );
+    }
+
+    #[test]
     fn a_page_is_cut_between_rows_never_inside_one() {
         let row = json!({"id": "x".repeat(1000)});
         let n = budget() / row.to_string().len().saturating_add(1);
