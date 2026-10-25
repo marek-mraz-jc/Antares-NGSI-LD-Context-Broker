@@ -616,9 +616,93 @@ pub fn id_pattern_literal(pattern: &str) -> Option<IdLiteral<'_>> {
     })
 }
 
+/// A literal every id a policy rule's `pattern` selects carries, the
+/// longest one after the start, else the prefix,
+/// read as the rule reads it, anchored at both ends (`^(?:pattern)$`); the
+/// text and whether ids start with it. Unlike [`id_pattern_literal`] it
+/// takes a literal from anywhere in the top-level sequence, so
+/// `^urn:x:KPI:[a-z]+:helsinki:stat-[a-z]+$` narrows on `:helsinki:stat-`
+/// and not on the prefix every KPI shares (T-5661). `None` for a pattern
+/// that does not parse or forces no literal (alternation, a case-insensitive
+/// group, only classes). A necessary condition only: the regex still decides.
+pub fn id_pattern_required(pattern: &str) -> Option<(String, bool)> {
+    use regex_syntax::hir::{HirKind, Look};
+    let hir = regex_syntax::Parser::new()
+        .parse(&format!("^(?:{pattern})$"))
+        .ok()?;
+    let HirKind::Concat(parts) = hir.kind() else {
+        return None;
+    };
+    let body = parts
+        .iter()
+        .skip_while(|h| matches!(h.kind(), HirKind::Look(Look::Start)));
+    let mut best: Option<(String, bool)> = None;
+    for (i, h) in body.enumerate() {
+        let HirKind::Literal(l) = h.kind() else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(&l.0) else {
+            continue;
+        };
+        // an inner literal beats the prefix, which in `urn:ngsi-ld:{Type}:`
+        // ids repeats the type the read already narrows on
+        let rank = |len: usize, anchored: bool| (!anchored, len);
+        if best
+            .as_ref()
+            .is_none_or(|(b, a)| rank(b.len(), *a) < rank(text.len(), i == 0))
+        {
+            best = Some((text.to_owned(), i == 0));
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod id_literal_tests {
     use super::*;
+
+    /// T-5661: a rule's pattern narrows on its most selective literal; each
+    /// result is a substring (a prefix when anchored) of every id it selects.
+    #[test]
+    fn required_literal_is_the_longest_the_rule_pattern_forces() {
+        let req = id_pattern_required;
+        let kpi = "^urn:ngsi-ld:KeyPerformanceIndicator:[a-z0-9.-]+:helsinki:stat-environment-[A-Za-z0-9._-]+$";
+        assert_eq!(
+            req(kpi),
+            Some((":helsinki:stat-environment-".to_owned(), false))
+        );
+        assert_eq!(req("urn:x:abc.*"), Some(("urn:x:abc".to_owned(), true)));
+        // a quantifier binds the last character
+        assert_eq!(req("^abc*$"), Some(("ab".to_owned(), true)));
+        assert_eq!(req("a|b"), None);
+        assert_eq!(req("urn:(a|b)"), Some(("urn:".to_owned(), true)));
+        // case-insensitive letters are classes; only the `:` is forced
+        assert_eq!(req("(?i)urn:a"), Some((":".to_owned(), false)));
+        assert_eq!(req("[ab]+"), None);
+        assert_eq!(req("(unclosed"), None);
+        assert_eq!(req(""), None);
+        for (p, id) in [
+            (
+                kpi,
+                "urn:ngsi-ld:KeyPerformanceIndicator:x.y:helsinki:stat-environment-a1",
+            ),
+            ("urn:x:abc.*", "urn:x:abc9"),
+            ("^abc*$", "ab"),
+            ("urn:(a|b)", "urn:b"),
+        ] {
+            let re = regex::Regex::new(&format!("^(?:{p})$")).expect("re");
+            assert!(re.is_match(id), "{p} vs {id}");
+            let (text, anchored) = req(p).expect("literal");
+            assert!(
+                if anchored {
+                    id.starts_with(&text)
+                } else {
+                    id.contains(&text)
+                },
+                "{p}: {id}"
+            );
+        }
+    }
 
     /// 5.2.33 idPattern narrowing: the literal is a necessary condition of
     /// the regex, never a sufficient one, so it may only ever shrink the
