@@ -321,6 +321,24 @@ fn history(tenant: &str, entity: &str) -> String {
     )
 }
 
+/// The Entity `m` has a history row passing `preds` (on alias `ai`): the
+/// page qualification. Each parent is probed on its own along its btree,
+/// `dir` from the end the window opens towards, so the first row read is
+/// most likely in the window. An EXISTS over [`history`] read each Entity's
+/// rows oldest first from the widened column bound and fetched every row the
+/// text predicate then refused: ~115 rows an Entity on the helsinki-bikes
+/// history, past the 30 s statement timeout for 577 Entities (T-5616).
+pub fn has_history(preds: &str, dir: &str) -> String {
+    format!(
+        "((SELECT true FROM attr_instances ai \
+           WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id{preds} \
+           ORDER BY ai.attr_id {dir}, ai.observed_at {dir} LIMIT 1) IS NOT NULL \
+         OR (SELECT true FROM attr_rows ai \
+           WHERE ai.tenant_id = m.tenant_id AND ai.entity_no = iri_no(m.tenant_id, m.id){preds} \
+           ORDER BY ai.attr_no {dir}, ai.observed_at {dir} LIMIT 1) IS NOT NULL)"
+    )
+}
+
 /// Turns each attribute's `[instances, instance ids]` that
 /// [`insts_and_ids`] returned back into its instances.
 fn unpack(doc: &mut Value) {
@@ -899,28 +917,31 @@ fn attr_object_expr(f: &TemporalFilter<'_>, first_bind: usize) -> Option<(String
     Some((expr, binds))
 }
 
-/// [`newest_rows`]' statement: `{window}` is its range bound on `t`, `${n}`
-/// the bind of N.
+/// [`newest_rows`]' statement: `{window}` is its range bound on `t`
+/// (`{xwindow}`, `{rwindow}` the same on `x` and `r`), `${n}` the bind of N.
 ///
 /// Distinct Attributes by a skip scan of the same btree, in each parent
-/// (T-5200); `OFFSET 0` keeps the instance read a parameterised index
+/// (T-5200), inside the window's column bound: an Attribute with no row
+/// there contributes no row anyway, and the bound keeps the scan to the
+/// partitions the window reaches instead of every week of the retention
+/// (T-5616); `OFFSET 0` keeps the instance read a parameterised index
 /// range per Attribute, which a hash join over the whole Entity would
 /// otherwise replace. The N-th newest takes the newest N of each parent,
 /// each arm limited itself so both read their btree backwards.
 const NEWEST_ROWS: &str = "(WITH RECURSIVE a(attr) AS (\
             SELECT min(x.attr_id) FROM attr_instances x \
-            WHERE x.tenant_id = m.tenant_id AND x.entity_id = m.id \
+            WHERE x.tenant_id = m.tenant_id AND x.entity_id = m.id{xwindow} \
           UNION ALL \
             SELECT (SELECT min(x.attr_id) FROM attr_instances x \
-                    WHERE x.tenant_id = m.tenant_id AND x.entity_id = m.id AND x.attr_id > a.attr) \
+                    WHERE x.tenant_id = m.tenant_id AND x.entity_id = m.id AND x.attr_id > a.attr{xwindow}) \
             FROM a WHERE a.attr IS NOT NULL), \
           b(no) AS (\
             SELECT min(r.attr_no) FROM attr_rows r \
-            WHERE r.tenant_id = m.tenant_id AND r.entity_no = iri_no(m.tenant_id, m.id) \
+            WHERE r.tenant_id = m.tenant_id AND r.entity_no = iri_no(m.tenant_id, m.id){rwindow} \
           UNION ALL \
             SELECT (SELECT min(r.attr_no) FROM attr_rows r \
                     WHERE r.tenant_id = m.tenant_id AND r.entity_no = iri_no(m.tenant_id, m.id) \
-                      AND r.attr_no > b.no) \
+                      AND r.attr_no > b.no{rwindow}) \
             FROM b WHERE b.no IS NOT NULL), \
           n(attr) AS (\
             SELECT a.attr FROM a WHERE a.attr IS NOT NULL \
@@ -967,18 +988,20 @@ fn newest_rows(f: &TemporalFilter<'_>, first_bind: usize, n_bind: usize) -> Opti
     if f.oldest_first || f.timeproperty != "observedAt" {
         return None;
     }
-    let window = match &f.range {
-        None => String::new(),
-        Some(r) if r.timerel == "any" => String::new(),
-        Some(r) if r.timerel == "after" => format!(
-            " AND {}",
-            crate::compile::temporal::column_range_bound(r, "t", first_bind.saturating_add(1))?
-        ),
-        Some(_) => return None,
+    let bound = |alias| match &f.range {
+        None => Some(String::new()),
+        Some(r) if r.timerel == "any" => Some(String::new()),
+        Some(r) if r.timerel == "after" => {
+            crate::compile::temporal::column_range_bound(r, alias, first_bind.saturating_add(1))
+                .map(|b| format!(" AND {b}"))
+        }
+        Some(_) => None,
     };
     Some(
         NEWEST_ROWS
-            .replace("{window}", &window)
+            .replace("{window}", &bound("t")?)
+            .replace("{xwindow}", &bound("x")?)
+            .replace("{rwindow}", &bound("r")?)
             .replace("{n}", &n_bind.to_string()),
     )
 }
@@ -1608,25 +1631,25 @@ impl PgTemporalStore {
         });
         let mut paged = false;
         if f.page.is_some() && !matches!(compiled_range, Some(None)) {
-            let mut qual = format!(
-                "EXISTS (SELECT 1 FROM {} ai WHERE true",
-                history("m.tenant_id", "m.id")
-            );
+            let mut preds = String::new();
             if let (Some(r), Some(Some(c))) = (&f.range, compiled_range) {
                 let n = binds.len().saturating_add(1);
                 for b in c.binds {
                     binds.push(B::Text(b));
                 }
-                qual.push_str(&format!(" AND {}", c.sql));
+                preds.push_str(&format!(" AND {}", c.sql));
                 // index-serving widened bound on the same binds ($n+1 = timeAt)
                 if let Some(cb) =
                     crate::compile::temporal::column_range_bound(r, "ai", n.saturating_add(1))
                 {
-                    qual.push_str(&format!(" AND {cb}"));
+                    preds.push_str(&format!(" AND {cb}"));
                 }
             }
-            qual.push(')');
-            wheres.push(qual);
+            let dir = match &f.range {
+                Some(r) if r.timerel == "before" => "ASC",
+                _ => "DESC",
+            };
+            wheres.push(has_history(&preds, dir));
             paged = true;
         }
         // 5.7.4.4 S2 superset prefilter: entities with no windowed instance
@@ -2274,6 +2297,56 @@ mod tests {
         );
         assert!(expr.contains("COLLATE \"C\" DESC NULLS LAST"), "{expr}");
         assert_eq!(binds, vec!["observedAt", "5"]);
+    }
+
+    /// T-5616: lastN's distinct-Attribute skip scan keeps to the window's
+    /// column bound in both parents, so it reads the weeks the window
+    /// reaches and not every week of the retention; no window, no bound.
+    #[test]
+    fn the_attribute_skip_scan_keeps_to_the_window() {
+        let after = TemporalFilter {
+            last_n: Some(10),
+            range: Some(InstanceRange {
+                timerel: "after",
+                time_at: "2026-10-24T00:00:00Z",
+                end_time_at: None,
+                timeproperty: "observedAt",
+            }),
+            ..Default::default()
+        };
+        let sql = newest_rows(&after, 3, 7).expect("after reads the newest rows");
+        assert!(!sql.contains("window}"), "{sql}");
+        for alias in ["x", "r", "t"] {
+            let bound = format!("{alias}.observed_at >= $4::timestamptz - interval '48 hours'");
+            assert!(sql.contains(&bound), "{bound} missing: {sql}");
+        }
+        assert_eq!(sql.matches("x.observed_at >= $4").count(), 2, "{sql}");
+        assert_eq!(sql.matches("r.observed_at >= $4").count(), 2, "{sql}");
+        let unbounded = TemporalFilter {
+            last_n: Some(10),
+            ..Default::default()
+        };
+        let sql = newest_rows(&unbounded, 3, 4).expect("no range reads the newest rows");
+        assert!(!sql.contains("window}"), "{sql}");
+        assert!(!sql.contains("observed_at >= $"), "{sql}");
+    }
+
+    /// T-5616: the page qualification probes each parent newest first (oldest
+    /// first for `before`), one row along its btree, never an EXISTS over the
+    /// union that reads an Entity's rows in the btree's own order.
+    #[test]
+    fn the_page_qualification_probes_one_row_per_parent() {
+        let sql = has_history(" AND ai.x", "DESC");
+        assert!(
+            sql.contains("ORDER BY ai.attr_id DESC, ai.observed_at DESC LIMIT 1"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY ai.attr_no DESC, ai.observed_at DESC LIMIT 1"),
+            "{sql}"
+        );
+        assert_eq!(sql.matches(" AND ai.x").count(), 2, "{sql}");
+        assert!(!sql.contains("EXISTS"), "{sql}");
     }
 
     #[test]
