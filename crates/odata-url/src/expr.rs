@@ -426,78 +426,95 @@ impl<'m, M: Model> Parser<'_, '_, 'm, M> {
         rest.starts_with('(') || rest.get(..3).is_some_and(|h| h.eq_ignore_ascii_case("%28"))
     }
 
-    /// `memberExpr` over `scope`, appended to `path`.
-    fn member_expr(&mut self, scope: Scope<'m>, mut path: MemberPath) -> Result<Expr, UrlError> {
-        let start = self.c.pos();
-        if self.c.at() {
-            return self.annotated(path, start);
-        }
-        let Some(name) = self.c.identifier()? else {
-            return Err(self.c.syntax("memberExpr"));
-        };
-        if self.c.peek() == Some(b'.') {
-            return self.qualified(start);
-        }
-        let member = match scope {
-            Scope::Type(ty) => self.model.member(ty, name),
-            Scope::Primitive => None,
-        };
-        // a `$compute` name, from the resource itself only
-        let root = path.variable.is_none() && path.path.is_empty();
-        let member = member.or_else(|| {
-            (root && self.computed.iter().any(|c| c == name))
-                .then_some(Member::Primitive { collection: false })
-        });
-        let Some(member) = member else {
-            if self.at_open() {
-                // An unqualified function call; no function is in the subset's model.
-                return Err(self.c.syntax("functionExprParameters"));
+    /// `memberExpr` over `scope`, appended to `path`. A path through single-valued complex or
+    /// navigation properties is walked in a loop, each segment one level of `max_expr_depth`
+    /// (F-ANT5-001: a self-referencing navigation repeated thousands of times must not recurse).
+    fn member_expr(&mut self, scope: Scope<'m>, path: MemberPath) -> Result<Expr, UrlError> {
+        let depth = self.depth;
+        let walked = self.member_walk(scope, path);
+        self.depth = depth;
+        walked
+    }
+
+    fn member_walk(
+        &mut self,
+        mut scope: Scope<'m>,
+        mut path: MemberPath,
+    ) -> Result<Expr, UrlError> {
+        loop {
+            let start = self.c.pos();
+            if self.c.at() {
+                return self.annotated(path, start);
             }
-            self.c.reset(start);
-            return Err(self.c.error(UrlErrorKind::Unresolved));
-        };
-        path.path.push(name.to_owned());
-        match member {
-            Member::Primitive { collection: false } => {
-                if self.slash_continues() {
-                    let at = self.c.pos();
-                    if self.c.at() {
-                        return self.annotated(path, at);
-                    }
-                    if self.c.identifier()?.is_some() && self.c.peek() == Some(b'.') {
-                        return self.qualified(at);
-                    }
-                    return Err(self.c.syntax("primitivePathExpr"));
-                }
-                Ok(Expr::Member(path))
+            let Some(name) = self.c.identifier()? else {
+                return Err(self.c.syntax("memberExpr"));
+            };
+            if self.c.peek() == Some(b'.') {
+                return self.qualified(start);
             }
-            Member::Primitive { collection: true } => self.collection(Scope::Primitive, path),
-            Member::Complex {
-                ty,
-                collection: false,
-            }
-            | Member::Navigation {
-                ty,
-                collection: false,
-            } => {
-                if self.slash_continues() {
-                    return self.member_expr(Scope::Type(ty), path);
-                }
-                Ok(Expr::Member(path))
-            }
-            Member::Complex {
-                ty,
-                collection: true,
-            } => self.collection(Scope::Type(ty), path),
-            Member::Navigation {
-                ty,
-                collection: true,
-            } => {
+            let member = match scope {
+                Scope::Type(ty) => self.model.member(ty, name),
+                Scope::Primitive => None,
+            };
+            // a `$compute` name, from the resource itself only
+            let root = path.variable.is_none() && path.path.is_empty();
+            let member = member.or_else(|| {
+                (root && self.computed.iter().any(|c| c == name))
+                    .then_some(Member::Primitive { collection: false })
+            });
+            let Some(member) = member else {
                 if self.at_open() {
-                    return Err(self.c.not_implemented(Feature::PathInExpression));
+                    // An unqualified function call; no function is in the subset's model.
+                    return Err(self.c.syntax("functionExprParameters"));
                 }
-                self.collection(Scope::Type(ty), path)
-            }
+                self.c.reset(start);
+                return Err(self.c.error(UrlErrorKind::Unresolved));
+            };
+            path.path.push(name.to_owned());
+            return match member {
+                Member::Primitive { collection: false } => {
+                    if self.slash_continues() {
+                        let at = self.c.pos();
+                        if self.c.at() {
+                            return self.annotated(path, at);
+                        }
+                        if self.c.identifier()?.is_some() && self.c.peek() == Some(b'.') {
+                            return self.qualified(at);
+                        }
+                        return Err(self.c.syntax("primitivePathExpr"));
+                    }
+                    Ok(Expr::Member(path))
+                }
+                Member::Primitive { collection: true } => self.collection(Scope::Primitive, path),
+                Member::Complex {
+                    ty,
+                    collection: false,
+                }
+                | Member::Navigation {
+                    ty,
+                    collection: false,
+                } => {
+                    if self.slash_continues() {
+                        self.enter()?;
+                        scope = Scope::Type(ty);
+                        continue;
+                    }
+                    Ok(Expr::Member(path))
+                }
+                Member::Complex {
+                    ty,
+                    collection: true,
+                } => self.collection(Scope::Type(ty), path),
+                Member::Navigation {
+                    ty,
+                    collection: true,
+                } => {
+                    if self.at_open() {
+                        return Err(self.c.not_implemented(Feature::PathInExpression));
+                    }
+                    self.collection(Scope::Type(ty), path)
+                }
+            };
         }
     }
 
