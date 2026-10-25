@@ -4,10 +4,11 @@
 //! "what may I do here" and never "what is here": a type only somebody else
 //! may touch is absent, not listed as denied.
 
-use crate::decide::{covers_types, held};
+use crate::decide::{covers_types, held, POLICY_VOCABULARY};
 use crate::document::{context, Policy, Selector, Table};
 use crate::names::{self, OPERATIONS};
 use crate::subject::{Caller, Platform};
+use antares_api::policy::Rule;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 
@@ -154,24 +155,33 @@ fn subject(caller: &Caller) -> Value {
 /// the permission that matched, the prohibition that ended it, or nothing.
 #[derive(Debug, Clone, Copy)]
 pub enum Verdict<'t> {
-    /// A permission listing the action's clause and covering the type.
+    /// A permission listing the action's clause and covering the type (and
+    /// the Attribute, when one is asked about).
     Granted(&'t Policy),
     /// A prohibition listing the action's clause and covering the type,
-    /// which ends it whatever any permission says (GW8).
+    /// which ends it whatever any permission says (GW8). A prohibition
+    /// refuses its whole type, whichever Attributes it lists, as `decide`
+    /// does.
     Prohibited(&'t Policy),
+    /// A permission covers the type but none lists the Attribute asked
+    /// about: the request goes through without it.
+    NotInGrant,
     /// No permission grants it, or the view does not serve the action, or
     /// the action is no Table 4.20-1 name.
     NoGrant,
 }
 
-/// The [`Verdict`] on the operation named `action` on `entity_type`
+/// The [`Verdict`] on the operation named `action` on `entity_type`, and on
+/// its Attribute `attribute` (a short name or an IRI) when one is named,
 /// through a view that serves the operation-matrix rows `served` answers
-/// for. [`check`] and [`explain`] both read it, so they cannot disagree.
+/// for. [`check`], [`explain`] and [`attributes_of`] all read it, so they
+/// cannot disagree.
 #[must_use]
 pub fn verdict<'t>(
     grants: &Grants<'t>,
     action: &str,
     entity_type: Option<&str>,
+    attribute: Option<&str>,
     served: &dyn Fn(&str) -> bool,
 ) -> Verdict<'t> {
     let Some(clause) = names::clause(action) else {
@@ -183,10 +193,10 @@ pub fn verdict<'t>(
     if !through_view {
         return Verdict::NoGrant;
     }
-    let types: Vec<String> = entity_type
-        .map(|t| context().expand_key(t))
-        .into_iter()
-        .collect();
+    let ctx = context();
+    let types: Vec<String> = entity_type.map(|t| ctx.expand_key(t)).into_iter().collect();
+    let attribute = attribute.map(|a| ctx.expand_key(a));
+    let write = clause.starts_with("5.6.");
     let lists = |p: &&&Policy| p.clauses.contains(clause);
     if let Some(p) = grants
         .prohibitions
@@ -196,32 +206,74 @@ pub fn verdict<'t>(
     {
         return Verdict::Prohibited(p);
     }
-    grants
+    if write && attribute.as_deref().is_some_and(is_access_control) {
+        return Verdict::NoGrant;
+    }
+    let rules = |p: &'t Policy| {
+        p.selectors
+            .iter()
+            .filter(|s| types.is_empty() || s.types.iter().any(|t| types.contains(t)))
+            .collect::<Vec<_>>()
+    };
+    let mut in_type = false;
+    // a window is about reading history; it admits no write (`decide::admits`)
+    for p in grants
         .permissions
         .iter()
         .filter(lists)
-        .find(|p| {
-            types.is_empty()
-                || p.selectors.is_empty()
-                || p.selectors
-                    .iter()
-                    .any(|s| s.types.iter().any(|t| types.contains(t)))
-        })
-        .map_or(Verdict::NoGrant, |p| Verdict::Granted(p))
+        .filter(|p| !write || p.conditions.temporal.is_empty())
+    {
+        let shows = |s: &Rule| {
+            attribute
+                .as_ref()
+                .is_none_or(|a| s.every_attribute || s.attributes.contains(a))
+        };
+        if p.selectors.is_empty() {
+            return Verdict::Granted(p);
+        }
+        let covering = rules(p);
+        in_type |= !covering.is_empty();
+        if covering.into_iter().any(shows) {
+            return Verdict::Granted(p);
+        }
+    }
+    if in_type {
+        Verdict::NotInGrant
+    } else {
+        Verdict::NoGrant
+    }
+}
+
+/// An Attribute name the engine refuses in every write (platform GW29).
+fn is_access_control(iri: &str) -> bool {
+    let ctx = context();
+    POLICY_VOCABULARY
+        .iter()
+        .any(|name| *name == iri || ctx.expand_key(name) == iri)
+}
+
+/// The Attribute a check asks about: `resource.properties.attribute`.
+#[must_use]
+pub fn attribute_of(query: &Value) -> Option<&str> {
+    query
+        .pointer("/resource/properties/attribute")
+        .and_then(Value::as_str)
 }
 
 /// One `AuthZEN` decision for one prospective request (platform R51): the
-/// operation named `action` on `entity_type`, decided as the engine decides
-/// (README section 3, steps 1 to 3). A permission may name its assigner,
-/// since the caller holds it; a refusal names nothing (GW6).
+/// operation named `action` on `entity_type` (and its Attribute
+/// `attribute`), decided as the engine decides (README section 3, steps 1
+/// to 3). A permission may name its assigner, since the caller holds it; a
+/// refusal names nothing (GW6).
 #[must_use]
 pub fn check(
     grants: &Grants<'_>,
     action: &str,
     entity_type: Option<&str>,
+    attribute: Option<&str>,
     served: &dyn Fn(&str) -> bool,
 ) -> Value {
-    match verdict(grants, action, entity_type, served) {
+    match verdict(grants, action, entity_type, attribute, served) {
         Verdict::Granted(p) => {
             let mut context = Map::new();
             context.insert("reason".into(), json!("policy_grant_matched"));
@@ -230,7 +282,9 @@ pub fn check(
             }
             json!({"decision": true, "context": context})
         }
-        Verdict::Prohibited(_) | Verdict::NoGrant => json!({"decision": false}),
+        Verdict::Prohibited(_) | Verdict::NotInGrant | Verdict::NoGrant => {
+            json!({"decision": false})
+        }
     }
 }
 
@@ -243,6 +297,7 @@ pub fn explain(
     grants: &Grants<'_>,
     action: &str,
     entity_type: Option<&str>,
+    attribute: Option<&str>,
     served: &dyn Fn(&str) -> bool,
 ) -> Value {
     let named = |p: &Policy, reason: &str| {
@@ -254,13 +309,63 @@ pub fn explain(
         }
         Value::Object(context)
     };
-    match verdict(grants, action, entity_type, served) {
+    match verdict(grants, action, entity_type, attribute, served) {
         Verdict::Granted(p) => {
             json!({"decision": true, "context": named(p, "policy_grant_matched")})
         }
         Verdict::Prohibited(p) => json!({"decision": false, "context": named(p, "prohibited")}),
+        Verdict::NotInGrant => json!({"decision": false, "context": {"reason": "not_in_grant"}}),
         Verdict::NoGrant => json!({"decision": false, "context": {"reason": "no_grant"}}),
     }
+}
+
+/// The actions the per-Attribute table answers, as `(member, action)`: a
+/// read of the Entity, a partial update and a delete of the Attribute.
+pub const ATTRIBUTE_ACTIONS: [(&str, &str); 3] = [
+    ("read", "retrieveEntity"),
+    ("write", "updateAttrs"),
+    ("delete", "deleteAttrs"),
+];
+
+/// The caller's decisions on each Attribute of `names` of `entity_type`
+/// (platform API/02 section 7b): `read`, `write` and `delete`, and one
+/// `reason`, the strongest of the three verdicts: `prohibited`, then
+/// `grant` (or `formula`, a grant with a condition the stored Entity must
+/// meet), then `not_in_grant`, then `no_grant`. A reason names no policy
+/// (GW6).
+#[must_use]
+pub fn attributes_of(
+    grants: &Grants<'_>,
+    entity_type: &str,
+    names: &[&str],
+    served: &dyn Fn(&str) -> bool,
+) -> Value {
+    let rows: Vec<Value> = names
+        .iter()
+        .map(|name| {
+            let mut row = Map::new();
+            row.insert("name".into(), json!(name));
+            let mut reason = 0;
+            for (member, action) in ATTRIBUTE_ACTIONS {
+                let v = verdict(grants, action, Some(entity_type), Some(name), served);
+                row.insert(member.into(), json!(matches!(v, Verdict::Granted(_))));
+                reason = reason.max(match v {
+                    Verdict::Prohibited(_) => 4,
+                    Verdict::Granted(p) if p.is_conditional() => 3,
+                    Verdict::Granted(_) => 2,
+                    Verdict::NotInGrant => 1,
+                    Verdict::NoGrant => 0,
+                });
+            }
+            let reason = ["no_grant", "not_in_grant", "grant", "formula", "prohibited"]
+                .get(reason)
+                .copied()
+                .unwrap_or("no_grant");
+            row.insert("reason".into(), json!(reason));
+            Value::Object(row)
+        })
+        .collect();
+    json!({"type": entity_type, "attributes": rows})
 }
 
 #[cfg(test)]
@@ -272,7 +377,7 @@ mod tests {
         v.pointer(path).cloned().unwrap_or(Value::Null)
     }
     use crate::document::compile;
-    use antares_api::policy::Subject;
+    use antares_api::policy::{Decision, Operation, Subject};
 
     fn table() -> Result<Table, String> {
         compile(&json!({"policies": [
@@ -450,14 +555,23 @@ mod tests {
         let t = table()?;
         let public = caller(&[("x-jc-roles", "")]);
         let grants = Grants::of(Some(&t), &public, Utc::now());
-        let yes = check(&grants, "queryEntity", Some("AirQualityObserved"), &every);
+        let yes = check(
+            &grants,
+            "queryEntity",
+            Some("AirQualityObserved"),
+            None,
+            &every,
+        );
         assert_eq!(
             yes,
             json!({"decision": true, "context": {"reason": "policy_grant_matched",
                                                  "assigner": "did:web:city.example.org"}})
         );
         assert_eq!(
-            at(&check(&grants, "queryEntity", None, &every), "/decision"),
+            at(
+                &check(&grants, "queryEntity", None, None, &every),
+                "/decision"
+            ),
             true
         );
         for (action, ty) in [
@@ -471,17 +585,22 @@ mod tests {
             ("retrieveEntity", Some("Expired")),
         ] {
             assert_eq!(
-                check(&grants, action, ty, &every),
+                check(&grants, action, ty, None, &every),
                 json!({"decision": false}),
                 "{action}"
             );
         }
-        let not_served = check(&grants, "queryEntity", None, &|r| r == "retrieve_entity");
+        let not_served = check(&grants, "queryEntity", None, None, &|r| {
+            r == "retrieve_entity"
+        });
         assert_eq!(not_served, json!({"decision": false}));
         let internal = caller(&[]);
         let none = Grants::of(Some(&t), &internal, Utc::now());
         assert_eq!(
-            at(&check(&none, "queryEntity", None, &every), "/decision"),
+            at(
+                &check(&none, "queryEntity", None, None, &every),
+                "/decision"
+            ),
             false
         );
         Ok(())
@@ -493,13 +612,25 @@ mod tests {
         let public = caller(&[("x-jc-roles", "")]);
         let grants = Grants::of(Some(&t), &public, Utc::now());
         assert_eq!(
-            explain(&grants, "queryEntity", Some("AirQualityObserved"), &every),
+            explain(
+                &grants,
+                "queryEntity",
+                Some("AirQualityObserved"),
+                None,
+                &every
+            ),
             json!({"decision": true, "context": {"reason": "policy_grant_matched",
                    "policy": "read-air", "assigner": "did:web:city.example.org"}})
         );
         // the prohibition that ended it is named, a refusal's reason included (EP-103)
         assert_eq!(
-            explain(&grants, "queryTemporal", Some("AirQualityObserved"), &every),
+            explain(
+                &grants,
+                "queryTemporal",
+                Some("AirQualityObserved"),
+                None,
+                &every
+            ),
             json!({"decision": false, "context": {"reason": "prohibited", "policy": "no-history"}})
         );
         for (action, ty) in [
@@ -509,12 +640,14 @@ mod tests {
             ("nosuch", None),
         ] {
             assert_eq!(
-                explain(&grants, action, ty, &every),
+                explain(&grants, action, ty, None, &every),
                 json!({"decision": false, "context": {"reason": "no_grant"}}),
                 "{action}"
             );
         }
-        let not_served = explain(&grants, "queryEntity", None, &|r| r == "retrieve_entity");
+        let not_served = explain(&grants, "queryEntity", None, None, &|r| {
+            r == "retrieve_entity"
+        });
         assert_eq!(at(&not_served, "/context/reason"), "no_grant");
 
         // one verdict: the two answers never disagree on the decision
@@ -524,13 +657,276 @@ mod tests {
             for (action, _) in OPERATIONS {
                 for ty in [None, Some("AirQualityObserved"), Some("InternalIncident")] {
                     assert_eq!(
-                        at(&explain(&held, action, ty, &every), "/decision"),
-                        at(&check(&held, action, ty, &every), "/decision"),
+                        at(&explain(&held, action, ty, None, &every), "/decision"),
+                        at(&check(&held, action, ty, None, &every), "/decision"),
                         "{action} {ty:?}"
                     );
                 }
             }
         }
+        Ok(())
+    }
+
+    /// One policy document of `policies` as the engine compiles it.
+    fn compiled(policies: &Value) -> Result<Table, String> {
+        compile(&json!({ "policies": policies }))
+    }
+
+    /// The decision `check` gives on `attribute` of `Car` for `action`.
+    fn may(grants: &Grants<'_>, action: &str, attribute: &str) -> Value {
+        at(
+            &check(grants, action, Some("Car"), Some(attribute), &every),
+            "/decision",
+        )
+    }
+
+    #[test]
+    fn an_attribute_is_granted_only_when_a_covering_selector_lists_it_or_none() -> Result<(), String>
+    {
+        let t = compiled(&json!([
+            {"id": "speed", "assignee": {"kind": "role", "id": "public"},
+             "operations": ["5.7.1", "5.6.4"],
+             "information": [{"entities": [{"type": "Car"}], "propertyNames": ["speed"]}]},
+            {"id": "whole-bus", "assignee": {"kind": "role", "id": "public"},
+             "operations": ["5.7.1"], "information": [{"entities": [{"type": "Bus"}]}]}
+        ]))?;
+        let public = caller(&[("x-jc-roles", "")]);
+        let grants = Grants::of(Some(&t), &public, Utc::now());
+        assert_eq!(may(&grants, "retrieveEntity", "speed"), true);
+        assert_eq!(may(&grants, "updateAttrs", "speed"), true);
+        // an IRI names the same Attribute
+        let speed = context().expand_key("speed");
+        assert_eq!(may(&grants, "retrieveEntity", &speed), true);
+        assert_eq!(may(&grants, "retrieveEntity", "colour"), false);
+        assert_eq!(may(&grants, "deleteAttrs", "speed"), false);
+        assert_eq!(
+            explain(
+                &grants,
+                "retrieveEntity",
+                Some("Car"),
+                Some("colour"),
+                &every
+            ),
+            json!({"decision": false, "context": {"reason": "not_in_grant"}})
+        );
+        // a selector listing no Attribute is the whole Entity
+        assert_eq!(
+            at(
+                &check(
+                    &grants,
+                    "retrieveEntity",
+                    Some("Bus"),
+                    Some("colour"),
+                    &every
+                ),
+                "/decision"
+            ),
+            true
+        );
+        // without an attribute the check answers as before
+        assert_eq!(
+            at(
+                &check(&grants, "retrieveEntity", Some("Car"), None, &every),
+                "/decision"
+            ),
+            true
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_prohibition_refuses_its_whole_type_whichever_attributes_it_lists() -> Result<(), String> {
+        let t = compiled(&json!([
+            {"id": "read-car", "assignee": {"kind": "role", "id": "public"},
+             "operations": ["5.7.1", "5.7.2"], "information": [{"entities": [{"type": "Car"}]}]},
+            {"id": "no-speed", "effect": "prohibit", "assignee": {"kind": "role", "id": "public"},
+             "operations": ["5.7.1", "5.7.2"],
+             "information": [{"entities": [{"type": "Car"}], "propertyNames": ["speed"]}]}
+        ]))?;
+        let public = caller(&[("x-jc-roles", "")]);
+        let grants = Grants::of(Some(&t), &public, Utc::now());
+        // the prohibition names `speed`, and refuses `colour` too: the real read does (below)
+        for attribute in ["speed", "colour"] {
+            assert_eq!(may(&grants, "retrieveEntity", attribute), false);
+            assert_eq!(
+                at(
+                    &explain(
+                        &grants,
+                        "retrieveEntity",
+                        Some("Car"),
+                        Some(attribute),
+                        &every
+                    ),
+                    "/context/reason"
+                ),
+                "prohibited"
+            );
+        }
+        // Step 1 of T-5527: the engine's own read refuses the whole type, it does not narrow it
+        let types = vec![context().expand_key("Car")];
+        let attrs = vec![context().expand_key("colour")];
+        let op = Operation {
+            types: &types,
+            attrs: &attrs,
+            ..Operation::new("5.7.2")
+        };
+        assert!(matches!(
+            crate::decide::decide(Some(&t), &public, &op, Utc::now()),
+            Decision::Deny(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn the_attribute_table_answers_each_action_and_a_reason_naming_no_policy() -> Result<(), String>
+    {
+        let t = compiled(&json!([
+            {"id": "editor", "assigner": "did:web:city.example.org",
+             "assignee": {"kind": "role", "id": "public"},
+             "operations": ["5.7.1", "5.6.4"],
+             "information": [{"entities": [{"type": "Car"}], "propertyNames": ["speed"]}]},
+            {"id": "if-red", "assignee": {"kind": "role", "id": "public"},
+             "operations": ["5.7.1"], "q": "colour==\"red\"",
+             "information": [{"entities": [{"type": "Car"}], "propertyNames": ["colour"]}]},
+            {"id": "never-plate", "effect": "prohibit", "assignee": {"kind": "role", "id": "public"},
+             "operations": ["5.6.5"], "information": [{"entities": [{"type": "Car"}]}]}
+        ]))?;
+        let public = caller(&[("x-jc-roles", "")]);
+        let grants = Grants::of(Some(&t), &public, Utc::now());
+        let table = attributes_of(
+            &grants,
+            "Car",
+            &["speed", "colour", "owner", "plate"],
+            &every,
+        );
+        assert_eq!(
+            table,
+            json!({"type": "Car", "attributes": [
+                {"name": "speed", "read": true, "write": true, "delete": false, "reason": "prohibited"},
+                {"name": "colour", "read": true, "write": false, "delete": false, "reason": "prohibited"},
+                {"name": "owner", "read": false, "write": false, "delete": false, "reason": "prohibited"},
+                {"name": "plate", "read": false, "write": false, "delete": false, "reason": "prohibited"}
+            ]})
+        );
+        let without = Grants {
+            permissions: grants.permissions.clone(),
+            prohibitions: Vec::new(),
+        };
+        let table = attributes_of(&without, "Car", &["speed", "colour", "plate"], &every);
+        let reasons: Vec<Value> = ["speed", "colour", "plate"]
+            .iter()
+            .enumerate()
+            .map(|(i, _)| at(&table, &format!("/attributes/{i}/reason")))
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![json!("grant"), json!("formula"), json!("not_in_grant")]
+        );
+        let other = attributes_of(&without, "Bus", &["speed"], &every);
+        assert_eq!(at(&other, "/attributes/0/reason"), "no_grant");
+        // deny by default: nothing held is false everywhere
+        let none = Grants::of(None, &public, Utc::now());
+        assert_eq!(
+            attributes_of(&none, "Car", &["speed"], &every),
+            json!({"type": "Car", "attributes": [
+                {"name": "speed", "read": false, "write": false, "delete": false, "reason": "no_grant"}]})
+        );
+        let text = attributes_of(&grants, "Car", &["speed"], &every).to_string();
+        for hidden in ["editor", "never-plate", "if-red", "did:web"] {
+            assert!(!text.contains(hidden), "{hidden} in {text}");
+        }
+        // a write of access-control vocabulary is refused by the engine (GW29)
+        assert_eq!(
+            attributes_of(&without, "Car", &["owner"], &|_| true),
+            json!({"type": "Car", "attributes": [
+                {"name": "owner", "read": false, "write": false, "delete": false, "reason": "not_in_grant"}]})
+        );
+        Ok(())
+    }
+
+    /// What the engine decides on a real request: `action` on `attribute` of
+    /// one `Car`, shown (a read) or allowed (a write).
+    fn real(t: &Table, who: &Caller, action: &str, attribute: &str) -> bool {
+        let Some(clause) = names::clause(action) else {
+            return false;
+        };
+        let ctx = context();
+        let (ty, attr) = (ctx.expand_key("Car"), ctx.expand_key(attribute));
+        let types = vec![ty.clone()];
+        let attrs = vec![attr.clone()];
+        let ids = ["urn:ngsi-ld:Car:1"];
+        let op = Operation {
+            types: &types,
+            attrs: &attrs,
+            ids: &ids,
+            ..Operation::new(clause)
+        };
+        match crate::decide::decide(Some(t), who, &op, Utc::now()) {
+            Decision::Allow => true,
+            Decision::Deny(_) | Decision::AllowIf(_) => false,
+            Decision::Filter(f) => f.rules.iter().any(|r| {
+                r.types.contains(&ty) && (r.every_attribute || r.attributes.contains(&attr))
+            }),
+        }
+    }
+
+    #[test]
+    fn the_check_on_an_attribute_equals_the_real_decision_for_every_generated_policy(
+    ) -> Result<(), String> {
+        let clauses = [
+            json!(["5.7.1"]),
+            json!(["5.7.1", "5.6.4"]),
+            json!(["5.7.1", "5.6.4", "5.6.5"]),
+            json!(["5.6.5"]),
+        ];
+        let information = [
+            None,
+            Some(json!([{"entities": [{"type": "Car"}]}])),
+            Some(json!([{"entities": [{"type": "Car"}], "propertyNames": ["a"]}])),
+            Some(json!([{"entities": [{"type": "Car"}], "propertyNames": ["a", "b"]}])),
+            Some(json!([{"entities": [{"type": "Bus"}], "propertyNames": ["a"]}])),
+        ];
+        let mut cases = 0_u32;
+        for grant_ops in &clauses {
+            for grant_info in &information {
+                for prohibit in std::iter::once(None).chain(information.iter().map(Some)) {
+                    for prohibit_ops in &clauses {
+                        let mut permit = json!({"id": "p", "assignee": {"kind": "role", "id": "public"},
+                                                "operations": grant_ops});
+                        if let (Some(o), Some(info)) = (permit.as_object_mut(), grant_info) {
+                            o.insert("information".into(), info.clone());
+                        }
+                        let mut policies = vec![permit];
+                        if let Some(info) = prohibit {
+                            let mut no = json!({"id": "n", "effect": "prohibit",
+                                                "assignee": {"kind": "role", "id": "public"},
+                                                "operations": prohibit_ops});
+                            if let (Some(o), Some(info)) = (no.as_object_mut(), info) {
+                                o.insert("information".into(), info.clone());
+                            }
+                            policies.push(no);
+                        }
+                        let t = compiled(&Value::Array(policies))?;
+                        let public = caller(&[("x-jc-roles", "")]);
+                        let grants = Grants::of(Some(&t), &public, Utc::now());
+                        for (_, action) in ATTRIBUTE_ACTIONS {
+                            for attribute in ["a", "b", "c"] {
+                                assert_eq!(
+                                    may(&grants, action, attribute),
+                                    real(&t, &public, action, attribute),
+                                    "{action} {attribute} {grant_ops} {grant_info:?} {prohibit:?} {prohibit_ops}"
+                                );
+                                cases = cases.saturating_add(1);
+                            }
+                        }
+                        if prohibit.is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 4 * 5 * (1 + 5 * 4) * 9);
         Ok(())
     }
 }
