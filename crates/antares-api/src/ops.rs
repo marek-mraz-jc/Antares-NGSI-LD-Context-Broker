@@ -691,6 +691,7 @@ pub(super) async fn tenant_purge(
         }
         st.temporal.purge_tenant(&tenant).await?;
         st.store.purge_tenant(&tenant).await?;
+        st.known_tenants.forget(&tenant);
         if let Some(sync) = &st.sub_sync {
             // Kept apart: the mirror entry is keyed per kind, so one id
             // naming both a Subscription and a Context Source Registration

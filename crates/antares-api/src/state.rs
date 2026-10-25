@@ -205,6 +205,55 @@ impl HistoryRules {
     }
 }
 
+/// The Tenants the store recently answered "exists" for (T-5500). The 5.5.10
+/// wall asks about the request's Tenant ahead of every operation that
+/// names one, and nearly every answer is "exists", so a name it holds skips
+/// the store for [`KnownTenants::TTL`]. It keeps positive answers only: a
+/// write can create a Tenant at any moment, so a "does not exist" is never
+/// kept. A purge on this process forgets the name at once; a purge on
+/// another process sharing the store is seen once the entry ages out.
+#[derive(Debug, Default)]
+pub struct KnownTenants(std::sync::Mutex<std::collections::HashMap<String, Instant>>);
+
+impl KnownTenants {
+    /// How long a remembered "exists" stands in for the store's answer.
+    pub const TTL: std::time::Duration = std::time::Duration::from_secs(30);
+    /// The most names held at once (ADR-0001's 10 000-tenant target): a
+    /// full map takes no new name until its old entries age out.
+    pub const CAP: usize = 10_000;
+
+    fn map(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, Instant>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Did the store say this Tenant exists within the last [`Self::TTL`]?
+    #[must_use]
+    pub fn holds(&self, tenant: &antares_model::TenantId) -> bool {
+        self.map()
+            .get(tenant.as_str())
+            .is_some_and(|at| at.elapsed() < Self::TTL)
+    }
+
+    /// The store just said this Tenant exists.
+    pub fn remember(&self, tenant: &antares_model::TenantId) {
+        let mut map = self.map();
+        if map.len() >= Self::CAP && !map.contains_key(tenant.as_str()) {
+            map.retain(|_, at| at.elapsed() < Self::TTL);
+            if map.len() >= Self::CAP {
+                return;
+            }
+        }
+        map.insert(tenant.as_str().to_owned(), Instant::now());
+    }
+
+    /// The Tenant was purged: the next request asks the store again.
+    pub fn forget(&self, tenant: &antares_model::TenantId) {
+        self.map().remove(tenant.as_str());
+    }
+}
+
 /// The handler `wire` installs for a notification that arrives on the
 /// internal distributed-subscription endpoint (5.8.1.4).
 pub type CsourceNotification = Arc<
@@ -345,6 +394,8 @@ pub struct Shared {
     /// [`crate::TENANT_BYTES_TTL`] (T-2890). One entry per existing tenant
     /// asked about; a purge drops its entry.
     pub tenant_bytes: Arc<std::sync::Mutex<std::collections::HashMap<String, crate::BytesEntry>>>,
+    /// The 5.5.10 wall's memory of Tenants that exist (T-5500).
+    pub known_tenants: Arc<KnownTenants>,
     /// Allocator stats provider (set by the broker; None in tests/wasm).
     pub mem_stats: Option<Arc<dyn Fn() -> serde_json::Value + Send + Sync>>,
     /// Bus state provider for /q/health (`bus: {mode, connected,
@@ -733,6 +784,7 @@ impl AppState {
                 surfaces: Arc::new(vec![Box::new(crate::Admin)]),
                 limits: Arc::new(crate::bounds::LimitStats::default()),
                 tenant_bytes: Arc::default(),
+                known_tenants: Arc::default(),
                 mem_stats: None,
                 bus_stats: None,
                 egress: Arc::new(crate::egress::Egress::new(egress_policy)),

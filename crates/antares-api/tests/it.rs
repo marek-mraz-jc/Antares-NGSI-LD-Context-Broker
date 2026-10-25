@@ -136,6 +136,7 @@ mod temporal_values_4_5_9;
 mod temporal_versions_2_4;
 mod tenant_header_6_3_14;
 mod tenant_isolation;
+mod tenant_known_t5500;
 mod tenant_move;
 mod tenant_purge_large;
 mod tenants_admin;
