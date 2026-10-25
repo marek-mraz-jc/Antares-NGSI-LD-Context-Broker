@@ -1622,16 +1622,13 @@ async fn delete_attr_inner(
         if let Some(g) = &guard {
             g.settled()?;
         }
-        // The temporal representation records the deletion (4.8 deletedAt).
-        // Only what the Entity held is deleted (5.6.5.4: "If the target Entity
-        // does not contain the target Attribute then an error of type
-        // ResourceNotFound shall be raised"), so an Entity held only
-        // temporally, an Attribute already deleted and a refused delete (the
-        // type selector did not match) all leave the history untouched.
-        if found && matches!(res, Some(Ok(_))) {
-            crate::history::mirror_delete_attr(st, &tenant, id, &attr_iri, want_ds.as_deref(), &ts)
-                .await;
-        }
+        // The store's change hook records the deletion (4.8 deletedAt,
+        // notify::record_temporal_change). Only what the Entity held is
+        // deleted (5.6.5.4: "If the target Entity does not contain the target
+        // Attribute then an error of type ResourceNotFound shall be raised"),
+        // so an Entity held only temporally, an Attribute already deleted and
+        // a refused delete (the type selector did not match) write nothing
+        // and leave the history untouched.
         Some(single_attr_local(res, found, id, attr, &tenant))
     };
     if regs.is_empty() {

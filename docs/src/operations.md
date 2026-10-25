@@ -390,7 +390,7 @@ Measured: full roll ≈ 43 s (the api pod pays the
 ~21 s drain, workers ~2 s each), 52/52 LB requests answered 200 across the
 whole roll.
 
-Proven: the `roll-weekly` workflow (Tue 04:17 UTC + dispatch) runs
+Proven: the `roll-weekly` workflow (Tue 10:17 UTC + dispatch) runs
 the FULL ETSI suite through the LB while the replicas roll in a loop — the
 suite has no retries, so any red TP is a real drain bug. The per-push
 `postgres-nats`/`timescale-nats` matrix cells do the same over the
@@ -462,9 +462,9 @@ operator's steps.
 | ETSI conformance, per-commit gate (file/postgres/timescale × 10 suites) | ci.yml → etsi-matrix.yml `preset: quick` (every push) |
 | ETSI conformance, FULL seven cells (memory/file/postgres/timescale + the two rolling role-fleet cells + wasm-file) × 10 suites | full.yml (twice a week + `v*` tags + dispatch); its bundle feeds [the report page](https://antaresbroker.joinedcontext.com/reports/latest/) + per-cell badges |
 | The browser artifact serves the full API from a container (file store, serial suites + IOP) | the `wasm-file` matrix cell (`WASM=1 WASM_DOCKER=1 STORE=file` through the one pipeline — Dockerfile.wasm, the same www/pkg bytes a page loads) |
-| Zero-downtime rolling update | `roll-weekly` (Tue 04:17 UTC + dispatch) + the full-run `-nats` matrix cells (10-pod fleet rolling under the whole suite) |
+| Zero-downtime rolling update | `roll-weekly` (Tue 10:17 UTC + dispatch) + the full-run `-nats` matrix cells (10-pod fleet rolling under the whole suite) |
 | Role-pair exactly-once semantics (duplicated matcher/notifier/temporal/registry pods) | ci.yml nats job (`nats_e2e::role_pairs_exactly_once_semantics`, live PG + NATS) |
 | NATS bus + role split e2e | ci.yml nats job (`nats_e2e`, live PG + NATS) |
 | Data written by the previous release is served by this one (file + postgres) | full.yml `upgrade-path` on every `v*` tag: the two release binaries are built and pointed at one store in turn (`dev/upgrade-path.sh`) |
 | k8s manifests boot | k8s-smoke.yml kind smoke (dispatch) |
-| Coverage | strict.yml coverage job (daily line-coverage floor) + etsi-coverage.yml (Mon 04:41 UTC) → merged lcov/html on the report page |
+| Coverage | strict.yml coverage job (daily line-coverage floor) + etsi-coverage.yml (Mon 10:41 UTC) → merged lcov/html on the report page |

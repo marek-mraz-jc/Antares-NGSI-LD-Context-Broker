@@ -10,6 +10,14 @@ name: workspace
 
 on:
   workflow_call:
+    inputs:
+      max_parallel:
+        # cells of each matrix job at a time; full.yml's schedule lowers it
+        # so a run leaves the account's job slots to the trains (T-5639).
+        # The default is above every matrix here, so ci.yml runs unthrottled.
+        description: "matrix cells per job at a time"
+        type: number
+        default: 16
 
 # Compiles and tests the workspace and uploads reports; the token only
 # has to read the checkout.
@@ -394,6 +402,7 @@ jobs:
     services: *workspace-services
     strategy:
       fail-fast: false
+      max-parallel: ${{ inputs.max_parallel }}
       matrix:
         set: [no-default-features, all-features, file-store]
     steps:
@@ -494,6 +503,7 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      max-parallel: ${{ inputs.max_parallel }}
       matrix:
         # `package`, not `crate`: dev/spec.py reads the first `crate:` matrix
         # as the shared-crates one
@@ -649,6 +659,7 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      max-parallel: ${{ inputs.max_parallel }}
       matrix:
         crate: [ngsild-model, ngsild-ql, ngsild-jsonld, ngsild-matcher, ngsild-residual, antares-store]
     steps:

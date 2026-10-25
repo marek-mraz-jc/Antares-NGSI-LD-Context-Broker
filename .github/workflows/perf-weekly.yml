@@ -25,7 +25,7 @@ on:
   # Schedule off — the run rents a Hetzner box. Dispatch it by hand
   # instead; restore by uncommenting.
   # schedule:
-  #   - cron: "17 3 * * 6"
+  #   - cron: "17 6 * * 5" # Friday, the heavy weekly of its day (T-5639)
   workflow_dispatch:
     inputs:
       repeats:

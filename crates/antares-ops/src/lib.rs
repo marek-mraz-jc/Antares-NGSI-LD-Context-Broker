@@ -1164,6 +1164,7 @@ impl Ops {
     /// # Errors
     /// The store's.
     pub async fn grant_doc(&self, id: &str) -> Result<Option<serde_json::Value>, String> {
+        views::count_doc_reads("grant", 1);
         self.state.grant_doc(id).await
     }
 

@@ -5,7 +5,7 @@ name: advisories
 # .github/actions/failure-issue — its dedupe/file logic started here).
 on:
   schedule:
-    - cron: "23 4 * * 1"
+    - cron: "23 8 * * 1"
   workflow_dispatch:
 
 permissions:

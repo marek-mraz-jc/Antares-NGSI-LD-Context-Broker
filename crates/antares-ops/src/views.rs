@@ -628,10 +628,10 @@ impl Reloader {
                     .map(|doc| (id.to_owned(), doc)),
             );
         }
-        self.fetched.fetch_add(
-            u64::try_from(fresh.len()).unwrap_or(u64::MAX),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let fetched = u64::try_from(fresh.len()).unwrap_or(u64::MAX);
+        self.fetched
+            .fetch_add(fetched, std::sync::atomic::Ordering::Relaxed);
+        count_doc_reads("reload", fetched);
         let next: HashMap<String, Held> = listed
             .into_iter()
             .filter_map(|(id, digest)| {
@@ -690,6 +690,16 @@ impl Reloader {
         drop(cache);
         rule_documents::reload(&self.state, &mut *self.policy.lock().await).await
     }
+}
+
+/// Count `n` reads of one stored document by its id on
+/// `antares_views_doc_reads_total`, by who read it (T-5501): `reload` (a body
+/// whose digest moved), `admin` (a GET on `/q/views`, `/q/schemas`,
+/// `/q/retention`, `/q/quality` or `/q/policy`, or a PUT on `/q/policy`,
+/// which reads the revision it replaces) or `grant` (an export grant
+/// a delivery checks).
+pub(crate) fn count_doc_reads(by: &'static str, n: u64) {
+    metrics::counter!("antares_views_doc_reads_total", "by" => by).increment(n);
 }
 
 fn log_entry(id: &str, e: &ViewEntry) {
@@ -946,6 +956,7 @@ async fn get_one(r: Arc<Reloader>, id: String) -> Result<Response, String> {
     if !valid_id(&id) {
         return Ok(not_found());
     }
+    count_doc_reads("admin", 1);
     Ok(match r.state.view_doc(&id).await? {
         Some(doc) => axum::Json(doc).into_response(),
         None => not_found(),
@@ -1015,6 +1026,7 @@ async fn stored_json(
     let Some(key) = key else {
         return Ok(bad_tenant());
     };
+    count_doc_reads("admin", 1);
     Ok(
         match r
             .state

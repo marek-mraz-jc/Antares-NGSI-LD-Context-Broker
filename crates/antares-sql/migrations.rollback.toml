@@ -108,3 +108,7 @@ note = "new entity_values with its statement triggers on entities; an older rele
 [0025]
 rollback = "compatible"
 note = "entity_attrs and its trigger stay; an older release never reads them and folds /attributes, while the trigger keeps the catalogue current for the roll-forward"
+
+[0026]
+rollback = "compatible"
+note = "views gains the generated digest column; an older release names its columns on INSERT and computes the digest in its own query, the same value, so it reads and writes views as before while the column stays current for the roll-forward"

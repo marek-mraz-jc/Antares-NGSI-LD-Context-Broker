@@ -12,8 +12,8 @@ comes from a local script, named with its box beside it.
 
 | run | box | what it measures | cadence |
 |---|---|---|---|
-| `perf-weekly` | ccx33 (8 dedicated vCPU, 32 GB), one hour | the request shapes other brokers publish, on the in-memory store; dispatched with `store=postgres` it adds the same tables against a PostgreSQL container on the box, at pool 20 and 100 (`pg-pool<N>/`) | Saturday |
-| `scale-weekly` | ccx53 (32 dedicated vCPU, 128 GB) + volume, one hour | the design targets on PostgreSQL, at scale 0.01 | Sunday |
+| `perf-weekly` | ccx33 (8 dedicated vCPU, 32 GB), one hour | the request shapes other brokers publish, on the in-memory store; dispatched with `store=postgres` it adds the same tables against a PostgreSQL container on the box, at pool 20 and 100 (`pg-pool<N>/`) | Friday |
+| `scale-weekly` | ccx53 (32 dedicated vCPU, 128 GB) + volume, one hour | the design targets on PostgreSQL, at scale 0.01 | Thursday |
 
 `scale-weekly` sizes the database to the box it rents: `shared_buffers` a
 quarter of RAM, `maintenance_work_mem` a sixteenth, the shared memory
@@ -768,7 +768,7 @@ dry run needs the core limit only; it shrinks the volume to 10 GB.
 Actions → *scale-weekly* → *Run workflow* with `scale` = `0.01` (about an
 hour, a few euros); read the step summary for the cost line and the
 tables. Then Actions → *perf-weekly* → *Run workflow*. Both schedules take
-over from there (Saturday 03:17 UTC and Sunday 02:17 UTC), and `pages`
+over from there (perf-weekly Friday, scale-weekly Thursday, 06:17 UTC), and `pages`
 folds the newest bundles into `/reports/perf/latest/`.
 
 If you would rather not rent hardware, disable the two workflows (Actions
