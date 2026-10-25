@@ -1824,6 +1824,7 @@ pub async fn fed_retrieve_temporal(
     params: &HashMap<String, String>,
     map: Option<&Value>,
     warnings: &mut Vec<String>,
+    proxies: &mut Vec<FedReg>,
 ) -> Result<Vec<(bool, Value)>, NgsiError> {
     let spec = crate::registry::CsrSpec {
         ids: Some(vec![id.to_owned()]),
@@ -1834,8 +1835,9 @@ pub async fn fed_retrieve_temporal(
     };
     let ctx_url = ctx_link_url(headers, &ctx.source);
     let ctx_url = &ctx_url;
-    let regs: Vec<FedReg> = matching_regs(st, tenant, &spec, ctx, headers)
-        .await?
+    let matched = matching_regs(st, tenant, &spec, ctx, headers).await?;
+    proxies.extend(matched.iter().filter(|r| r.is_proxy()).cloned());
+    let regs: Vec<FedReg> = matched
         .into_iter()
         // 5.7.3.4: a live EntityMap in use is the ONLY source of matching
         // registrations; its linked map location travels with the forward.
@@ -2012,7 +2014,9 @@ pub fn merge_docs(base: &mut Value, add: &Value, aux: bool) {
 // ---------- distributed reads ----------
 
 /// Federated retrieve: internal docs from every matching registration,
-/// (aux, doc) pairs so callers can order the merge.
+/// (aux, doc) pairs so callers can order the merge. `sole_failure` receives
+/// the failed answer when the one registration asked is exclusive or
+/// redirect: 6.3.17 p.278 gives that single source its own error statuses.
 #[allow(clippy::too_many_arguments)] // mirrors the wire: one param per forwarded request part
 pub async fn fed_retrieve(
     st: &AppState,
@@ -2023,6 +2027,7 @@ pub async fn fed_retrieve(
     map: Option<&Value>,
     except_reg: Option<&str>,
     warnings: &mut Vec<String>,
+    sole_failure: &mut Option<Part>,
 ) -> Result<Vec<(bool, Value)>, NgsiError> {
     let spec = crate::registry::CsrSpec {
         ids: Some(vec![id.to_owned()]),
@@ -2111,8 +2116,21 @@ pub async fn fed_retrieve(
     })
     .await;
     let mut out = Vec::new();
+    let single = fetched.len() == 1;
     for (reg, status, body, peer_warns) in fetched {
         if !usable_payload(st, tenant, status, &body, peer_warns, warnings) {
+            if single && reg.is_proxy() {
+                *sole_failure = Some(Part {
+                    status,
+                    detail: format!(
+                        "distributed operation to registration {} returned {status}",
+                        reg.reg_id
+                    ),
+                    registration: Some(reg.reg_id.clone()),
+                    proxy: true,
+                    update: None,
+                });
+            }
             continue;
         }
         let candidates: Vec<&Value> = match &body {
@@ -2634,6 +2652,7 @@ pub async fn fed_query_temporal(
     ctx: &Context,
     params: &HashMap<String, String>,
     warnings: &mut Vec<String>,
+    proxies: &mut Vec<FedReg>,
 ) -> Result<Vec<(bool, Value)>, NgsiError> {
     let mut spec = query_spec(ctx, params);
     spec.temporal = crate::temporalq::TemporalQ::from_params(params, false)
@@ -2641,8 +2660,9 @@ pub async fn fed_query_temporal(
         .flatten();
     let ctx_url = ctx_link_url(headers, &ctx.source);
     let ctx_url = &ctx_url;
-    let regs: Vec<FedReg> = matching_regs(st, tenant, &spec, ctx, headers)
-        .await?
+    let matched = matching_regs(st, tenant, &spec, ctx, headers).await?;
+    proxies.extend(matched.iter().filter(|r| r.is_proxy()).cloned());
+    let regs: Vec<FedReg> = matched
         .into_iter()
         .filter(|reg| reg.supports("queryTemporal"))
         .collect();
@@ -2757,22 +2777,113 @@ pub fn merge_candidates(local: Vec<Value>, fed: Vec<(bool, Value)>) -> Vec<Value
 // ---------- distributed writes ----------
 
 /// Outcome of one part of a distributed write.
+#[derive(Clone, Debug, Default)]
 pub struct Part {
+    /// The status the local write or the source answered.
     pub status: u16,
     pub detail: String,
+    /// 5.2.17 BatchEntityError registrationId: the Context Source
+    /// Registration a forwarded part went to; `None` for the local part.
+    pub registration: Option<String>,
+    /// The part went to an exclusive or redirect registration (6.3.17).
+    pub proxy: bool,
+    /// A source's 207 UpdateResult (5.2.18), Attribute names expanded.
+    pub update: Option<RemoteUpdate>,
+}
+
+/// 5.2.18 UpdateResult a source answered for a forwarded attribute write.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RemoteUpdate {
+    pub updated: Vec<String>,
+    /// (Attribute IRI, reason)
+    pub not_updated: Vec<(String, String)>,
 }
 
 impl Part {
+    /// A part decided by this broker itself.
+    pub fn local(status: u16, detail: impl Into<String>) -> Self {
+        Part {
+            status,
+            detail: detail.into(),
+            ..Part::default()
+        }
+    }
     pub fn ok(&self) -> bool {
         // 207 from a forwarded source is a partial failure, not a success
         (200..300).contains(&self.status) && self.status != 207
     }
+    /// The status this part answers alone. 6.3.17 p.278: for a proxied
+    /// (exclusive/redirect) source the error vocabulary is fixed: 508 loop,
+    /// 504 timeout, 404 not found, and "502 Bad Gateway - if the single
+    /// forwarded request fails for any other reason such as the Context
+    /// Broker itself having insufficient access rights". 409 keeps
+    /// AlreadyExists semantics (the peer speaks NGSI-LD) and a 207 stays the
+    /// partial verdict it is; a 401/403, a peer's 500/503 or a 400 on the
+    /// inter-broker request surfaces as 502. Inside a 207 each error keeps
+    /// the source's own status, the most informative one.
+    pub fn alone_status(&self) -> u16 {
+        if self.proxy
+            && !(200..300).contains(&self.status)
+            && !matches!(self.status, 207 | 404 | 409 | 504 | 508)
+        {
+            502
+        } else {
+            self.status
+        }
+    }
+    /// The ProblemDetails type and title of a failed part. 5.6.1.4/5.6.2…:
+    /// an unsupported-operation part is the Conflict error type; an
+    /// entity-exists part stays AlreadyExists.
+    fn problem(&self, status: u16) -> (&'static str, &'static str) {
+        match status {
+            409 if self.detail.contains("does not accept") => ("Conflict", "Conflict"),
+            409 => ("AlreadyExists", "Conflict"),
+            404 => ("ResourceNotFound", "Not Found"),
+            _ => ("InternalError", "Error"),
+        }
+    }
 }
 
-/// Combine local + forwarded parts (6.3.17/6.4.3.1): all-success ⇒ `ok`,
-/// single failing part ⇒ its own error, mixed ⇒ 207 Multi-Status.
+/// One failed part answered alone, as the ProblemDetails of its status.
+pub fn part_error(p: &Part, tenant: &TenantId) -> Response {
+    problem_response(p, tenant, false)
+}
+
+/// The failure of the single registered source of a distributed read (6.3.17
+/// p.278), naming the Context Source Registration it was asked through.
+pub fn source_error(p: &Part, tenant: &TenantId) -> Response {
+    problem_response(p, tenant, true)
+}
+
+fn problem_response(p: &Part, tenant: &TenantId, name_registration: bool) -> Response {
+    let code = p.alone_status();
+    let status = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY);
+    let (etype, title) = p.problem(code);
+    let mut body = json!({
+        "type": format!("https://uri.etsi.org/ngsi-ld/errors/{etype}"),
+        "title": title,
+        "detail": p.detail,
+        "status": code,
+    });
+    if let (true, Some(rid), Some(o)) = (name_registration, &p.registration, body.as_object_mut()) {
+        o.insert("registrationId".into(), Value::String(rid.clone()));
+    }
+    let mut resp = (
+        status,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        axum::Json(body),
+    )
+        .into_response();
+    echo_tenant(tenant, &mut resp);
+    resp
+}
+
+/// Combine local + forwarded parts of a write on Entity `id` (`None` for a
+/// set operation such as Purge) (6.3.17/6.4.3.1): all-success ⇒ `ok`, single failing part ⇒ its own
+/// error, mixed ⇒ 207 Multi-Status with a BatchOperationResult.
 pub fn combine(
     profile: crate::Profile,
+    id: Option<&str>,
     mut parts: Vec<Part>,
     ok: Response,
     tenant: &TenantId,
@@ -2793,51 +2904,40 @@ pub fn combine(
         let Some(p) = parts.first() else {
             return ok;
         };
-        let status = StatusCode::from_u16(p.status).unwrap_or(StatusCode::BAD_GATEWAY);
-        let (etype, title) = match p.status {
-            // 5.6.1.4/5.6.2…: an unsupported-operation part is the Conflict
-            // error type; an entity-exists part stays AlreadyExists.
-            409 if p.detail.contains("does not accept") => ("Conflict", "Conflict"),
-            409 => ("AlreadyExists", "Conflict"),
-            404 => ("ResourceNotFound", "Not Found"),
-            _ => ("InternalError", "Error"),
-        };
-        let body = json!({
-            "type": format!("https://uri.etsi.org/ngsi-ld/errors/{etype}"),
-            "title": title,
-            "detail": p.detail,
-            "status": p.status,
-        });
-        let mut resp = (
-            status,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            axum::Json(body),
-        )
-            .into_response();
-        echo_tenant(tenant, &mut resp);
-        return resp;
+        return part_error(p, tenant);
     }
+    // TS 104 176 7.2.3.2: the 207 body is a BatchOperationResult. 5.2.16
+    // success: "Array of Entity IDs corresponding to the Elements that were
+    // successfully treated"; 5.2.17 BatchEntityError: entityId "Entity ID
+    // corresponding to the Entity in error", registrationId "Registration Id
+    // corresponding to a failed distributed operation".
     let errors: Vec<Value> = parts
         .iter()
         .filter(|p| !p.ok())
         .map(|p| {
-            json!({
+            let (etype, title) = p.problem(p.status);
+            let mut e = json!({
                 "error": {
                     "status": p.status,
-                    "type": "https://uri.etsi.org/ngsi-ld/errors/InternalError",
-                    "title": "distributed operation failed",
+                    "type": format!("https://uri.etsi.org/ngsi-ld/errors/{etype}"),
+                    "title": title,
                     "detail": p.detail,
                 }
-            })
+            });
+            if let Some(o) = e.as_object_mut() {
+                if let Some(id) = id {
+                    o.insert("entityId".into(), Value::String(id.to_owned()));
+                }
+                if let Some(rid) = &p.registration {
+                    o.insert("registrationId".into(), Value::String(rid.clone()));
+                }
+            }
+            e
         })
         .collect();
-    // 6.3.17: "the error response should be as informative as possible" — a
-    // 207 that hides the succeeded halves (did my local delete happen?)
-    // isn't. Parts carry no entity id, so success entries are the details.
-    let success: Vec<&str> = parts
-        .iter()
-        .filter(|p| p.ok())
-        .map(|p| p.detail.as_str())
+    let success: Vec<&str> = id
+        .filter(|_| parts.iter().any(Part::ok))
+        .into_iter()
         .collect();
     let body = json!({"success": success, "errors": errors});
     let mut resp = (
@@ -2980,7 +3080,7 @@ pub async fn forward_part(
     ctx_url: &str,
     body: Option<Value>,
 ) -> Part {
-    let (status, _, _) = forward(
+    let (status, answer, _) = forward(
         st,
         method,
         url.clone(),
@@ -3006,41 +3106,65 @@ pub async fn forward_part(
         "distributed operation to registration {} returned {status}",
         reg.reg_id
     );
-    // 6.3.17 p.278: for a proxied (exclusive/redirect) source the error
-    // vocabulary is fixed — 508 loop, 504 timeout, 404 not found, and
-    // "502 Bad Gateway — if the single forwarded request fails for any other
-    // reason such as the Context Broker itself having insufficient access
-    // rights". 404/504/508 pass through, 409 keeps AlreadyExists semantics
-    // (the peer speaks NGSI-LD) and a 207 stays the partial verdict it is;
-    // every other failure — auth-class 401/403, a peer's 500/503, a 400 on
-    // the inter-broker request — surfaces as 502. The original status stays
-    // in `detail` for diagnosis.
-    let status = if reg.is_proxy()
-        && !(200..300).contains(&status)
-        && !matches!(status, 207 | 404 | 409 | 504 | 508)
-    {
-        502
-    } else {
-        status
-    };
-    Part { status, detail }
+    Part {
+        status,
+        detail,
+        registration: Some(reg.reg_id.clone()),
+        proxy: reg.is_proxy(),
+        update: (status == 207).then(|| remote_update(&answer)).flatten(),
+    }
 }
 
-/// Forward one attribute-level write to every matching registration.
+/// A source's 207 body read as a 5.2.18 UpdateResult, names as the source
+/// wrote them; `None` when it is not one.
+fn remote_update(body: &Value) -> Option<RemoteUpdate> {
+    let o = body.as_object()?;
+    let names = |v: Option<&Value>| -> Option<Vec<Value>> {
+        match v {
+            None => Some(Vec::new()),
+            Some(Value::Array(a)) => Some(a.clone()),
+            Some(_) => None,
+        }
+    };
+    let updated = names(o.get("updated"))?
+        .iter()
+        .map(|n| n.as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    let not_updated = names(o.get("notUpdated"))?
+        .iter()
+        .map(|d| {
+            let name = d.get("attributeName")?.as_str()?.to_owned();
+            let reason = d.get("reason").and_then(Value::as_str).unwrap_or_default();
+            Some((name, reason.to_owned()))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(RemoteUpdate {
+        updated,
+        not_updated,
+    })
+}
+
+/// Forward one attribute-level write to every matching registration. A
+/// `fragment` body (Append, Update Attributes) is an Attribute map, reduced
+/// per registration to the Attributes it covers: 5.6.3.4 "If an exclusive or
+/// redirect Context Source Registration matches against the input data, the
+/// Attributes from matching input data are forwarded", and 4.3.6.1 "all
+/// constraints specified in the registration shall be respected".
 #[allow(clippy::too_many_arguments)] // mirrors the wire: one param per forwarded request part
 pub async fn fed_attr_parts(
     st: &AppState,
     headers: &HeaderMap,
     tenant: &TenantId,
-    ctx_source: &Value,
+    ctx: &Context,
     regs: &[FedReg],
     op: &str,
     method: reqwest::Method,
     path: &str,
     query: &[(String, String)],
     body: Option<Value>,
+    fragment: bool,
 ) -> Vec<Part> {
-    let ctx_url = ctx_link_url(headers, ctx_source);
+    let ctx_url = ctx_link_url(headers, &ctx.source);
     let mut parts = Vec::new();
     for reg in regs {
         // 5.6.2.4 (and the sibling attribute operations): a proxy-mode
@@ -3049,41 +3173,62 @@ pub async fn fed_attr_parts(
         // forwarded.
         if !reg.supports(op) {
             if reg.is_proxy() {
-                parts.push(conflict_part(op));
+                parts.push(conflict_part(op, reg));
             } else {
-                // status 0 = "not forwarded" sentinel: keeps the parts list
-                // 1:1 with regs (combine_attr_parts zips them) without
-                // counting as success or failure.
-                parts.push(Part {
-                    status: 0,
-                    detail: format!("not forwarded: {op} not supported"),
-                });
+                parts.push(not_forwarded(format!("{op} not supported")));
             }
             continue;
         }
-        parts.push(
-            forward_part(
-                st,
-                method.clone(),
-                format!("{}/ngsi-ld/v1{path}", reg.endpoint),
-                query,
-                headers,
-                tenant,
-                reg,
-                &ctx_url,
-                body.clone(),
-            )
-            .await,
-        );
+        let body = match (&body, fragment) {
+            (Some(Value::Object(o)), true) => match reduce_to_scope(o, reg, ctx) {
+                Some(b) => Some(b),
+                None => {
+                    parts.push(not_forwarded("no Attribute of the registration".into()));
+                    continue;
+                }
+            },
+            _ => body.clone(),
+        };
+        let mut part = forward_part(
+            st,
+            method.clone(),
+            format!("{}/ngsi-ld/v1{path}", reg.endpoint),
+            query,
+            headers,
+            tenant,
+            reg,
+            &ctx_url,
+            body,
+        )
+        .await;
+        // the source answered in the Context it was sent (ctx_url)
+        if let Some(u) = part.update.as_mut() {
+            for n in u.updated.iter_mut() {
+                *n = ctx.expand_key(n);
+            }
+            for (n, _) in u.not_updated.iter_mut() {
+                *n = ctx.expand_key(n);
+            }
+        }
+        parts.push(part);
     }
     parts
 }
 
+/// status 0 = "not forwarded" sentinel: keeps the parts list 1:1 with regs
+/// (combine_attr_parts zips them) without counting as success or failure.
+fn not_forwarded(why: String) -> Part {
+    Part::local(0, format!("not forwarded: {why}"))
+}
+
 /// Conflict part for an exclusive registration that does not accept the op.
-pub fn conflict_part(op: &str) -> Part {
+pub fn conflict_part(op: &str, reg: &FedReg) -> Part {
     Part {
         status: 409,
         detail: format!("exclusive registration does not accept {op}"),
+        registration: Some(reg.reg_id.clone()),
+        proxy: true,
+        update: None,
     }
 }
 
@@ -3107,6 +3252,25 @@ pub fn strip_covered_expanded(fragment: &Value, regs: &[FedReg]) -> Value {
         }
     }
     f
+}
+
+/// 4.3.6.3 (TS 104 175 9.3.3): with an exclusive or redirect registration
+/// the "Context Broker itself is not permitted to hold context data about the
+/// registered Entities and Attributes locally (thus all registered context
+/// data is obtained from the external registered sources)". Drop from a
+/// local EXPANDED document the Attributes such a registration claims for it.
+pub fn drop_proxied_local(doc: &mut Value, proxies: &[FedReg], ctx: &Context) {
+    let Some(o) = doc.as_object() else {
+        return;
+    };
+    let claims: Vec<FedReg> = proxies
+        .iter()
+        .filter(|r| r.is_proxy() && r.covers_item(o, ctx))
+        .cloned()
+        .collect();
+    if !claims.is_empty() {
+        *doc = strip_covered_expanded(doc, &claims);
+    }
 }
 
 /// Strip the members proxied registrations cover from a compacted object;
@@ -3161,14 +3325,12 @@ mod tests {
     #[test]
     fn a_404_beside_a_success_is_a_multi_status_on_a_write() {
         let t = antares_model::TenantId::new(TenantId::DEFAULT).expect("tenant");
-        let part = |status: u16| Part {
-            status,
-            detail: String::new(),
-        };
+        let part = |status: u16| Part::local(status, String::new());
         let ok = || StatusCode::NO_CONTENT.into_response();
         assert_eq!(
             combine(
                 crate::Profile::default(),
+                Some("urn:ngsi-ld:V:1"),
                 vec![part(204), part(404)],
                 ok(),
                 &t
@@ -3179,6 +3341,7 @@ mod tests {
         assert_eq!(
             combine(
                 crate::Profile::default(),
+                Some("urn:ngsi-ld:V:1"),
                 vec![part(404), part(204)],
                 ok(),
                 &t
@@ -3189,6 +3352,7 @@ mod tests {
         assert_eq!(
             combine(
                 crate::Profile::default(),
+                Some("urn:ngsi-ld:V:1"),
                 vec![part(404), part(404)],
                 ok(),
                 &t
@@ -3199,6 +3363,7 @@ mod tests {
         assert_eq!(
             combine(
                 crate::Profile::default(),
+                Some("urn:ngsi-ld:V:1"),
                 vec![part(204), part(500)],
                 ok(),
                 &t
@@ -3215,29 +3380,54 @@ mod tests {
     #[test]
     fn ignore_profile_reads_a_404_beside_a_success_as_no_data() {
         let t = antares_model::TenantId::new(TenantId::DEFAULT).expect("tenant");
-        let part = |status: u16| Part {
-            status,
-            detail: String::new(),
-        };
+        let part = |status: u16| Part::local(status, String::new());
         let ok = || StatusCode::NO_CONTENT.into_response();
         let p = crate::Profile {
             fed_write_ignore_404: true,
             ..crate::Profile::default()
         };
         assert_eq!(
-            combine(p, vec![part(204), part(404)], ok(), &t).status(),
+            combine(
+                p,
+                Some("urn:ngsi-ld:V:1"),
+                vec![part(204), part(404)],
+                ok(),
+                &t
+            )
+            .status(),
             204
         );
         assert_eq!(
-            combine(p, vec![part(404), part(204)], ok(), &t).status(),
+            combine(
+                p,
+                Some("urn:ngsi-ld:V:1"),
+                vec![part(404), part(204)],
+                ok(),
+                &t
+            )
+            .status(),
             204
         );
         assert_eq!(
-            combine(p, vec![part(404), part(404)], ok(), &t).status(),
+            combine(
+                p,
+                Some("urn:ngsi-ld:V:1"),
+                vec![part(404), part(404)],
+                ok(),
+                &t
+            )
+            .status(),
             404
         );
         assert_eq!(
-            combine(p, vec![part(204), part(404), part(500)], ok(), &t).status(),
+            combine(
+                p,
+                Some("urn:ngsi-ld:V:1"),
+                vec![part(204), part(404), part(500)],
+                ok(),
+                &t
+            )
+            .status(),
             207
         );
     }
@@ -4219,12 +4409,10 @@ mod tests {
         .await;
         assert_eq!(part.status, 400, "the peer refused the write");
         // one failed forward + one succeeded local part ⇒ 207 Multi-Status
-        let local = Part {
-            status: 204,
-            detail: "local write applied".into(),
-        };
+        let local = Part::local(204, "local write applied");
         let resp = combine(
             crate::Profile::default(),
+            Some("urn:ngsi-ld:V:1"),
             vec![local, part],
             StatusCode::NO_CONTENT.into_response(),
             &tenant,

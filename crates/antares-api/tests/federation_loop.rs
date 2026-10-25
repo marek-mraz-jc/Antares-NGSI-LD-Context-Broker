@@ -27,11 +27,12 @@ const ALIAS: &str = "antares1";
 const ENTITY: &str = "urn:ngsi-ld:Vehicle:d018";
 
 /// A canned Context Source: replies `reply` to every request, counts hits,
-/// and keeps the head of the last request it saw (for header assertions).
+/// and keeps the head and body of the last request it saw.
 struct Mock {
     port: u16,
     hits: Arc<AtomicUsize>,
     last_head: Arc<std::sync::Mutex<String>>,
+    last_body: Arc<std::sync::Mutex<String>>,
 }
 
 fn mock_replying(reply: &'static str) -> Mock {
@@ -44,7 +45,8 @@ fn mock_replying(reply: &'static str) -> Mock {
     let reply = reply.replacen("\r\n", "\r\nConnection: close\r\n", 1);
     let hits: Arc<AtomicUsize> = Arc::default();
     let last_head: Arc<std::sync::Mutex<String>> = Arc::default();
-    let (seen, head) = (hits.clone(), last_head.clone());
+    let last_body: Arc<std::sync::Mutex<String>> = Arc::default();
+    let (seen, head, seen_body) = (hits.clone(), last_head.clone(), last_body.clone());
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { continue };
@@ -83,6 +85,8 @@ fn mock_replying(reply: &'static str) -> Mock {
                 }
             }
             *head.lock().expect("lock") = headers.trim_end().to_owned();
+            *seen_body.lock().expect("lock") =
+                String::from_utf8_lossy(&buf[head_end..]).to_string();
             let _ = s.write_all(reply.as_bytes());
         }
     });
@@ -90,6 +94,7 @@ fn mock_replying(reply: &'static str) -> Mock {
         port,
         hits,
         last_head,
+        last_body,
     }
 }
 
@@ -495,14 +500,412 @@ async fn inclusive_partial_failure_is_207() {
         .await
         .expect("body");
     let doc: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-    assert!(
-        !doc["success"].as_array().expect("success").is_empty(),
-        "the local delete succeeded and must be reported: {doc}"
+    // 5.2.16 success: "Array of Entity IDs corresponding to the Elements
+    // that were successfully treated"; 5.2.17 BatchEntityError entityId
+    // "Entity ID corresponding to the Entity in error" and registrationId
+    // "Registration Id corresponding to a failed distributed operation".
+    assert_eq!(doc["success"], serde_json::json!([ENTITY]), "{doc}");
+    assert_eq!(doc["errors"][0]["entityId"], ENTITY, "{doc}");
+    assert_eq!(
+        doc["errors"][0]["registrationId"], "urn:ngsi-ld:ContextSourceRegistration:inclusive-none",
+        "{doc}"
     );
     assert_eq!(
         doc["errors"][0]["error"]["status"], 500,
         "an inclusive source's error keeps its own status in the 207: {doc}"
     );
+}
+
+/// POST one Context Source Registration document.
+async fn register_doc(st: &AppState, doc: serde_json::Value) {
+    let body = doc.to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ngsi-ld/v1/csourceRegistrations")
+        .header("Content-Type", "application/json")
+        .header("Content-Length", body.len())
+        .body(Body::from(body))
+        .expect("request");
+    assert_eq!(
+        send(st, req).await.status(),
+        StatusCode::CREATED,
+        "registration create"
+    );
+}
+
+/// A registration of `mode` for ENTITY claiming `attrs` at `port`.
+fn csr(id: &str, mode: &str, ops: &[&str], attrs: &[&str], port: u16) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "type": "ContextSourceRegistration",
+        "mode": mode,
+        "operations": ops,
+        "information": [{"entities": [{"type": "Vehicle", "id": ENTITY}], "propertyNames": attrs}],
+        "endpoint": format!("http://127.0.0.1:{port}"),
+    })
+}
+
+async fn post_json(
+    st: &AppState,
+    uri: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let body = body.to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("Content-Type", "application/json")
+        .header("Content-Length", body.len())
+        .body(Body::from(body))
+        .expect("request");
+    let res = send(st, req).await;
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+fn vehicle(attrs: &[&str]) -> serde_json::Value {
+    let mut doc = serde_json::json!({"id": ENTITY, "type": "Vehicle"});
+    for a in attrs {
+        doc[*a] = serde_json::json!({"type": "Property", "value": 1});
+    }
+    doc
+}
+
+const VOCAB: &str = "https://uri.etsi.org/ngsi-ld/default-context/";
+
+/// TS 104 176 7.2.3.2 / CIM 009 6.4.3.1: a distributed Create Entity with
+/// one part failing answers 207 with a BatchOperationResult. 5.2.16 success
+/// holds Entity IDs; 5.2.17 BatchEntityError: entityId "Entity ID
+/// corresponding to the Entity in error", registrationId "Registration Id
+/// corresponding to a failed distributed operation". Coraine
+/// csource-reg-distops-create-207 / -409.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_5_2_17_distributed_create_207_is_a_batch_operation_result() {
+    let st = state();
+    let ok = mock_replying("HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n");
+    let down = mock_replying("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
+    let ops = ["createEntity", "retrieveEntity"];
+    register_doc(
+        &st,
+        csr("urn:CSR:OK", "redirect", &ops, &["speed"], ok.port),
+    )
+    .await;
+    register_doc(
+        &st,
+        csr("urn:CSR:Down", "redirect", &ops, &["color"], down.port),
+    )
+    .await;
+    let (status, doc) = post_json(&st, "/ngsi-ld/v1/entities", vehicle(&["speed", "color"])).await;
+    assert_eq!(status, StatusCode::MULTI_STATUS, "{doc}");
+    assert_eq!(doc["success"], serde_json::json!([ENTITY]), "{doc}");
+    let errors = doc["errors"].as_array().expect("errors");
+    assert_eq!(errors.len(), 1, "{doc}");
+    assert_eq!(errors[0]["entityId"], ENTITY, "{doc}");
+    assert_eq!(errors[0]["registrationId"], "urn:CSR:Down", "{doc}");
+    // inside the 207 each error keeps the source's own status
+    assert_eq!(errors[0]["error"]["status"], 503, "{doc}");
+}
+
+/// 5.6.1.4: "For matching Registrations where the Create Entity operation
+/// is not supported, this shall result in an error of type Conflict if the
+/// complete Create Entity operation failed or in a partial success if some
+/// parts of it succeeded." Coraine csource-reg-distops-create-excl-no-op.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_5_6_1_4_unsupported_part_is_a_conflict_inside_the_207() {
+    let st = state();
+    let m = mock_source();
+    let reg = csr(
+        "urn:CSR:NoCreate",
+        "exclusive",
+        &["retrieveEntity"],
+        &["speed"],
+        m.0,
+    );
+    register_doc(&st, reg).await;
+    let (status, doc) = post_json(&st, "/ngsi-ld/v1/entities", vehicle(&["speed", "color"])).await;
+    assert_eq!(status, StatusCode::MULTI_STATUS, "{doc}");
+    assert_eq!(doc["success"], serde_json::json!([ENTITY]), "{doc}");
+    assert_eq!(doc["errors"][0]["entityId"], ENTITY, "{doc}");
+    assert_eq!(
+        doc["errors"][0]["registrationId"], "urn:CSR:NoCreate",
+        "{doc}"
+    );
+    assert_eq!(doc["errors"][0]["error"]["status"], 409, "{doc}");
+    assert_eq!(
+        doc["errors"][0]["error"]["type"], "https://uri.etsi.org/ngsi-ld/errors/Conflict",
+        "{doc}"
+    );
+    assert_eq!(
+        m.1.load(Ordering::SeqCst),
+        0,
+        "the source is never contacted"
+    );
+}
+
+/// 5.6.3.4: "If an exclusive or redirect Context Source Registration
+/// matches against the input data, the Attributes from matching input data
+/// are forwarded for remote processing." An Attribute the registration does
+/// not claim never reaches the source. Coraine
+/// csource-reg-distops-append-exclusive.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_5_6_3_4_append_forwards_only_the_registered_attributes() {
+    let st = state();
+    let (status, _) = post_json(&st, "/ngsi-ld/v1/entities", vehicle(&[])).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let m = mock_replying("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+    let ops = ["appendAttrs", "retrieveEntity"];
+    register_doc(
+        &st,
+        csr("urn:CSR:AppendExcl", "exclusive", &ops, &["speed"], m.port),
+    )
+    .await;
+    let fragment = serde_json::json!({
+        "speed": {"type": "Property", "value": 99},
+        "brand": {"type": "Property", "value": "Zephyr"},
+    });
+    let uri = format!("/ngsi-ld/v1/entities/{ENTITY}/attrs");
+    let (status, doc) = post_json(&st, &uri, fragment).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{doc}");
+    let sent: serde_json::Value =
+        serde_json::from_str(&m.last_body.lock().expect("lock")).expect("forwarded json");
+    assert_eq!(
+        sent["speed"]["value"], 99,
+        "the claimed Attribute is forwarded: {sent}"
+    );
+    assert!(
+        sent.get("brand").is_none(),
+        "brand is not the source's: {sent}"
+    );
+}
+
+/// 5.2.18 UpdateResult updated: "List of Attributes (represented by their
+/// name) that were appended or updated." A source answering its own 207
+/// UpdateResult is unfolded: what it updated is updated, what it refused is
+/// notUpdated with its reason; an Attribute it reports outside its
+/// registration does not count (4.3.6.1). Coraine
+/// csource-reg-distops-updated-dedup.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_5_2_18_a_source_update_result_is_unfolded() {
+    let st = state();
+    let speed = mock_replying(
+        "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/json\r\nContent-Length: 37\r\n\r\n{\"updated\":[\"speed\"],\"notUpdated\":[]}",
+    );
+    let color = mock_replying(
+        "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/json\r\nContent-Length: 101\r\n\r\n{\"updated\":[\"color\",\"speed\"],\"notUpdated\":[{\"attributeName\":\"paint\",\"reason\":\"read-only at source\"}]}",
+    );
+    let ops = ["appendAttrs"];
+    register_doc(
+        &st,
+        csr("urn:CSR:Speed", "redirect", &ops, &["speed"], speed.port),
+    )
+    .await;
+    register_doc(
+        &st,
+        csr(
+            "urn:CSR:Color",
+            "redirect",
+            &ops,
+            &["color", "paint"],
+            color.port,
+        ),
+    )
+    .await;
+    let uri = format!("/ngsi-ld/v1/entities/{ENTITY}/attrs");
+    let mut frag = vehicle(&["speed", "color", "paint"]);
+    if let Some(o) = frag.as_object_mut() {
+        o.remove("id");
+        o.remove("type");
+    }
+    let (status, doc) = post_json(&st, &uri, frag).await;
+    assert_eq!(status, StatusCode::MULTI_STATUS, "{doc}");
+    let iri = |a: &str| format!("{VOCAB}{a}");
+    // updated is a list of names, order not defined: each one once
+    let mut updated: Vec<&str> = doc["updated"]
+        .as_array()
+        .expect("updated")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    updated.sort_unstable();
+    assert_eq!(updated, [iri("color"), iri("speed")], "{doc}");
+    assert_eq!(
+        doc["notUpdated"],
+        serde_json::json!([{
+            "attributeName": iri("paint"),
+            "reason": "read-only at source",
+            "registrationId": "urn:CSR:Color",
+        }]),
+        "{doc}"
+    );
+}
+
+async fn get_json(st: &AppState, uri: &str) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .body(Body::empty())
+        .expect("request");
+    let res = send(st, req).await;
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// 6.3.17 p.278 (TS 104 176 6.3.5): "In the case of an exclusive or redirect
+/// registration, where all of the data is held outside of the Context Broker
+/// and held in a single registered source, the following errors shall be
+/// returned: ... 504 Gateway Timeout - if the single registered source fails
+/// to respond in time ... 502 Bad Gateway - if the single forwarded request
+/// fails for any other reason". Retrieve Entity is no exception. Coraine
+/// csource-reg-distops-retrieve-upstream-error.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_6_3_17_single_source_read_failure_is_502() {
+    for (reply, want) in [
+        (
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+            StatusCode::BAD_GATEWAY,
+        ),
+        (
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
+            StatusCode::BAD_GATEWAY,
+        ),
+        (
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let st = state();
+        let m = mock_replying(reply);
+        register_doc(
+            &st,
+            csr(
+                "urn:CSR:Src",
+                "exclusive",
+                &["retrieveEntity"],
+                &["speed"],
+                m.port,
+            ),
+        )
+        .await;
+        let (status, doc) = get_json(&st, &format!("/ngsi-ld/v1/entities/{ENTITY}")).await;
+        assert_eq!(status, want, "{reply}: {doc}");
+        if want == StatusCode::BAD_GATEWAY {
+            assert_eq!(doc["status"], 502, "{doc}");
+            assert_eq!(doc["registrationId"], "urn:CSR:Src", "{doc}");
+        }
+    }
+}
+
+/// 6.3.17 p.278: "504 Gateway Timeout - if the single registered source
+/// fails to respond in time", for a redirect and an exclusive registration;
+/// a refused connection is the 502. Coraine distop_retrieve_timeout_504.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_6_3_17_single_source_read_timeout_is_504() {
+    let port = mock_stalling();
+    for mode in ["redirect", "exclusive"] {
+        let st = state();
+        let mut reg = csr("urn:CSR:Slow", mode, &["retrieveEntity"], &["speed"], port);
+        reg["management"] = serde_json::json!({"timeout": 200});
+        register_doc(&st, reg).await;
+        let (status, doc) = get_json(&st, &format!("/ngsi-ld/v1/entities/{ENTITY}")).await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{mode}: {doc}");
+        assert_eq!(doc["registrationId"], "urn:CSR:Slow", "{doc}");
+    }
+    // nothing listens on a port just released
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("addr")
+        .port();
+    let st = state();
+    let mut reg = csr(
+        "urn:CSR:Dead",
+        "exclusive",
+        &["retrieveEntity"],
+        &["speed"],
+        closed,
+    );
+    reg["management"] = serde_json::json!({"timeout": 200});
+    register_doc(&st, reg).await;
+    let (status, doc) = get_json(&st, &format!("/ngsi-ld/v1/entities/{ENTITY}")).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{doc}");
+}
+
+/// 4.5.23.1 (TS 104 175 7.7.1): "Only Relationships targeting a locally
+/// stored Entity or Relationships annotated with an objectType whose object
+/// is an Internal Linked Entity are considered to be retrievable in this
+/// manner." A target a registration holds under the Relationship's
+/// objectType joins; one without objectType, or whose objectType no
+/// registration holds it under, does not, and is never asked for. Coraine
+/// linked_entities_objecttype_gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_4_5_23_1_object_typed_link_joins_a_registered_entity() {
+    let st = state();
+    let m = mock_replying(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 73\r\n\r\n{\"id\":\"urn:E2\",\"type\":\"T2\",\"P\":{\"type\":\"Property\",\"value\":\"from-CP1-E2\"}}",
+    );
+    register_doc(
+        &st,
+        serde_json::json!({
+            "id": "urn:CSR:remote",
+            "type": "ContextSourceRegistration",
+            "mode": "inclusive",
+            "information": [{"entities": [
+                {"id": "urn:E2", "type": "T2"},
+                {"id": "urn:E3", "type": "T3"},
+                {"id": "urn:E5", "type": "T5"},
+            ]}],
+            "endpoint": format!("http://127.0.0.1:{}", m.port),
+        }),
+    )
+    .await;
+    let local = serde_json::json!({"id": "urn:E4", "type": "T4", "P": {"type": "Property", "value": "local-E4"}});
+    assert_eq!(
+        post_json(&st, "/ngsi-ld/v1/entities", local).await.0,
+        StatusCode::CREATED
+    );
+    let linking = serde_json::json!({
+        "id": "urn:E1",
+        "type": "T1",
+        "linkLocalNoType": {"type": "Relationship", "object": "urn:E4"},
+        "linkRemoteTyped": {"type": "Relationship", "object": "urn:E2", "objectType": "T2"},
+        "linkRemoteWrongType": {"type": "Relationship", "object": "urn:E5", "objectType": "T9"},
+        "linkRemoteUntyped": {"type": "Relationship", "object": "urn:E3"},
+    });
+    assert_eq!(
+        post_json(&st, "/ngsi-ld/v1/entities", linking).await.0,
+        StatusCode::CREATED
+    );
+    let (status, doc) = get_json(&st, "/ngsi-ld/v1/entities/urn:E1?join=inline&joinLevel=1").await;
+    assert_eq!(status, StatusCode::OK, "{doc}");
+    assert_eq!(
+        doc["linkLocalNoType"]["entity"]["P"]["value"], "local-E4",
+        "{doc}"
+    );
+    assert_eq!(
+        doc["linkRemoteTyped"]["entity"]["P"]["value"], "from-CP1-E2",
+        "{doc}"
+    );
+    assert!(doc["linkRemoteWrongType"].get("entity").is_none(), "{doc}");
+    assert!(doc["linkRemoteUntyped"].get("entity").is_none(), "{doc}");
+    assert_eq!(m.hits.load(Ordering::SeqCst), 1, "only urn:E2 is asked for");
+    // local=true: no registration is considered (6.3.18)
+    let (_, doc) = get_json(
+        &st,
+        "/ngsi-ld/v1/entities/urn:E1?join=inline&joinLevel=1&local=true",
+    )
+    .await;
+    assert!(doc["linkRemoteTyped"].get("entity").is_none(), "{doc}");
 }
 
 /// 4.3.6.2 p.41 + 6.3.17 p.278: "In the case of an auxiliary registration
@@ -1379,6 +1782,79 @@ async fn clause_5_7_4_temporal_query_forwarding() {
     let res = send(&st, temporal_query()).await;
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(hits.load(Ordering::SeqCst), 0, "never contacted");
+}
+
+/// 4.3.6.3 (TS 104 175 9.3.3): with an exclusive registration the "Context
+/// Broker itself is not permitted to hold context data about the registered
+/// Entities and Attributes locally (thus all registered context data is
+/// obtained from the external registered sources)". The local history of the
+/// claimed Attribute stays out of a temporal query and a temporal retrieve;
+/// the unclaimed one stays in. Coraine
+/// troe_timescale_temporal_distop_query_exclusive.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_4_3_6_3_exclusive_temporal_reads_drop_the_local_history() {
+    let local = serde_json::json!({
+        "id": ENTITY, "type": "Vehicle",
+        "speed": [{"type": "Property", "value": 10, "observedAt": "2026-04-28T09:00:00Z"}],
+        "fuel": [{"type": "Property", "value": 90, "observedAt": "2026-04-28T09:00:00Z"}],
+    });
+    let remote = serde_json::json!({
+        "id": ENTITY, "type": "Vehicle",
+        "speed": [{"type": "Property", "value": 30, "observedAt": "2026-04-28T11:00:00Z"}],
+    });
+    let reply = |body: serde_json::Value| -> &'static str {
+        let body = body.to_string();
+        Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        )
+    };
+    let values = |doc: &serde_json::Value, attr: &str| -> Vec<i64> {
+        doc[attr]
+            .as_array()
+            .map(|a| a.iter().filter_map(|i| i["value"].as_i64()).collect())
+            .unwrap_or_default()
+    };
+    for (path, answer) in [
+        (
+            "/ngsi-ld/v1/temporal/entities?type=Vehicle&timerel=after&timeAt=2026-04-28T00:00:00Z"
+                .to_owned(),
+            serde_json::json!([remote]),
+        ),
+        (
+            format!(
+                "/ngsi-ld/v1/temporal/entities/{ENTITY}?timerel=after&timeAt=2026-04-28T00:00:00Z"
+            ),
+            remote.clone(),
+        ),
+    ] {
+        let st = state();
+        let (status, doc) = post_json(&st, "/ngsi-ld/v1/temporal/entities", local.clone()).await;
+        assert_eq!(status, StatusCode::CREATED, "{doc}");
+        let m = mock_replying(reply(answer));
+        let ops = ["queryTemporal", "retrieveTemporal"];
+        register_doc(
+            &st,
+            csr("urn:CSR:TExcl", "exclusive", &ops, &["speed"], m.port),
+        )
+        .await;
+        let (status, doc) = get_json(&st, &path).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {doc}");
+        let doc = if doc.is_array() { doc[0].clone() } else { doc };
+        assert_eq!(
+            values(&doc, "speed"),
+            [30],
+            "{path}: only the source's speed: {doc}"
+        );
+        assert_eq!(
+            values(&doc, "fuel"),
+            [90],
+            "{path}: unclaimed fuel stays: {doc}"
+        );
+    }
 }
 
 /// 5.6.20.4 support ladder: no mergeBatch → per-entity Merge Entity

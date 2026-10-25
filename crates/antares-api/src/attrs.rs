@@ -288,13 +288,14 @@ async fn write_attrs(
         st,
         headers,
         &tenant,
-        &parsed.ctx.source,
+        &parsed.ctx,
         &regs,
         mode.op,
         mode.method.clone(),
         &format!("/entities/{}/attrs/", path_segment(id)),
         &query,
         Some(Value::Object(without_context_map(obj))),
+        true,
     )
     .await;
     Ok(combine_attr_parts(
@@ -620,6 +621,27 @@ fn combine_attr_parts(
             continue;
         }
         let covered: Vec<&String> = attr_iris.iter().filter(|a| reg.covers_attr(a)).collect();
+        // 5.2.18: a source's own 207 UpdateResult names what it "appended
+        // or updated"; only the Attributes this registration covers count
+        // (4.3.6.1), each listed once.
+        if let Some(u) = &part.update {
+            for a in covered {
+                if u.updated.contains(a) {
+                    any_fed_ok = true;
+                    if !updated.contains(a) {
+                        updated.push(a.clone());
+                    }
+                } else {
+                    let reason = u
+                        .not_updated
+                        .iter()
+                        .find(|(n, _)| n == a)
+                        .map_or_else(|| part.detail.clone(), |(_, r)| r.clone());
+                    not_updated.push((a.clone(), reason, Some(reg.reg_id.clone())));
+                }
+            }
+            continue;
+        }
         if part.ok() {
             any_fed_ok = true;
             for a in covered {
@@ -684,16 +706,12 @@ fn combine_attr_parts(
     // 207 Multi Status is the answer for an entity distributed over multiple
     // endpoints, so a lone proxied source's failure passes through as itself.
     if let ([reg], [part]) = (regs, fed_parts) {
-        if reg.is_proxy() && !part.ok() && matches!(local, LocalOutcome::Skipped) {
-            return crate::federation::combine(
-                crate::Profile::default(), // one failing part: no 404 to drop
-                vec![crate::federation::Part {
-                    status: part.status,
-                    detail: part.detail.clone(),
-                }],
-                no_content(tenant),
-                tenant,
-            );
+        if reg.is_proxy()
+            && !part.ok()
+            && part.update.is_none()
+            && matches!(local, LocalOutcome::Skipped)
+        {
+            return crate::federation::part_error(part, tenant);
         }
     }
     if not_updated.is_empty() {
@@ -1016,7 +1034,7 @@ async fn partial_update_inner(
         st,
         headers,
         &tenant,
-        &parsed.ctx.source,
+        &parsed.ctx,
         &regs,
         "updateAttrs",
         reqwest::Method::PATCH,
@@ -1027,6 +1045,7 @@ async fn partial_update_inner(
         ),
         &fwd_query(params, &["type"]),
         Some(Value::Object(without_context_map(obj))),
+        false,
     )
     .await;
     Ok(combine_single_attr(
@@ -1190,7 +1209,7 @@ pub async fn replace_attr(
             &st,
             &headers,
             &tenant,
-            &parsed.ctx.source,
+            &parsed.ctx,
             &regs,
             "replaceAttrs",
             reqwest::Method::PUT,
@@ -1201,6 +1220,7 @@ pub async fn replace_attr(
             ),
             &fwd_query(&params, &["type"]),
             Some(Value::Object(without_context_map(obj))),
+            false,
         )
         .await;
         Ok(combine_single_attr(
@@ -1366,7 +1386,7 @@ async fn set_attr_value_inner(
         st,
         headers,
         &tenant,
-        &ctx.source,
+        &ctx,
         &regs,
         "replaceAttrs",
         reqwest::Method::PUT,
@@ -1377,6 +1397,7 @@ async fn set_attr_value_inner(
         ),
         &fwd_query(params, &["type", "datasetId", "observedAt"]),
         Some(value),
+        false,
     )
     .await;
     Ok(combine_single_attr(
@@ -1624,7 +1645,7 @@ async fn delete_attr_inner(
         st,
         headers,
         &tenant,
-        &ctx.source,
+        &ctx,
         &regs,
         "deleteAttrs",
         reqwest::Method::DELETE,
@@ -1635,6 +1656,7 @@ async fn delete_attr_inner(
         ),
         &query,
         None,
+        false,
     )
     .await;
     Ok(combine_single_attr(
@@ -2363,10 +2385,7 @@ mod update_result_tests {
             "urn:ngsi-ld:ContextSourceRegistration:csr1",
             Some(vec![brand.clone()]),
         )];
-        let parts = vec![Part {
-            status: 504,
-            detail: "distributed operation timed out".into(),
-        }];
+        let parts = vec![Part::local(504, "distributed operation timed out")];
         let resp = combine_attr_parts(
             &tenant,
             &all,
@@ -2411,10 +2430,10 @@ mod update_result_tests {
                     mode: mode.into(),
                     ..reg("urn:ngsi-ld:ContextSourceRegistration:csr1", None)
                 }];
-                let parts = vec![Part {
+                let parts = vec![Part::local(
                     status,
-                    detail: "distributed operation to registration csr1 failed".into(),
-                }];
+                    "distributed operation to registration csr1 failed",
+                )];
                 let resp = combine_attr_parts(
                     &tenant,
                     std::slice::from_ref(&speed),
@@ -2452,16 +2471,7 @@ mod update_result_tests {
             reg("urn:ngsi-ld:ContextSourceRegistration:csr1", None),
             reg("urn:ngsi-ld:ContextSourceRegistration:csr2", None),
         ];
-        let parts = vec![
-            Part {
-                status: 204,
-                detail: "ok".into(),
-            },
-            Part {
-                status: 404,
-                detail: "not found".into(),
-            },
-        ];
+        let parts = vec![Part::local(204, "ok"), Part::local(404, "not found")];
         let resp = combine_attr_parts(
             &tenant,
             std::slice::from_ref(&speed),
@@ -2481,10 +2491,7 @@ mod update_result_tests {
         let tenant = antares_model::TenantId::new("default").expect("tenant");
         let speed = "https://uri.etsi.org/ngsi-ld/default-context/speed".to_owned();
         let regs = vec![reg("urn:ngsi-ld:ContextSourceRegistration:csr1", None)];
-        let ok_parts = vec![Part {
-            status: 204,
-            detail: "ok".into(),
-        }];
+        let ok_parts = vec![Part::local(204, "ok")];
         let resp = combine_attr_parts(
             &tenant,
             std::slice::from_ref(&speed),
@@ -2497,10 +2504,7 @@ mod update_result_tests {
         );
         assert_eq!(resp.status().as_u16(), 204);
         // entity unknown locally AND every forward failed → 404 ProblemDetails
-        let bad_parts = vec![Part {
-            status: 404,
-            detail: "not found".into(),
-        }];
+        let bad_parts = vec![Part::local(404, "not found")];
         let resp = combine_attr_parts(
             &tenant,
             std::slice::from_ref(&speed),
