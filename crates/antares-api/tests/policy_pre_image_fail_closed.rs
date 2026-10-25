@@ -11,7 +11,8 @@ use antares_api::policy::{
     Decision, DecisionFuture, NotifyDecision, Operation, PolicyEngine, Subject,
 };
 use antares_api::AppState;
-use antares_store::Kind;
+use antares_model::{NgsiError, TenantId};
+use antares_store::{filter, Kind, MutateFn, TemporalDriver};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::Double;
@@ -144,4 +145,116 @@ async fn a_batch_delete_waits_for_a_batch_slot() {
     assert!(!call.is_finished(), "ran without a slot");
     drop(held);
     assert_eq!(call.await.unwrap(), StatusCode::NO_CONTENT);
+}
+
+/// The batch upsert and update read their pre-images in one `get_entities`
+/// and fail closed the same way (F-ANT2-009).
+#[tokio::test]
+async fn a_batch_write_with_an_unreadable_pre_image_fails_whole() {
+    let e = json!([{"id": ID, "type": "Secret", "pin": {"type": "Property", "value": 2}}]);
+    for op in ["upsert", "update"] {
+        let st = seeded().await;
+        let mut broken = st.clone().with_policy(Arc::new(NoSecrets));
+        broken.store = Arc::new(Double::refusing_doc(st.store.clone(), Kind::Entity, ID));
+        let uri = format!("/ngsi-ld/v1/entityOperations/{op}");
+        assert_eq!(
+            send(&broken, "POST", &uri, &e.to_string()).await,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{op}"
+        );
+        let doc = st
+            .store
+            .get(&Default::default(), Kind::Entity, ID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(doc.to_string().contains("\"value\":1"), "{op} wrote: {doc}");
+    }
+}
+
+/// A temporal store that cannot read one evolution; everything else passes.
+struct RefusingTemporal(Arc<dyn TemporalDriver>);
+
+#[async_trait::async_trait]
+impl TemporalDriver for RefusingTemporal {
+    async fn temporal_append(
+        &self,
+        t: &TenantId,
+        id: &str,
+        shell: &Value,
+        additions: &Value,
+    ) -> Result<(), NgsiError> {
+        self.0.temporal_append(t, id, shell, additions).await
+    }
+    async fn query_temporal(
+        &self,
+        t: &TenantId,
+        f: &filter::TemporalFilter<'_>,
+    ) -> Result<filter::TemporalOutcome, NgsiError> {
+        self.0.query_temporal(t, f).await
+    }
+    async fn get_temporal(
+        &self,
+        t: &TenantId,
+        id: &str,
+        f: &filter::TemporalFilter<'_>,
+    ) -> Result<Option<Value>, NgsiError> {
+        self.0.get_temporal(t, id, f).await
+    }
+    async fn get(&self, _t: &TenantId, id: &str) -> Result<Option<Value>, NgsiError> {
+        Err(NgsiError::InternalError(format!("{id} unreadable")))
+    }
+    async fn create(&self, t: &TenantId, id: &str, doc: Value) -> Result<bool, NgsiError> {
+        self.0.create(t, id, doc).await
+    }
+    async fn upsert(&self, t: &TenantId, id: &str, doc: Value) -> Result<bool, NgsiError> {
+        self.0.upsert(t, id, doc).await
+    }
+    async fn delete(&self, t: &TenantId, id: &str) -> Result<bool, NgsiError> {
+        self.0.delete(t, id).await
+    }
+    async fn list(&self, t: &TenantId) -> Result<Vec<Value>, NgsiError> {
+        self.0.list(t).await
+    }
+    async fn mutate_boxed<'a>(
+        &self,
+        t: &TenantId,
+        id: &str,
+        f: MutateFn<'a>,
+    ) -> Result<Option<Result<(), ()>>, NgsiError> {
+        self.0.mutate_boxed(t, id, f).await
+    }
+}
+
+/// A temporal write whose evolution cannot be read fails; it is not
+/// decided over the absent current state (F-ANT2-009, temporal_pre_image).
+#[tokio::test]
+async fn a_temporal_write_with_an_unreadable_evolution_fails() {
+    const T: &str = "urn:ngsi-ld:Secret:t";
+    let st = AppState::new("me".into());
+    let e = json!({"id": T, "type": "Secret", "pin": [
+        {"type": "Property", "value": 1, "observedAt": "2026-01-01T00:00:00Z"}
+    ]});
+    assert_eq!(
+        send(&st, "POST", "/ngsi-ld/v1/temporal/entities", &e.to_string()).await,
+        StatusCode::CREATED
+    );
+    let uri = format!("/ngsi-ld/v1/temporal/entities/{T}");
+    let guarded = st.clone().with_policy(Arc::new(NoSecrets));
+    assert_eq!(
+        send(&guarded, "DELETE", &uri, "").await,
+        StatusCode::FORBIDDEN
+    );
+    let mut broken = guarded.clone();
+    broken.temporal = Arc::new(RefusingTemporal(st.temporal.clone()));
+    assert_eq!(
+        send(&broken, "DELETE", &uri, "").await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(st
+        .temporal
+        .get(&Default::default(), T)
+        .await
+        .unwrap()
+        .is_some());
 }
