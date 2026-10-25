@@ -161,11 +161,22 @@ fn admitted(st: &AppState, headers: &axum::http::HeaderMap) -> bool {
 /// anonymous caller as `x-jc-roles` with none.
 fn vouched_subject(names: &[String], st: &AppState, headers: &axum::http::HeaderMap) -> bool {
     names.iter().any(|name| headers.contains_key(name.as_str()))
-        && (crate::state::in_process_depth() > 0
-            || st
-                .provenance_from
-                .as_deref()
-                .is_none_or(|gateway| crate::provenance::from_gateway(headers, Some(gateway))))
+        && (crate::state::in_process_depth() > 0 || from_named_gateway(st, headers))
+}
+
+/// No gateway named, or the request carries its mesh identity.
+#[cfg(feature = "jc")]
+fn from_named_gateway(st: &AppState, headers: &axum::http::HeaderMap) -> bool {
+    st.provenance_from
+        .as_deref()
+        .is_none_or(|gateway| crate::provenance::from_gateway(headers, Some(gateway)))
+}
+
+/// Vanilla Antares reads no gateway identity (ANTARES_PROVENANCE_FROM is a
+/// platform key), so no gateway is named.
+#[cfg(not(feature = "jc"))]
+fn from_named_gateway(_st: &AppState, _headers: &axum::http::HeaderMap) -> bool {
+    true
 }
 
 /// `401` with a bearer challenge and `detail`.
@@ -297,8 +308,10 @@ mod tests {
         assert!(shown.contains("metrics_open"), "{shown}");
     }
 
+    #[cfg(feature = "jc")]
     const GATEWAY: &str = "context-gateway.jc.serviceaccount.identity.linkerd.cluster.local";
 
+    #[cfg(feature = "jc")]
     fn headers(pairs: &[(&'static str, &'static str)]) -> axum::http::HeaderMap {
         let mut out = axum::http::HeaderMap::new();
         for (k, v) in pairs {
@@ -310,6 +323,7 @@ mod tests {
     /// F-ANT2-001: a bare subject header passes the T-5032 wall only from
     /// the gateway's mesh identity or an in-process call, once the broker
     /// names its gateway.
+    #[cfg(feature = "jc")]
     #[tokio::test]
     async fn a_subject_is_believed_only_from_the_gateway_or_this_process() {
         let names = vec!["x-jc-subject".to_owned()];
