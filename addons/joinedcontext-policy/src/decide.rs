@@ -17,7 +17,7 @@ const CREATES: [&str; 2] = ["5.6.1", "5.6.7"];
 
 /// Access control written into the data (platform GW29): an Entity never
 /// carries a member of these names, short or expanded.
-const POLICY_VOCABULARY: [&str; 6] = [
+pub(crate) const POLICY_VOCABULARY: [&str; 6] = [
     "owner",
     "acl",
     "allowedRoles",

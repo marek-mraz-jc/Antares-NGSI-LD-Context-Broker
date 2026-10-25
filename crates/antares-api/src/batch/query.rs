@@ -95,14 +95,20 @@ async fn batch_query_inner(
         // spends it. Minting a fresh allowance per payload Entity multiplies
         // the ceiling by the page size, which is the request the ceiling
         // exists to bound: a page of densely linked Entities.
-        let held = crate::entities::contained_by(&page_params);
-        let ctx = &parsed.ctx;
+        let scope = JoinScope {
+            st,
+            tenant: &tenant,
+            ctx: &parsed.ctx,
+            repr: &repr,
+            level: *level,
+            held: crate::entities::contained_by(&page_params),
+        };
         match mode.as_str() {
-            "inline" => inline_joins(st, &tenant, ctx, &repr, &mut payload, *level, &held).await,
-            "flat" => {
-                let linked = flat_joins(st, &tenant, ctx, &repr, &page, *level, &held).await;
-                payload.extend(linked);
+            "inline" => {
+                let remote = crate::federation::active(&page_params).then_some(headers);
+                scope.inline(&mut payload, remote).await;
             }
+            "flat" => payload.extend(scope.flat(&page).await),
             _ => {}
         }
     }
@@ -198,52 +204,68 @@ async fn fed_matches(
     )
 }
 
-/// 4.5.23 inline join: the linked Entities inside each payload Entity.
-async fn inline_joins(
-    st: &AppState,
-    tenant: &antares_model::TenantId,
-    ctx: &antares_jsonld::Context,
-    repr: &crate::repr::Repr,
-    payload: &mut [Value],
+/// The 4.5.23 join of one page: what both join modes walk with.
+struct JoinScope<'a> {
+    st: &'a AppState,
+    tenant: &'a antares_model::TenantId,
+    ctx: &'a antares_jsonld::Context,
+    repr: &'a crate::repr::Repr,
     level: usize,
-    held: &[String],
-) {
-    let mut budget = crate::repr::MAX_JOIN_LOOKUPS;
-    for p in payload {
-        crate::repr::inline_join_beyond(st, tenant, ctx, repr, p, level, held, &mut budget).await;
-    }
+    held: Vec<String>,
 }
 
-/// 4.5.23 flat join: the linked Entities the page does not hold, to follow it.
-async fn flat_joins(
-    st: &AppState,
-    tenant: &antares_model::TenantId,
-    ctx: &antares_jsonld::Context,
-    repr: &crate::repr::Repr,
-    page: &[Value],
-    level: usize,
-    held: &[String],
-) -> Vec<Value> {
-    let mut budget = crate::repr::MAX_JOIN_LOOKUPS;
-    let mut linked = std::collections::BTreeMap::new();
-    for doc in page {
-        crate::repr::collect_flat_beyond(
-            st,
-            tenant,
-            ctx,
-            repr,
-            doc,
-            level,
-            &mut linked,
-            held,
-            &mut budget,
-        )
-        .await;
+impl JoinScope<'_> {
+    /// 4.5.23 inline join: the linked Entities inside each payload Entity;
+    /// `remote` carries the request headers when the query is federated.
+    async fn inline(&self, payload: &mut [Value], remote: Option<&HeaderMap>) {
+        let mut budget = crate::repr::MAX_JOIN_LOOKUPS;
+        for p in payload {
+            crate::repr::inline_join_beyond(
+                self.st,
+                self.tenant,
+                self.ctx,
+                self.repr,
+                p,
+                self.level,
+                &self.held,
+                &mut budget,
+                remote,
+            )
+            .await;
+        }
     }
-    let page_ids: Vec<&str> = page.iter().filter_map(|d| d["id"].as_str()).collect();
-    linked
-        .into_iter()
-        .filter(|(id, _)| !page_ids.contains(&id.as_str()))
-        .map(|(_, (ldoc, lrepr))| crate::repr::compact_for(&lrepr, &apply(&ldoc, &lrepr), ctx))
-        .collect()
+
+    /// 4.5.23 flat join: the linked Entities the page does not hold, to follow it.
+    async fn flat(&self, page: &[Value]) -> Vec<Value> {
+        let (st, tenant, ctx, repr, level, held) = (
+            self.st,
+            self.tenant,
+            self.ctx,
+            self.repr,
+            self.level,
+            &self.held[..],
+        );
+        let mut budget = crate::repr::MAX_JOIN_LOOKUPS;
+        let mut linked = std::collections::BTreeMap::new();
+        for doc in page {
+            crate::repr::collect_flat_beyond(
+                st,
+                tenant,
+                ctx,
+                repr,
+                doc,
+                level,
+                &mut linked,
+                held,
+                &mut budget,
+            )
+            .await;
+        }
+        let page_ids: Vec<&str> = page.iter().filter_map(|d| d["id"].as_str()).collect();
+        linked
+            .into_iter()
+            .filter(|(id, _)| !page_ids.contains(&id.as_str()))
+            .map(|(_, (ldoc, lrepr))| crate::repr::compact_for(&lrepr, &apply(&ldoc, &lrepr), ctx))
+            .collect()
+    }
 }

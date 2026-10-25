@@ -350,6 +350,20 @@ fn car_rules() -> Value {
 pub async fn fixture_with(engine: Option<Arc<dyn PolicyEngine>>) -> Result<Fixture, String> {
     // ponytail: the allowlist is read once per process; every test shares it
     std::env::set_var(antares_mcp::SUBSCRIPTION_ENDPOINTS_ENV, HOOKS);
+    // `summarize` reads the host's own cgroup and /proc: a loaded test host
+    // (the whole target in parallel) crossed the Tight CPU line and answered
+    // the count alone (T-5646). No reading crosses these, so every test sees
+    // the Normal budget; the states themselves are budget.rs unit tests.
+    for (key, never) in [
+        (antares_mcp::SUMMARY_BUSY_MEMORY_PCT_ENV, "1000"),
+        (antares_mcp::SUMMARY_TIGHT_MEMORY_PCT_ENV, "1000"),
+        (antares_mcp::SUMMARY_BUSY_CPU_AVG10_ENV, "101"),
+        (antares_mcp::SUMMARY_TIGHT_CPU_AVG10_ENV, "101"),
+        (antares_mcp::SUMMARY_BUSY_NODE_MIB_ENV, "1"),
+        (antares_mcp::SUMMARY_TIGHT_NODE_MIB_ENV, "1"),
+    ] {
+        std::env::set_var(key, never);
+    }
     // the surface's own sink, as a broker built with `mcp` registers it
     let broker = TestBroker::with_sinks(vec![Box::new(antares_mcp::Sink)], engine).await?;
     let app = broker.serve(antares_mcp::Mcp)?;

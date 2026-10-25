@@ -21,6 +21,10 @@ concurrency:
   group: image-jc-${{ github.ref }}
   cancel-in-progress: true
 
+# Every job names its own grants; one without them reads the repository and nothing more.
+permissions:
+  contents: read
+
 jobs:
   build:
     # T-4721: the full tests promote, they never rebuild. This takes the newest image ship.yml
@@ -65,7 +69,7 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
       - run: docker save antares-local:latest | gzip > antares-image.tgz
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: antares-image-jc
           path: antares-image.tgz
@@ -82,10 +86,10 @@ jobs:
       contents: read
     steps:
       # The suites, baselines and expectations of the commit the image was built from.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.build.outputs.sha }}
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: antares-image-jc
       - run: docker load < antares-image.tgz
@@ -102,7 +106,7 @@ jobs:
         env:
           STORES: file
         run: ./dev/etsi-baseline.py check cells
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: ETSI-jc-file
@@ -140,10 +144,10 @@ jobs:
       OUT: cells/ETSI-cell-file
     steps:
       # The suites, baselines and expectations of the commit the image was built from.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.build.outputs.sha }}
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: antares-image-jc
       - run: docker load < antares-image.tgz
@@ -171,7 +175,7 @@ jobs:
         run: |
           python3 tests/external/etsi/ratchet.py ci/policy/etsi/restricted.expected "$OUT/tp-status.csv"
           python3 ci/policy/etsi/refusals.py "$OUT"
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: ETSI-jc-policy-${{ matrix.cell }}
@@ -200,7 +204,7 @@ jobs:
       DIGEST: ${{ needs.build.outputs.digest }}
       GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
       - run: |
           set -euo pipefail
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin

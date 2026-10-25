@@ -103,8 +103,14 @@ pub(crate) async fn serve(
     let history = mapping::HISTORY.contains(&op);
     answer(view, mapping, op, caller, inner, |json| match attribute {
         Some(slot) => mapping.rebuild_attribute(slot, json),
-        None if history => mapping.rebuild_history(json, &inverted.keep),
-        None => mapping.rebuild(json, &inverted.keep),
+        None if history => {
+            mapping.rebuild_history(json, &inverted.keep);
+            true
+        }
+        None => {
+            mapping.rebuild(json, &inverted.keep);
+            true
+        }
     })
     .await
 }
@@ -148,6 +154,7 @@ async fn discover(
     }
     answer(view, mapping, op, caller, inner, |json| {
         mapping.rebuild_discovery(json, slot);
+        true
     })
     .await
 }
@@ -160,7 +167,7 @@ async fn answer(
     op: OperationId,
     caller: &Caller,
     inner: OpsRequest,
-    rebuild: impl FnOnce(&mut serde_json::Value),
+    rebuild: impl FnOnce(&mut serde_json::Value) -> bool,
 ) -> Result<Response, Refusal> {
     let answer = view.run_unmapped(op, caller, inner).await?;
     let (mut parts, body) = answer.into_parts();
@@ -175,7 +182,10 @@ async fn answer(
     let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
         return Ok(Response::from_parts(parts, Body::from(bytes)));
     };
-    rebuild(&mut json);
+    if !rebuild(&mut json) {
+        // a value the view cannot translate is not served
+        return Err(Refusal::NotFound);
+    }
     Ok(Response::from_parts(parts, Body::from(json.to_string())))
 }
 

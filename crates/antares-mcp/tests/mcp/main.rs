@@ -21,4 +21,5 @@ mod mcp_output;
 mod mcp_resources;
 mod mcp_summary;
 mod mcp_transport;
+mod mcp_untrusted;
 mod mcp_writes;

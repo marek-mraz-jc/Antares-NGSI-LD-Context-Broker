@@ -151,6 +151,27 @@ here:
 - The selection of which numeric Attributes are measurements: every numeric
   Property is a Datastream; a view hides the ones it does not publish.
 
+## 3. Named outputs
+
+A view's `representations.sta` lists named outputs (docs API/11 EP-159,
+T-5225; the shared contract in [views](views.md)). Each output is its own
+read-only service at `/x/views/{view}/sta/{output}/v1.1`, beside the view's
+own `/sta/v1.1`, which serves what it served before:
+
+- Its Things are the Entities of its `sources` types that the view shows and
+  its `filter` selects. The filter's `q` and `scopeQ` are AND-ed with the
+  request's, and its geo-query is fixed. The filter applies to every set,
+  every count and every id looked up, so a resource of an Entity outside it
+  answers 404.
+- Its Datastreams are the attributes its sources' `datastreams` role names
+  (`mapping: {datastreams: [pm10, NO2]}`), every numeric Property when no
+  source maps the role. A Datastream's Observations read only an Entity the
+  filter selects now.
+- A Sensor or a point of interest of a type the output does not list is none
+  of its resources: list `Device` as a source to serve the Sensors.
+- An output name the list does not hold, an output that does not hold, or one
+  whose types the view shows none of, answers 404.
+
 ## Related
 
 - [Surfaces](surfaces.md)
