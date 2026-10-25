@@ -324,7 +324,7 @@ fn history(tenant: &str, entity: &str) -> String {
 /// The Entity `m` has a history row passing `preds` (on alias `ai`): the
 /// page qualification. Each parent is probed on its own along its btree,
 /// `dir` from the end the window opens towards, so the first row read is
-/// most likely in the window. An EXISTS over [`history`] read each Entity's
+/// most likely in the window. An EXISTS over `history` read each Entity's
 /// rows oldest first from the widened column bound and fetched every row the
 /// text predicate then refused: ~115 rows an Entity on the helsinki-bikes
 /// history, past the 30 s statement timeout for 577 Entities (T-5616).
