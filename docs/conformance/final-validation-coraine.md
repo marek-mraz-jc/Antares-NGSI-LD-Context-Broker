@@ -395,6 +395,23 @@ Changes against section 3: `entity_create_local_reg_conflict` and `entity_update
 | value_type_subattr | fixed T-5213 | pass | none now (was: valueType accepted on a Relationship / ListRelationship) | 4.5.3.2 p.52-53: "An NGSI-LD Relationship in normalized representation shall be represented by a member whose key is the" Relationship name; its member list has no valueType, which 4.5.2.2 defines for a Property: "\"valueType\": a string value which shall be type coerced into a datatype URI." | 5.2.6.4.4 p.52-54: "The supported JSON members shall comply with the requirements provided in Table 5.2.6.4.4-1." (table has no valueType; valueType is in Property table 5.2.6.4.3 p.49-52) | crates/antares-jsonld/src/expand.rs:664-670 (valueType on Relationship/ListRelationship is BadRequestData) | Antares right |
 | vocab_property | A T-5463 | fail | step 34 GET: concise V2 {"vocab": ["test"]} returned with vocab ["test"], expected "test" | 4.5.20.2 p.74: "vocab": a JSON object consisting of a single string or array of strings | 5.2.6.4.7 p.59-61: vocab (see note 1) String or String[] | compact.rs:103-117 compacts a vocab array element by element and keeps the array | spec unclear (both) |
 
+### 4.1.1 Fixed by T-5464 (group B)
+
+Each `Antares wrong (both versions)` row of group B has a broker test in `crates/antares-api/tests/federation_loop.rs` that asserts the clause quoted in 4.1 and failed on dev `b3f454da`:
+
+| case | test | change |
+|---|---|---|
+| csource-reg-distops-create-207, csource-reg-distops-create-409 | `clause_5_2_17_distributed_create_207_is_a_batch_operation_result`, `inclusive_partial_failure_is_207` | the 207 is a BatchOperationResult: `success` holds the Entity id, each error carries `entityId`, `registrationId` and the source's own status (`federation::combine`) |
+| csource-reg-distops-create-excl-no-op | `clause_5_6_1_4_unsupported_part_is_a_conflict_inside_the_207` | an unsupported operation stays type Conflict inside the 207 |
+| csource-reg-distops-append-exclusive | `clause_5_6_3_4_append_forwards_only_the_registered_attributes` | Append and Update Attributes forward to each registration only the Attributes it covers (`fed_attr_parts`) |
+| csource-reg-distops-updated-dedup | `clause_5_2_18_a_source_update_result_is_unfolded` | a source's 207 UpdateResult is read: its `updated` names count as updated, its `notUpdated` reasons pass through |
+| csource-reg-distops-retrieve-upstream-error | `clause_6_3_17_single_source_read_failure_is_502` | a single exclusive or redirect source failing a Retrieve Entity answers 502 with `registrationId`; its 404 stays 404 |
+| distop_retrieve_timeout_504 | `clause_6_3_17_single_source_read_timeout_is_504` | the same source timing out answers 504, a refused connection 502 |
+| linked_entities_objecttype_gate | `clause_4_5_23_1_object_typed_link_joins_a_registered_entity` | an inline join reads a target not stored locally through a registration holding its id under the Relationship's objectType |
+| troe_timescale_temporal_distop_query_exclusive | `clause_4_3_6_3_exclusive_temporal_reads_drop_the_local_history` | temporal query and retrieve drop the local history of an Attribute an exclusive or redirect registration claims |
+
+Differences left in these Coraine cases after the fix, none of them a broker defect: `statusCode` in NotUpdatedDetails and ProblemDetails (csource-reg-distops-updated-dedup, -retrieve-upstream-error; no such member in 5.2.19 or 5.5.2), `updated` and `attributeName` as expanded IRIs (5.5.7), urn:V3 listed by Coraine although the registration does not name it (4.3.6.1), and the flattened join form, which does not read registered targets yet.
+
 ### 4.2 Sample of "spec unclear" against TS 104 175
 
 The ten largest "spec unclear" rows (25 cases): the newer text decides none of them.
