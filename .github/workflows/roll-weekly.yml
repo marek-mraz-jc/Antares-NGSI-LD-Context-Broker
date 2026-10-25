@@ -11,9 +11,9 @@ name: roll-weekly
 
 on:
   schedule:
-    # Tue 04:17 UTC — offset from full's Wed+Sat 03:23 and fuzz's Mon+Thu
-    # 03:17 so the scheduled walls never queue on the same day.
-    - cron: "17 4 * * 2"
+    # Tue 10:17 UTC — after the dailies' 02-05 UTC window and 4 h after
+    # external-suites, so two walls never queue at once (T-5639).
+    - cron: "17 10 * * 2"
   workflow_dispatch:
 
 concurrency:

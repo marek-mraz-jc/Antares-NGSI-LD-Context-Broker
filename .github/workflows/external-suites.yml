@@ -29,7 +29,7 @@ on:
         description: SEAMWARE/coraine commit whose test/funcTests run
         default: d313d87fabd74f67e0d4d1f222ccf0c45239a0a9
   schedule:
-    - cron: "17 3 * * 0" # weekly, Sunday 03:17 UTC
+    - cron: "17 6 * * 2" # weekly, Tuesday 06:17 UTC, the heavy weekly of Tuesday (T-5639)
   push:
     paths:
       - tests/external/**
@@ -38,9 +38,11 @@ on:
 permissions:
   contents: read
 
+# A scheduled run is never cancelled (its own group); pushes still supersede
+# each other (T-5639).
 concurrency:
-  group: external-suites-${{ github.ref }}
-  cancel-in-progress: true
+  group: external-suites-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 env:
   SMOKE: ${{ github.event_name == 'push' || inputs.smoke == true }}

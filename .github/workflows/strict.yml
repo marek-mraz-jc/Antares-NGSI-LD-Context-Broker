@@ -7,7 +7,7 @@ name: strict
 #                      replay (-runs=0), query pushdown properties at 10k
 #                      cases, workspace coverage floor, surface feature
 #                      powerset at depth 2
-#   WEEKLY Sun 03:41 : ThreadSanitizer over the workspace tests, Miri over
+#   WEEKLY Sun 07:41 : ThreadSanitizer over the workspace tests, Miri over
 #                      the pure parsing crates
 #
 # workflow_dispatch runs everything. Scheduled workflows only run on the
@@ -15,11 +15,16 @@ name: strict
 on:
   schedule:
     - cron: "41 2 * * *" # daily — hygiene + fuzz-regression + coverage
-    - cron: "41 3 * * 0" # weekly Sunday — tsan + miri
+    - cron: "41 7 * * 0" # weekly Sunday — tsan + miri
   workflow_dispatch:
 
 # The default for the sanitizer, Miri, fuzz and coverage jobs; the alarm
 # job that files an issue declares its own wider set.
+# One scheduled run at a time, never cancelled (T-5639).
+concurrency:
+  group: strict-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -29,7 +34,7 @@ jobs:
     # rotting; cargo-machete flags dependencies nothing uses (each one is
     # advisory surface cargo-deny scans forever).
     name: Doc warnings + unused deps (daily)
-    if: github.event.schedule != '41 3 * * 0'
+    if: github.event.schedule != '41 7 * * 0'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -51,7 +56,7 @@ jobs:
     # (-runs=0 = execute the corpus, no new fuzzing) so a fixed crash can
     # never come back between weekly fuzz runs.
     name: Fuzz-crash regression replay (daily)
-    if: github.event.schedule != '41 3 * * 0'
+    if: github.event.schedule != '41 7 * * 0'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -74,7 +79,7 @@ jobs:
     # disagreement prints its shrunk input: commit it as a named regression
     # test beside the fix.
     name: Query pushdown properties, 10k cases (daily)
-    if: github.event.schedule != '41 3 * * 0'
+    if: github.event.schedule != '41 7 * * 0'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -104,7 +109,7 @@ jobs:
     # one floor per test source. dev/etsi-coverage.sh reports the same split
     # per store, with the ETSI cells as further columns.
     name: Coverage floor (daily)
-    if: github.event.schedule != '41 3 * * 0'
+    if: github.event.schedule != '41 7 * * 0'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     env:
@@ -310,6 +315,8 @@ jobs:
     timeout-minutes: 90
     strategy:
       fail-fast: false
+      # 4 of the 9 crates at a time, beside tsan and the powerset (T-5639)
+      max-parallel: 4
       matrix:
         crate: [ngsild-model, ngsild-ql, ngsild-matcher, linkml-model, odata-csdl, odata-url, odata-json, odata-batch, ngsild-residual]
     env:
@@ -335,7 +342,7 @@ jobs:
     # surface features are read from the broker's manifest
     # (dev/surface-features.py), so a new surface joins by being declared.
     name: Surface feature powerset, depth 2 (daily)
-    if: github.event.schedule != '41 3 * * 0'
+    if: github.event.schedule != '41 7 * * 0'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:

@@ -18,7 +18,7 @@ on:
     branches: [dev]
     paths: ["docs/**", "book.toml", "*.md", ".vale.ini"]
   schedule:
-    - cron: "23 5 * * 3"
+    - cron: "23 11 * * 3"
   workflow_dispatch:
 
 # Building the book, the prose gate and the OpenAPI check all read the

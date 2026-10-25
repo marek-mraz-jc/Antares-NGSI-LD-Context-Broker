@@ -17,7 +17,7 @@ name: bench-surfaces
 on:
   schedule:
     - cron: "41 1 * * *"
-    - cron: "41 2 * * 0"
+    - cron: "41 8 * * 0"
   workflow_dispatch:
     inputs:
       weekly:
@@ -48,7 +48,7 @@ jobs:
       - name: The benches against their budget rows
         env:
           OUT: results/bench-surfaces
-          WEEKLY: ${{ (github.event.schedule == '41 2 * * 0' || inputs.weekly) && '1' || '' }}
+          WEEKLY: ${{ (github.event.schedule == '41 8 * * 0' || inputs.weekly) && '1' || '' }}
         run: dev/perf/bench-surfaces.sh
       # The core request paths (T-4853): q/geo/type/scopeQ parse, their SQL
       # and JSON-LD compaction, each read against the run's own calibration
