@@ -243,7 +243,7 @@ The seam therefore gains one hook and one document table:
 - `/q/policy` (GET, the table) and `/q/policy/{tenant}` (GET, PUT,
   DELETE), served by `antares-ops` beside `/q/views` and behind the same
   admin credential. The document is opaque JSON: the engine owns its
-  schema, so the broker bounds it (64 KiB, depth and element count) and
+  schema, so the broker bounds it (1 MiB since T-5717, depth and element count) and
   validates nothing else. A PUT the engine refuses answers 400 with the
   engine's reason and is not stored.
 - Documents are stored under the reserved tenant `antares-policy`, with a

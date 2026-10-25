@@ -382,7 +382,7 @@ Only in a broker built with the `views` feature and started with a policy
 engine that reads rule documents (ADR-0020 amendment); with `allow-all`, or
 an engine that reads none, every route here answers `404`. A rule document
 belongs to one client tenant and is opaque to the broker: the engine owns
-its schema. The broker bounds it (64 KiB, 32 levels of nesting, 8192 JSON
+its schema. The broker bounds it (1 MiB, 32 levels of nesting, 131072 JSON
 values), hands it to the engine, and stores it under the reserved tenant
 `antares-policy` with a revision it counts. The table reloads with the view
 table: the pod that took a write before it answers, every other pod within
@@ -410,7 +410,7 @@ for a name that is not a client tenant.
 The body is the document. `201` created, `204` replaced; `400` for no JSON,
 `null`, a depth or value count over its bound, or the engine's reason for
 refusing it (nothing is stored, the previous revision keeps deciding);
-`413` over 64 KiB.
+`413` over 1 MiB.
 
 ### DELETE /q/policy/{tenant}
 
