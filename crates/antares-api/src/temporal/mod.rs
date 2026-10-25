@@ -21,6 +21,7 @@ use crate::negotiate::CleanParams;
 use antares_model::is_meta;
 
 mod aggregate;
+mod filter;
 mod query;
 mod render;
 mod retrieve;
@@ -28,7 +29,8 @@ mod retrieve;
 mod tests;
 mod write;
 
-pub(crate) use aggregate::*;
+use aggregate::*;
+pub(crate) use filter::*;
 pub use query::*;
 pub(crate) use render::*;
 pub use retrieve::*;

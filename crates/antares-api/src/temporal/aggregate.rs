@@ -156,253 +156,318 @@ pub(super) fn render_aggregated(
     ctx: &Context,
     timeprop: &str,
 ) -> Result<Map<String, Value>, NgsiError> {
-    use chrono::{DateTime, Datelike, FixedOffset};
-    let fmt = |d: DateTime<FixedOffset>| d.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let mut out = Map::new();
     for (k, instances) in &w.attrs {
-        let mut times: Vec<(DateTime<FixedOffset>, &Value)> = Vec::new();
-        let mut class: Option<AggrClass> = None;
-        for inst in instances {
-            let Some(t) = inst
-                .get(timeprop)
-                .and_then(Value::as_str)
-                .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
-            else {
-                continue;
-            };
-            if class.is_none() {
-                class = Some(classify_instance(inst));
-            }
-            let Some(raw) = raw_of(inst) else { continue };
-            times.push((t, raw));
-        }
-        if times.is_empty() {
-            continue;
-        }
-        // Set alongside the first instance, and `times` is non-empty here.
-        let Some(class) = class else { continue };
-        // 5.7.4.4 p.211: "If an aggregated temporal representation is
-        // requested and any of the requested Attributes is not eligible for
-        // at least one of the aggregation methods specified in the request
-        // parameters, then an error of type InvalidRequest shall be raised."
-        for method in &r.aggr_methods {
-            if !aggr_eligible(class, method) {
-                return Err(NgsiError::InvalidRequest(format!(
-                    "attribute {} ({class:?}-valued) is not eligible for \
-                     aggregation method {method} (4.5.19.1, 5.7.4.4)",
-                    ctx.compact_iri(k)
-                )));
-            }
-        }
-        // ADR-N-054 2.5 (DM-118): an `onChange` Attribute leaves out the rows
-        // that repeat a value, and a left-out row is not a zero.
         let held = w.held.contains(k);
-        if let Some(method) = r
-            .aggr_methods
-            .iter()
-            .find(|m| held && matches!(m.as_str(), "sum" | "totalCount"))
-        {
-            return Err(NgsiError::InvalidRequest(format!(
-                "aggregation-not-meaningful: {method} over {}, which records a row only \
-                 when its value changes (ADR-N-054 2.5)",
-                ctx.compact_iri(k)
-            )));
+        if let Some(attr_out) = aggregate_attr(k, instances, held, tq, r, ctx, timeprop)? {
+            out.insert(ctx.compact_iri(k), Value::Object(attr_out));
         }
-        times.sort_by_key(|(t, _)| *t);
-        let Some(&(earliest, _)) = times.first() else {
-            continue;
-        };
-        let anchor = tq
-            .and_then(|tq| DateTime::parse_from_rfc3339(&tq.time_at).ok())
-            .unwrap_or(earliest);
-        // 4.5.19.1: "A duration of 0 second (e.g. expressed as "PT0S" or
-        // "P0D") is valid and is interpreted as a duration spanning the whole
-        // time range specified by the temporal query." The query names one
-        // edge of that range; 4.11 leaves the other open for `before` and
-        // `after`, so the data closes the open one.
-        let whole = {
-            let at = |s: &str| DateTime::parse_from_rfc3339(s).ok();
-            let (Some(&(first, _)), Some(&(last_at, _))) = (times.first(), times.last()) else {
-                continue;
-            };
-            let last = last_at
-                .checked_add_signed(chrono::Duration::seconds(1))
-                .unwrap_or(last_at);
-            match tq {
-                Some(q) if q.timerel == "before" => (first, at(&q.time_at).unwrap_or(last)),
-                Some(q) if q.timerel == "between" => (
-                    at(&q.time_at).unwrap_or(first),
-                    q.end_time_at.as_deref().and_then(at).unwrap_or(last),
-                ),
-                Some(q) if q.timerel == "after" => (at(&q.time_at).unwrap_or(first), last),
-                _ => (first, last),
-            }
-        };
-        // the row carried in from before the window holds from its start
-        if held {
-            for (t, _) in &mut times {
-                *t = (*t).max(whole.0);
-            }
-        }
-        // bucket boundaries
-        let bucket_of =
-            |t: DateTime<FixedOffset>| -> (DateTime<FixedOffset>, DateTime<FixedOffset>) {
-                match r.aggr_period {
-                    AggrPeriod::Whole => whole,
-                    AggrPeriod::Seconds(sc) => {
-                        // checked throughout: an offset no representable
-                        // date can hold puts the instant in one final
-                        // open-ended bucket instead of panicking
-                        let idx = t.signed_duration_since(anchor).num_seconds().div_euclid(sc);
-                        let bucket = idx
-                            .checked_mul(sc)
-                            .and_then(chrono::Duration::try_seconds)
-                            .and_then(|off| anchor.checked_add_signed(off))
-                            .and_then(|start| {
-                                chrono::Duration::try_seconds(sc)
-                                    .and_then(|w| start.checked_add_signed(w))
-                                    .map(|end| (start, end))
-                            });
-                        match bucket {
-                            Some(b) => b,
-                            None => (anchor, chrono::DateTime::<chrono::Utc>::MAX_UTC.into()),
-                        }
-                    }
-                    AggrPeriod::Months(m, sc) => {
-                        // start of the k-th period, O(1) in k. Negative k are
-                        // the periods BEFORE the anchor, which is what a
-                        // `before` query is made of.
-                        let step = |k: i64| -> Option<DateTime<FixedOffset>> {
-                            let n = k.unsigned_abs().checked_mul(u64::from(m))?;
-                            let n = chrono::Months::new(u32::try_from(n).ok()?);
-                            let base = if k < 0 {
-                                anchor.checked_sub_months(n)?
-                            } else {
-                                anchor.checked_add_months(n)?
-                            };
-                            let off = chrono::Duration::try_seconds(k.checked_mul(sc)?)?;
-                            base.checked_add_signed(off)
-                        };
-                        // The whole-month distance ignores the day and the time
-                        // of day, and one period is at least one month, so it
-                        // brackets the exact index within one step: binary-search
-                        // between it and the anchor instead of walking there,
-                        // which is O(log) however far the instant is.
-                        let approx = i64::from(t.year())
-                            .saturating_sub(i64::from(anchor.year()))
-                            .saturating_mul(12)
-                            .saturating_add(i64::from(t.month()))
-                            .saturating_sub(i64::from(anchor.month()))
-                            .div_euclid(i64::from(m));
-                        let (mut lo, mut hi) = (
-                            approx.min(0).saturating_sub(1),
-                            approx.max(0).saturating_add(1),
-                        );
-                        while hi.saturating_sub(lo) > 1 {
-                            let mid = lo.saturating_add(hi.saturating_sub(lo).div_euclid(2));
-                            if step(mid).is_some_and(|s| s <= t) {
-                                lo = mid;
-                            } else {
-                                hi = mid;
-                            }
-                        }
-                        // saturate instead of panic: a huge month period or a
-                        // far-future timeAt overflows chrono's range — treat the
-                        // remainder as one open-ended bucket
-                        match (step(lo), step(hi)) {
-                            (Some(start), Some(end)) if start <= t => (start, end),
-                            (Some(start), None) if start <= t => {
-                                (start, chrono::DateTime::<chrono::Utc>::MAX_UTC.into())
-                            }
-                            _ => (anchor, chrono::DateTime::<chrono::Utc>::MAX_UTC.into()),
-                        }
-                    }
-                }
-            };
-        type Bucket = (DateTime<FixedOffset>, DateTime<FixedOffset>);
-        type Rows<'a> = Vec<(DateTime<FixedOffset>, &'a Value)>;
-        let mut buckets: Vec<(Bucket, Rows)> = Vec::new();
-        // An onChange attribute held its value through a period no row fell in: that period
-        // answers the value, as `every` would have, up to the window's end, never past now,
-        // and at most MAX_HELD_BUCKETS of them: a far edge and PT1S is refused, not allocated (T-4669).
-        let edge = whole.1.min(chrono::Utc::now().fixed_offset());
-        let mut refused = false;
-        let mut fill = |buckets: &mut Vec<(Bucket, Rows)>, until: DateTime<FixedOffset>| {
-            while let Some(end) = buckets.last().map(|((_, end), _)| *end) {
-                let gap = bucket_of(end);
-                if end >= until || end >= edge || gap.0 < end {
-                    break;
-                }
-                if buckets.len() >= MAX_HELD_BUCKETS {
-                    refused = true;
-                    break;
-                }
-                buckets.push((gap, Vec::new()));
-            }
-        };
-        for &(t, v) in &times {
-            let b = bucket_of(t);
-            if held {
-                fill(&mut buckets, b.0);
-            }
-            match buckets.last_mut() {
-                Some((bb, rows)) if bb.0 == b.0 => rows.push((t, v)),
-                _ => buckets.push((b, vec![(t, v)])),
-            }
-        }
-        if held {
-            fill(&mut buckets, whole.1);
-        }
-        if refused {
-            return Err(NgsiError::BadRequestData(format!(
-                "aggrPeriodDuration splits the window of {} into more than {MAX_HELD_BUCKETS} \
-                 periods; ask a longer period or a shorter window",
-                ctx.compact_iri(k)
-            )));
-        }
-        // the value the last bucket with a row ended on holds into the next one
-        let carried: Vec<Option<&Value>> = buckets
-            .iter()
-            .scan(None, |last, (_, rows)| {
-                let before = *last;
-                if let Some(&(_, v)) = rows.last() {
-                    *last = Some(v);
-                }
-                Some(before)
-            })
-            .collect();
-        let mut attr_out = Map::new();
-        // 4.5.19.0: the member is labelled "Property" for Properties and
-        // "Relationship" for Relationships.
-        let label = if class == AggrClass::Relationship {
-            "Relationship"
-        } else {
-            "Property"
-        };
-        attr_out.insert("type".into(), Value::String(label.into()));
-        for method in &r.aggr_methods {
-            let rows: Vec<Value> = buckets
-                .iter()
-                .zip(&carried)
-                .map(|(((bs, be), rows), &before)| {
-                    let weighted = (held && method == "avg")
-                        .then(|| time_weighted_avg(class, rows, before, *bs, (*be).min(whole.1)))
-                        .flatten();
-                    let val = weighted.unwrap_or_else(|| {
-                        let vals: Vec<&Value> = match (rows.is_empty(), before) {
-                            (true, Some(v)) => vec![v],
-                            _ => rows.iter().map(|&(_, v)| v).collect(),
-                        };
-                        aggregate_bucket(method, class, &vals)
-                    });
-                    Value::Array(vec![val, Value::String(fmt(*bs)), Value::String(fmt(*be))])
-                })
-                .collect();
-            attr_out.insert(method.clone(), Value::Array(rows));
-        }
-        out.insert(ctx.compact_iri(k), Value::Object(attr_out));
     }
     Ok(out)
+}
+
+type Moment = chrono::DateTime<chrono::FixedOffset>;
+/// One period: its start and its (exclusive) end.
+type Bucket = (Moment, Moment);
+/// The instances of one period, by their time.
+type Rows<'a> = Vec<(Moment, &'a Value)>;
+
+/// One Attribute's 4.5.19 member, `None` when no instance carries a time.
+/// `held`: the Attribute records `onChange` (ADR-N-054 2.5).
+fn aggregate_attr(
+    k: &str,
+    instances: &[Value],
+    held: bool,
+    tq: Option<&TemporalQ>,
+    r: &TRepr,
+    ctx: &Context,
+    timeprop: &str,
+) -> Result<Option<Map<String, Value>>, NgsiError> {
+    let (mut times, class) = timed_rows(instances, timeprop);
+    // Set alongside the first instance, and `times` is non-empty then.
+    let Some(class) = class.filter(|_| !times.is_empty()) else {
+        return Ok(None);
+    };
+    check_methods(k, class, held, r, ctx)?;
+    times.sort_by_key(|(t, _)| *t);
+    let Some(whole) = whole_range(&times, tq) else {
+        return Ok(None);
+    };
+    let Some(&(earliest, _)) = times.first() else {
+        return Ok(None);
+    };
+    let anchor = tq
+        .and_then(|tq| chrono::DateTime::parse_from_rfc3339(&tq.time_at).ok())
+        .unwrap_or(earliest);
+    // the row carried in from before the window holds from its start
+    if held {
+        for (t, _) in &mut times {
+            *t = (*t).max(whole.0);
+        }
+    }
+    let bucket_of = |t: Moment| -> Bucket {
+        match r.aggr_period {
+            AggrPeriod::Whole => whole,
+            AggrPeriod::Seconds(sc) => seconds_bucket(anchor, sc, t),
+            AggrPeriod::Months(m, sc) => months_bucket(anchor, m, sc, t),
+        }
+    };
+    let Some(buckets) = bucketed(&times, held, whole, &bucket_of) else {
+        return Err(NgsiError::BadRequestData(format!(
+            "aggrPeriodDuration splits the window of {} into more than {MAX_HELD_BUCKETS} \
+             periods; ask a longer period or a shorter window",
+            ctx.compact_iri(k)
+        )));
+    };
+    Ok(Some(render_buckets(&buckets, class, held, whole.1, r)))
+}
+
+/// The instances that carry `timeprop`, with their raw values, and the
+/// aggregation class of the first of them.
+fn timed_rows<'a>(instances: &'a [Value], timeprop: &str) -> (Rows<'a>, Option<AggrClass>) {
+    let mut times: Rows<'a> = Vec::new();
+    let mut class: Option<AggrClass> = None;
+    for inst in instances {
+        let Some(t) = inst
+            .get(timeprop)
+            .and_then(Value::as_str)
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        else {
+            continue;
+        };
+        if class.is_none() {
+            class = Some(classify_instance(inst));
+        }
+        let Some(raw) = raw_of(inst) else { continue };
+        times.push((t, raw));
+    }
+    (times, class)
+}
+
+/// 5.7.4.4 p.211: "If an aggregated temporal representation is
+/// requested and any of the requested Attributes is not eligible for
+/// at least one of the aggregation methods specified in the request
+/// parameters, then an error of type InvalidRequest shall be raised."
+/// ADR-N-054 2.5 (DM-118): an `onChange` Attribute leaves out the rows
+/// that repeat a value, and a left-out row is not a zero.
+fn check_methods(
+    k: &str,
+    class: AggrClass,
+    held: bool,
+    r: &TRepr,
+    ctx: &Context,
+) -> Result<(), NgsiError> {
+    for method in &r.aggr_methods {
+        if !aggr_eligible(class, method) {
+            return Err(NgsiError::InvalidRequest(format!(
+                "attribute {} ({class:?}-valued) is not eligible for \
+                 aggregation method {method} (4.5.19.1, 5.7.4.4)",
+                ctx.compact_iri(k)
+            )));
+        }
+    }
+    if let Some(method) = r
+        .aggr_methods
+        .iter()
+        .find(|m| held && matches!(m.as_str(), "sum" | "totalCount"))
+    {
+        return Err(NgsiError::InvalidRequest(format!(
+            "aggregation-not-meaningful: {method} over {}, which records a row only \
+             when its value changes (ADR-N-054 2.5)",
+            ctx.compact_iri(k)
+        )));
+    }
+    Ok(())
+}
+
+/// 4.5.19.1: "A duration of 0 second (e.g. expressed as "PT0S" or
+/// "P0D") is valid and is interpreted as a duration spanning the whole
+/// time range specified by the temporal query." The query names one
+/// edge of that range; 4.11 leaves the other open for `before` and
+/// `after`, so the data closes the open one. `times` is sorted.
+fn whole_range(times: &Rows<'_>, tq: Option<&TemporalQ>) -> Option<Bucket> {
+    let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok();
+    let (&(first, _), &(last_at, _)) = (times.first()?, times.last()?);
+    let last = last_at
+        .checked_add_signed(chrono::Duration::seconds(1))
+        .unwrap_or(last_at);
+    Some(match tq {
+        Some(q) if q.timerel == "before" => (first, at(&q.time_at).unwrap_or(last)),
+        Some(q) if q.timerel == "between" => (
+            at(&q.time_at).unwrap_or(first),
+            q.end_time_at.as_deref().and_then(at).unwrap_or(last),
+        ),
+        Some(q) if q.timerel == "after" => (at(&q.time_at).unwrap_or(first), last),
+        _ => (first, last),
+    })
+}
+
+/// The `sc`-second period from `anchor` holding `t`. Checked throughout:
+/// an offset no representable date can hold puts the instant in one final
+/// open-ended bucket instead of panicking.
+fn seconds_bucket(anchor: Moment, sc: i64, t: Moment) -> Bucket {
+    let idx = t.signed_duration_since(anchor).num_seconds().div_euclid(sc);
+    let bucket = idx
+        .checked_mul(sc)
+        .and_then(chrono::Duration::try_seconds)
+        .and_then(|off| anchor.checked_add_signed(off))
+        .and_then(|start| {
+            chrono::Duration::try_seconds(sc)
+                .and_then(|w| start.checked_add_signed(w))
+                .map(|end| (start, end))
+        });
+    match bucket {
+        Some(b) => b,
+        None => (anchor, chrono::DateTime::<chrono::Utc>::MAX_UTC.into()),
+    }
+}
+
+/// The period of `m` months and `sc` seconds from `anchor` holding `t`.
+fn months_bucket(anchor: Moment, m: u32, sc: i64, t: Moment) -> Bucket {
+    use chrono::Datelike;
+    // start of the k-th period, O(1) in k. Negative k are
+    // the periods BEFORE the anchor, which is what a
+    // `before` query is made of.
+    let step = |k: i64| -> Option<Moment> {
+        let n = k.unsigned_abs().checked_mul(u64::from(m))?;
+        let n = chrono::Months::new(u32::try_from(n).ok()?);
+        let base = if k < 0 {
+            anchor.checked_sub_months(n)?
+        } else {
+            anchor.checked_add_months(n)?
+        };
+        let off = chrono::Duration::try_seconds(k.checked_mul(sc)?)?;
+        base.checked_add_signed(off)
+    };
+    // The whole-month distance ignores the day and the time
+    // of day, and one period is at least one month, so it
+    // brackets the exact index within one step: binary-search
+    // between it and the anchor instead of walking there,
+    // which is O(log) however far the instant is.
+    let approx = i64::from(t.year())
+        .saturating_sub(i64::from(anchor.year()))
+        .saturating_mul(12)
+        .saturating_add(i64::from(t.month()))
+        .saturating_sub(i64::from(anchor.month()))
+        .div_euclid(i64::from(m));
+    let (mut lo, mut hi) = (
+        approx.min(0).saturating_sub(1),
+        approx.max(0).saturating_add(1),
+    );
+    while hi.saturating_sub(lo) > 1 {
+        let mid = lo.saturating_add(hi.saturating_sub(lo).div_euclid(2));
+        if step(mid).is_some_and(|s| s <= t) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    // saturate instead of panic: a huge month period or a
+    // far-future timeAt overflows chrono's range — treat the
+    // remainder as one open-ended bucket
+    match (step(lo), step(hi)) {
+        (Some(start), Some(end)) if start <= t => (start, end),
+        (Some(start), None) if start <= t => {
+            (start, chrono::DateTime::<chrono::Utc>::MAX_UTC.into())
+        }
+        _ => (anchor, chrono::DateTime::<chrono::Utc>::MAX_UTC.into()),
+    }
+}
+
+/// The sorted rows in their periods. An onChange attribute held its value
+/// through a period no row fell in: that period answers the value, as
+/// `every` would have, up to the window's end, never past now, and at most
+/// MAX_HELD_BUCKETS of them: a far edge and PT1S is refused (`None`), not
+/// allocated (T-4669).
+fn bucketed<'a>(
+    times: &Rows<'a>,
+    held: bool,
+    whole: Bucket,
+    bucket_of: &dyn Fn(Moment) -> Bucket,
+) -> Option<Vec<(Bucket, Rows<'a>)>> {
+    let mut buckets: Vec<(Bucket, Rows)> = Vec::new();
+    let edge = whole.1.min(chrono::Utc::now().fixed_offset());
+    let mut refused = false;
+    let mut fill = |buckets: &mut Vec<(Bucket, Rows)>, until: Moment| {
+        while let Some(end) = buckets.last().map(|((_, end), _)| *end) {
+            let gap = bucket_of(end);
+            if end >= until || end >= edge || gap.0 < end {
+                break;
+            }
+            if buckets.len() >= MAX_HELD_BUCKETS {
+                refused = true;
+                break;
+            }
+            buckets.push((gap, Vec::new()));
+        }
+    };
+    for &(t, v) in times {
+        let b = bucket_of(t);
+        if held {
+            fill(&mut buckets, b.0);
+        }
+        match buckets.last_mut() {
+            Some((bb, rows)) if bb.0 == b.0 => rows.push((t, v)),
+            _ => buckets.push((b, vec![(t, v)])),
+        }
+    }
+    if held {
+        fill(&mut buckets, whole.1);
+    }
+    (!refused).then_some(buckets)
+}
+
+/// The member of one Attribute: its type and, per method, one
+/// `[value, start, end]` per period. `window_end` caps a held value's weight.
+fn render_buckets(
+    buckets: &[(Bucket, Rows<'_>)],
+    class: AggrClass,
+    held: bool,
+    window_end: Moment,
+    r: &TRepr,
+) -> Map<String, Value> {
+    let fmt = |d: Moment| d.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    // the value the last bucket with a row ended on holds into the next one
+    let carried: Vec<Option<&Value>> = buckets
+        .iter()
+        .scan(None, |last, (_, rows)| {
+            let before = *last;
+            if let Some(&(_, v)) = rows.last() {
+                *last = Some(v);
+            }
+            Some(before)
+        })
+        .collect();
+    let mut attr_out = Map::new();
+    // 4.5.19.0: the member is labelled "Property" for Properties and
+    // "Relationship" for Relationships.
+    let label = if class == AggrClass::Relationship {
+        "Relationship"
+    } else {
+        "Property"
+    };
+    attr_out.insert("type".into(), Value::String(label.into()));
+    for method in &r.aggr_methods {
+        let rows: Vec<Value> = buckets
+            .iter()
+            .zip(&carried)
+            .map(|(((bs, be), rows), &before)| {
+                let weighted = (held && method == "avg")
+                    .then(|| time_weighted_avg(class, rows, before, *bs, (*be).min(window_end)))
+                    .flatten();
+                let val = weighted.unwrap_or_else(|| {
+                    let vals: Vec<&Value> = match (rows.is_empty(), before) {
+                        (true, Some(v)) => vec![v],
+                        _ => rows.iter().map(|&(_, v)| v).collect(),
+                    };
+                    aggregate_bucket(method, class, &vals)
+                });
+                Value::Array(vec![val, Value::String(fmt(*bs)), Value::String(fmt(*be))])
+            })
+            .collect();
+        attr_out.insert(method.clone(), Value::Array(rows));
+    }
+    attr_out
 }
 
 /// The mean of a bucket from `start` to `end` whose `rows` (time, value) each

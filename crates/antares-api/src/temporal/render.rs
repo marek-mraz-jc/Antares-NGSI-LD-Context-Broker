@@ -195,74 +195,15 @@ pub(super) fn window(
         let scope_instances = k == "scope"
             && v.as_array()
                 .is_some_and(|a| a.first().is_some_and(Value::is_object));
-        if is_meta(k) && !scope_instances {
+        if (is_meta(k) && !scope_instances) || !projected(k, attrs_filter, omit) {
             continue;
         }
-        if let Some(want) = attrs_filter {
-            if !want.contains(k) {
-                continue;
-            }
+        let mut instances = in_window(v, tq, dataset);
+        if w.held.contains(k) {
+            carry_held(&mut instances, v, tq, dataset, timeprop);
         }
-        if let Some(omit) = omit {
-            if omit.iter().any(|n| n.iri == *k && n.children.is_none()) {
-                continue;
-            }
-        }
-        let of_dataset = |inst: &&Value| match (dataset, inst.get("datasetId")) {
-            (None, _) => true,
-            (Some(want), Some(Value::String(have))) => want.iter().any(|w| w == have),
-            (Some(want), None) => want.iter().any(|w| w == "@none"),
-            _ => false,
-        };
-        let mut instances: Vec<Value> = v
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(of_dataset)
-            .filter(|inst| tq.is_none_or(|tq| tq.instance_matches(inst)))
-            .cloned()
-            .collect();
-        // ADR-N-054 2.5 (DM-117): an `onChange` Attribute held its last row
-        // before the window when the window opened, so that row comes along.
-        let start = tq.and_then(|t| match t.timerel.as_str() {
-            "after" | "between" => Some(dt_key(&t.time_at)),
-            _ => None,
-        });
-        if let (true, Some(start)) = (w.held.contains(k), &start) {
-            let key = |i: &&Value| i.get(timeprop).and_then(Value::as_str).map(dt_key);
-            let carry = v
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(of_dataset)
-                .filter(|i| key(i).is_some_and(|t| t < *start))
-                .max_by_key(key);
-            if let Some(c) = carry {
-                instances.push(c.clone());
-            }
-        }
-        // 4.18/C.5.16: the scope valid AT the window start was set at or
-        // before it — carry the latest pre-window instance into the
-        // representation (a temporal scope stays valid until replaced).
         if scope_instances {
-            let start = tq.and_then(|t| match t.timerel.as_str() {
-                "after" | "between" => Some(t.time_at.as_str()),
-                _ => None,
-            });
-            if let Some(start) = start {
-                let carry = v
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|i| scope_set_time(i).is_some_and(|t| dt_key(t) < dt_key(start)))
-                    .max_by_key(|i| scope_set_time(i).map(dt_key))
-                    .cloned();
-                if let Some(c) = carry {
-                    if !instances.contains(&c) {
-                        instances.push(c);
-                    }
-                }
-            }
+            carry_scope(&mut instances, v, tq);
         }
         instances.sort_by(|a, b| {
             // Canonicalize before comparing: '.' sorts before 'Z', so a raw
@@ -272,38 +213,134 @@ pub(super) fn window(
             let tb = b.get(timeprop).and_then(Value::as_str).unwrap_or("");
             dt_key(ta).cmp(&dt_key(tb))
         });
-        // 6.4.7.3: lastN pages newest first, firstN and neither oldest first
-        if page.desc {
-            instances.reverse();
-        }
-        // Table 6.4.7.3-2: an offsetN past the end "should be assumed to be
-        // equal to the size of the result set, i.e. only the last element
-        // of the result set is to be returned"
-        let skip = page.offset.min(instances.len().saturating_sub(1));
-        instances.drain(..skip);
-        if let Some(n) = page.n {
-            if instances.len() > n {
-                instances.truncate(n);
-                w.more = true;
-            }
-        }
+        w.more |= page_instances(&mut instances, page);
         if instances.is_empty() {
             continue;
         }
-        w.max_per_attr = w.max_per_attr.max(instances.len());
-        for inst in &instances {
-            if let Some(t) = inst.get(timeprop).and_then(Value::as_str) {
-                if w.ts_min.as_deref().is_none_or(|m| dt_key(t) < dt_key(m)) {
-                    w.ts_min = Some(t.to_owned());
-                }
-                if w.ts_max.as_deref().is_none_or(|m| dt_key(t) > dt_key(m)) {
-                    w.ts_max = Some(t.to_owned());
-                }
-            }
-        }
+        w.note(&instances, timeprop);
         w.attrs.insert(k.clone(), instances);
     }
     w
+}
+
+impl Windowed {
+    /// One Attribute's page joins the window: its size and time range.
+    fn note(&mut self, instances: &[Value], timeprop: &str) {
+        self.max_per_attr = self.max_per_attr.max(instances.len());
+        for inst in instances {
+            if let Some(t) = inst.get(timeprop).and_then(Value::as_str) {
+                if self.ts_min.as_deref().is_none_or(|m| dt_key(t) < dt_key(m)) {
+                    self.ts_min = Some(t.to_owned());
+                }
+                if self.ts_max.as_deref().is_none_or(|m| dt_key(t) > dt_key(m)) {
+                    self.ts_max = Some(t.to_owned());
+                }
+            }
+        }
+    }
+}
+
+/// Whether attrs and omit keep Attribute `k`.
+fn projected(
+    k: &str,
+    attrs_filter: Option<&Vec<String>>,
+    omit: Option<&Vec<crate::repr::ProjNode>>,
+) -> bool {
+    attrs_filter.is_none_or(|want| want.iter().any(|w| w == k))
+        && omit.is_none_or(|omit| !omit.iter().any(|n| n.iri == k && n.children.is_none()))
+}
+
+fn of_dataset(dataset: Option<&Vec<String>>, inst: &Value) -> bool {
+    match (dataset, inst.get("datasetId")) {
+        (None, _) => true,
+        (Some(want), Some(Value::String(have))) => want.iter().any(|w| w == have),
+        (Some(want), None) => want.iter().any(|w| w == "@none"),
+        _ => false,
+    }
+}
+
+/// The instances of one Attribute in the asked datasets and the window.
+fn in_window(v: &Value, tq: Option<&TemporalQ>, dataset: Option<&Vec<String>>) -> Vec<Value> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter(|inst| of_dataset(dataset, inst))
+        .filter(|inst| tq.is_none_or(|tq| tq.instance_matches(inst)))
+        .cloned()
+        .collect()
+}
+
+/// ADR-N-054 2.5 (DM-117): an `onChange` Attribute held its last row
+/// before the window when the window opened, so that row comes along.
+fn carry_held(
+    instances: &mut Vec<Value>,
+    v: &Value,
+    tq: Option<&TemporalQ>,
+    dataset: Option<&Vec<String>>,
+    timeprop: &str,
+) {
+    let Some(start) = tq.and_then(|t| match t.timerel.as_str() {
+        "after" | "between" => Some(dt_key(&t.time_at)),
+        _ => None,
+    }) else {
+        return;
+    };
+    let key = |i: &&Value| i.get(timeprop).and_then(Value::as_str).map(dt_key);
+    let carry = v
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|inst| of_dataset(dataset, inst))
+        .filter(|i| key(i).is_some_and(|t| t < start))
+        .max_by_key(key);
+    if let Some(c) = carry {
+        instances.push(c.clone());
+    }
+}
+
+/// 4.18/C.5.16: the scope valid AT the window start was set at or
+/// before it — carry the latest pre-window instance into the
+/// representation (a temporal scope stays valid until replaced).
+fn carry_scope(instances: &mut Vec<Value>, v: &Value, tq: Option<&TemporalQ>) {
+    let Some(start) = tq.and_then(|t| match t.timerel.as_str() {
+        "after" | "between" => Some(t.time_at.as_str()),
+        _ => None,
+    }) else {
+        return;
+    };
+    let carry = v
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|i| scope_set_time(i).is_some_and(|t| dt_key(t) < dt_key(start)))
+        .max_by_key(|i| scope_set_time(i).map(dt_key))
+        .cloned();
+    if let Some(c) = carry {
+        if !instances.contains(&c) {
+            instances.push(c);
+        }
+    }
+}
+
+/// 6.4.7.3: the sorted instances cut to one page; true when the
+/// Attribute holds more past it.
+fn page_instances(instances: &mut Vec<Value>, page: InstancePage) -> bool {
+    // lastN pages newest first, firstN and neither oldest first
+    if page.desc {
+        instances.reverse();
+    }
+    // Table 6.4.7.3-2: an offsetN past the end "should be assumed to be
+    // equal to the size of the result set, i.e. only the last element
+    // of the result set is to be returned"
+    let skip = page.offset.min(instances.len().saturating_sub(1));
+    instances.drain(..skip);
+    match page.n {
+        Some(n) if instances.len() > n => {
+            instances.truncate(n);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// `Content-Range: date-time <start>-<end>/<size>` (Scorpio-parity semantics).
@@ -449,33 +486,7 @@ pub(super) fn present_temporal(
     let Some(obj) = doc.as_object() else {
         return Ok(doc.clone());
     };
-    let mut out = Map::new();
-    for (k, v) in obj {
-        let scope_instances = k == "scope"
-            && v.as_array()
-                .is_some_and(|a| a.first().is_some_and(Value::is_object));
-        if is_meta(k) && !scope_instances {
-            match k.as_str() {
-                // Table 6.3.11-1: `sysAttrs` is what admits "the system
-                // generated temporal attributes createdAt, modifiedAt and
-                // the system temporal attribute expiresAt … In the case of
-                // temporal representations, also the system generated
-                // temporal attribute deletedAt". Without it none of them is
-                // in the payload — the same set `repr.rs` gates on the
-                // current-state path.
-                "createdAt" | "modifiedAt" | "expiresAt" | "deletedAt" if !r.sys => continue,
-                _ => {}
-            }
-            if !crate::repr::meta_projected(r.pick.as_deref(), r.omit.as_deref(), k) {
-                continue;
-            }
-            if k == "type" {
-                out.insert("type".into(), antares_jsonld::compact_types(v, ctx));
-            } else {
-                out.insert(k.clone(), v.clone());
-            }
-        }
-    }
+    let mut out = present_meta(obj, ctx, r);
     if r.aggregated {
         for (k, v) in render_aggregated(w, tq, r, ctx, timeprop)? {
             out.insert(k, v);
@@ -503,140 +514,186 @@ pub(super) fn present_temporal(
             }
             None => instances,
         };
-        if instances.is_empty() {
+        let rendered = if instances.is_empty() {
             // gap-cut leftovers render as empty arrays
-            out.insert(ctx.compact_iri(k), Value::Array(vec![]));
-            continue;
-        }
-        if r.temporal_values {
-            // group instances by datasetId (4.5.9)
-            let mut groups: Vec<(Option<String>, Vec<&Value>)> = Vec::new();
-            for inst in instances {
-                let ds = inst
-                    .get("datasetId")
-                    .and_then(Value::as_str)
-                    .map(String::from);
-                match groups.iter_mut().find(|(g, _)| *g == ds) {
-                    Some((_, list)) => list.push(inst),
-                    None => groups.push((ds, vec![inst])),
-                }
-            }
-            let mut rendered: Vec<Value> = groups
-                .iter()
-                .map(|(ds, list)| {
-                    let atype = list
-                        .first()
-                        .and_then(|i| i.get("type"))
-                        .cloned()
-                        .unwrap_or_else(|| Value::String("Property".into()));
-                    let values: Vec<Value> = list
-                        .iter()
-                        .map(|inst| {
-                            // 4.5.9: Property/Relationship pairs carry the bare
-                            // value/object; other attribute kinds wrap it under
-                            // their member name.
-                            let v = if let Some(v) = inst.get("value") {
-                                // 4.5.9: "the first element shall be a
-                                // Property value" — the one the instance
-                                // holds. A f64 round trip would retype an
-                                // integer and drop a digit past 2^53.
-                                v.clone()
-                            } else if let Some(o) = inst.get("object") {
-                                o.clone()
-                            } else if let Some(lm) = inst.get("languageMap") {
-                                serde_json::json!({"languageMap": lm})
-                            } else if let Some(j) = inst.get("json") {
-                                serde_json::json!({"json": j})
-                            } else if let Some(vv) = inst.get("vocab") {
-                                let compacted = match vv {
-                                    Value::String(iri) => Value::String(ctx.compact_iri(iri)),
-                                    Value::Array(a) => Value::Array(
-                                        a.iter()
-                                            .map(|s| match s {
-                                                Value::String(iri) => {
-                                                    Value::String(ctx.compact_iri(iri))
-                                                }
-                                                o => o.clone(),
-                                            })
-                                            .collect(),
-                                    ),
-                                    o => o.clone(),
-                                };
-                                serde_json::json!({"vocab": compacted})
-                            } else if let Some(l) = inst.get("valueList") {
-                                // 4.5.9 p.63 EXAMPLE 3: the pair's first element
-                                // is the BARE ordered array, not a {"valueList"}
-                                // wrapper — unlike languageMap/
-                                // json/vocab, which the clause does wrap
-                                l.clone()
-                            } else if let Some(l) = inst.get("objectList") {
-                                // 4.5.9 p.65: same bare form for ListRelationship
-                                l.clone()
-                            } else {
-                                Value::Null
-                            };
-                            let t = inst.get(timeprop).cloned().unwrap_or(Value::Null);
-                            Value::Array(vec![v, t])
-                        })
-                        .collect();
-                    let mut o = Map::new();
-                    // 4.5.9: the simplified member name follows the attribute type
-                    let member = match atype.as_str() {
-                        Some("Relationship") => "objects",
-                        Some("LanguageProperty") => "languageMaps",
-                        Some("VocabProperty") => "vocabs",
-                        Some("JsonProperty") => "jsons",
-                        Some("ListProperty") => "valueLists",
-                        Some("ListRelationship") => "objectLists",
-                        _ => "values",
-                    };
-                    o.insert("type".into(), atype);
-                    if let Some(ds) = ds {
-                        o.insert("datasetId".into(), Value::String(ds.clone()));
-                    }
-                    o.insert(member.into(), Value::Array(values));
-                    Value::Object(o)
-                })
-                .collect();
-            let rendered = if rendered.len() == 1 {
-                rendered.remove(0)
-            } else {
-                Value::Array(rendered)
-            };
-            out.insert(ctx.compact_iri(k), rendered);
+            Value::Array(vec![])
+        } else if r.temporal_values {
+            simplified_attr(instances, ctx, timeprop)
         } else {
-            let presented: Vec<Value> = instances
-                .iter()
-                .map(|inst| {
-                    let mut ci = inst.clone();
-                    if !r.sys {
-                        if let Some(o) = ci.as_object_mut() {
-                            o.remove("createdAt");
-                            o.remove("modifiedAt");
-                            // 6.3.11: expiresAt is sysAttrs-gated too
-                            o.remove("expiresAt");
-                            // ... and so are the sub-Attributes' own (4.8)
-                            for sub in o.values_mut() {
-                                let subs = match sub {
-                                    Value::Array(a) => a.iter_mut().collect(),
-                                    other => vec![other],
-                                };
-                                for so in subs.into_iter().filter_map(Value::as_object_mut) {
-                                    if so.contains_key("type") {
-                                        so.remove("createdAt");
-                                        so.remove("modifiedAt");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    compact_instance(&ci, ctx)
-                })
-                .collect();
-            out.insert(ctx.compact_iri(k), Value::Array(presented));
-        }
+            Value::Array(
+                instances
+                    .iter()
+                    .map(|inst| normalized_instance(inst, ctx, r.sys))
+                    .collect(),
+            )
+        };
+        out.insert(ctx.compact_iri(k), rendered);
     }
     Ok(Value::Object(out))
+}
+
+/// The Entity's own members (id, type, scope, the system attributes) as
+/// sysAttrs, pick and omit admit them.
+fn present_meta(obj: &Map<String, Value>, ctx: &Context, r: &TRepr) -> Map<String, Value> {
+    let mut out = Map::new();
+    for (k, v) in obj {
+        let scope_instances = k == "scope"
+            && v.as_array()
+                .is_some_and(|a| a.first().is_some_and(Value::is_object));
+        if !is_meta(k) || scope_instances {
+            continue;
+        }
+        match k.as_str() {
+            // Table 6.3.11-1: `sysAttrs` is what admits "the system
+            // generated temporal attributes createdAt, modifiedAt and
+            // the system temporal attribute expiresAt … In the case of
+            // temporal representations, also the system generated
+            // temporal attribute deletedAt". Without it none of them is
+            // in the payload — the same set `repr.rs` gates on the
+            // current-state path.
+            "createdAt" | "modifiedAt" | "expiresAt" | "deletedAt" if !r.sys => continue,
+            _ => {}
+        }
+        if !crate::repr::meta_projected(r.pick.as_deref(), r.omit.as_deref(), k) {
+            continue;
+        }
+        if k == "type" {
+            out.insert("type".into(), antares_jsonld::compact_types(v, ctx));
+        } else {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    out
+}
+
+/// 4.5.9 temporalValues: the instances grouped by datasetId, one object
+/// per group, the group alone when there is one.
+fn simplified_attr(instances: &[Value], ctx: &Context, timeprop: &str) -> Value {
+    let mut groups: Vec<(Option<String>, Vec<&Value>)> = Vec::new();
+    for inst in instances {
+        let ds = inst
+            .get("datasetId")
+            .and_then(Value::as_str)
+            .map(String::from);
+        match groups.iter_mut().find(|(g, _)| *g == ds) {
+            Some((_, list)) => list.push(inst),
+            None => groups.push((ds, vec![inst])),
+        }
+    }
+    let mut rendered: Vec<Value> = groups
+        .iter()
+        .map(|(ds, list)| simplified_group(ds.as_deref(), list, ctx, timeprop))
+        .collect();
+    if rendered.len() == 1 {
+        rendered.remove(0)
+    } else {
+        Value::Array(rendered)
+    }
+}
+
+/// One datasetId's instances as `{type, datasetId?, <member>: [[v, t]]}`.
+fn simplified_group(ds: Option<&str>, list: &[&Value], ctx: &Context, timeprop: &str) -> Value {
+    let atype = list
+        .first()
+        .and_then(|i| i.get("type"))
+        .cloned()
+        .unwrap_or_else(|| Value::String("Property".into()));
+    let values: Vec<Value> = list
+        .iter()
+        .map(|inst| {
+            let t = inst.get(timeprop).cloned().unwrap_or(Value::Null);
+            Value::Array(vec![simplified_value(inst, ctx), t])
+        })
+        .collect();
+    let mut o = Map::new();
+    // 4.5.9: the simplified member name follows the attribute type
+    let member = match atype.as_str() {
+        Some("Relationship") => "objects",
+        Some("LanguageProperty") => "languageMaps",
+        Some("VocabProperty") => "vocabs",
+        Some("JsonProperty") => "jsons",
+        Some("ListProperty") => "valueLists",
+        Some("ListRelationship") => "objectLists",
+        _ => "values",
+    };
+    o.insert("type".into(), atype);
+    if let Some(ds) = ds {
+        o.insert("datasetId".into(), Value::String(ds.to_owned()));
+    }
+    o.insert(member.into(), Value::Array(values));
+    Value::Object(o)
+}
+
+/// 4.5.9: Property/Relationship pairs carry the bare value/object; other
+/// attribute kinds wrap it under their member name.
+fn simplified_value(inst: &Value, ctx: &Context) -> Value {
+    if let Some(v) = inst.get("value") {
+        // 4.5.9: "the first element shall be a
+        // Property value" — the one the instance
+        // holds. A f64 round trip would retype an
+        // integer and drop a digit past 2^53.
+        v.clone()
+    } else if let Some(o) = inst.get("object") {
+        o.clone()
+    } else if let Some(lm) = inst.get("languageMap") {
+        serde_json::json!({"languageMap": lm})
+    } else if let Some(j) = inst.get("json") {
+        serde_json::json!({"json": j})
+    } else if let Some(vv) = inst.get("vocab") {
+        serde_json::json!({"vocab": compact_vocab(vv, ctx)})
+    } else if let Some(l) = inst.get("valueList") {
+        // 4.5.9 p.63 EXAMPLE 3: the pair's first element
+        // is the BARE ordered array, not a {"valueList"}
+        // wrapper — unlike languageMap/
+        // json/vocab, which the clause does wrap
+        l.clone()
+    } else if let Some(l) = inst.get("objectList") {
+        // 4.5.9 p.65: same bare form for ListRelationship
+        l.clone()
+    } else {
+        Value::Null
+    }
+}
+
+fn compact_vocab(vv: &Value, ctx: &Context) -> Value {
+    match vv {
+        Value::String(iri) => Value::String(ctx.compact_iri(iri)),
+        Value::Array(a) => Value::Array(
+            a.iter()
+                .map(|s| match s {
+                    Value::String(iri) => Value::String(ctx.compact_iri(iri)),
+                    o => o.clone(),
+                })
+                .collect(),
+        ),
+        o => o.clone(),
+    }
+}
+
+/// One instance in the normalized representation, its system attributes
+/// gone unless sysAttrs asked for them.
+fn normalized_instance(inst: &Value, ctx: &Context, sys: bool) -> Value {
+    let mut ci = inst.clone();
+    if let Some(o) = ci.as_object_mut().filter(|_| !sys) {
+        o.remove("createdAt");
+        o.remove("modifiedAt");
+        // 6.3.11: expiresAt is sysAttrs-gated too
+        o.remove("expiresAt");
+        // ... and so are the sub-Attributes' own (4.8)
+        for sub in o.values_mut() {
+            let subs = match sub {
+                Value::Array(a) => a.iter_mut().collect(),
+                other => vec![other],
+            };
+            for so in subs.into_iter().filter_map(Value::as_object_mut) {
+                if so.contains_key("type") {
+                    so.remove("createdAt");
+                    so.remove("modifiedAt");
+                }
+            }
+        }
+    }
+    compact_instance(&ci, ctx)
 }
 
 pub(crate) fn parse_aggr_period(s: &str) -> Option<AggrPeriod> {
@@ -703,41 +760,11 @@ pub(crate) fn parse_trepr(
         ..TRepr::default()
     };
     if let Some(opts) = params.get("options") {
-        for o in opts.split(',') {
-            match o.trim() {
-                "sysAttrs" => r.sys = true,
-                "temporalValues" => r.temporal_values = true,
-                "aggregatedValues" => r.aggregated = true,
-                "normalized" => {}
-                other => {
-                    return Err(NgsiError::InvalidRequest(format!(
-                        "unsupported options value {other:?}"
-                    )))
-                }
-            }
-        }
+        apply_options(&mut r, opts)?;
     }
     // format wins over options on conflict (6.3.7)
     if let Some(f) = params.get("format") {
-        match f.as_str() {
-            "temporalValues" => {
-                r.temporal_values = true;
-                r.aggregated = false;
-            }
-            "aggregatedValues" => {
-                r.aggregated = true;
-                r.temporal_values = false;
-            }
-            "normalized" => {
-                r.temporal_values = false;
-                r.aggregated = false;
-            }
-            other => {
-                return Err(NgsiError::InvalidRequest(format!(
-                    "unsupported format value {other:?}"
-                )))
-            }
-        }
+        apply_format(&mut r, f)?;
     }
     crate::repr::check_projection_exclusive(params)?;
     if let Some(pck) = params.get("pick") {
@@ -754,15 +781,7 @@ pub(crate) fn parse_trepr(
         .map(|s| s.split(',').map(|d| d.trim().to_owned()).collect());
     r.page = InstancePage::parse(params)?;
     if let Some(m) = params.get("aggrMethods") {
-        for method in m.split(',') {
-            let method = method.trim();
-            if !AGGR_METHODS.contains(&method) {
-                return Err(NgsiError::BadRequestData(format!(
-                    "invalid aggrMethods value {method:?} (4.5.19)"
-                )));
-            }
-            r.aggr_methods.push(method.to_owned());
-        }
+        r.aggr_methods = parse_aggr_methods(m)?;
         // aggrMethods implies aggregation UNLESS an explicit format says otherwise
         if !params.contains_key("format") {
             r.aggregated = true;
@@ -774,27 +793,75 @@ pub(crate) fn parse_trepr(
         ));
     }
     if let Some(d) = params.get("aggrPeriodDuration") {
-        let p = parse_aggr_period(d).ok_or_else(|| {
-            NgsiError::BadRequestData(format!("invalid aggrPeriodDuration {d:?}"))
-        })?;
-        // 4.11: the value space ends where duration arithmetic does —
-        // beyond ~100 years chrono::Duration::seconds is out of bounds
-        // (a panic, i.e. a remote 500), so such periods are rejected.
-        // Both components are bounded at ~100 years, the months in their own
-        // unit since a month is not a fixed number of seconds.
-        let (months, secs) = match p {
-            AggrPeriod::Whole => (0, 0),
-            AggrPeriod::Seconds(sc) => (0, sc),
-            AggrPeriod::Months(m, sc) => (m, sc),
-        };
-        if months > 1200 || secs > 86_400 * 366 * 100 {
-            return Err(NgsiError::BadRequestData(format!(
-                "aggrPeriodDuration {d:?} is out of range"
-            )));
-        }
-        r.aggr_period = p;
+        r.aggr_period = checked_aggr_period(d)?;
     }
     Ok(r)
+}
+
+fn apply_options(r: &mut TRepr, opts: &str) -> Result<(), NgsiError> {
+    for o in opts.split(',') {
+        match o.trim() {
+            "sysAttrs" => r.sys = true,
+            "temporalValues" => r.temporal_values = true,
+            "aggregatedValues" => r.aggregated = true,
+            "normalized" => {}
+            other => {
+                return Err(NgsiError::InvalidRequest(format!(
+                    "unsupported options value {other:?}"
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_format(r: &mut TRepr, f: &str) -> Result<(), NgsiError> {
+    (r.temporal_values, r.aggregated) = match f {
+        "temporalValues" => (true, false),
+        "aggregatedValues" => (false, true),
+        "normalized" => (false, false),
+        other => {
+            return Err(NgsiError::InvalidRequest(format!(
+                "unsupported format value {other:?}"
+            )))
+        }
+    };
+    Ok(())
+}
+
+fn parse_aggr_methods(m: &str) -> Result<Vec<String>, NgsiError> {
+    m.split(',')
+        .map(|method| {
+            let method = method.trim();
+            if !AGGR_METHODS.contains(&method) {
+                return Err(NgsiError::BadRequestData(format!(
+                    "invalid aggrMethods value {method:?} (4.5.19)"
+                )));
+            }
+            Ok(method.to_owned())
+        })
+        .collect()
+}
+
+/// 4.11: the value space ends where duration arithmetic does —
+/// beyond ~100 years chrono::Duration::seconds is out of bounds
+/// (a panic, i.e. a remote 500), so such periods are rejected.
+/// Both components are bounded at ~100 years, the months in their own
+/// unit since a month is not a fixed number of seconds.
+fn checked_aggr_period(d: &str) -> Result<AggrPeriod, NgsiError> {
+    let p = parse_aggr_period(d)
+        .ok_or_else(|| NgsiError::BadRequestData(format!("invalid aggrPeriodDuration {d:?}")))?;
+    let (months, secs) = match p {
+        AggrPeriod::Whole => (0, 0),
+        AggrPeriod::Seconds(sc) => (0, sc),
+        AggrPeriod::Months(m, sc) => (m, sc),
+    };
+    if months > 1200 || secs > 86_400 * 366 * 100 {
+        return Err(NgsiError::BadRequestData(format!(
+            "aggrPeriodDuration {d:?} is out of range"
+        )));
+    }
+    Ok(p)
 }
 
 /// The attribute-selection set for windowing: attrs= or pick=.
