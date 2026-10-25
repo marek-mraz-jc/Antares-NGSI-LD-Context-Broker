@@ -223,7 +223,9 @@ pub(crate) async fn linkable(
     let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
     let local_id = format!("urn:ngsi-ld:Context:v{hex}");
     let url = match st.store.context_get(Some(tenant), &local_id).await? {
-        Some(row) if row_visible(&row, tenant) => row["url"].as_str().map(str::to_owned),
+        Some(row) if row_visible(&row, tenant) => {
+            row.get("url").and_then(Value::as_str).map(str::to_owned)
+        }
         Some(_) => None,
         None => {
             let held = st
@@ -231,7 +233,10 @@ pub(crate) async fn linkable(
                 .context_list_meta(Some(tenant))
                 .await?
                 .iter()
-                .filter(|r| r["kind"] == "ImplicitlyCreated" && row_visible(r, tenant))
+                .filter(|r| {
+                    r.get("kind").and_then(Value::as_str) == Some("ImplicitlyCreated")
+                        && row_visible(r, tenant)
+                })
                 .count();
             if held >= MAX_IMPLICIT_CONTEXTS {
                 tracing::warn!(
