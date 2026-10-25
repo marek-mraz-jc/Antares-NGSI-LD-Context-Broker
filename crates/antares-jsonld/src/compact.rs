@@ -160,8 +160,13 @@ pub fn compact_entity_shallow(internal: &Value, ctx: &Context) -> Value {
     let mut out = Map::new();
     for (k, v) in obj {
         match k.as_str() {
-            "id" | "scope" | "createdAt" | "modifiedAt" | "deletedAt" | "expiresAt" => {
+            "id" | "createdAt" | "modifiedAt" | "deletedAt" | "expiresAt" => {
                 out.insert(k.clone(), v.clone());
+            }
+            // 4.5.1: a Scope, or an array only "in case of an Entity that has
+            // multiple Scopes" — the same rule as the normalized form
+            "scope" => {
+                out.insert("scope".into(), unwrap_single(v.clone()));
             }
             "type" => {
                 out.insert("type".into(), compact_types(v, ctx));
@@ -654,6 +659,20 @@ mod tests {
             json!({"vocab": "https://example.org/loc", "extra": 1})
         );
         assert_eq!(compact_entity_shallow(&json!("x"), &ctx), json!("x"));
+    }
+
+    /// 4.5.1 (CIM 009 V1.9.1 p.47-48): "scope" is "a Scope ... or an
+    /// unordered JSON array with multiple Scopes in case of an Entity that
+    /// has multiple Scopes". A stored one-element union (append with
+    /// noOverwrite, Coraine append_scope_union_single) is one Scope in
+    /// keyValues as in normalized; two stay an array.
+    #[test]
+    fn simplified_single_scope_is_unwrapped() {
+        let ctx = std::sync::Arc::new(crate::core_context());
+        let out = compact_entity_shallow(&json!({"id": "urn:x", "scope": ["/x"]}), &ctx);
+        assert_eq!(out["scope"], json!("/x"));
+        let out = compact_entity_shallow(&json!({"id": "urn:x", "scope": ["/x", "/y"]}), &ctx);
+        assert_eq!(out["scope"], json!(["/x", "/y"]));
     }
 
     /// vocab members that are not IRIs (a number in the array, an object

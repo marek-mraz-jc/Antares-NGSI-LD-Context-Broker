@@ -2098,7 +2098,9 @@ async fn batch_query_inner(
     } else {
         Value::Array(payload)
     };
-    let mut resp = respond_prefer(StatusCode::OK, out, &parsed.ctx, accept, &tenant, headers);
+    // 6.3.6: the json answer's Link names the @context it was compacted in
+    let served = crate::contexts::linkable(st, &tenant, headers, &parsed.ctx, accept).await?;
+    let mut resp = respond_prefer(StatusCode::OK, out, &served, accept, &tenant, headers);
     if let Some(total) = count_hdr {
         if let Ok(v) = total.to_string().parse() {
             resp.headers_mut().insert("NGSILD-Results-Count", v);
