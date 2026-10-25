@@ -716,7 +716,18 @@ impl AppState {
             loader.set_local_lookup(Arc::new(move |tenant, url| {
                 let store = store.clone();
                 Box::pin(async move {
-                    let (_, row) = hosted_row(&*store, tenant, url).await?;
+                    // A miss for a named Tenant still asks the DEFAULT one: a
+                    // fetch of this URL would reach the serve endpoint with no
+                    // NGSILD-Tenant, get the default Tenant's row and cache it
+                    // for everyone (F-ANT4-002). Found here, it keeps its owner.
+                    let default = antares_model::TenantId::default();
+                    let (_, row) = match hosted_row(&*store, tenant, url).await {
+                        Some(found) => found,
+                        None if tenant.is_some_and(|t| *t != default) => {
+                            hosted_row(&*store, Some(&default), url).await?
+                        }
+                        None => return None,
+                    };
                     // Ownership is one rule for the whole broker (ADR-0021): a
                     // Cached row is a copy of a public document and belongs to no
                     // Tenant, everything else belongs to its `owner` — with the
@@ -1532,6 +1543,41 @@ mod jsonld_context_locality_5_13 {
             serde_json::json!(2),
             "both counted uses land on the shared row (5.13.3.5)"
         );
+    }
+
+    /// F-ANT4-002: the default Tenant's Hosted @context is not fetched for
+    /// another Tenant through the broker's own (tenant-less) serve URL.
+    #[tokio::test]
+    async fn a_default_tenant_context_is_not_fetched_for_another_tenant() {
+        let st = AppState::new("me".into());
+        let owner = antares_model::TenantId::default();
+        let (url, fetches) = context_server("/ngsi-ld/v1/jsonldContexts/local-d");
+        st.store
+            .context_put(
+                Some(&owner),
+                "local-d",
+                serde_json::json!({
+                    "url": url, "localId": "local-d", "kind": "Hosted",
+                    "owner": owner.as_str(), "createdAt": now_iso(),
+                    "body": {"@context": {"peerTemp": "http://example.org/peerTemp"}},
+                }),
+            )
+            .await
+            .expect("seed hosted row");
+        let beta = antares_model::TenantId::new("beta").expect("tenant");
+        let user = serde_json::json!(url);
+        for _ in 0..2 {
+            let e = st.loader.resolve_for(&beta, &user).await;
+            assert!(
+                matches!(e, Err(antares_model::NgsiError::LdContextNotAvailable(_))),
+                "{e:?}"
+            );
+        }
+        assert_eq!(fetch_count(&fetches), 0, "never fetched over HTTP");
+        st.loader
+            .resolve_for(&owner, &user)
+            .await
+            .expect("owner resolves");
     }
 
     /// 5.13.3.5 counts uses of an @context this broker hosts on its own
