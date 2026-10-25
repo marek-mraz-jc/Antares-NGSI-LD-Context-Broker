@@ -39,12 +39,12 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: the generator gives 600 000 distinct requests in the mix
         run: node tests/perf/distinct-1000/queries.js
-      - uses: grafana/setup-k6-action@v1
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: grafana/setup-k6-action@43b9fc21641a76002687994433dd586f56e791b1 # v1.2.2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build the platform binary
         run: cargo build --locked --release -p antares-broker --features full,jc-policy,linkml,parquet,tabular,ical,feed
       - name: 1 000 distinct queries a second
@@ -60,7 +60,7 @@ jobs:
           tests/perf/distinct-1000/run.sh || status=$?
           { echo '```'; cat results/distinct-1000/result.txt results/distinct-1000/resources.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: bench-distinct-1000
