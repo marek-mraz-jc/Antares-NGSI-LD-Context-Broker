@@ -9,7 +9,7 @@ root, OData, OGC API - Features, SensorThings, iCalendar, MCP and a WebSocket fa
 subscribers. `dev/perf/surfaces_gate.py` judges each shape against `dev/perf/surfaces-budgets.json`
 (p95, p99, errors, throughput, each with its reason) and against `ci/perf-baseline/surfaces.json`
 when that baseline was measured on the same machine class. The `load-surfaces` workflow runs it
-every Sunday at 04:23Z and fails on a breach.
+every Sunday at 06:23Z and fails on a breach.
 
 The platform's own surfaces (the Portal grid, the Portal's live view, MQTT ingest through the edge
 broker) load dev at night from joinedcontext-conformance `tests/k6/night.sh`.

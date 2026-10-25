@@ -30,6 +30,13 @@ on:
         description: "commit to check out (empty: the triggering commit)"
         type: string
         default: ""
+      max_parallel:
+        # cells of each matrix job at a time; full.yml's schedule lowers it
+        # so a run leaves the account's job slots to the trains (T-5639).
+        # The default is above every matrix here, so ci.yml runs unthrottled.
+        description: "matrix cells per job at a time"
+        type: number
+        default: 16
 
 env:
   MEM_LIMIT_MB: 350 # per-broker peak-RSS gate, same limit as ScorpioBroker's pipeline
@@ -98,6 +105,7 @@ jobs:
       (needs['build-wasm'].result == 'success' || needs['build-wasm'].result == 'skipped')
     strategy:
       fail-fast: false
+      max-parallel: ${{ inputs.max_parallel }}
       matrix:
         # ONE source of truth for both presets — quick is a strict subset.
         include: >-

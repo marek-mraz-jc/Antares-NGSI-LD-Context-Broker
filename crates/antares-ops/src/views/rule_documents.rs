@@ -175,6 +175,7 @@ async fn get_one(r: Arc<Reloader>, tenant: String) -> Result<Response, String> {
     if let Err(answer) = admit(&r, &tenant) {
         return Ok(*answer);
     }
+    super::count_doc_reads("admin", 1);
     Ok(match r.state.policy_doc(&tenant).await? {
         Some(doc) => axum::Json(doc).into_response(),
         None => not_found(),
@@ -213,6 +214,7 @@ async fn put_one(r: Arc<Reloader>, tenant: String, body: Bytes) -> Result<Respon
         if let Err(why) = engine.load(&tenant, &doc) {
             return Ok(problem(StatusCode::BAD_REQUEST, "BadRequestData", &why));
         }
+        super::count_doc_reads("admin", 1);
         let previous = r.state.policy_doc(&tenant).await?;
         let stored = json!({
             "tenant": tenant,
