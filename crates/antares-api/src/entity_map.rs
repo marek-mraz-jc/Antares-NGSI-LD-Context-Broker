@@ -240,7 +240,9 @@ pub(crate) async fn map_set_expiry(
         .store
         .mutate(tenant, Kind::EntityMap, id, |d| {
             if let Some(o) = d.as_object_mut() {
-                o.insert("expiresAt".into(), want["expiresAt"].clone());
+                if let Some(e) = want.get("expiresAt") {
+                    o.insert("expiresAt".into(), e.clone());
+                }
             }
             Ok::<_, std::convert::Infallible>(())
         })
