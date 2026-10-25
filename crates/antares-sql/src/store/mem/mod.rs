@@ -1356,6 +1356,30 @@ impl Store {
             .cloned()
     }
 
+    /// Read-modify-write under the write lock; `None` when the row is absent
+    /// or another Tenant's, `Some(Err)` when `f` refused (nothing written).
+    pub fn context_mutate(
+        &self,
+        tenant: Option<&TenantId>,
+        id: &str,
+        f: impl FnOnce(&mut Value) -> Result<(), ()>,
+    ) -> Option<Result<(), ()>> {
+        on_blocking(self.shadow.is_some(), || {
+            let mut inner = self.write_inner();
+            let row = inner
+                .contexts
+                .get_mut(id)
+                .filter(|r| context_row_visible(r, tenant))?;
+            let mut doc = row.clone();
+            if f(&mut doc).is_err() {
+                return Some(Err(()));
+            }
+            self.persist(T_JSONLD_CONTEXTS, id.as_bytes(), Some(&doc));
+            *row = doc;
+            Some(Ok(()))
+        })
+    }
+
     pub fn context_delete(&self, tenant: Option<&TenantId>, id: &str) -> bool {
         on_blocking(self.shadow.is_some(), || {
             let mut inner = self.write_inner();
