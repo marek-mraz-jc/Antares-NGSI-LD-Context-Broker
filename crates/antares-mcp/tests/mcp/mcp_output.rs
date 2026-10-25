@@ -214,7 +214,13 @@ async fn an_entity_value_shaped_like_an_instruction_is_returned_as_json_and_appe
         .pointer("/content/0/text")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let as_json: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    // the same JSON, fenced under the line that calls it data (T-5559)
+    let inner: Vec<&str> = text.lines().skip(2).collect();
+    let inner = inner
+        .split_last()
+        .map(|(_, rest)| rest.join("\n"))
+        .unwrap_or_default();
+    let as_json: Value = serde_json::from_str(&inner).map_err(|e| e.to_string())?;
     assert_eq!(&as_json, a.structured(), "the text block is the same JSON");
     for (method, params) in [
         ("tools/list", json!({})),
