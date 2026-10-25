@@ -7,6 +7,7 @@
 
 use crate::negotiate::*;
 use crate::state::{now_iso, AppState};
+use antares_jsonld::Context;
 use antares_jsonld::Loader;
 use antares_model::{NgsiError, TenantId};
 use axum::body::Bytes;
@@ -14,7 +15,9 @@ use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::negotiate::CleanParams;
 
@@ -181,6 +184,97 @@ pub async fn purge_tenant(st: &AppState, tenant: &TenantId) -> Result<(), NgsiEr
         }
     }
     Ok(())
+}
+
+/// Most ImplicitlyCreated @contexts one Tenant may hold. A read with an inline
+/// @context writes one row per DISTINCT @context, so a caller who may only
+/// read could otherwise grow the store without bound by varying it.
+const MAX_IMPLICIT_CONTEXTS: usize = 1_000;
+
+/// 6.3.6: an "application/json" response "shall include a Link to the
+/// associated JSON-LD @context", and a Link carries a URL. An inline @context
+/// (an object, or an array of more than one entry) has none, so the broker
+/// hosts it as an ImplicitlyCreated @context (TS 104 175 13.1) and answers
+/// with a copy of `ctx` whose source is that URL. The local id is
+/// content-addressed per Tenant: the same inline @context, request after
+/// request, is one row behind one URL. Past [`MAX_IMPLICIT_CONTEXTS`] the
+/// response keeps the Core @context Link it had before.
+pub(crate) async fn linkable(
+    st: &AppState,
+    tenant: &TenantId,
+    headers: &HeaderMap,
+    ctx: &Arc<Context>,
+    accept: Accept,
+) -> ApiResult<Arc<Context>> {
+    let inline = match &ctx.source {
+        Value::Object(_) => true,
+        Value::Array(a) => a.len() > 1 || a.first().is_some_and(|v| !v.is_string()),
+        _ => false,
+    };
+    if accept != Accept::Json || !inline {
+        return Ok(Arc::clone(ctx));
+    }
+    let body = serde_json::to_vec(&ctx.source)
+        .map_err(|e| NgsiError::InternalError(format!("@context not serializable: {e}")))?;
+    let mut h = Sha256::new();
+    h.update(tenant.as_str().as_bytes());
+    h.update([0]);
+    h.update(&body);
+    let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let local_id = format!("urn:ngsi-ld:Context:v{hex}");
+    let url = match st.store.context_get(Some(tenant), &local_id).await? {
+        Some(row) if row_visible(&row, tenant) => {
+            row.get("url").and_then(Value::as_str).map(str::to_owned)
+        }
+        Some(_) => None,
+        None => {
+            let held = st
+                .store
+                .context_list_meta(Some(tenant))
+                .await?
+                .iter()
+                .filter(|r| {
+                    r.get("kind").and_then(Value::as_str) == Some("ImplicitlyCreated")
+                        && row_visible(r, tenant)
+                })
+                .count();
+            if held >= MAX_IMPLICIT_CONTEXTS {
+                tracing::warn!(
+                    tenant = tenant.as_str(),
+                    "ImplicitlyCreated @context cap reached; Link names the Core @context"
+                );
+                None
+            } else {
+                let url = format!("{}/{local_id}", base_url(headers));
+                st.store
+                    .context_put(
+                        Some(tenant),
+                        &local_id,
+                        json!({
+                            "url": url,
+                            "localId": local_id,
+                            "kind": "ImplicitlyCreated",
+                            "createdAt": now_iso(),
+                            "owner": tenant.as_str(),
+                            "body": {"@context": ctx.source.clone()},
+                        }),
+                    )
+                    .await?;
+                st.loader
+                    .put_local_for(tenant, url.clone(), ctx.source.clone())
+                    .await;
+                Some(url)
+            }
+        }
+    };
+    Ok(match url {
+        Some(url) => {
+            let mut linked = Context::clone(ctx);
+            linked.source = Value::String(url);
+            Arc::new(linked)
+        }
+        None => Arc::clone(ctx),
+    })
 }
 
 /// Resolve an id to the @context it names (5.13.4.4). Every probe is a keyed
