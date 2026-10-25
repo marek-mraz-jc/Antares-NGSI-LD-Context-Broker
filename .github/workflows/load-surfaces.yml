@@ -12,7 +12,7 @@ name: load-surfaces
 #   python3 dev/perf/surfaces_gate.py baseline --results <artifact dir> --machine github-ubuntu-latest
 on:
   schedule:
-    - cron: "23 4 * * 0"
+    - cron: "23 6 * * 0" # Sunday 06:23 UTC, the heavy weekly of Sunday (T-5639)
   workflow_dispatch:
     inputs:
       shapes:

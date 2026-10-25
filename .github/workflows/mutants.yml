@@ -12,7 +12,7 @@ name: mutants
 on:
   workflow_dispatch:
   schedule:
-    - cron: "41 2 * * 0"
+    - cron: "41 6 * * 1" # Monday 06:41 UTC, the heavy weekly of Monday (T-5639)
   push:
     # dev only: a worker branch's push queued hours of runners ahead of ci.yml (2026-10-10)
     branches: [dev]
@@ -23,9 +23,11 @@ on:
 permissions:
   contents: read
 
+# A scheduled run is never cancelled (its own group); pushes still supersede
+# each other (T-5639).
 concurrency:
-  group: mutants-${{ github.ref }}
-  cancel-in-progress: true
+  group: mutants-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 jobs:
   mutants:
@@ -34,6 +36,9 @@ jobs:
     timeout-minutes: 300
     strategy:
       fail-fast: false
+      # 6 of the 24 cells at a time: the account runs 20 jobs, the trains
+      # need the rest (T-5639)
+      max-parallel: 6
       matrix:
         target:
           - name: ql

@@ -11,7 +11,7 @@ name: fuzz
 # issue naming an artifact that was never written is one nobody can act on.
 on:
   schedule:
-    - cron: "17 3 * * 1,4" # twice a week, Mon + Thu 03:17 UTC
+    - cron: "17 12 * * 1,4" # twice a week, Mon + Thu 12:17 UTC
   workflow_dispatch:
     inputs:
       # A new target's first long run (T-3507: 30 minutes) on a hosted
@@ -23,6 +23,11 @@ on:
         description: run time per target, seconds
         default: "300"
 
+# One scheduled run at a time, never cancelled (T-5639).
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
   issues: write # the crash alarm
@@ -33,6 +38,9 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
+      # 6 of the 27 targets at a time: the account runs 20 jobs, the trains
+      # need the rest (T-5639)
+      max-parallel: 6
       matrix:
         target: ${{ fromJSON(inputs.targets || '["parse_q", "scope_q", "geo_params", "expand_entity", "q_to_sql", "type_selection", "projection", "representation", "join", "temporal", "order_by", "link_header", "tenant_header", "accept_header", "id_pattern", "datetime", "linkml_read", "view_config_load", "odata_url_parse", "odata_json_body", "odata_batch_multipart", "odata_batch_json", "mcp_tool_arguments", "mcp_cursor", "ws_client_message", "residual_compile", "model_names"]') }}
     steps:
