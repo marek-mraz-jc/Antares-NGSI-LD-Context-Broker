@@ -549,8 +549,6 @@ async fn the_odata_column_is_served_as_the_matrix_states() {
     enum Want {
         /// 200 after asking the engine once, with the row's clause.
         Gated,
-        /// 200 from the model, asking nothing.
-        Model,
         /// A write with this body: under view `all` a 2xx after asking
         /// the engine once, with the row's clause; under `restricted`,
         /// which offers no write, 405 before the engine.
@@ -577,12 +575,13 @@ async fn the_odata_column_is_served_as_the_matrix_states() {
             format!("{KEY}/speed"),
             Want::Gated,
         ),
-        ("retrieve_entity_types", "GET", String::new(), Want::Model),
+        // the documents naming the model ask the engine (F-ANT4-003)
+        ("retrieve_entity_types", "GET", String::new(), Want::Gated),
         (
             "retrieve_entity_type_details",
             "GET",
             "$metadata".into(),
-            Want::Model,
+            Want::Gated,
         ),
         // paging is by offset: no EntityMap is made (the row's binding says "may")
         (
@@ -701,9 +700,6 @@ async fn the_odata_column_is_served_as_the_matrix_states() {
                     wrong.push(format!(
                         "{cell}: asked {seen:?}, the row's clause is {clause:?}"
                     ));
-                }
-                Want::Model if status != StatusCode::OK || !seen.is_empty() => {
-                    wrong.push(format!("{cell}: {status} after {seen:?}"));
                 }
                 Want::Write(_) if view == "all" && (!status.is_success() || seen != clause) => {
                     wrong.push(format!(

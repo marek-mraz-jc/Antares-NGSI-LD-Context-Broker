@@ -394,7 +394,11 @@ mod tests {
         // an AND keeps the other leaf
         let c = pf(r#"speed>25;t>"2020-01-01T00:00:00Z""#).expect("compiles");
         assert!(!c.sql.contains("->>'value'"), "{}", c.sql);
-        assert!(!c.binds.contains(&"2020-01-01T00:00:00Z".to_owned()), "{:?}", c.binds);
+        assert!(
+            !c.binds.contains(&"2020-01-01T00:00:00Z".to_owned()),
+            "{:?}",
+            c.binds
+        );
         // both remaining extensions are superset-only: never page-exact
         let r = between();
         for q in ["speed!=10", r#"label[en]=="hi""#] {
