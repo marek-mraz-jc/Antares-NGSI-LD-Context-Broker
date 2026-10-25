@@ -1061,7 +1061,7 @@
   "TP/NGSI-LD/ContextInformation/Provision/Entities/CreateEntity/4524_01.robot::4524_01_01 Concise JsonProperty Is Inferred And Json Kept Verbatim",
   "TP/NGSI-LD/ContextInformation/Provision/Entities/CreateEntity/4524_01.robot::4524_01_02 JsonProperty With UnitCode Is Rejected",
   "TP/NGSI-LD/ContextInformation/Provision/Entities/CreateEntity/4524_01.robot::4524_01_03 JsonProperty With A Value Member Is Rejected",
-  "TP/NGSI-LD/ContextInformation/Provision/Entities/CreateEntity/4524_01.robot::4524_01_04 Scalar Json Member Is Rejected",
+  "TP/NGSI-LD/ContextInformation/Provision/Entities/CreateEntity/4524_01.robot::4524_01_04 Scalar Json Member Is Kept Verbatim",
   "TP/NGSI-LD/ContextInformation/Provision/Entities/CreateEntity/452_01.robot::452_01_01 Property With A Relationship Object",
   "TP/NGSI-LD/ContextInformation/Provision/Entities/CreateEntity/452_01.robot::452_01_02 Property With A LanguageMap",
   "TP/NGSI-LD/ContextInformation/Provision/Entities/CreateEntity/452_01.robot::452_01_03 Property With A ValueList",

@@ -2059,6 +2059,7 @@ async fn batch_query_inner(
                         *level,
                         &held,
                         &mut budget,
+                        crate::federation::active(&page_params).then_some(headers),
                     )
                     .await;
                 }
