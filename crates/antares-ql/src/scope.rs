@@ -26,10 +26,11 @@ pub fn scope_matches(scope_q: &str, doc: &Value) -> bool {
     })
 }
 
-/// Checks a `scopeQ` against the 4.19 grammar before it is evaluated: a
-/// disjunction (`,` or `|`) of optionally parenthesized `;`-conjunctions of
-/// ScopeQs, each `/level(/level)*` with `+` a whole level and `#` only as the
-/// last one, or `/#`. An empty query, an empty group or pattern (`/a,,/b`,
+/// Checks a `scopeQ` against the 4.19 grammar (TS 104 175 7.2.5) before it is
+/// evaluated: a disjunction (`,` or `|`) of ScopeQs and parenthesized
+/// `;`-conjunctions of them, each `/level(/level)*` with `+` a whole level and
+/// `#` only as the last one, or `/#`; a level starts with a letter. A bare
+/// conjunction (`/a;/b`) is a 400 like any other text outside the grammar. An empty query, an empty group or pattern (`/a,,/b`,
 /// `/a;;/b`) or an empty level (`//a`) is a 400 BadRequestData: without this
 /// [`scope_matches`] skips the empty piece and answers a wider query than the
 /// one asked. Longer than [`MAX_SCOPE_Q_BYTES`] is a 403 TooComplexQuery.
@@ -47,6 +48,10 @@ pub fn check_scope_q(scope_q: &str) -> Result<(), NgsiError> {
         let group = group.trim();
         let inner = match (group.strip_prefix('('), group.strip_suffix(')')) {
             (Some(_), Some(_)) => group.get(1..group.len().saturating_sub(1)).unwrap_or(""),
+            // TS 104 175 7.2.5: "For logical and grouping parenthesis are needed"
+            (None, None) if group.contains(';') => {
+                return Err(bad("a ';' conjunction needs parentheses, e.g. (/a;/b)"));
+            }
             (None, None) => group,
             _ => return Err(bad("unbalanced parenthesis")),
         };
@@ -74,12 +79,16 @@ fn check_scope_pattern(pat: &str) -> Result<(), &'static str> {
             "" => return Err("empty scope level"),
             "#" if i != last => return Err("'#' is only the last level"),
             "#" | "+" => {}
-            l if l.contains(['#', '+', '(', ')', ';', ',', '|'])
-                || l.chars().any(char::is_whitespace) =>
-            {
-                return Err("reserved character inside a scope level");
+            // ScopeQLevel = unicodeLetter *(unicodeNumber / unicodeLetter / "_"), the
+            // grammar every stored Scope already follows (antares-jsonld valid_scope_value)
+            l => {
+                let mut ch = l.chars();
+                if !(ch.next().is_some_and(char::is_alphabetic)
+                    && ch.all(|c| c.is_alphabetic() || c.is_numeric() || c == '_'))
+                {
+                    return Err("a scope level is a letter, then letters, digits or '_'");
+                }
             }
-            _ => {}
         }
     }
     Ok(())
@@ -242,12 +251,12 @@ mod clause_4_19 {
     }
 
     /// The ABNF puts `andOp` inside the parenthesized `OrScopeQ` alone, so
-    /// `(a;b),(c;d)` is the only spelling it derives — yet the official
-    /// suite's `019_01_06 QueryWithAndScope` sends `a;b` bare and expects
-    /// 200 (`testsuite-doubts.md`). Both are served, and they have to MEAN
-    /// the same thing: `;` binds tighter than `,`/`|`, which is the reading
-    /// the parentheses would have forced. A gateway narrowing a request by
-    /// rewriting `scopeQ` may emit either form.
+    /// `(a;b),(c;d)` is the only spelling it derives, and [`check_scope_q`]
+    /// refuses the bare `a;b` at every entry (forge cc8711ce moved
+    /// `019_01_06_05` to the parenthesized form and added `019_03_07_05`).
+    /// [`scope_matches`] still evaluates a bare conjunction an internal
+    /// caller builds, and the two spellings have to MEAN the same thing:
+    /// `;` binds tighter than `,`/`|`, the reading the parentheses force.
     #[test]
     fn a_conjunction_means_the_same_parenthesized_or_bare() {
         let docs = [
@@ -363,12 +372,37 @@ mod clause_4_19 {
             "/Madrid,/Berlin",
             "/Madrid|/Berlin",
             "(/Madrid;/Gardens),/Berlin",
-            "/a;/b",
+            "(/Madrid/Gardens/ParqueNorte;/CompanyA/OrganizationB/UnitC)",
+            "/Madrid/Gardens/ParqueNorte/#",
+            "/Madrid/+/#",
+            "/Ma_drid2/Été",
         ] {
             assert!(check_scope_q(ok).is_ok(), "{ok}");
         }
         for bad in [
-            "", "/a,,/b", "/a;;/b", "//a", "/a/", "Madrid", "/a/#/b", "(/a;/b", "()", "/a b", "/a#",
+            "",
+            "/a,,/b",
+            "/a;;/b",
+            "//a",
+            "/a/",
+            "Madrid",
+            "/a/#/b",
+            "(/a;/b",
+            "()",
+            "/a b",
+            "/a#",
+            // TS 104 175 7.2.5 (forge 019_03_07): "For logical and grouping parenthesis are
+            // needed", and a ScopeQLevel is a unicodeLetter then letters, numbers or "_"
+            "/a;/b",
+            "/Madrid;",
+            "/a;/b,/c",
+            "/Madrid/1st",
+            "/Madrid/+G",
+            "/a.b",
+            "/a-b",
+            // an empty pattern inside a group
+            "(/a;;/b)",
+            "(/Madrid;)",
         ] {
             let err = check_scope_q(bad).unwrap_err();
             assert_eq!(err.status(), 400, "{bad:?}: {err}");

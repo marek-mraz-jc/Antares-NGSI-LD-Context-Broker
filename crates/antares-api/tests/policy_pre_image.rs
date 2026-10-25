@@ -276,7 +276,9 @@ async fn a_write_to_an_absent_id_hands_no_image_and_answers_as_before() {
 /// id exists, none where it does not.
 #[tokio::test(flavor = "multi_thread")]
 async fn each_batch_member_carries_its_own_image() {
-    for (clause, path, body) in [
+    // TS 104 176 7.8.3.1: 201 when the absent id was created and the
+    // stored one updated; 7.11.3.1: 207 when an id did not exist.
+    for (clause, path, body, want) in [
         (
             "5.6.8",
             "upsert",
@@ -284,8 +286,14 @@ async fn each_batch_member_carries_its_own_image() {
                 {"id": VEHICLE, "type": "Vehicle", "speed": {"type": "Property", "value": 9}},
                 {"id": ABSENT, "type": "Vehicle", "speed": {"type": "Property", "value": 9}},
             ]),
+            StatusCode::CREATED,
         ),
-        ("5.6.10", "delete", json!([VEHICLE, ABSENT])),
+        (
+            "5.6.10",
+            "delete",
+            json!([VEHICLE, ABSENT]),
+            StatusCode::MULTI_STATUS,
+        ),
     ] {
         let (st, seen) = state().await;
         seed(&st).await;
@@ -296,10 +304,7 @@ async fn each_batch_member_carries_its_own_image() {
             Some(body),
         )
         .await;
-        assert!(
-            code.is_success() || code == StatusCode::MULTI_STATUS,
-            "{path}: {code}"
-        );
+        assert_eq!(code, want, "{path}");
         let log = seen.lock().unwrap();
         let images: Vec<(String, Option<Vec<String>>)> = log
             .iter()

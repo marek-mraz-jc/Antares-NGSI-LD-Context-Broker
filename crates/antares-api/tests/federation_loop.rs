@@ -870,10 +870,11 @@ async fn clause_5_6_7_batch_create_forwarding_fallbacks() {
     let m = mock_replying("HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n");
     let st = register_with(state(), serde_json::json!(["createEntity"]), m.port).await;
     let res = send(&st, batch_create()).await;
-    assert!(
-        res.status().is_success() || res.status() == StatusCode::MULTI_STATUS,
-        "fallback forwarding must not fail the batch: {}",
-        res.status()
+    // TS 104 176 7.7.3.1: every entity created, so 201 with the id array
+    assert_eq!(
+        res.status(),
+        StatusCode::CREATED,
+        "fallback forwarding must not fail the batch"
     );
     assert_eq!(
         m.hits.load(Ordering::SeqCst),

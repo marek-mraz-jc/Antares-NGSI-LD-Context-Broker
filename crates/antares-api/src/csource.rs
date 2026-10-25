@@ -1012,7 +1012,7 @@ pub async fn create_registration(
     let go = async {
         let tenant = tenant_from(&headers)?;
         check_params(&params, &["local"])?;
-        let parsed = parse_body(&st.loader, &headers, &body, BodyKind::Standard).await?;
+        let parsed = parse_body(&st, &headers, &body, BodyKind::Standard).await?;
         let obj = parsed.value.as_object().ok_or_else(|| {
             NgsiError::BadRequestData("registration must be a JSON object".into())
         })?;
@@ -1146,10 +1146,11 @@ pub async fn query_registrations(
                 "omit",
             ],
         )?;
-        // Table 6.8.3.2-1: pick and omit, exclusive as in 4.21
+        // Table 6.8.3.2-1: pick and omit, refused together as for Entities
+        // (repr::check_projection_exclusive; no clause states it)
         if params.contains_key("pick") && params.contains_key("omit") {
             return Err(NgsiError::BadRequestData(
-                "pick and omit are mutually exclusive (4.21)".into(),
+                "pick and omit cannot be combined in one request".into(),
             )
             .into());
         }
@@ -1417,7 +1418,7 @@ pub async fn update_registration(
         antares_model::EntityId::new(&id)
             .map_err(|_| NgsiError::BadRequestData(format!("invalid registration id {id:?}")))?;
         check_params(&params, &["local"])?;
-        let parsed = parse_body(&st.loader, &headers, &body, BodyKind::MergePatch).await?;
+        let parsed = parse_body(&st, &headers, &body, BodyKind::MergePatch).await?;
         let obj = parsed.object(NgsiError::BadRequestData(
             "fragment must be a JSON object".into(),
         ))?;

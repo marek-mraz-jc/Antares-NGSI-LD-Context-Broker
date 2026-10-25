@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! 4.19: every operation that takes a `scopeQ` refuses one outside the
-//! grammar (`/a,,/b`, `/a;;/b`, `//a`) with 400 BadRequestData before it
+//! grammar (`/a,,/b`, `/a;;/b`, `//a`, and since forge 019_03_07 a bare
+//! conjunction `/a;/b` or a level not starting with a letter, TS 104 175
+//! 7.2.5) with 400 BadRequestData before it
 //! reads anything, in the URI, a Query body and a Subscription alike; a
 //! well-formed one (`/Madrid/#`) is still answered (T-3959).
 
@@ -10,7 +12,13 @@ use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-const BAD: [&str; 3] = ["/a,,/b", "/a;;/b", "//a"];
+const BAD: [&str; 5] = [
+    "/a,,/b",
+    "/a;;/b",
+    "//a",
+    "/Madrid;/CompanyA",
+    "/Madrid/1st",
+];
 const GOOD: &str = "/Madrid/#";
 
 async fn send(st: &AppState, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
@@ -108,7 +116,14 @@ async fn a_well_formed_scope_q_is_still_answered() {
     }
     for (uri, doc) in bodies(GOOD) {
         let (status, body) = send(&st, "POST", uri, Some(doc)).await;
-        assert!(status.is_success(), "{uri}: {status} {body}");
+        // TS 104 176 7.12.3.1 / 8.x query: a valid query answers 200;
+        // 7.13.3.2: a created Subscription answers 201
+        let want = if uri.ends_with("/subscriptions") {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        };
+        assert_eq!(status, want, "{uri}: {body}");
     }
 }
 

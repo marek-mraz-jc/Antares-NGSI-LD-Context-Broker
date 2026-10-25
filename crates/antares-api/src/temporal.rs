@@ -70,7 +70,7 @@ pub async fn upsert_temporal(
     let go = async {
         let tenant = tenant_from(&headers)?;
         check_params(&params, &["options", "local"])?;
-        let parsed = parse_body(&st.loader, &headers, &body, BodyKind::Standard).await?;
+        let parsed = parse_body(&st, &headers, &body, BodyKind::Standard).await?;
         let obj = parsed.object(NgsiError::BadRequestData(
             "temporal entity must be a JSON object".into(),
         ))?;
@@ -164,6 +164,7 @@ pub async fn upsert_temporal(
                 );
             }
             return Ok(crate::federation::combine(
+                st.profile,
                 parts,
                 created(
                     format!(
@@ -3382,7 +3383,7 @@ pub async fn add_temporal_attrs(
         let tenant = tenant_from(&headers)?;
         antares_model::EntityId::new(&id)?;
         check_params(&params, &["local"])?;
-        let parsed = parse_body(&st.loader, &headers, &body, BodyKind::Standard).await?;
+        let parsed = parse_body(&st, &headers, &body, BodyKind::Standard).await?;
         let obj = parsed.object(NgsiError::BadRequestData(
             "fragment must be a JSON object".into(),
         ))?;
@@ -3499,6 +3500,7 @@ pub async fn add_temporal_attrs(
                 );
             }
             return Ok(crate::federation::combine(
+                st.profile,
                 parts,
                 no_content(&tenant),
                 &tenant,
@@ -3780,6 +3782,7 @@ async fn answer_temporal_attr_write(
         );
     }
     Ok(crate::federation::combine(
+        st.profile,
         parts,
         no_content(tenant),
         tenant,
@@ -3816,7 +3819,7 @@ pub async fn modify_temporal_instance(
         )
         .await?;
         let cond = crate::policy::Condition::of(&granted);
-        let parsed = parse_body(&st.loader, &headers, &body, BodyKind::MergePatch).await?;
+        let parsed = parse_body(&st, &headers, &body, BodyKind::MergePatch).await?;
         let obj = parsed.object(NgsiError::BadRequestData(
             "fragment must be a JSON object".into(),
         ))?;
@@ -4035,7 +4038,7 @@ pub async fn batch_temporal_query(
             &["limit", "offset", "count", "options", "format", "local"],
         )?;
         parse_accept(&headers)?;
-        let parsed = parse_body(&st.loader, &headers, &body, BodyKind::Standard).await?;
+        let parsed = parse_body(&st, &headers, &body, BodyKind::Standard).await?;
         let q = parsed.object(NgsiError::BadRequestData(
             "query body must be an object".into(),
         ))?;
@@ -5284,9 +5287,9 @@ mod clause_4_21 {
         assert!(reject_linked_projection(&plain, "5.7.3.4").is_ok());
     }
 
-    /// 4.21 Projections: "pick, omit and attrs are mutually exclusive" holds
-    /// on the temporal representation exactly as it does on the current-state
-    /// one — the temporal operations define no exception to it, so any pair
+    /// 4.21 Projections: the pick/omit/attrs refusal (repr::check_projection_exclusive,
+    /// ETSI TP 020_22) holds on the temporal representation exactly as it does
+    /// on the current-state one — the temporal operations define no exception to it, so any pair
     /// is BadRequestData and each one alone parses.
     #[test]
     fn pick_omit_and_attrs_cannot_be_combined_on_a_temporal_query() {

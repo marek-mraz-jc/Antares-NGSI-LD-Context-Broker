@@ -695,7 +695,10 @@ pub(crate) fn parse_projection(s: &str, ctx: &Context) -> Result<Vec<ProjNode>, 
 }
 
 /// Apply the representation to an internal doc, producing a new internal doc
-/// 4.21 Projections: "pick, omit and attrs are mutually exclusive" — the one
+/// 4.21 Projections. CIM 009 V1.9.1 4.21 and TS 104 175 7.3.2 state no rule
+/// for combining them; the ETSI TPs 018_18, 020_22 and 028_08 refuse pick
+/// with attrs, omit with attrs and one member in both pick and omit. Antares
+/// refuses every pair (T-5496 audit: a stricter reading, kept), the one
 /// reading, so an operation cannot accept a combination another rejects.
 pub fn check_projection_exclusive(params: &HashMap<String, String>) -> Result<(), NgsiError> {
     let excl = ["pick", "omit", "attrs"]
@@ -704,7 +707,7 @@ pub fn check_projection_exclusive(params: &HashMap<String, String>) -> Result<()
         .count();
     if excl > 1 {
         return Err(NgsiError::BadRequestData(
-            "pick, omit and attrs are mutually exclusive (4.21)".into(),
+            "pick, omit and attrs cannot be combined in one request".into(),
         ));
     }
     Ok(())
@@ -1901,7 +1904,7 @@ mod clause_6_3_7 {
         assert!(parse_repr(&params(&[("datasetId", "urn:ds:1,@none")]), &ctx).is_ok());
     }
 
-    /// 4.21: pick, omit and attrs are mutually exclusive — any pair is a 400,
+    /// pick, omit and attrs: any pair is a 400 (see check_projection_exclusive),
     /// each one alone is fine.
     #[test]
     fn pick_omit_and_attrs_cannot_be_combined() {

@@ -225,12 +225,16 @@ const MAX_TYPE_ARMS: usize = 16;
 /// names, the Entities whose first type it is (`i_entities_first_type_id`),
 /// plus one arm for the few of two or more types whose first type is none
 /// of them (`i_entities_multi_type_id`). The arms are disjoint (an Entity
-/// has one first type) and their union is exactly the selection.
+/// has one first type) and their union is exactly the selection. Only a
+/// group of one type gets first-type arms: a match of an AND-group (`A;B`)
+/// has two types, so the multi-type arm reaches it, where a first-type arm
+/// walked every Entity of A to keep none (T-5498: 53 000 s on dev).
 struct TypeSplit {
-    /// Bind of each named type, one first-type arm each.
+    /// Bind of each type a one-type group names, one first-type arm each.
     firsts: Vec<usize>,
-    /// Bind of every named type, as an array.
-    named: usize,
+    /// Bind of those types as an array, `None` when every group is an
+    /// AND-group and the multi-type arm alone reads the selection.
+    named: Option<usize>,
     /// The selection itself, `types @> $g` per AND-group, ORed.
     selection: String,
     /// A selection of one type is decided by `types[1] = $t` alone.
@@ -252,10 +256,13 @@ fn arms(wheres: &[String], split: Option<&TypeSplit>) -> Vec<String> {
             false => format!("{base} AND types[1] = ${n} AND {}", s.selection),
         })
         .collect();
-    arms.push(format!(
-        "{base} AND cardinality(types) > 1 AND types[1] <> ALL(${}) AND {}",
-        s.named, s.selection
-    ));
+    arms.push(match s.named {
+        Some(n) => format!(
+            "{base} AND cardinality(types) > 1 AND types[1] <> ALL(${n}) AND {}",
+            s.selection
+        ),
+        None => format!("{base} AND cardinality(types) > 1 AND {}", s.selection),
+    });
     arms
 }
 
@@ -458,7 +465,12 @@ fn type_selection(groups: &[Vec<String>], binds: &mut Vec<Bind>) -> Result<TypeS
         .iter()
         .filter(|g| super::storable(g).len() == g.len())
         .collect();
-    let mut named: Vec<&String> = groups.iter().flat_map(|g| g.iter()).collect();
+    // the type of each group naming one (`A;A` is `A`): a group of two
+    // types is read by the multi-type arm alone
+    let mut named: Vec<&String> = groups
+        .iter()
+        .filter_map(|g| g.first().filter(|f| g.iter().all(|t| t == *f)))
+        .collect();
     named.sort_unstable();
     named.dedup();
     let ors: Vec<String> = groups
@@ -483,10 +495,13 @@ fn type_selection(groups: &[Vec<String>], binds: &mut Vec<Bind>) -> Result<TypeS
             binds.len()
         })
         .collect();
-    binds.push(Bind::TextArr(named.into_iter().cloned().collect()));
+    let named = (!named.is_empty()).then(|| {
+        binds.push(Bind::TextArr(named.into_iter().cloned().collect()));
+        binds.len()
+    });
     Ok(TypeSplit {
         firsts,
-        named: binds.len(),
+        named,
         selection,
         exact_first: matches!(groups.as_slice(), [g] if g.len() == 1),
     })
@@ -2414,6 +2429,44 @@ mod tests {
         );
     }
 
+    /// T-5498: a match of `A;B` has two types, so the multi-type arm alone
+    /// reads it; a first-type arm walked every Entity of A and kept none.
+    /// A one-type group beside it (`A,B;C`) keeps its first-type arm, and
+    /// `A;A` is the one type A.
+    #[test]
+    fn an_and_group_reads_the_multi_type_arm_only() {
+        let t = |s: &str| s.to_owned();
+        let mut binds = vec![Bind::Text(t("t"))];
+        let split = type_selection(&[vec![t("A"), t("B")]], &mut binds).expect("split");
+        assert_eq!(
+            arms(&[t("tenant_id = $1")], Some(&split)),
+            ["tenant_id = $1 AND cardinality(types) > 1 AND (types @> $2)"]
+        );
+        assert_eq!(binds.len(), 2, "no first-type binds");
+
+        let mut binds = vec![Bind::Text(t("t"))];
+        let split =
+            type_selection(&[vec![t("A")], vec![t("B"), t("C")]], &mut binds).expect("split");
+        assert_eq!(
+            arms(&[t("tenant_id = $1")], Some(&split)),
+            [
+                "tenant_id = $1 AND types[1] = $4 AND (types @> $2 OR types @> $3)",
+                "tenant_id = $1 AND cardinality(types) > 1 AND types[1] <> ALL($5) \
+                 AND (types @> $2 OR types @> $3)",
+            ]
+        );
+        assert!(matches!(&binds[3], Bind::Text(x) if x == "A"));
+        assert!(matches!(&binds[4], Bind::TextArr(v) if v == &[t("A")]));
+
+        let mut binds = vec![Bind::Text(t("t"))];
+        let split = type_selection(&[vec![t("A"), t("A")]], &mut binds).expect("split");
+        assert_eq!(
+            arms(&[t("tenant_id = $1")], Some(&split)).len(),
+            2,
+            "A;A is A"
+        );
+    }
+
     /// count=false never asks for a count; count=true asks only when the
     /// page cannot show the total: more rows past it, or an off-the-end page.
     #[test]
@@ -2448,7 +2501,7 @@ mod tests {
         );
         let split = TypeSplit {
             firsts: vec![2],
-            named: 3,
+            named: Some(3),
             selection: "(types @> $5)".to_owned(),
             exact_first: true,
         };

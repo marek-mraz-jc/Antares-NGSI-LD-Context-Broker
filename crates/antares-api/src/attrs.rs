@@ -134,7 +134,7 @@ async fn write_attrs(
     let tenant = tenant_from(headers)?;
     antares_model::EntityId::new(id)?;
     check_params(params, &["options", "local", "type"])?;
-    let parsed = parse_body(&st.loader, headers, body, mode.body_kind).await?;
+    let parsed = parse_body(st, headers, body, mode.body_kind).await?;
     let obj = parsed.object(NgsiError::BadRequestData(
         "fragment must be a JSON object".into(),
     ))?;
@@ -686,6 +686,7 @@ fn combine_attr_parts(
     if let ([reg], [part]) = (regs, fed_parts) {
         if reg.is_proxy() && !part.ok() && matches!(local, LocalOutcome::Skipped) {
             return crate::federation::combine(
+                crate::Profile::default(), // one failing part: no 404 to drop
                 vec![crate::federation::Part {
                     status: part.status,
                     detail: part.detail.clone(),
@@ -876,7 +877,7 @@ async fn partial_update_inner(
     antares_model::EntityId::new(id)?;
     check_attr_name(attr)?;
     check_params(params, &["local", "type"])?;
-    let parsed = parse_body(&st.loader, headers, body, BodyKind::MergePatch).await?;
+    let parsed = parse_body(st, headers, body, BodyKind::MergePatch).await?;
     let obj = parsed.object(NgsiError::BadRequestData(
         "fragment must be a JSON object".into(),
     ))?;
@@ -1058,7 +1059,7 @@ pub async fn replace_attr(
         antares_model::EntityId::new(&id)?;
         check_attr_name(&attr)?;
         check_params(&params, &["local", "type"])?;
-        let parsed = parse_body(&st.loader, &headers, &body, BodyKind::Standard).await?;
+        let parsed = parse_body(&st, &headers, &body, BodyKind::Standard).await?;
         // 5.5.7 term expansion first, then 5.6.19.4: "If the target Attribute
         // is scope, then an error of type BadRequestData shall be raised" —
         // the target is the expanded name, so the IRI spelling counts too.

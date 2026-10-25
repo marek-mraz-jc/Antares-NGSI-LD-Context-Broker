@@ -37,6 +37,27 @@ Full run: external-suites run 38860287033, workflow_dispatch on `74b72185` (2026
 
 The 98 TPs (b) fails are the ratchet `tests/external/etsi/forge-latest-ratchet.txt`, each with its triage from 4.1; since T-4855 a `latest` cell that fails another TP, or passes a listed one, fails the job (`docs/conformance/suite-edits.md` section 4). All 8 cells of a suite fail the same TPs, so no store and no binary differs; the forge's main moved from `5c398518` to `56e721d0` during the run and the failing set stayed the same. Run 38806308784 on `214c75a4` ran forge `5c398518` and had 97 failures on (b). The one new failure is 028_06: `be3244ae` initialises an absent Subscription `jsonldContext` (5.8.1.4), and the forge TP compares the whole Subscription read back, where its siblings 028_01 and 030_03 ignore that member. Run 38793032271 on `cb88e44` had 149 failures on (b); 60 of them were harness failures (48 IOP setups that sent `/ngsi-ld/v1/ngsi-ld/v1`, 12 MQTT TPs given an unreachable broker host), gone since `214c75a4`. Triage of the 8 IOP TPs that the doubled path had hidden found two Antares bugs in distributed queries, both under 4.3.6.1 and fixed on this branch (`65d53b87`, `be403960`). The forge IOP tree, run locally on `be403960` (memory store), gives 40 PASS / 8 FAIL, the same 8 TPs, each failing on its test bug alone.
 
+#### T-5495 re-run (2026-10-24)
+
+Local `dev/etsi-pipeline.sh`, vanilla image, memory store, `STOP_ON_ERROR=0`, the forge tree made forge-free as
+external-suites.yml does. Results stay out of git; rerun the same way to reproduce.
+
+| forge ref | sha | antares | TPs | not passing | of them MQTT 058_* (sandbox) |
+|---|---|---|---|---|---|
+| develop (default branch) | `cc8711ce` | dev `98e7f38` | 1101 | 101 | 12 |
+| `integration/all-fixes` | `6475ccb9` | `bafe084e` (dev `98e7f38` + T-5486 + T-5495) | 1158 | 94 | 12 |
+
+- develop, against the ratchet: 13 listed TPs pass because forge fixed them (`b3bb243f` asserts 504: 043_01_01/02/03/05,
+  028_07_02; `25b3e0fa` adds objectType: 018_10_01/02, 018_13_01/02, 019_13_01/02, 019_16_01/02). They came off the
+  ratchet, 85 remain. New failures: 019_03_07_05 and 019_03_07_08 (Antares bug, fixed, 4.2), D002_02_01_inc and
+  D002_02_02_inc (T-5486, fixed on its branch, which this one carries), and the 12 MQTT TPs.
+- The 12 MQTT TPs fail in the sandbox only: `eclipse-mosquitto:2` resolved to 2.1.2, which in this docker-in-docker
+  host cannot open even its own default config, so no TP reached a broker. CI's `latest` cells are the arbiter.
+- all-fixes, against the ratchet: 67 of the 85 TPs pass, which confirms their test-bug verdicts by an independent suite
+  fix; 31 listed TPs fail on both refs and keep the 4.1 rows. 51 TPs fail on all-fixes only (4.1, rows marked
+  "all-fixes"). The first all-fixes run failed all 1158 TPs: `dev/etsi-run.sh` rewrote the multi-line
+  `ngsild_test_suite_context` assignment with a one-line sed; the harness now appends the assignment.
+
 ### 3.2 Coraine functional
 
 831 cases per cell. The verdicts come from `compare.py`; "pass" counts the cases that match after its normalisation.
@@ -111,6 +132,18 @@ Each failure goes into exactly one bucket, with the clause quoted (CIM 009 V1.9.
 | ETSI (b) | D002_02_exc | test bug | TS 104 175 10.2.8.4: a partly failed delete is a partial success (207) | forge |
 | ETSI (b) | D005_01_inc | test bug | TS 104 175 10.2.5.4: no default instance of `speed` locally gives ResourceNotFound for that part, so 207 | forge |
 | ETSI (b) | 038_05_01, 042_02_01, 042_03_01, D004_01_inc, D010_01_exc, D016_01_inc | test bug | tooling: a keyword library not imported, `expected_status=any` missing, an unset `$payload`, a stub on another URL than the one counted, `Should Contain` on a list | forge |
+| ETSI (b) | 019_03_07_05, 019_03_07_08 | Antares bug, fixed | TS 104 175 7.2.5: "For logical and grouping parenthesis are needed"; `ScopeQLevel = unicodeLetter *ScopeQLevelChar` | 4.2 (T-5495) |
+| ETSI (b) | 043_01_01/02/03/05, 028_07_02, 018_10_01/02, 018_13_01/02, 019_13_01/02, 019_16_01/02 | test bug, fixed upstream | forge `b3bb243f` (504) and `25b3e0fa` (objectType) | off the ratchet (T-5495) |
+| ETSI (b) | D002_02_01_inc, D002_02_02_inc | Antares bug, fixed | 6.3.17: a source's 404 is "not abnormal" only for HTTP GET | T-5486 |
+| all-fixes | 054_02_02, 056_02_02 | Antares deviates, held by forge develop | TS 104 176 6.3.2: 405 "shall be raised when a client invokes a recognized but unsupported HTTP verb over a resource"; develop expects 400 | T-5584, `etsi-raises.md` §25 |
+| all-fixes | 003_06_01, 003_08_01 | Antares deviates, held by forge develop | TS 104 176 6.2.4: "if the request payload body (as JSON) contains a @context term, then an HTTP error response of type BadRequestData shall be raised"; develop expects 207 | T-5584, §26 |
+| all-fixes | 047_03_01, 047_07_01/02, 047_10_01, 047_11_01/02, 047_12_01, 047_13_01, 047_14_01, 047_15_01, 047_16_02; knock-on 041_01_01, 041_02_03, 041_03_03 | Antares deviates, held by forge develop | TS 104 175 12.4.7: "the csource notification shall be sent on initial subscription"; Antares skips it while nothing matches | T-5584, §27 |
+| all-fixes | 019_26_01..06 | test bug | TS 104 175 7.2.3.2 defines q, expandValues, jsonKeys; the TPs send Coraine's `langProperties` (400 unknown parameter). Without it Antares answers each `street[fr]`/`street[*]` query as 7.2.3.2 reads | §28 |
+| all-fixes | 019_02_08_05, 019_27_05 | Antares per spec | TS 104 175 5.2.6.4.10: `json` is "Raw unexpandable JSON which shall not be interpreted as JSON-LD using the supplied @context" | §28 |
+| all-fixes | 020_13_01..04/06..09, 021_15_01..04/06, 021_16_01 | test bug | RFC 8288 3 (TS 104 176 6.4.7.3): OWS around `;`; the assertion regex wants `>;rel=`. Antares' Links carry offsetN | §28 |
+| all-fixes | 020_13_05, 020_14_01/02, 021_15_05 | harness | TS 104 176 6.4.7.3: the page is "lastN or the maximum limit configured, whichever is smaller"; the ETSI stack configures 9 | §28 |
+| all-fixes | D011_01_exc, D011_01_03_inc, D011_02_exc_01 | test bug | TS 104 176 7.2.3.1 defines `attrs`; the stub matches only `pick=` | §28 |
+| all-fixes | 001_02_02, 016_02_06, D002_02_01_inc, D002_02_02_inc, D004_01_inc | suites disagree, spec unclear | InvalidRequest vs BadRequestData for `{}`; 405 vs 400 for an empty path segment; 6.3.17 on a source's 404 to a write | T-5497 |
 
 ### 4.2 Antares bugs fixed on this branch
 
@@ -141,6 +174,7 @@ Each fix has a red-first test and a note in its `docs/spec/` clause file. The Co
 | `80ce647b` | 4.8 | the temporal representation showed sub-Attribute `createdAt`/`modifiedAt` without `options=sysAttrs` | Coraine troe_timescale_routes_single_entity and 2 more |
 | `5ad2b5a7` | 5.6.14.4 | an instance PATCH stored the EntityTemporal Fragment itself as the value | Coraine troe_timescale_temporal_instance |
 | `612a061b` | 4.5.2.2 | `valueType` read back as the expanded IRI | Coraine value_type_subattr |
+| T-5495 | TS 104 175 7.2.5 | a scopeQ with a bare `;` conjunction or a level not starting with a letter was answered instead of refused (BadRequestData) | forge 019_03_07_05, 019_03_07_08 |
 
 ### 4.3 Where the two suites disagree
 

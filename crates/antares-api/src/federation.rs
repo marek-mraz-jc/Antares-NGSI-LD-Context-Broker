@@ -2761,11 +2761,21 @@ impl Part {
 
 /// Combine local + forwarded parts (6.3.17/6.4.3.1): all-success ⇒ `ok`,
 /// single failing part ⇒ its own error, mixed ⇒ 207 Multi-Status.
-pub fn combine(parts: Vec<Part>, ok: Response, tenant: &TenantId) -> Response {
+pub fn combine(
+    profile: crate::Profile,
+    mut parts: Vec<Part>,
+    ok: Response,
+    tenant: &TenantId,
+) -> Response {
     // 6.3.17 calls a source's 404 not abnormal only for HTTP GET; every
     // part here is an unsafe write, whose error response "should be as
     // informative as possible": a 404 beside a success stays in the 207
     // (ETSI D002_02_01_inc, D002_02_02_inc). 404 everywhere is the one 404.
+    // ANTARES_FED_WRITE_SOURCE_404=ignore reads the 404 as "no data" for
+    // writes too (forge all-fixes, Coraine): beside a success it drops out.
+    if profile.fed_write_ignore_404 && parts.iter().any(Part::ok) {
+        parts.retain(|p| p.status != 404);
+    }
     if parts.iter().all(Part::ok) {
         return ok;
     }
@@ -3146,10 +3156,80 @@ mod tests {
             detail: String::new(),
         };
         let ok = || StatusCode::NO_CONTENT.into_response();
-        assert_eq!(combine(vec![part(204), part(404)], ok(), &t).status(), 207);
-        assert_eq!(combine(vec![part(404), part(204)], ok(), &t).status(), 207);
-        assert_eq!(combine(vec![part(404), part(404)], ok(), &t).status(), 404);
-        assert_eq!(combine(vec![part(204), part(500)], ok(), &t).status(), 207);
+        assert_eq!(
+            combine(
+                crate::Profile::default(),
+                vec![part(204), part(404)],
+                ok(),
+                &t
+            )
+            .status(),
+            207
+        );
+        assert_eq!(
+            combine(
+                crate::Profile::default(),
+                vec![part(404), part(204)],
+                ok(),
+                &t
+            )
+            .status(),
+            207
+        );
+        assert_eq!(
+            combine(
+                crate::Profile::default(),
+                vec![part(404), part(404)],
+                ok(),
+                &t
+            )
+            .status(),
+            404
+        );
+        assert_eq!(
+            combine(
+                crate::Profile::default(),
+                vec![part(204), part(500)],
+                ok(),
+                &t
+            )
+            .status(),
+            207
+        );
+    }
+
+    /// T-5497 ANTARES_FED_WRITE_SOURCE_404=ignore: a 404 beside a success
+    /// drops out (forge all-fixes D002_02_01_inc/D002_02_02_inc, Coraine
+    /// distop_delete_inclusive_source_404 step 03); 404 everywhere stays
+    /// one 404 and any other failure stays in the 207.
+    #[test]
+    fn ignore_profile_reads_a_404_beside_a_success_as_no_data() {
+        let t = antares_model::TenantId::new(TenantId::DEFAULT).expect("tenant");
+        let part = |status: u16| Part {
+            status,
+            detail: String::new(),
+        };
+        let ok = || StatusCode::NO_CONTENT.into_response();
+        let p = crate::Profile {
+            fed_write_ignore_404: true,
+            ..crate::Profile::default()
+        };
+        assert_eq!(
+            combine(p, vec![part(204), part(404)], ok(), &t).status(),
+            204
+        );
+        assert_eq!(
+            combine(p, vec![part(404), part(204)], ok(), &t).status(),
+            204
+        );
+        assert_eq!(
+            combine(p, vec![part(404), part(404)], ok(), &t).status(),
+            404
+        );
+        assert_eq!(
+            combine(p, vec![part(204), part(404), part(500)], ok(), &t).status(),
+            207
+        );
     }
 
     /// 4.3.6.6: contextSourceInfo carries the headers a source needs to
@@ -4090,6 +4170,7 @@ mod tests {
             detail: "local write applied".into(),
         };
         let resp = combine(
+            crate::Profile::default(),
             vec![local, part],
             StatusCode::NO_CONTENT.into_response(),
             &tenant,
