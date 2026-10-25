@@ -518,11 +518,11 @@ pub(crate) async fn on_csource_notification(
         {
             continue;
         }
-        let Some(endpoint) = reg.get("endpoint").and_then(Value::as_str).map(|e| {
-            e.trim_end_matches('/')
-                .trim_end_matches("/ngsi-ld/v1")
-                .to_owned()
-        }) else {
+        let Some(endpoint) = reg
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .map(crate::federation::endpoint_base)
+        else {
             continue;
         };
         let mapped = ds_remotes(&ds_get(st, tenant, own_id).await)

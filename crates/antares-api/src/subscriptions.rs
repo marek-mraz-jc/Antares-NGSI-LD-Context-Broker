@@ -941,7 +941,8 @@ fn own_socket(st: &AppState, uri: Option<&str>) -> bool {
     uri.is_some_and(|u| u.starts_with(SOCKET_ENDPOINT) && st.sinks.require(u, &[]).is_ok())
 }
 
-fn endpoint_uri(sub: &Map<String, Value>) -> Option<&str> {
+/// `notification.endpoint.uri` of a Subscription.
+pub(crate) fn endpoint_uri(sub: &Map<String, Value>) -> Option<&str> {
     sub.get("notification")?
         .get("endpoint")?
         .get("uri")?
@@ -1200,6 +1201,7 @@ pub async fn list(
         &format!("/ngsi-ld/v1/{}", resource_path(kind)),
         accept,
         total,
+        kind == Kind::CSourceSubscription,
     )?;
     let sys = sys_attrs_asked(params);
     let payload: Vec<Value> = page

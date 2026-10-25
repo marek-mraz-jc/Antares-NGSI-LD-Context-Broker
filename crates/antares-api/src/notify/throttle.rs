@@ -471,7 +471,9 @@ pub(super) fn fold(job: LaneJob, rx: &mut tokio::sync::mpsc::Receiver<LaneJob>) 
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn tell_lost(st: &AppState, g: &Matched) {
     if let (Some(uri), Some(id)) = (
-        endpoint_uri(&g.sub),
+        g.sub
+            .as_object()
+            .and_then(crate::subscriptions::endpoint_uri),
         g.sub.get("id").and_then(Value::as_str),
     ) {
         if let Some(sink) = st.sinks.sink_for_uri(uri) {
@@ -576,16 +578,10 @@ pub(super) async fn delivery_permits(tenant: &TenantId) -> impl Sized {
 /// (ADR-0025 rule 7). The same test `deliver_as` polices egress by.
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn in_process_sink(st: &AppState, sub: &Value) -> bool {
-    endpoint_uri(sub).is_some_and(|uri| {
-        in_process(st, uri).is_some() || st.sinks.sink_for_uri(uri).is_some_and(|s| !s.network())
-    })
-}
-
-/// `notification.endpoint.uri` of a Subscription.
-#[cfg(not(target_arch = "wasm32"))]
-pub(super) fn endpoint_uri(sub: &Value) -> Option<&str> {
-    sub.get("notification")?
-        .get("endpoint")?
-        .get("uri")?
-        .as_str()
+    sub.as_object()
+        .and_then(crate::subscriptions::endpoint_uri)
+        .is_some_and(|uri| {
+            in_process(st, uri).is_some()
+                || st.sinks.sink_for_uri(uri).is_some_and(|s| !s.network())
+        })
 }

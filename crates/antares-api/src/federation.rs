@@ -286,13 +286,9 @@ pub fn handle_via_loop(
     tenant: &TenantId,
     regs: &mut Vec<FedReg>,
 ) -> Option<Response> {
-    // A chain past [`MAX_VIA_HOPS`] is refused outright: the operation is
-    // not re-forwarded and not run locally either, because a request that
-    // deep is a cascade the pseudonyms failed to close.
-    if via_hops(headers) > MAX_VIA_HOPS {
-        regs.clear();
-        return Some(loop_508(tenant));
-    }
+    // [`via_loop`] also refuses a chain past [`MAX_VIA_HOPS`] outright: the
+    // operation is not re-forwarded and not run locally either, because a
+    // request that deep is a cascade the pseudonyms failed to close.
     if !via_loop(headers, alias) {
         return None;
     }
@@ -555,16 +551,7 @@ pub async fn matching_regs(
                 .get("contextSourceAlias")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            let endpoint = doc
-                .get("endpoint")
-                .and_then(Value::as_str)?
-                .trim_end_matches('/');
-            // registrations may name the API root itself (…/ngsi-ld/v1) —
-            // normalize so forward URLs never double the prefix (IOP fixtures)
-            let endpoint = endpoint
-                .strip_suffix("/ngsi-ld/v1")
-                .unwrap_or(endpoint)
-                .to_owned();
+            let endpoint = endpoint_base(doc.get("endpoint").and_then(Value::as_str)?);
             let mode = doc
                 .get("mode")
                 .and_then(Value::as_str)
@@ -1720,29 +1707,21 @@ fn local_only_of(reg: &Value) -> bool {
 /// `forward` (endpoint/tenant/csi/alias) and `supports`.
 /// 4.3.6.6 contextSourceInfo, as the key/value pairs a forward applies.
 fn csi_of(reg: &Value) -> Vec<(String, String)> {
-    reg.get("contextSourceInfo")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|kv| {
-                    Some((
-                        kv.get("key")?.as_str()?.to_owned(),
-                        kv.get("value")?.as_str()?.to_owned(),
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    crate::notify::kv_pairs(reg.get("contextSourceInfo"))
+}
+
+/// A registration's endpoint without a trailing `/` or the API root it may name
+/// (`…/ngsi-ld/v1`), so a forward URL never doubles the prefix (IOP fixtures).
+pub(crate) fn endpoint_base(endpoint: &str) -> String {
+    let e = endpoint.trim_end_matches('/');
+    e.strip_suffix("/ngsi-ld/v1").unwrap_or(e).to_owned()
 }
 
 pub(crate) fn fed_reg_of(reg_id: &str, reg: &Value) -> FedReg {
     let endpoint = reg
         .get("endpoint")
         .and_then(Value::as_str)
-        .map(|e| {
-            let e = e.trim_end_matches('/');
-            e.strip_suffix("/ngsi-ld/v1").unwrap_or(e).to_owned()
-        })
+        .map(endpoint_base)
         .unwrap_or_default();
     FedReg {
         reg_id: reg_id.to_owned(),
@@ -2129,6 +2108,7 @@ pub async fn fed_retrieve(
                     registration: Some(reg.reg_id.clone()),
                     proxy: true,
                     update: None,
+                    conflict: false,
                 });
             }
             continue;
@@ -2789,6 +2769,9 @@ pub struct Part {
     pub proxy: bool,
     /// A source's 207 UpdateResult (5.2.18), Attribute names expanded.
     pub update: Option<RemoteUpdate>,
+    /// An exclusive registration refused the operation ([`conflict_part`]): a 409 Conflict, not
+    /// AlreadyExists.
+    pub conflict: bool,
 }
 
 /// 5.2.18 UpdateResult a source answered for a forwarded attribute write.
@@ -2836,7 +2819,7 @@ impl Part {
     /// entity-exists part stays AlreadyExists.
     fn problem(&self, status: u16) -> (&'static str, &'static str) {
         match status {
-            409 if self.detail.contains("does not accept") => ("Conflict", "Conflict"),
+            409 if self.conflict => ("Conflict", "Conflict"),
             409 => ("AlreadyExists", "Conflict"),
             404 => ("ResourceNotFound", "Not Found"),
             _ => ("InternalError", "Error"),
@@ -3112,6 +3095,7 @@ pub async fn forward_part(
         registration: Some(reg.reg_id.clone()),
         proxy: reg.is_proxy(),
         update: (status == 207).then(|| remote_update(&answer)).flatten(),
+        conflict: false,
     }
 }
 
@@ -3229,6 +3213,7 @@ pub fn conflict_part(op: &str, reg: &FedReg) -> Part {
         registration: Some(reg.reg_id.clone()),
         proxy: true,
         update: None,
+        conflict: true,
     }
 }
 
