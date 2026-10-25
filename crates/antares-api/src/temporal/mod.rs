@@ -117,6 +117,26 @@ impl InstancePage {
         }
     }
 
+    /// The per-Attribute cap a store may apply before the window, N or not
+    /// (F-ANT1-017): [`Self::store_cap`] for an N; with none, the broker's
+    /// default page in this page's order, past offsetN, and one more, so the
+    /// trim still sees the overflow and answers its partial range as on the
+    /// whole history. None for an aggregated representation without N: it
+    /// reads every instance of its window.
+    fn instance_cap(&self, aggregated: bool, default: usize, limit: usize) -> Option<i64> {
+        match self.n {
+            Some(_) => self.store_cap(),
+            None if aggregated => None,
+            None => {
+                let cap = self
+                    .size(default, limit)
+                    .saturating_add(self.offset)
+                    .saturating_add(1);
+                Some(i64::try_from(cap).unwrap_or(i64::MAX))
+            }
+        }
+    }
+
     /// The per-Attribute cap a store may apply before the window: every
     /// instance up to the end of this page in its order, and one more, so
     /// the window still sees whether a next page exists.

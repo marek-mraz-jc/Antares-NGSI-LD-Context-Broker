@@ -446,3 +446,55 @@ async fn following_the_links_serves_every_instance_of_every_attribute() {
         }
     }
 }
+
+/// F-ANT1-017: a temporal query with no firstN/lastN is cut by the broker's
+/// default trim (206, the oldest instances first) on both stores alike, and
+/// the PostgreSQL store, given the cap the API now passes, reconstructs at
+/// most the ceiling plus one instance per Attribute, not the whole history.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_without_n_is_cut_alike_and_the_store_reads_the_cap() {
+    for b in brokers().await {
+        let (code, body, _) = b
+            .send(
+                "GET",
+                "/ngsi-ld/v1/temporal/entities?type=Vehicle&timerel=after&timeAt=2019-01-01T00:00:00Z",
+                None,
+            )
+            .await;
+        assert_eq!(code, StatusCode::PARTIAL_CONTENT, "{body}");
+        let long = body
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|e| e["id"] == LONG)
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert_eq!(instants(&long), mins(&[0, 1, 2, 3, 4, 5, 6, 7, 8]));
+        let Some(tenant) = &b.tenant else {
+            continue;
+        };
+        let tenant = antares_model::TenantId::new(tenant).expect("tenant");
+        let ids = [LONG];
+        let filter = antares_store::filter::TemporalFilter {
+            ids: Some(&ids),
+            last_n: Some(10),
+            oldest_first: true,
+            timeproperty: "observedAt",
+            ..Default::default()
+        };
+        let read =
+            b.st.temporal
+                .query_temporal(&tenant, &filter)
+                .await
+                .expect("query");
+        let most = read
+            .rows
+            .iter()
+            .filter_map(Value::as_object)
+            .flat_map(|o| o.values())
+            .filter_map(Value::as_array)
+            .map(Vec::len)
+            .max();
+        assert_eq!(most, Some(10), "{:?}", read.rows);
+    }
+}

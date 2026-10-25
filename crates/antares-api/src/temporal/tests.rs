@@ -188,6 +188,31 @@ mod clause_6_3_10 {
             .collect()
     }
 
+    /// F-ANT1-017: with no firstN/lastN the store may cap each Attribute at
+    /// the default page plus one, oldest first: the trim over the capped
+    /// history serves what it serves over the whole one, still cut (206).
+    #[tokio::test]
+    async fn the_default_trim_cap_keeps_the_answer() {
+        let cap = page(None).instance_cap(false, 100, ETSI_LIMIT);
+        assert_eq!(cap, Some(10));
+        assert_eq!(page(None).instance_cap(true, 100, ETSI_LIMIT), None);
+        assert_eq!(page(Some(3)).instance_cap(false, 100, ETSI_LIMIT), Some(4));
+        let q = tq("after", "2019-01-01T00:00:00Z");
+        let whole = windowed(&evolution(59), Some(&q), None).await;
+        let capped = windowed(&evolution(10), Some(&q), None).await;
+        assert_eq!(observed(&capped), observed(&whole));
+        assert_eq!(observed(&whole).len(), ETSI_LIMIT);
+        assert_eq!(
+            (capped.truncated, capped.more),
+            (whole.truncated, whole.more)
+        );
+        assert_eq!(
+            (&capped.ts_min, &capped.ts_max, capped.cut_served),
+            (&whole.ts_min, &whole.ts_max, whole.cut_served)
+        );
+        assert!(capped.truncated);
+    }
+
     /// 6.3.10: a temporal retrieval the broker cannot serve in full is
     /// answered with 206 and a Content-Range. The body must then BE the
     /// partial representation the header describes — a window wide enough to
