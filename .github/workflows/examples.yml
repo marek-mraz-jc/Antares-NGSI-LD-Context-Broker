@@ -13,6 +13,10 @@ concurrency:
   group: examples-${{ github.ref }}
   cancel-in-progress: true
 
+# Every job names its own grants; one without them reads the repository and nothing more.
+permissions:
+  contents: read
+
 jobs:
   plugin-example:
     # The reference plugin is the proof that the seams are usable from
@@ -28,9 +32,9 @@ jobs:
       contents: read
       issues: write # the drift alarm
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       # The platform's engine is the other addon (T-3637): its contract
       # tests through the router, and its place on the broker's shelf.
@@ -127,7 +131,7 @@ jobs:
           kill "$(cat broker.pid)" 2>/dev/null || true
           kill "$(cat policy-broker.pid)" 2>/dev/null || true
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: plugin-example-results
@@ -153,11 +157,11 @@ jobs:
       contents: read
       issues: write # the drift alarm
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build the image under test
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           tags: ghcr.io/joinedcontext/antares-broker:dev # the tag the examples reference; a local load wins over the registry

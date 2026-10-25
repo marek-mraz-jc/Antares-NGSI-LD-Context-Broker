@@ -137,8 +137,8 @@ jobs:
       MALLOC_CONF: background_thread:true,narenas:4,dirty_decay_ms:10000,muzzy_decay_ms:10000
       _RJEM_MALLOC_CONF: background_thread:true,narenas:4,dirty_decay_ms:10000,muzzy_decay_ms:10000
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - name: Install k6 and the Postgres client
         run: |
           curl -sL https://github.com/grafana/k6/releases/download/v0.54.0/k6-v0.54.0-linux-amd64.tar.gz \
@@ -286,7 +286,7 @@ jobs:
               cat "$OUT/scenarios/verdicts.md"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: scale-weekly-results

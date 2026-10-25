@@ -23,6 +23,10 @@ concurrency:
 env:
   MEM_LIMIT_MB: 350
 
+# Every job names its own grants; one without them reads the repository and nothing more.
+permissions:
+  contents: read
+
 jobs:
   build:
     permissions:
@@ -42,11 +46,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
 
       - name: Load the image built for this run
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: antares-image
 
@@ -65,7 +69,7 @@ jobs:
 
       - name: Upload roll results
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: ETSI-roll-weekly
           path: |
@@ -95,7 +99,7 @@ jobs:
       contents: read
       issues: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/failure-issue
         with:
           title: roll-under-suite drill failed

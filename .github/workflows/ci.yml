@@ -64,6 +64,10 @@ concurrency:
 env:
   HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
 
+# Every job names its own grants; one without them reads the repository and nothing more.
+permissions:
+  contents: read
+
 jobs:
   fast-gate:
     # Under workflow_run a fast run that did not go green (red, or cancelled
@@ -151,11 +155,11 @@ jobs:
     env:
       VIEWS_DIFF_CASES: "2000"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.HEAD_SHA }}
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: views-differential
       - run: cargo test --locked -p antares-broker --features full,jc-policy,linkml,internal-csr --test views_matrix every_surface_answers_what_ngsi_ld_admits_for_generated -- --nocapture
@@ -194,12 +198,12 @@ jobs:
       packages: write
     steps:
       - name: Download the tested image
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: antares-image
 
       - name: Download the arm64 image
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: antares-image-arm64
 
