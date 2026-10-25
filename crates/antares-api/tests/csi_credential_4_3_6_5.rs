@@ -228,7 +228,9 @@ async fn a_failing_forward_writes_the_credential_nowhere() {
     .await;
 
     let (code, headers, body) = call(&st, "GET", "/ngsi-ld/v1/entities?type=Vehicle").await;
-    assert!(code.is_success() || code.is_server_error(), "{code}");
+    // TS 104 176 6.3.5: inclusive sources that fail are reported by an
+    // NGSILD-Warning on the local answer, not by an error status
+    assert_eq!(code, StatusCode::OK, "{body}");
     assert!(
         seen.lock()
             .expect("lock")

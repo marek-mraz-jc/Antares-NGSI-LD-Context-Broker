@@ -239,7 +239,8 @@ async fn a_temporal_history_outside_the_rule_is_not_served() {
                          "speed": [{"type": "Property", "value": 1,
                                     "observedAt": "2026-01-01T00:00:00Z"}]});
         let (code, body) = send(&st, "POST", "/ngsi-ld/v1/temporal/entities", Some(doc)).await;
-        assert!(code.is_success(), "{body}");
+        // TS 104 176 8.2.3.2: a new Temporal Representation is 201
+        assert_eq!(code, StatusCode::CREATED, "{body}");
     }
     let (code, list) = send(
         &st,

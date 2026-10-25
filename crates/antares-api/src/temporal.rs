@@ -5284,9 +5284,9 @@ mod clause_4_21 {
         assert!(reject_linked_projection(&plain, "5.7.3.4").is_ok());
     }
 
-    /// 4.21 Projections: "pick, omit and attrs are mutually exclusive" holds
-    /// on the temporal representation exactly as it does on the current-state
-    /// one — the temporal operations define no exception to it, so any pair
+    /// 4.21 Projections: the pick/omit/attrs refusal (repr::check_projection_exclusive,
+    /// ETSI TP 020_22) holds on the temporal representation exactly as it does
+    /// on the current-state one — the temporal operations define no exception to it, so any pair
     /// is BadRequestData and each one alone parses.
     #[test]
     fn pick_omit_and_attrs_cannot_be_combined_on_a_temporal_query() {

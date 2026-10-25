@@ -326,7 +326,7 @@ async fn one_point_in_time_keeps_one_instance_id() {
         Some(json!({ATTR: prop(1, Some(T1))})),
     )
     .await;
-    assert!(status.is_success(), "append: {status} {body}");
+    assert_eq!(status, 204, "7.4.3.1 append: {body}");
     let first = ids_of(&instances(&st, id, None).await);
     assert_eq!(first.len(), 1, "one write, one instance: {first:?}");
 
@@ -338,7 +338,7 @@ async fn one_point_in_time_keeps_one_instance_id() {
         Some(prop(1, Some(T1))),
     )
     .await;
-    assert!(status.is_success());
+    assert_eq!(status, 204, "7.5.3.3 replace");
     assert_eq!(ids_of(&instances(&st, id, None).await), first, "row 5");
 
     // corrected value, same instant: the instance is replaced, not added to
@@ -349,7 +349,7 @@ async fn one_point_in_time_keeps_one_instance_id() {
         Some(prop(7, Some(T1))),
     )
     .await;
-    assert!(status.is_success());
+    assert_eq!(status, 204, "7.5.3.3 replace");
     let after = instances(&st, id, None).await;
     assert_eq!(
         ids_of(&after),
@@ -387,7 +387,7 @@ async fn a_gated_write_is_absent_from_every_axis() {
         Some(json!({ATTR: prop(1, None)})),
     )
     .await;
-    assert!(status.is_success(), "append: {status} {body}");
+    assert_eq!(status, 204, "7.4.3.1 append: {body}");
     let (status, body) = req(
         &st,
         "PUT",
@@ -395,7 +395,7 @@ async fn a_gated_write_is_absent_from_every_axis() {
         Some(prop(2, None)),
     )
     .await;
-    assert!(status.is_success(), "replace: {status} {body}");
+    assert_eq!(status, 204, "7.5.3.3 replace: {body}");
     assert!(
         instances(&st, id, None).await.is_empty(),
         "default axis kept a gated write"
@@ -491,7 +491,7 @@ async fn aggregation_counts_instances_not_distinct_values() {
         Some(json!({ATTR: prop(5, Some(T0))})),
     )
     .await;
-    assert!(status.is_success(), "{body}");
+    assert_eq!(status, 204, "{body}");
     // the SAME value at two further instants
     for t in [T1, T2] {
         let (status, body) = req(
@@ -501,7 +501,7 @@ async fn aggregation_counts_instances_not_distinct_values() {
             Some(prop(5, Some(t))),
         )
         .await;
-        assert!(status.is_success(), "{body}");
+        assert_eq!(status, 204, "{body}");
     }
     assert_eq!(
         instances(&st, id, None).await.len(),
