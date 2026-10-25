@@ -743,13 +743,18 @@ impl PgDocStore {
     }
 
     /// Every doc's id and the first 64 bits of the md5 of its text, under
-    /// `list`'s ceiling: the bodies stay in the database (T-4354).
+    /// `list`'s ceiling: the bodies stay in the database (T-4354). `views`
+    /// keeps the digest in its generated column (migration 0026, T-5501);
+    /// the other tables compute it here.
     pub async fn list_digests(
         &self,
         tenant: &TenantId,
         kind: DocKind,
     ) -> Result<Vec<(String, u64)>, sqlx::Error> {
-        let select = format!("id, left(md5({}::text), 16)", kind.doc_column());
+        let select = match kind {
+            DocKind::View => "id, digest".to_owned(),
+            _ => format!("id, left(md5({}::text), 16)", kind.doc_column()),
+        };
         self.every_row(tenant, kind, &select)
             .await?
             .into_iter()

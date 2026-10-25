@@ -967,6 +967,50 @@ async fn list_digests_move_only_with_the_body() {
     assert_ne!(next[1].1, first[1].1);
 }
 
+/// T-5501: `views.digest` is a stored generated column. It moves with a
+/// changed body, stays with an unchanged one, equals the expression an older
+/// release computes in its query, and is what `list_digests` answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn views_digest_column_follows_upsert() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let s = PgDocStore::new(pool.clone());
+    let t = TenantId::new("pgdigestcol").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let stored = || async {
+        let (digest, computed): (String, String) = sqlx::query_as(
+            "SELECT digest, left(md5(doc::text), 16) FROM views WHERE tenant_id = $1 AND id = 'v'",
+        )
+        .bind(t.as_str())
+        .fetch_one(&pool)
+        .await
+        .expect("digest");
+        assert_eq!(digest, computed);
+        digest
+    };
+    s.upsert(&t, DocKind::View, "v", &json!({"id": "v", "n": 1}))
+        .await
+        .expect("insert");
+    let first = stored().await;
+    let listed = s.list_digests(&t, DocKind::View).await.expect("digests");
+    assert_eq!(
+        listed,
+        [(
+            "v".to_owned(),
+            u64::from_str_radix(&first, 16).expect("hex")
+        )]
+    );
+    s.upsert(&t, DocKind::View, "v", &json!({"id": "v", "n": 1}))
+        .await
+        .expect("same");
+    assert_eq!(stored().await, first);
+    s.upsert(&t, DocKind::View, "v", &json!({"id": "v", "n": 2}))
+        .await
+        .expect("update");
+    assert_ne!(stored().await, first);
+    s.delete(&t, DocKind::View, "v").await.expect("cleanup");
+}
+
 /// T-5159: `record_deliveries` books several subscriptions in one statement,
 /// each with its own stamp and its own pre-image; a subscription that is gone
 /// has no entry.
