@@ -209,19 +209,16 @@ jobs:
           path: unit-junit/
           if-no-files-found: warn
       # Supply chain per run (surfaces-threat-model 11.1, T-3489), every
-      # tool at an exact version. cargo-audit reads Cargo.lock whole and
-      # fails on any warning (unmaintained, yanked) too; it ignores exactly
-      # what deny.toml ignores, so the two tools cannot drift. machete needs
+      # tool at an exact version. cargo-audit (run last, beside cargo-deny)
+      # reads Cargo.lock whole and fails on any warning (unmaintained,
+      # yanked) too; it ignores exactly what deny.toml ignores, so the two
+      # tools cannot drift. machete needs
       # no build. The SBOMs are the broker's: vanilla (grepped for every
       # surface, ops and protocol crate, rule M3) and full once that feature
       # exists.
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit@0.22.2,cargo-machete@0.9.2,cargo-cyclonedx@0.5.9
-      - name: cargo-audit
-        run: |
-          python3 dev/advisory-ignores.py --self-test
-          cargo audit --deny warnings $(python3 dev/advisory-ignores.py)
       - name: cargo-machete
         run: cargo machete
       - name: SBOM (vanilla and full)
@@ -367,8 +364,15 @@ jobs:
       # release binary, not the cargo-deny-action, so the job stays portable
       # across runner archs. Last in the job (T-5634): an advisory red
       # here skipped every gate that followed it, and a fresh RUSTSEC entry
-      # with no eligible fix hid them for days.
+      # with no eligible fix hid them for days. cargo-audit sits beside it
+      # for the same reason; deny runs even when audit is red, so one
+      # advisory never hides the other tool's verdict.
+      - name: cargo-audit
+        run: |
+          python3 dev/advisory-ignores.py --self-test
+          cargo audit --deny warnings $(python3 dev/advisory-ignores.py)
       - name: cargo-deny (licenses, advisories, bans, sources)
+        if: ${{ !cancelled() }}
         run: |
           V=0.20.2
           curl -sSfL "https://github.com/EmbarkStudios/cargo-deny/releases/download/${V}/cargo-deny-${V}-$(uname -m)-unknown-linux-musl.tar.gz" \
