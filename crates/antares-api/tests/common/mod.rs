@@ -33,6 +33,7 @@ pub struct Double {
     geo_paged: AtomicUsize,
     rows_read: AtomicUsize,
     registration_reads: AtomicUsize,
+    tenant_probes: AtomicUsize,
 }
 
 impl Double {
@@ -54,6 +55,7 @@ impl Double {
             geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
+            tenant_probes: AtomicUsize::new(0),
         }
     }
 
@@ -76,6 +78,7 @@ impl Double {
             geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
+            tenant_probes: AtomicUsize::new(0),
         }
     }
 
@@ -98,6 +101,7 @@ impl Double {
             geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
+            tenant_probes: AtomicUsize::new(0),
         }
     }
 
@@ -122,6 +126,7 @@ impl Double {
             geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
+            tenant_probes: AtomicUsize::new(0),
         }
     }
 
@@ -158,6 +163,7 @@ impl Double {
             geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
+            tenant_probes: AtomicUsize::new(0),
         }
     }
 
@@ -180,6 +186,7 @@ impl Double {
             geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
+            tenant_probes: AtomicUsize::new(0),
         }
     }
 
@@ -202,6 +209,7 @@ impl Double {
             geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
+            tenant_probes: AtomicUsize::new(0),
         }
     }
 
@@ -233,6 +241,11 @@ impl Double {
     /// registration mirror is installed (T-5499).
     pub fn registration_reads(&self) -> usize {
         self.registration_reads.load(Ordering::SeqCst)
+    }
+
+    /// How many times a caller asked whether a Tenant exists.
+    pub fn tenant_probes(&self) -> usize {
+        self.tenant_probes.load(Ordering::SeqCst)
     }
 
     fn refused_create(&self, kind: Kind, id: &str) -> Result<(), NgsiError> {
@@ -462,6 +475,7 @@ impl CurrentStateDriver for Double {
         self.inner.record_delivery(tenant, kind, id, now).await
     }
     async fn tenant_exists(&self, tenant: &TenantId) -> Result<bool, NgsiError> {
+        self.tenant_probes.fetch_add(1, Ordering::SeqCst);
         self.inner.tenant_exists(tenant).await
     }
     async fn subscription_tenants(&self) -> Result<Vec<String>, NgsiError> {

@@ -298,6 +298,7 @@ pub async fn import(
             // in it: an emptied one would still list.
             if !existed && matches!(occupied(&st, &tenant).await, Ok(held) if held.is_empty()) {
                 let _ = st.store.purge_tenant(&tenant).await;
+                st.known_tenants.forget(&tenant);
             }
             ApiError::from(e).into_response()
         }

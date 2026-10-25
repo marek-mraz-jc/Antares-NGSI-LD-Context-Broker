@@ -469,7 +469,15 @@ pub(super) async fn tenant_exists_layer(
             .as_deref()
             .and_then(|s| antares_model::TenantId::new(s).ok())
         {
-            match st.store.tenant_exists(&t).await {
+            // T-5500: a Tenant the store said exists a moment ago is not
+            // asked about again; only "exists" is remembered.
+            let known = st.known_tenants.holds(&t);
+            let exists = if known {
+                Ok(true)
+            } else {
+                st.store.tenant_exists(&t).await
+            };
+            match exists {
                 Ok(false) => {
                     let mut resp = crate::negotiate::ApiError::from(NgsiError::NonexistentTenant(
                         format!("tenant {} does not exist", t.as_str()),
@@ -481,6 +489,7 @@ pub(super) async fn tenant_exists_layer(
                     return resp;
                 }
                 Err(e) => return crate::negotiate::ApiError::from(e).into_response(),
+                Ok(true) if !known => st.known_tenants.remember(&t),
                 Ok(true) => {}
             }
         }
