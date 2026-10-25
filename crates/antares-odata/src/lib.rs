@@ -121,15 +121,26 @@ async fn respond(ops: &Ops, req: Request) -> Response {
         return not_found();
     };
     let version = csdl_version(&req);
-    // The model shows what the engine lets this caller read (F-ANT4-003),
-    // as the LinkML surface narrows the same schema.
+    // The documents that name the model's types and properties show only
+    // what the engine lets this caller read (F-ANT4-003), as the LinkML
+    // surface narrows the same schema. A query naming a hidden property
+    // reads it as absent, so the model it runs over stays the view's.
     let (mut parts, body) = req.into_parts();
     let Ok(caller) = Caller::from_request_parts(&mut parts, &()).await;
     let mut req = Request::from_parts(parts, body);
-    let Some(visible) = model_visible(&view, &caller).await else {
-        return not_found();
+    let names_the_model = req.method() == Method::GET
+        && req
+            .uri()
+            .path()
+            .strip_prefix(&format!("/{id}/odata/v4"))
+            .is_some_and(|rest| matches!(rest, "" | "/" | "/$metadata"));
+    let visible = if names_the_model {
+        Some(model_visible(&view, &caller).await)
+    } else {
+        None
     };
-    let Some((edm, csdl, metadata_etag)) = model(&id, &view, &visible, version) else {
+    let visible = visible.as_ref();
+    let Some((edm, csdl, metadata_etag)) = model(&id, &view, visible, version) else {
         return not_found();
     };
     // A 4.0 document serves an Untyped member as a dynamic property of an open type (CSDL XML
@@ -141,7 +152,7 @@ async fn respond(ops: &Ops, req: Request) -> Response {
         .flat_map(|s| &s.entity_types)
         .any(|t| t.open);
     let url_model = (version == CsdlVersion::V4_0 && open)
-        .then(|| model(&id, &view, &visible, CsdlVersion::V4_01))
+        .then(|| model(&id, &view, visible, CsdlVersion::V4_01))
         .flatten()
         .map(|(_, csdl, _)| csdl);
     let state = Arc::new(ODataState {
@@ -280,22 +291,29 @@ type ModelKey = (String, edm::Shown, edm::Writable, u64, bool, String);
 /// A built model, its CSDL document and that document's `ETag`.
 type Built = (Arc<edm::Edm>, Arc<odata_csdl::Model>, Option<String>);
 
-/// What the caller may read through `view`, asked as a query (the reads the
-/// model describes) or, for a view without one, a retrieve; `None` when the
-/// engine refuses both. A view offering neither reads nothing, and its
-/// model is narrowed to nothing.
-async fn model_visible(view: &ViewOps, caller: &Caller) -> Option<antares_ops::Visible> {
-    let Some(op) = [OperationId::QueryEntities, OperationId::RetrieveEntity]
-        .into_iter()
-        .find(|op| view.allows(*op))
-    else {
-        return Some(antares_ops::Visible::default());
+/// What the caller may read through `view`: asked as the type details the
+/// LinkML surface asks for its schema documents, else as the reads the model
+/// describes. A view offering none of them, or an engine refusing, leaves
+/// the caller a model that names nothing (fail closed).
+async fn model_visible(view: &ViewOps, caller: &Caller) -> antares_ops::Visible {
+    let Some(op) = [
+        OperationId::RetrieveEntityTypeDetails,
+        OperationId::QueryEntities,
+        OperationId::RetrieveEntity,
+    ]
+    .into_iter()
+    .find(|op| view.allows(*op)) else {
+        return antares_ops::Visible::default();
     };
-    view.visible(caller, op, &[], &[]).await.ok()
+    view.visible(caller, op, &[], &[]).await.unwrap_or_default()
 }
 
-/// `shown` without the types and Attributes `visible` hides.
-fn narrowed(shown: edm::Shown, visible: &antares_ops::Visible) -> edm::Shown {
+/// `shown` without the types and Attributes `visible` hides; all of it
+/// without one.
+fn narrowed(shown: edm::Shown, visible: Option<&antares_ops::Visible>) -> edm::Shown {
+    let Some(visible) = visible else {
+        return shown;
+    };
     shown
         .into_iter()
         .filter(|(ty, _)| visible.shows_type(ty))
@@ -315,7 +333,7 @@ fn narrowed(shown: edm::Shown, visible: &antares_ops::Visible) -> edm::Shown {
 fn model(
     id: &str,
     view: &ViewOps,
-    visible: &antares_ops::Visible,
+    visible: Option<&antares_ops::Visible>,
     version: CsdlVersion,
 ) -> Option<Built> {
     static CACHE: LazyLock<moka::sync::Cache<ModelKey, (Built, u32)>> = LazyLock::new(|| {
