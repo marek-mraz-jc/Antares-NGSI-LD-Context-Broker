@@ -208,19 +208,6 @@ jobs:
           name: unit-junit
           path: unit-junit/
           if-no-files-found: warn
-      # Every deny.toml check on every change (T-3475): licenses (nothing
-      # links TSL — Timescale is talked to over SQL only), advisories, bans
-      # (wildcards, banned crates) and sources (crates.io only, no unknown
-      # git or registry). bans and sources ran only in the weekly sweep, so
-      # a dependency from an unlisted git source merged green. A pinned
-      # release binary, not the cargo-deny-action, so the job stays portable
-      # across runner archs.
-      - name: cargo-deny (licenses, advisories, bans, sources)
-        run: |
-          V=0.20.2
-          curl -sSfL "https://github.com/EmbarkStudios/cargo-deny/releases/download/${V}/cargo-deny-${V}-$(uname -m)-unknown-linux-musl.tar.gz" \
-            | tar xz -C "$HOME/.cargo/bin" --strip-components=1 --wildcards '*/cargo-deny'
-          cargo deny --log-level warn check all
       # Supply chain per run (surfaces-threat-model 11.1, T-3489), every
       # tool at an exact version. cargo-audit reads Cargo.lock whole and
       # fails on any warning (unmaintained, yanked) too; it ignores exactly
@@ -372,6 +359,21 @@ jobs:
           ! grep -rnE '(reqwest::)?(Client|ClientBuilder|HttpClient)::(builder|new|default)\(\)' \
               crates/ examples/ --include='*.rs' \
             | grep -v 'crates/antares-jsonld/src/loader.rs:'
+      # Every deny.toml check on every change (T-3475): licenses (nothing
+      # links TSL — Timescale is talked to over SQL only), advisories, bans
+      # (wildcards, banned crates) and sources (crates.io only, no unknown
+      # git or registry). bans and sources ran only in the weekly sweep, so
+      # a dependency from an unlisted git source merged green. A pinned
+      # release binary, not the cargo-deny-action, so the job stays portable
+      # across runner archs. Last in the job (T-5634): an advisory red
+      # here skipped every gate that followed it, and a fresh RUSTSEC entry
+      # with no eligible fix hid them for days.
+      - name: cargo-deny (licenses, advisories, bans, sources)
+        run: |
+          V=0.20.2
+          curl -sSfL "https://github.com/EmbarkStudios/cargo-deny/releases/download/${V}/cargo-deny-${V}-$(uname -m)-unknown-linux-musl.tar.gz" \
+            | tar xz -C "$HOME/.cargo/bin" --strip-components=1 --wildcards '*/cargo-deny'
+          cargo deny --log-level warn check all
 
 
   feature-sets:
