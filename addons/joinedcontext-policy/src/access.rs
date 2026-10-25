@@ -844,6 +844,45 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn a_write_of_access_control_vocabulary_is_never_granted() -> Result<(), String> {
+        let t = compiled(&json!([
+            {"id": "edit-car", "assignee": {"kind": "role", "id": "public"},
+             "operations": ["5.7.1", "5.6.4"], "information": [{"entities": [{"type": "Car"}]}]}
+        ]))?;
+        let public = caller(&[("x-jc-roles", "")]);
+        let grants = Grants::of(Some(&t), &public, Utc::now());
+        assert_eq!(may(&grants, "updateAttrs", "speed"), true);
+        // GW29: the whole-type grant still admits no write of `owner`
+        assert_eq!(may(&grants, "updateAttrs", "owner"), false);
+        let owner = context().expand_key("owner");
+        assert_eq!(may(&grants, "updateAttrs", &owner), false);
+        assert_eq!(may(&grants, "retrieveEntity", "owner"), true);
+        Ok(())
+    }
+
+    #[test]
+    fn a_grant_with_a_time_window_admits_no_write() -> Result<(), String> {
+        let t = compiled(&json!([
+            {"id": "last-day", "assignee": {"kind": "role", "id": "public"},
+             "operations": ["5.7.1", "5.6.4"], "temporalQ": "timerel=after;timeAt=P-1D",
+             "information": [{"entities": [{"type": "Car"}]}]}
+        ]))?;
+        let public = caller(&[("x-jc-roles", "")]);
+        let grants = Grants::of(Some(&t), &public, Utc::now());
+        // as `decide::admits`: the window is about reading history
+        assert_eq!(
+            at(
+                &check(&grants, "updateAttrs", Some("Car"), None, &every),
+                "/decision"
+            ),
+            false
+        );
+        assert_eq!(may(&grants, "updateAttrs", "speed"), false);
+        assert_eq!(may(&grants, "retrieveEntity", "speed"), true);
+        Ok(())
+    }
+
     /// What the engine decides on a real request: `action` on `attribute` of
     /// one `Car`, shown (a read) or allowed (a write).
     fn real(t: &Table, who: &Caller, action: &str, attribute: &str) -> bool {
