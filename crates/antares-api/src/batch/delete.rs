@@ -25,6 +25,11 @@ async fn batch_delete_inner(
 ) -> ApiResult<Response> {
     let tenant = tenant_from(headers)?;
     check_params(params, &["local"])?;
+    // T-4562 for deletes too (F-ANT2-026): a delete batch holds a
+    // connection as long as a write batch does.
+    let _admitted = crate::bounds::admit_batch(body.len())
+        .await
+        .ok_or(ApiError::Overloaded(crate::negotiate::RETRY_AFTER_SECONDS))?;
     let ids = delete_ids(headers, body)?;
     let mut out = BatchOutcome::new();
     // ADR-0020 per member, as for the write batches (T-3480): each id
@@ -146,13 +151,20 @@ async fn decide_deletes(
     let Some(engine) = &st.policy else {
         return Ok(());
     };
-    let mut pres: Vec<crate::policy::PreImage> = Vec::new();
-    for id in ids.iter() {
-        pres.push(match id.as_str() {
-            Some(id) => crate::policy::pre_image(st, tenant, id, None).await,
+    // One read for every id (F-ANT2-025), failing closed as `pre_image`.
+    let wanted: Vec<&str> = ids.iter().filter_map(|v| v.as_str()).collect();
+    let stored = if wanted.is_empty() {
+        HashMap::new()
+    } else {
+        st.store.get_entities(tenant, &wanted).await?
+    };
+    let pres: Vec<crate::policy::PreImage> = ids
+        .iter()
+        .map(|v| match v.as_str() {
+            Some(id) => crate::policy::image(stored.get(id).cloned(), None),
             None => crate::policy::PreImage::default(),
-        });
-    }
+        })
+        .collect();
     let one: Vec<Vec<&str>> = ids
         .iter()
         .map(|v| v.as_str().into_iter().collect())
