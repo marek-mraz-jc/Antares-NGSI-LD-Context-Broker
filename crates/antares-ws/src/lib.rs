@@ -272,6 +272,15 @@ fn upgrade(
     let asked = match (named.next(), named.next()) {
         (None, _) => None,
         (Some(t), None) => match t.to_str() {
+            // 6.3.14 grammar, and no client names one of the broker's own
+            // tenants (`snap-…`, the view and grant stores): F-ANT3-005
+            Ok(t) if antares_ops::TenantId::new(t).is_err() => {
+                return problem(
+                    StatusCode::BAD_REQUEST,
+                    "BadRequestData",
+                    "NGSILD-Tenant is not a valid client Tenant (6.3.14)",
+                )
+            }
             Ok(t) => Some(t.to_owned()),
             Err(_) => {
                 return problem(
