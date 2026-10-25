@@ -32,7 +32,7 @@ mod write;
 
 use antares_ops::{Caller, OperationId, Ops, Surface, ViewOps};
 use axum::body::Bytes;
-use axum::extract::{MatchedPath, Request};
+use axum::extract::{FromRequestParts as _, MatchedPath, Request};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse as _, Response};
@@ -109,7 +109,7 @@ async fn serve(ops: &Ops, mut req: Request) -> Response {
 /// One request to a view's endpoint. The path is read as sent, below the
 /// prefix (`/{view}/odata/v4...`): a view id is `[a-z0-9-]`, so its raw
 /// segment is its id, and `ca%72s` never reaches the view `cars`.
-async fn respond(ops: &Ops, mut req: Request) -> Response {
+async fn respond(ops: &Ops, req: Request) -> Response {
     let id = req
         .uri()
         .path()
@@ -121,7 +121,15 @@ async fn respond(ops: &Ops, mut req: Request) -> Response {
         return not_found();
     };
     let version = csdl_version(&req);
-    let Some((edm, csdl, metadata_etag)) = model(&id, &view, version) else {
+    // The model shows what the engine lets this caller read (F-ANT4-003),
+    // as the LinkML surface narrows the same schema.
+    let (mut parts, body) = req.into_parts();
+    let Ok(caller) = Caller::from_request_parts(&mut parts, &()).await;
+    let mut req = Request::from_parts(parts, body);
+    let Some(visible) = model_visible(&view, &caller).await else {
+        return not_found();
+    };
+    let Some((edm, csdl, metadata_etag)) = model(&id, &view, &visible, version) else {
         return not_found();
     };
     // A 4.0 document serves an Untyped member as a dynamic property of an open type (CSDL XML
@@ -133,7 +141,7 @@ async fn respond(ops: &Ops, mut req: Request) -> Response {
         .flat_map(|s| &s.entity_types)
         .any(|t| t.open);
     let url_model = (version == CsdlVersion::V4_0 && open)
-        .then(|| model(&id, &view, CsdlVersion::V4_01))
+        .then(|| model(&id, &view, &visible, CsdlVersion::V4_01))
         .flatten()
         .map(|(_, csdl, _)| csdl);
     let state = Arc::new(ODataState {
@@ -272,9 +280,44 @@ type ModelKey = (String, edm::Shown, edm::Writable, u64, bool, String);
 /// A built model, its CSDL document and that document's `ETag`.
 type Built = (Arc<edm::Edm>, Arc<odata_csdl::Model>, Option<String>);
 
-/// The model of `view` at `version`, built once per key on this pod (O21),
-/// `None` when its Tenant has no schema this surface can read.
-fn model(id: &str, view: &ViewOps, version: CsdlVersion) -> Option<Built> {
+/// What the caller may read through `view`, asked as a query (the reads the
+/// model describes) or, for a view without one, a retrieve; `None` when the
+/// engine refuses both. A view offering neither reads nothing, and its
+/// model is narrowed to nothing.
+async fn model_visible(view: &ViewOps, caller: &Caller) -> Option<antares_ops::Visible> {
+    let Some(op) = [OperationId::QueryEntities, OperationId::RetrieveEntity]
+        .into_iter()
+        .find(|op| view.allows(*op))
+    else {
+        return Some(antares_ops::Visible::default());
+    };
+    view.visible(caller, op, &[], &[]).await.ok()
+}
+
+/// `shown` without the types and Attributes `visible` hides.
+fn narrowed(shown: edm::Shown, visible: &antares_ops::Visible) -> edm::Shown {
+    shown
+        .into_iter()
+        .filter(|(ty, _)| visible.shows_type(ty))
+        .map(|(ty, attrs)| {
+            let attrs = attrs
+                .into_iter()
+                .filter(|a| visible.shows_attribute(&ty, a))
+                .collect();
+            (ty, attrs)
+        })
+        .collect()
+}
+
+/// The model of `view` at `version` as `visible` narrows it, built once per
+/// key on this pod (O21), `None` when its Tenant has no schema this surface
+/// can read.
+fn model(
+    id: &str,
+    view: &ViewOps,
+    visible: &antares_ops::Visible,
+    version: CsdlVersion,
+) -> Option<Built> {
     static CACHE: LazyLock<moka::sync::Cache<ModelKey, (Built, u32)>> = LazyLock::new(|| {
         moka::sync::Cache::builder()
             .max_capacity(MODEL_CACHE_BYTES)
@@ -282,7 +325,17 @@ fn model(id: &str, view: &ViewOps, version: CsdlVersion) -> Option<Built> {
             .build()
     });
     let (revision, bytes) = view.schema()?;
-    let shown = view.shown_by_type();
+    let schema = parsed(revision, &bytes)?;
+    // A view of `*` names no type; it shows the whole schema (ADR-0023 rule 12).
+    let every = view.shows_every_name();
+    let shown = narrowed(
+        if every {
+            schema.slot_iris_by_class()
+        } else {
+            view.shown_by_type()
+        },
+        visible,
+    );
     let writable = edm::Writable {
         insert: view.allows(OperationId::CreateEntity),
         update: view.allows(OperationId::MergeEntity) || view.allows(OperationId::ReplaceEntity),
@@ -301,18 +354,15 @@ fn model(id: &str, view: &ViewOps, version: CsdlVersion) -> Option<Built> {
     if let Some((hit, _)) = CACHE.get(&key) {
         return Some(hit);
     }
-    let schema = parsed(revision, &bytes)?;
-    // A view of `*` names no type; it shows the whole schema (ADR-0023 rule 12).
-    let every = view.shows_every_name().then(|| schema.slot_iris_by_class());
     // A view's names are the Entities' IRIs; the schema's may be another vocabulary's.
     let viewed;
-    let schema = if every.is_some() {
+    let schema = if every {
         &*schema
     } else {
         viewed = schema.as_shown(&key.1, antares_ops::core_iri);
         &viewed
     };
-    let edm = edm::build(id, schema, every.as_ref().unwrap_or(&key.1), key.2, version).ok()?;
+    let edm = edm::build(id, schema, &key.1, key.2, version).ok()?;
     let listed: Vec<_> = antares_ops::outputs::listed(view.representation("odata"), "odata")
         .into_iter()
         .filter_map(|(_, o)| o.ok())

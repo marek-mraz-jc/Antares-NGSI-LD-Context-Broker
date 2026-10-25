@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! `$apply` (Data Aggregation 4.0, odata-linkml-mapping Q19, T-3937): each transformation over
 //! the Cars the view shows. The view shows `brand`, `owner`, `seats`, `speed` and `since` and
-//! hides `note`; the narrowing engine hides `owner` and every Car outside the scope `/open`
-//! (Car 5), so no aggregate counts or sums either.
+//! hides `note`; the narrowing engine hides `owner` (from the model as well, F-ANT4-003) and
+//! every Car outside the scope `/open` (Car 5), so no aggregate counts or sums either.
 
 use antares_ops::policy::{
     Decision, DecisionFuture, Filter, NotifyDecision, Operation, PolicyEngine, Subject,
@@ -344,23 +344,17 @@ async fn an_aggregate_never_counts_or_sums_what_the_view_or_the_engine_hides() -
         .await?,
         json!([{"n": 4, "s": 10, "d": 2}])
     );
-    // `owner` reads as absent on every Car the engine serves
-    assert_eq!(
-        rows(
-            &app,
-            "aggregate(owner with countdistinct as d,owner with max as m)"
-        )
-        .await?,
-        json!([{"d": 0, "m": null}])
-    );
-    assert_eq!(
-        rows(&app, "groupby((owner),aggregate($count as n))").await?,
-        json!([{"owner": null, "n": 4}])
-    );
-    assert_eq!(
-        ids(&app, "filter(owner eq 'Dan')").await?,
-        Vec::<String>::new()
-    );
+    // the engine hides `owner` from the model too (F-ANT4-003): the same
+    // 400 of an unknown name as the view's `note`
+    for apply in [
+        "aggregate(owner with countdistinct as d,owner with max as m)",
+        "groupby((owner),aggregate($count as n))",
+        "filter(owner eq 'Dan')",
+    ] {
+        let uri = format!("{ROOT}/Car?$apply={}", apply.replace(' ', "%20"));
+        let (status, body) = send(&app, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{apply}: {body}");
+    }
     // the view hides `note`: the 400 of an unknown name
     for apply in [
         "aggregate(note with countdistinct as d)",
@@ -630,7 +624,6 @@ async fn ranking_concat_and_search_never_reach_what_is_hidden() -> Result<(), St
         ids(&app, "toppercent(100,seats)").await?,
         ["4", "3", "2", "1"]
     );
-    assert_eq!(ids(&app, "topcount(9,owner)").await?, Vec::<String>::new());
     assert_eq!(
         ids(&app, "concat(identity,bottomcount(1,seats))").await?,
         ["1", "2", "3", "4", "1"]
@@ -644,8 +637,9 @@ async fn ranking_concat_and_search_never_reach_what_is_hidden() -> Result<(), St
         .await?,
         json!([{"s": 10, "n": 4}])
     );
-    // the view hides `note`: an unknown name
+    // the view hides `note` and the engine `owner`: an unknown name
     for apply in [
+        "topcount(9,owner)",
         "topcount(1,note)",
         "compute(note as x)",
         "concat(identity,filter(note eq 'x'))",
@@ -680,5 +674,23 @@ async fn a_chain_of_concat_is_refused_before_it_outgrows_one_scan() -> Result<()
             .len(),
         40
     );
+    Ok(())
+}
+
+/// F-ANT4-003: `$metadata` names what the engine lets the caller read, as
+/// the LinkML surface does; the same view without the engine names `owner`.
+#[tokio::test]
+async fn the_metadata_hides_what_the_engine_hides() -> Result<(), String> {
+    for (hiding, named) in [(true, false), (false, true)] {
+        let (_b, app) = broker(hiding).await?;
+        let (status, body) = send(&app, Method::GET, &format!("{ROOT}/$metadata"), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let text = body.to_string();
+        assert!(
+            text.contains("\"brand\"") || text.contains("Name=\\\"brand\\\""),
+            "{text}"
+        );
+        assert_eq!(text.contains("owner"), named, "hiding {hiding}: {text}");
+    }
     Ok(())
 }
