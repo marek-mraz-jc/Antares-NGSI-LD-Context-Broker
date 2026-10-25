@@ -3785,7 +3785,7 @@ async fn answer_temporal_attr_write(
     }
     Ok(crate::federation::combine(
         st.profile,
-        Some(&id),
+        Some(id),
         parts,
         no_content(tenant),
         tenant,

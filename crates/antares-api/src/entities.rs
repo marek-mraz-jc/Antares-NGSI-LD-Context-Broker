@@ -2520,7 +2520,7 @@ async fn merge_entity_inner(
         }
         return Ok(crate::federation::combine(
             st.profile,
-            Some(&id),
+            Some(id),
             parts,
             no_content(&tenant),
             &tenant,
