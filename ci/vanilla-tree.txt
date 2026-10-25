@@ -1910,7 +1910,7 @@ antares-broker v0.3.0
 │   │   │   │   │               │       │   │   │   │   └── crypto-common v0.2.2
 │   │   │   │   │               │       │   │   │   │       └── hybrid-array feature "default" (*)
 │   │   │   │   │               │       │   │   │   └── ctutils feature "default"
-│   │   │   │   │               │       │   │   │       └── ctutils v0.4.2
+│   │   │   │   │               │       │   │   │       └── ctutils v0.4.5
 │   │   │   │   │               │       │   │   │           └── cmov feature "default"
 │   │   │   │   │               │       │   │   │               └── cmov v0.5.4
 │   │   │   │   │               │       │   │   └── digest feature "block-api"
@@ -2066,7 +2066,7 @@ antares-broker v0.3.0
 │   │   │   │           │   │   │   │   └── crypto-common v0.2.2
 │   │   │   │           │   │   │   │       └── hybrid-array feature "default" (*)
 │   │   │   │           │   │   │   └── ctutils feature "default"
-│   │   │   │           │   │   │       └── ctutils v0.4.2
+│   │   │   │           │   │   │       └── ctutils v0.4.5
 │   │   │   │           │   │   │           └── cmov feature "default"
 │   │   │   │           │   │   │               └── cmov v0.5.4
 │   │   │   │           │   │   └── digest feature "block-api"
