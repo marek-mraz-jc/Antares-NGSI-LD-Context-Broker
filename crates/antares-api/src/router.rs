@@ -462,8 +462,12 @@ pub(super) async fn tenant_exists_layer(
     // @context resources are keyed by local id across tenants (5.13) — a
     // Cached row belongs to no tenant, so the existence of the requesting
     // one decides nothing here. Ownership of a Hosted row is still enforced,
-    // by `contexts::row_visible` on every serve, list and delete.
-    let tenant_free = path.starts_with("/info/") || path.starts_with("/jsonldContexts");
+    // by `contexts::row_visible` on every serve, list and delete. A POST
+    // stores a Hosted row its Tenant owns, so that Tenant must exist
+    // (F-ANT2-006): a row of a Tenant that never existed could not be
+    // purged with it. DELETE stays free so such a row can still go.
+    let tenant_free = path.starts_with("/info/")
+        || (path.starts_with("/jsonldContexts") && req.method() != axum::http::Method::POST);
     if !implicit_create && !tenant_free {
         if let Some(t) = named
             .as_deref()
