@@ -410,6 +410,8 @@ Each `Antares wrong (both versions)` row of group B has a broker test in `crates
 | linked_entities_objecttype_gate | `clause_4_5_23_1_object_typed_link_joins_a_registered_entity` | an inline join reads a target not stored locally through a registration holding its id under the Relationship's objectType |
 | troe_timescale_temporal_distop_query_exclusive | `clause_4_3_6_3_exclusive_temporal_reads_drop_the_local_history` | temporal query and retrieve drop the local history of an Attribute an exclusive or redirect registration claims |
 
+In the local vanilla file-store cell (Coraine `d313d87`, branch build) 6 of the 9 pass: append-exclusive, create-207, create-409, create-excl-no-op, distop_retrieve_timeout_504 and linked_entities_objecttype_gate.
+
 Differences left in these Coraine cases after the fix, none of them a broker defect: `statusCode` in NotUpdatedDetails and ProblemDetails (csource-reg-distops-updated-dedup, -retrieve-upstream-error; no such member in 5.2.19 or 5.5.2), `updated` and `attributeName` as expanded IRIs (5.5.7), urn:V3 listed by Coraine although the registration does not name it (4.3.6.1), and the flattened join form, which does not read registered targets yet.
 
 ### 4.2 Sample of "spec unclear" against TS 104 175
