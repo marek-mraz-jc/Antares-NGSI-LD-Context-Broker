@@ -28,8 +28,10 @@ PORT="${CONTEXT_PORT:-8079}"
 LOCAL="http://localhost:$PORT/"
 STATE="${CONTEXT_STATE:-$PWD/${RESULTS:-results}/local-context}"
 
-# every file that names the raw prefix, variables.py excepted
-named() { grep -rlF --exclude=variables.py "$1" "$SUITE/resources" "$SUITE/TP" "$SUITE/data" 2>/dev/null || true; }
+# every file that names the raw prefix, variables.py excepted; never __pycache__: robot compiles
+# variables.py after `start`, the appended context wins at import but the .pyc keeps the default
+# (all three ETSI cells red with every TP passing, ci run 40274454802), and sed corrupts a .pyc
+named() { grep -rlF --exclude=variables.py --exclude-dir=__pycache__ "$1" "$SUITE/resources" "$SUITE/TP" "$SUITE/data" 2>/dev/null || true; }
 
 case "${1:-}" in
   start)

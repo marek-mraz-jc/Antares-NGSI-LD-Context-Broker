@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import urllib.request
 from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -465,6 +466,44 @@ After A Failure
     print("  recorder ok (a step that runs is recorded, a NOT RUN one is not and raises nothing)")
 
 
+def check_local_context():
+    """start/check/stop of etsi-local-context.sh on a tiny suite: the .pyc robot compiles from
+    variables.py after `start` keeps the raw default and must not fail `check` (ci run
+    40274454802: all three cells red with every TP passing), and `stop` restores every file."""
+    import shutil
+    import socket
+    raw = "https://raw.githubusercontent.com/joinedcontext/Antares-NGSI-LD-Context-Broker/dev/ngsi-ld-test-suite/resources/jsonld-contexts/"
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = str(s.getsockname()[1])
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(f"{d}/dev")
+        shutil.copy(f"{HERE}/etsi-local-context.sh", f"{d}/dev/")
+        suite = f"{d}/ngsi-ld-test-suite"
+        for sub in ("resources/jsonld-contexts", "TP", "data"):
+            os.makedirs(f"{suite}/{sub}")
+        open(f"{suite}/resources/jsonld-contexts/ngsi-ld-test-suite-compound.jsonld", "w").write("{}")
+        open(f"{suite}/resources/variables.py", "w").write(f"ngsild_test_suite_context = '{raw}x.jsonld'\n")
+        data = f'{{"@context": "{raw}ngsi-ld-test-suite-compound.jsonld"}}'
+        open(f"{suite}/data/e.jsonld", "w").write(data)
+        env = dict(os.environ, CONTEXT_PORT=port, CONTEXT_STATE=f"{d}/state")
+        sh = lambda *a: subprocess.run(["bash", f"{d}/dev/etsi-local-context.sh", *a], env=env,
+                                       capture_output=True, text=True)
+        local = sh("start").stdout.strip()
+        try:
+            assert local == f"http://localhost:{port}/ngsi-ld-test-suite-compound.jsonld", local
+            assert raw not in open(f"{suite}/data/e.jsonld").read()
+            subprocess.run([sys.executable, "-c", "import variables"], cwd=f"{suite}/resources", check=True)
+            assert os.listdir(f"{suite}/resources/__pycache__"), "variables.py was not compiled"
+            urllib.request.urlopen(local, timeout=5).read()
+            chk = sh("check")
+            assert chk.returncode == 0, chk.stdout + chk.stderr
+        finally:
+            sh("stop")
+        assert open(f"{suite}/data/e.jsonld").read() == data, "stop did not restore the data file"
+    print("  local context ok (a compiled variables.py does not fail check; stop restores)")
+
+
 if __name__ == "__main__":
     print("etsi sampling self-check")
     check_proc_parsing()
@@ -474,4 +513,5 @@ if __name__ == "__main__":
     check_view_diff()
     check_view_residue()
     check_recorder()
+    check_local_context()
     print("OK")
