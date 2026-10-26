@@ -348,6 +348,21 @@ mod tests {
         assert_eq!(decoded, Some(m));
     }
 
+    /// F-ANT5-009: a position whose instances all carry a datasetId is read from the
+    /// first one, so the vehicle stays in the feed.
+    #[test]
+    fn a_named_only_position_still_places_the_vehicle() {
+        let when = "2026-10-23T10:04:30Z";
+        let named = json!({"location": [{"type": "GeoProperty", "datasetId": "urn:ngsi-ld:Dataset:hsl",
+            "value": {"type": "Point", "coordinates": [24.94, 60.17]}, "observedAt": when}]});
+        let (m, skipped) = message(&[bus("urn:a", when, &named)], now(), 300);
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            at(&json(&m), "/entity/0/vehicle/position/latitude"),
+            json!(60.17)
+        );
+    }
+
     #[test]
     fn what_a_vehicle_lacks_stays_absent_and_km_h_become_m_s() {
         let lean = json!({"route": null, "heading": null, "occupancy": {"type": "Property", "value": 140, "unitCode": "P1"},
