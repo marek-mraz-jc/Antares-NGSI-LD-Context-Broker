@@ -133,6 +133,60 @@ async fn one_batch_cannot_multiply_the_context_fetch_cap() {
     );
 }
 
+/// F-ANT2-011: an `@context` array names each of its URLs. Counting the
+/// array as one value let 32 items of 32 distinct URLs each buy 32 times the
+/// cap; every URL counts, so the second item is refused before it fetches.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_context_array_counts_each_url_against_the_batch_cap() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let seen = hits.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut sock) = stream else { break };
+            seen.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf);
+            let body = r#"{"@context":{"t":"https://example.org/t"}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/ld+json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes());
+        }
+    });
+    let cap = antares_api::bounds::MAX_CONTEXT_FETCHES;
+    let items: Vec<serde_json::Value> = (0..cap)
+        .map(|i| {
+            let urls: Vec<String> = (0..cap)
+                .map(|j| format!("http://127.0.0.1:{}/c{i}-{j}.jsonld", addr.port()))
+                .collect();
+            serde_json::json!({"id": format!("urn:ngsi-ld:Batch:{i}"), "type": "t", "@context": urls})
+        })
+        .collect();
+    let body = serde_json::Value::Array(items).to_string();
+    let st = AppState::new("test".into());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ngsi-ld/v1/entityOperations/create")
+        .header("Content-Type", "application/ld+json")
+        .header("Content-Length", body.len())
+        .body(Body::from(body))
+        .expect("request");
+    let status = send(&st, req).await;
+    assert!(
+        status.is_success() || status == StatusCode::MULTI_STATUS,
+        "the batch answers per item: {status}"
+    );
+    let fetched = hits.load(Ordering::SeqCst);
+    assert!(
+        fetched <= cap,
+        "one request fetched {fetched} @context documents, cap is {cap}"
+    );
+}
+
 /// After DELETE, a subscription's state is GONE — later matching
 /// changes produce no delivery attempt. (Scorpio orphaned callback UUIDs
 /// forever; the wrong-typed-key NPE meant the delete path never cleaned up.)

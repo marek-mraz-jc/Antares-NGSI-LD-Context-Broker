@@ -522,6 +522,9 @@ impl std::ops::Deref for AppState {
 
 impl std::ops::DerefMut for AppState {
     fn deref_mut(&mut self) -> &mut Shared {
+        // the memoised in-process router captured the settings about to
+        // change: a later call must build one over the new ones
+        self.inbound = Arc::new(std::sync::OnceLock::new());
         Arc::make_mut(&mut self.shared)
     }
 }
@@ -1580,6 +1583,100 @@ mod jsonld_context_locality_5_13 {
             .expect("owner resolves");
     }
 
+    /// F-ANT2-008: a Cached @context serves every Tenant, so a named Tenant
+    /// may neither delete nor reload it; the default Tenant may.
+    #[tokio::test]
+    async fn only_the_default_tenant_deletes_a_cached_context() {
+        let st = AppState::new("me".into());
+        let (url, _) = context_server("/shared.jsonld");
+        let alpha = antares_model::TenantId::new("alpha").expect("tenant");
+        st.loader
+            .resolve_for(&alpha, &serde_json::json!(url))
+            .await
+            .expect("cached");
+        let path = format!(
+            "/ngsi-ld/v1/jsonldContexts/{}",
+            url.replace(':', "%3A").replace('/', "%2F")
+        );
+        let send = |method: &str, uri: String, tenant: Option<&str>| {
+            let mut b = axum::http::Request::builder().method(method).uri(uri);
+            if let Some(t) = tenant {
+                b = b.header("NGSILD-Tenant", t);
+            }
+            let req = b.body(axum::body::Body::empty()).expect("request");
+            tower::ServiceExt::oneshot(crate::router(st.clone()), req)
+        };
+        for uri in [path.clone(), format!("{path}?reload=true")] {
+            let refused = send("DELETE", uri, Some("beta")).await.expect("response");
+            assert_eq!(refused.status(), axum::http::StatusCode::FORBIDDEN);
+        }
+        let details = send("GET", format!("{path}?details=true"), None)
+            .await
+            .expect("response");
+        assert_eq!(
+            details.status(),
+            axum::http::StatusCode::OK,
+            "the row is kept"
+        );
+        let deleted = send("DELETE", path, None).await.expect("response");
+        assert_eq!(deleted.status(), axum::http::StatusCode::NO_CONTENT);
+    }
+
+    /// F-ANT2-004: a Tenant purge drops its Hosted @context from the loader
+    /// too, so the name recreated is not served the old term mappings.
+    #[tokio::test]
+    async fn a_purged_tenants_hosted_context_resolves_no_more() {
+        let st = AppState::new("me".into());
+        let t = antares_model::TenantId::new("purgectx").expect("tenant");
+        let (url, fetches) = context_server("/ngsi-ld/v1/jsonldContexts/local-p");
+        st.store
+            .context_put(
+                Some(&t),
+                "local-p",
+                serde_json::json!({
+                    "url": url, "localId": "local-p", "kind": "Hosted",
+                    "owner": t.as_str(), "createdAt": now_iso(),
+                    "body": {"@context": {"peerTemp": "http://example.org/peerTemp"}},
+                }),
+            )
+            .await
+            .expect("seed hosted row");
+        let user = serde_json::json!(url);
+        st.loader
+            .resolve_for(&t, &user)
+            .await
+            .expect("owner resolves");
+        let req = |m: &str, uri: &str, body: &str| {
+            axum::http::Request::builder()
+                .method(m)
+                .uri(uri)
+                .header("NGSILD-Tenant", "purgectx")
+                .header("Content-Type", "application/json")
+                .header("Content-Length", body.len())
+                .body(axum::body::Body::from(body.to_owned()))
+                .expect("request")
+        };
+        let entity = r#"{"id": "urn:ngsi-ld:Room:p", "type": "Room"}"#;
+        let made = tower::ServiceExt::oneshot(
+            crate::router(st.clone()),
+            req("POST", "/ngsi-ld/v1/entities", entity),
+        )
+        .await
+        .expect("response");
+        assert_eq!(made.status(), axum::http::StatusCode::CREATED);
+        let purged = tower::ServiceExt::oneshot(
+            crate::router(st.clone()),
+            req("DELETE", "/q/tenants/purgectx", ""),
+        )
+        .await
+        .expect("response");
+        assert_eq!(purged.status(), axum::http::StatusCode::NO_CONTENT);
+        // the purge released the loader's entry for the row while it still
+        // listed it; run after the store purge it listed nothing
+        assert!(st.loader.usage_get(&url).await.is_none());
+        assert_eq!(fetch_count(&fetches), 0);
+    }
+
     /// 5.13.3.5 counts uses of an @context this broker hosts on its own
     /// stored row — no second, Cached copy of the same document, and no
     /// fetch of its URL: the row holds the document (5.13.1 "Hosted").
@@ -1801,5 +1898,24 @@ mod clone_cost {
         c.max_limit = 7;
         assert_eq!((a.max_limit, c.max_limit), (1000, 7));
         assert!(!std::ptr::eq(&a.http, &c.http));
+    }
+
+    /// F-ANT2-024: a setting written after an in-process call reaches the
+    /// next call; the memoised router of the clone was built over the old
+    /// settings and answered `limit=5` as if `max_limit` were still 1000.
+    #[tokio::test]
+    async fn a_write_after_a_call_reaches_the_next_call() {
+        let call = |st: &AppState| {
+            let req = axum::http::Request::get("/ngsi-ld/v1/entities?type=T&limit=5")
+                .body(axum::body::Body::empty())
+                .expect("request");
+            let st = st.clone();
+            async move { st.call(&axum::http::HeaderMap::new(), req).await.status() }
+        };
+        let a = AppState::new("antares-test".into());
+        assert_eq!(call(&a).await, axum::http::StatusCode::OK);
+        let mut c = a.clone();
+        c.max_limit = 1;
+        assert_eq!(call(&c).await, axum::http::StatusCode::FORBIDDEN);
     }
 }
