@@ -48,6 +48,63 @@ pub(super) fn cap_keeps_shown(
     })
 }
 
+/// The Attributes the store may qualify an Entity for a page through under
+/// `rules` (T-5616): `Some(None)` any, `Some(Some(list))` only these, `None`
+/// where the rules' verdict on an Entity is not the store's, so it may not
+/// page. It is where every rule names Entities by type alone (no condition,
+/// id or idPattern), all show the same Attributes through the same windows,
+/// no type hides Attributes of its own, each requested type is named by a
+/// rule, and the windows hold the whole request window (open towards now,
+/// opened by its `after` or `between` instant on `observedAt`): an Entity
+/// with an instance of a shown Attribute in the request window then shows
+/// that instance, and one without shows none. `attrs`, the request's own,
+/// narrow what is shown. Without it a view read every Entity of the type
+/// for each page: 577 bike stations, past the 30 s statement timeout.
+pub(super) fn page_attrs(
+    rules: &crate::policy::Filter,
+    types: Option<&[String]>,
+    tq: Option<&TemporalQ>,
+    attrs: Option<&[String]>,
+) -> Option<Option<Vec<String>>> {
+    let first = rules.rules.first()?;
+    let start = range_start(tq);
+    let late = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::hours(1))
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC);
+    let windows_hold = first.temporal.is_empty()
+        || (tq.is_none_or(|t| t.timeproperty == "observedAt")
+            && start.is_some_and(|s| {
+                first
+                    .temporal
+                    .iter()
+                    .all(|w| w.to.is_none() && w.opens_by(s, late))
+            }));
+    let alike = rules.rules.iter().all(|r| {
+        r.admits_by_type_alone()
+            && r.attributes == first.attributes
+            && r.every_attribute == first.every_attribute
+            && r.temporal == first.temporal
+    });
+    let named = types.is_some_and(|ts| {
+        ts.iter()
+            .all(|t| rules.rules.iter().any(|r| r.types.contains(t)))
+    });
+    if !(windows_hold && alike && named && rules.omit_by_type.is_empty()) {
+        return None;
+    }
+    Some(match (first.every_attribute, attrs) {
+        (true, None) => None,
+        (true, Some(a)) => Some(a.to_vec()),
+        (false, None) => Some(first.attributes.clone()),
+        (false, Some(a)) => Some(
+            a.iter()
+                .filter(|x| first.attributes.contains(x))
+                .cloned()
+                .collect(),
+        ),
+    })
+}
+
 /// The instant a window read oldest first starts at: `timeAt` of `after`
 /// and `between`; `before` and no window start at the beginning of time.
 pub(super) fn range_start(tq: Option<&TemporalQ>) -> Option<&str> {

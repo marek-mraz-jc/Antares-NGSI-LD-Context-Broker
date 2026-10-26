@@ -1316,7 +1316,7 @@ async fn the_temporal_page_qualification_reads_each_station_newest_first() {
     };
     let text = compile_instance_range(&range, "ai.data", 2).expect("after compiles");
     let column = column_range_bound(&range, "ai", 3).expect("observedAt has a column");
-    let qual = pg::temporal::has_history(&format!(" AND {} AND {column}", text.sql), "DESC");
+    let qual = pg::temporal::has_history(&format!(" AND {} AND {column}", text.sql), "DESC", None);
     let mut tx = pool.begin().await.expect("tx");
     for s in [
         "SET LOCAL plan_cache_mode = force_generic_plan",

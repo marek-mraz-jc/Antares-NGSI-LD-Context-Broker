@@ -82,6 +82,8 @@ struct Recording {
     ranged: Mutex<Vec<(bool, bool)>>,
     /// instances the store answered each query with
     served: Mutex<Vec<usize>>,
+    /// per query: whether the store paged, through which Attributes
+    paged: Mutex<Vec<Option<Option<Vec<String>>>>>,
 }
 
 /// The Attribute instances of `docs`, every Attribute and dataset.
@@ -115,6 +117,11 @@ impl TemporalDriver for Recording {
             .lock()
             .expect("lock")
             .push((f.range.is_some(), f.last_n.is_some()));
+        self.paged.lock().expect("lock").push(
+            f.page
+                .as_ref()
+                .map(|_| f.page_attrs.map(<[String]>::to_vec)),
+        );
         let out = self.inner.query_temporal(t, f).await?;
         self.served.lock().expect("lock").push(instances(&out.rows));
         Ok(out)
@@ -174,6 +181,7 @@ async fn state_with(rule: Rule, more: &[Value]) -> (AppState, Arc<Recording>) {
         inner: st.temporal.clone(),
         ranged: Mutex::new(Vec::new()),
         served: Mutex::new(Vec::new()),
+        paged: Mutex::new(Vec::new()),
     });
     st.temporal = recording.clone();
     st.policy = Some(Arc::new(Ruled(vec![rule])));
@@ -507,6 +515,7 @@ async fn a_window_page_reads_only_its_instances_from_postgres() {
         inner: st.temporal.clone(),
         ranged: Mutex::new(Vec::new()),
         served: Mutex::new(Vec::new()),
+        paged: Mutex::new(Vec::new()),
     });
     st.temporal = recording.clone();
     st.policy = Some(Arc::new(Ruled(vec![plain()])));
@@ -534,4 +543,70 @@ async fn a_window_page_reads_only_its_instances_from_postgres() {
         vec![2 * 101, 2 * 201, 2 * 600],
         "each page reads its own instances and one more per Attribute"
     );
+}
+
+/// T-5616: a view's type-only rule pages the Entities in the store, through
+/// the Attributes it shows (the request's own `attrs` among them), so a
+/// type-wide query reads one page of Entities, not all 577 bike stations.
+/// Every rule shape whose verdict on an Entity the store cannot see keeps the
+/// page in the API.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_type_only_rule_pages_in_the_store_through_its_attributes() {
+    let speed = vec![format!("{DC}speed")];
+    let opens_late = Rule {
+        temporal: vec![Window {
+            from: Some(TimeBound::At(
+                "2026-01-01T00:00:09Z".parse().expect("instant"),
+            )),
+            to: None,
+        }],
+        ..plain()
+    };
+    let by_pattern = Rule {
+        id_patterns: vec!["urn:ngsi-ld:Vehicle:.*".into()],
+        ..plain()
+    };
+    for (rule, query, paged, shown) in [
+        (
+            plain(),
+            "type=Vehicle",
+            Some(Some(speed.clone())),
+            vec![7, 8, 9, 10],
+        ),
+        (
+            plain(),
+            "type=Vehicle&attrs=speed",
+            Some(Some(speed.clone())),
+            vec![7, 8, 9, 10],
+        ),
+        (
+            plain(),
+            "type=Vehicle&attrs=zone",
+            Some(Some(Vec::new())),
+            Vec::new(),
+        ),
+        (plain(), "type=Vehicle&q=speed%3E8", None, vec![9, 10]),
+        (opens_late, "type=Vehicle", None, vec![9, 10]),
+        (conditional(), "type=Vehicle", None, vec![7, 8, 9, 10]),
+        (by_pattern, "type=Vehicle", None, vec![7, 8, 9, 10]),
+        (plain(), "type=Vehicle,Bus", None, vec![7, 8, 9, 10]),
+    ] {
+        let (st, recording) = state(rule.clone()).await;
+        let (status, body) = send(
+            &st,
+            &format!("/ngsi-ld/v1/temporal/entities?{query}&{AFTER}&limit=5"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{query} {rule:?}: {body}");
+        let got = body.as_array().map_or(Vec::new(), |a| {
+            a.iter().flat_map(speeds).collect::<Vec<_>>()
+        });
+        assert_eq!(got, shown, "{query} {rule:?}: {body}");
+        assert_eq!(
+            *recording.paged.lock().expect("lock"),
+            vec![paged],
+            "{query} {rule:?}"
+        );
+    }
 }

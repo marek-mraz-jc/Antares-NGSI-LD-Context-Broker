@@ -116,3 +116,7 @@ note = "views gains the generated digest column; an older release names its colu
 [0027]
 rollback = "compatible"
 note = "a new index on entities (tenant_id, id COLLATE \"C\"); an older release never names it and its writes keep it current"
+
+[0028]
+rollback = "compatible"
+note = "offset_until is not kept by an older release: after a roll-forward, lastN of an attribute given a non-UTC observedAt during the rollback may read its newest rows only, ranked by instant"
