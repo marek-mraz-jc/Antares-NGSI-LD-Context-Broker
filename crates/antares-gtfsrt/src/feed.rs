@@ -4,8 +4,9 @@
 //! `tests/gtfsrt/gtfs-realtime.proto` the tests check these against), and the SDM `Vehicle`
 //! mapped to it (docs/src/gtfsrt.md section 2). What an Entity does not carry stays absent.
 
+use antares_ops::default_instance as attribute;
 use chrono::{DateTime, Duration, Utc};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 /// `FeedMessage`: the header and one entity per vehicle.
 #[derive(Clone, PartialEq, prost::Message)]
@@ -107,14 +108,6 @@ pub struct VehicleDescriptor {
     /// The licence plate.
     #[prost(string, optional, tag = "3")]
     pub license_plate: Option<String>,
-}
-
-/// An Attribute's default instance: the member itself, or the first of several.
-fn attribute<'a>(entity: &'a Value, name: &str) -> Option<&'a Map<String, Value>> {
-    match entity.get(name)? {
-        Value::Array(instances) => instances.first()?.as_object(),
-        other => other.as_object(),
-    }
 }
 
 fn text(entity: &Value, name: &str) -> Option<String> {
@@ -304,7 +297,8 @@ mod tests {
 
     /// `base` with each member of `extra` set, or removed when it is `null`.
     fn with(base: Value, extra: &Value) -> Value {
-        let mut map: Map<String, Value> = serde_json::from_value(base).unwrap_or_default();
+        let mut map: serde_json::Map<String, Value> =
+            serde_json::from_value(base).unwrap_or_default();
         for (k, v) in extra.as_object().into_iter().flatten() {
             if v.is_null() {
                 map.remove(k);
@@ -352,6 +346,21 @@ mod tests {
         );
         let decoded = FeedMessage::decode(m.encode_to_vec().as_slice()).ok();
         assert_eq!(decoded, Some(m));
+    }
+
+    /// F-ANT5-009: a position whose instances all carry a datasetId is read from the
+    /// first one, so the vehicle stays in the feed.
+    #[test]
+    fn a_named_only_position_still_places_the_vehicle() {
+        let when = "2026-10-23T10:04:30Z";
+        let named = json!({"location": [{"type": "GeoProperty", "datasetId": "urn:ngsi-ld:Dataset:hsl",
+            "value": {"type": "Point", "coordinates": [24.94, 60.17]}, "observedAt": when}]});
+        let (m, skipped) = message(&[bus("urn:a", when, &named)], now(), 300);
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            at(&json(&m), "/entity/0/vehicle/position/latitude"),
+            json!(60.17)
+        );
     }
 
     #[test]

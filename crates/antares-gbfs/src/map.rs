@@ -3,6 +3,7 @@
 //! files (docs/src/gbfs.md section 2). What an Entity does not carry stays out of the file; a
 //! station missing a field GBFS requires is left out of that file and counted.
 
+use antares_ops::default_instance as attribute;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -126,14 +127,6 @@ fn email(address: &str) -> bool {
         && !domain.ends_with('.')
         && !address.chars().any(|c| c.is_whitespace() || c.is_control())
         && !domain.contains('@')
-}
-
-/// An Attribute's default instance: the member itself, or the first of several.
-fn attribute<'a>(entity: &'a Value, name: &str) -> Option<&'a Map<String, Value>> {
-    match entity.get(name)? {
-        Value::Array(instances) => instances.first()?.as_object(),
-        other => other.as_object(),
-    }
 }
 
 fn value<'a>(entity: &'a Value, name: &str) -> Option<&'a Value> {
@@ -404,6 +397,23 @@ mod tests {
         assert_eq!(
             (at(&status, "/ttl").clone(), at(&status, "/version").clone()),
             (json!(30), json!("3.0"))
+        );
+        Ok(())
+    }
+
+    /// F-ANT5-009: an Attribute whose instances all carry a datasetId is read from the
+    /// first one, so the station stays in the feed.
+    #[test]
+    fn a_named_only_instance_still_reports_the_station() -> Result<(), String> {
+        let when = "2026-10-23T10:00:00+02:00";
+        let bikes = json!({"availableBikeNumber": [
+            {"type": "Property", "datasetId": "urn:ngsi-ld:Dataset:hsl", "value": 4, "observedAt": when}]});
+        let stations = [station("urn:a", &bikes)];
+        let (status, skipped) = file("station_status", &system()?, "v", &stations, "u");
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            at(&status, "/data/stations/0/num_vehicles_available"),
+            json!(4)
         );
         Ok(())
     }

@@ -665,6 +665,18 @@ pub async fn delete_context(
         let Some(entry) = find_entry(&st, &tenant, &id).await? else {
             return Err(NgsiError::ResourceNotFound(format!("@context {id} not found")).into());
         };
+        // A Cached copy (the core one included) belongs to no Tenant and
+        // serves every one: only the default Tenant, the operator's, may
+        // evict or refetch it (F-ANT2-008). Decided (worker-t5704, owner may
+        // override): admin-only, because one Tenant could otherwise evict
+        // or refetch the cache every other Tenant resolves from.
+        if matches!(entry, CtxEntry::Cached(_) | CtxEntry::Core(_)) && tenant != TenantId::default()
+        {
+            return Err(ApiError::Denied(
+                "a Cached @context is shared by every Tenant: only the default Tenant deletes or reloads it"
+                    .into(),
+            ));
+        }
         if reload {
             // reload is only meaningful for Cached @contexts (5.13.5.4);
             // other kinds are 400 (051_04_05)
@@ -692,7 +704,7 @@ pub async fn delete_context(
                 // The write-through row shares the deterministic local id —
                 // deleting the API entry must delete the persisted copy too,
                 // or a restart resurrects a deleted @context (5.13.5).
-                let _ = st.store.context_delete(Some(&tenant), &u.local_id).await;
+                st.store.context_delete(Some(&tenant), &u.local_id).await?;
                 Ok(no_content(&tenant))
             }
             CtxEntry::Stored(doc) => {

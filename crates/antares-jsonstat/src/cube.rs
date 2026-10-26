@@ -4,6 +4,7 @@
 //! period, indicator, then the table's other keys and the unit), each cell one Entity, a cell no
 //! Entity holds `null` and never 0.
 
+use antares_ops::default_instance as attribute;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,14 +23,6 @@ const DIMENSIONS: [&str; 5] = [
     "dimensionKey",
     "unitText",
 ];
-
-/// An Attribute's default instance: the member itself, or the first of several.
-fn attribute<'a>(entity: &'a Value, name: &str) -> Option<&'a Map<String, Value>> {
-    match entity.get(name)? {
-        Value::Array(instances) => instances.first()?.as_object(),
-        other => other.as_object(),
-    }
-}
 
 /// An Attribute's text: a Property's string, or a `LanguageProperty`'s text in its first
 /// language (a request's `lang` turns it into a Property before it gets here).
@@ -264,6 +257,22 @@ mod tests {
         assert_eq!(at(&d, "/dimension/indicator/category/label/U"), "Births");
         assert_eq!(at(&d, "/updated"), "2026-01-01T00:00:00Z");
         assert_eq!(at(&d, "/source"), Value::Null);
+    }
+
+    /// F-ANT5-009: a kpiValue whose instances all carry a datasetId is read from the
+    /// first one, so the cell stays in the cube.
+    #[test]
+    fn a_named_only_kpi_value_is_still_a_cell() {
+        let mut m: Map<String, Value> =
+            serde_json::from_value(kpi("SK0", "2024", None, &json!(1))).unwrap_or_default();
+        m.insert(
+            "kpiValue".into(),
+            json!([{"type": "Property", "datasetId": "urn:ngsi-ld:Dataset:sus", "value": 7}]),
+        );
+        let e = Value::Object(m);
+        let (d, skipped) = dataset("t", &[e]);
+        assert_eq!(skipped, 0);
+        assert_eq!(at(&d, "/value"), json!([7]));
     }
 
     #[test]

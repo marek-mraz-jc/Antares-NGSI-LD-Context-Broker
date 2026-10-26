@@ -170,3 +170,65 @@ async fn batch_run_phases_keep_the_outcome_order() {
     .await;
     assert_eq!(code, StatusCode::NOT_FOUND);
 }
+
+/// F-ANT2-021: Batch Update is Append Attributes per Entity (5.6.9, 5.6.3):
+/// the instance the update names replaces the stored one, so a `unitCode`
+/// the update leaves out is gone, not merged over.
+#[tokio::test]
+async fn a_batch_update_replaces_the_instance_it_names() {
+    let st = AppState::new("antares-batch-update".into());
+    let id = "urn:ngsi-ld:Room:u1";
+    let (code, _) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/entities",
+        Some(json!({"id": id, "type": "Room",
+            "temp": {"type": "Property", "value": 1, "unitCode": "CEL"}})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED);
+    let (code, body) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/entityOperations/update",
+        Some(json!([{"id": id, "type": "Room", "temp": {"type": "Property", "value": 2}}])),
+    )
+    .await;
+    assert_eq!(code, StatusCode::NO_CONTENT, "{body}");
+    let (_, e) = send(&st, "GET", &format!("/ngsi-ld/v1/entities/{id}"), None).await;
+    assert_eq!(e.pointer("/temp/value"), Some(&json!(2)));
+    assert_eq!(e.pointer("/temp/unitCode"), None, "{e}");
+}
+
+/// F-ANT2-022: an instance a noOverwrite Batch Update appends is stamped as
+/// every other write stamps one.
+#[tokio::test]
+async fn a_no_overwrite_batch_update_stamps_what_it_appends() {
+    let st = AppState::new("antares-batch-append".into());
+    let id = "urn:ngsi-ld:Room:u2";
+    let (code, _) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/entities",
+        Some(json!({"id": id, "type": "Room", "temp": {"type": "Property", "value": 1}})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED);
+    let (code, body) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/entityOperations/update?options=noOverwrite",
+        Some(json!([{"id": id, "type": "Room", "hum": {"type": "Property", "value": 40}}])),
+    )
+    .await;
+    assert_eq!(code, StatusCode::NO_CONTENT, "{body}");
+    let (_, e) = send(
+        &st,
+        "GET",
+        &format!("/ngsi-ld/v1/entities/{id}?options=sysAttrs"),
+        None,
+    )
+    .await;
+    assert!(e.pointer("/hum/createdAt").is_some(), "{e}");
+    assert!(e.pointer("/hum/modifiedAt").is_some(), "{e}");
+}

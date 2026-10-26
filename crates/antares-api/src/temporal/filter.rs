@@ -256,19 +256,27 @@ pub(super) fn scope_window_retain(
     tq: Option<&TemporalQ>,
     timeprop: &str,
 ) -> bool {
-    let iv = scope_match_intervals(doc, sq);
+    // every comparison on dt_key: raw strings put `…00.500Z` below `…00Z`
+    let iv: Vec<(String, Option<String>)> = scope_match_intervals(doc, sq)
+        .into_iter()
+        .map(|(s, e)| (dt_key(&s), e.as_deref().map(dt_key)))
+        .collect();
     let (wstart, wend) = match tq {
         Some(t) => match t.timerel.as_str() {
-            "before" => (None, Some(t.time_at.as_str())),
-            "after" => (Some(t.time_at.as_str()), None),
-            "between" => (Some(t.time_at.as_str()), t.end_time_at.as_deref()),
+            "before" => (None, Some(dt_key(&t.time_at))),
+            "after" => (Some(dt_key(&t.time_at)), None),
+            "between" => (
+                Some(dt_key(&t.time_at)),
+                t.end_time_at.as_deref().map(dt_key),
+            ),
             _ => (None, None),
         },
         None => (None, None),
     };
     let intersects = iv.iter().any(|(s, e)| {
-        wend.is_none_or(|w| s.as_str() < w)
-            && e.as_deref().is_none_or(|e| wstart.is_none_or(|w| e > w))
+        wend.as_deref().is_none_or(|w| s.as_str() < w)
+            && e.as_deref()
+                .is_none_or(|e| wstart.as_deref().is_none_or(|w| e > w))
     });
     if !intersects {
         return false;
@@ -280,10 +288,14 @@ pub(super) fn scope_window_retain(
             }
             if let Some(arr) = v.as_array_mut() {
                 arr.retain(|inst| {
-                    inst.get(timeprop).and_then(Value::as_str).is_some_and(|t| {
-                        iv.iter()
-                            .any(|(s, e)| t >= s.as_str() && e.as_deref().is_none_or(|e| t < e))
-                    })
+                    inst.get(timeprop)
+                        .and_then(Value::as_str)
+                        .map(dt_key)
+                        .is_some_and(|t| {
+                            let t = t.as_str();
+                            iv.iter()
+                                .any(|(s, e)| t >= s.as_str() && e.as_deref().is_none_or(|e| t < e))
+                        })
                 });
             }
         }
