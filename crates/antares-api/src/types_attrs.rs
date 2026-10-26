@@ -665,6 +665,28 @@ async fn id_prefixes(
         }))
 }
 
+/// The exact id prefixes every rule of `rules` forces, united: a necessary
+/// condition of the rules' OR, as [`id_prefixes`] is of one rule. A query
+/// under a dataset view whose Policy narrows by one `idPattern` walked every
+/// Entity of the type for its few matches, the regex judged per row: 10 s and
+/// the gateway's 503 for `limit=1` over 128 678 KPIs on prod (T-5787).
+/// `None` when a rule that holds for anything does not split.
+pub(crate) async fn rules_id_prefixes(
+    st: &AppState,
+    tenant: &antares_model::TenantId,
+    rules: &[crate::policy::Rule],
+) -> Result<Option<Vec<String>>, NgsiError> {
+    let mut all = Vec::new();
+    // a rule naming no type holds for nothing (`Rule::types`)
+    for rule in rules.iter().filter(|r| !r.types.is_empty()) {
+        match id_prefixes(st, tenant, Some(rule)).await? {
+            Some(ps) => all.extend(ps),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(all).filter(|a| !a.is_empty()))
+}
+
 /// One probe of [`first_visible`] up to `max` Entities read: [`PROBE_PAGE`]
 /// first, then [`SCAN_PAGE`] at a time by keyset, so a walk for an
 /// Attribute few Entities carry reads each Entity once (T-4934).
