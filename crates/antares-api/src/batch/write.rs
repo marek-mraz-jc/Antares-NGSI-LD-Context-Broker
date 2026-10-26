@@ -517,6 +517,8 @@ impl BatchRun<'_> {
                     if append_new_instances(doc, expanded, ts)? {
                         skipped.insert(id.to_owned());
                     }
+                } else if opts.mode == BatchMode::Update {
+                    crate::entities::update_into(doc, expanded, ts);
                 } else {
                     merge_into(doc, expanded, ts);
                 }
@@ -764,7 +766,13 @@ fn append_new_instances(doc: &mut Value, expanded: &Value, ts: &str) -> Result<b
         ) {
             continue;
         }
-        let incoming: Vec<Value> = v.as_array().cloned().unwrap_or_default();
+        // stamped as every other write path stamps a new instance
+        let mut incoming = v.clone();
+        crate::stamp::stamp_instances(&mut incoming, ts);
+        let incoming: Vec<Value> = match incoming {
+            Value::Array(a) => a,
+            _ => Vec::new(),
+        };
         match target.get_mut(k).and_then(Value::as_array_mut) {
             None => {
                 target.insert(k.clone(), Value::Array(incoming));
