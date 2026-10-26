@@ -289,8 +289,7 @@ pub async fn interval_tick(st: &AppState) {
                         continue;
                     }
                     matching.extend(
-                        build_data(st, &tenant, &sub, &ctx, None, Some(&d), &[], false, &now)
-                            .await,
+                        build_data(st, &tenant, &sub, &ctx, None, Some(&d), &[], false, &now).await,
                     );
                 }
                 if !matching.is_empty() {

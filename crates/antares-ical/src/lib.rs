@@ -308,11 +308,7 @@ fn output(view: &ViewOps, name: &str) -> Result<CompiledOutput, Problem> {
 /// What every Query Entities names: the view's types whose local name is a plan's, or for a
 /// view of every type the stored types of those names ([`ViewOps::type_selector`]). A
 /// caller's `type` may only name those types.
-async fn selector(
-    view: &ViewOps,
-    wanted: &[&str],
-    types: &[String],
-) -> Result<String, Problem> {
+async fn selector(view: &ViewOps, wanted: &[&str], types: &[String]) -> Result<String, Problem> {
     if types.iter().any(|t| !wanted.contains(&local(t))) {
         return Err(Problem::new(
             StatusCode::BAD_REQUEST,

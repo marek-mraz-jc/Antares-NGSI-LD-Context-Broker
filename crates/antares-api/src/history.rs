@@ -684,18 +684,21 @@ pub(crate) async fn layer(
     let tenant = crate::negotiate::tenant_from(req.headers()).ok();
     let (resp, evs, changes) = BUFFER
         .scope(std::cell::RefCell::new(Vec::new()), async {
-            STAGED.scope(std::cell::RefCell::new(Vec::new()), CHANGES
-                .scope(std::cell::RefCell::new(Vec::new()), async {
-                    PROVENANCE
-                        .scope(
-                            provenance,
-                            TENANT.scope(tenant, async {
-                                let resp = next.run(req).await;
-                                (resp, BUFFER.with(|b| b.take()), CHANGES.with(|c| c.take()))
-                            }),
-                        )
-                        .await
-                }))
+            STAGED
+                .scope(
+                    std::cell::RefCell::new(Vec::new()),
+                    CHANGES.scope(std::cell::RefCell::new(Vec::new()), async {
+                        PROVENANCE
+                            .scope(
+                                provenance,
+                                TENANT.scope(tenant, async {
+                                    let resp = next.run(req).await;
+                                    (resp, BUFFER.with(|b| b.take()), CHANGES.with(|c| c.take()))
+                                }),
+                            )
+                            .await
+                    }),
+                )
                 .await
         })
         .await;

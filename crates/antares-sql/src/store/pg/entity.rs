@@ -1533,7 +1533,10 @@ impl PgEntityStore {
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok((rows.into_iter().map(|r| r.get::<Value, _>(0)).collect(), total))
+        Ok((
+            rows.into_iter().map(|r| r.get::<Value, _>(0)).collect(),
+            total,
+        ))
     }
 
     /// Read-modify-write: row lock via `SELECT … FOR NO KEY UPDATE`, closure

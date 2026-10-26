@@ -252,8 +252,12 @@ async fn a_q_never_matches_an_expired_instance() {
         {"type": "Property", "value": 30, "expiresAt": "2000-01-01T00:00:00Z", "datasetId": "urn:d:1"},
         {"type": "Property", "value": 40}
     ]);
-    for (id, speed) in [("urn:ngsi-ld:Vehicle:gone", gone), ("urn:ngsi-ld:Vehicle:kept", kept)] {
-        let doc = json!({"id": id, "type": [format!("{DC}/Vehicle")], format!("{DC}/speed"): speed});
+    for (id, speed) in [
+        ("urn:ngsi-ld:Vehicle:gone", gone),
+        ("urn:ngsi-ld:Vehicle:kept", kept),
+    ] {
+        let doc =
+            json!({"id": id, "type": [format!("{DC}/Vehicle")], format!("{DC}/speed"): speed});
         assert!(s.create(&t, Kind::Entity, id, doc).await.expect("create"));
     }
     let ctx = antares_jsonld::core_context();
@@ -281,6 +285,10 @@ async fn a_q_never_matches_an_expired_instance() {
             .expect("query");
         assert!(out.decided, "{term}");
         assert_eq!(ids(&out.rows), want, "{term}");
-        assert_eq!(out.total, Some(i64::try_from(want.len()).expect("len")), "{term}");
+        assert_eq!(
+            out.total,
+            Some(i64::try_from(want.len()).expect("len")),
+            "{term}"
+        );
     }
 }

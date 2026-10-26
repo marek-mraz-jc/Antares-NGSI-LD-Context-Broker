@@ -341,9 +341,11 @@ async fn lift_orphans(
                 }
             };
             let last = rows.len() < PAGE;
-            pending.extend(rows.iter().filter(|d| !orphaned(d).is_empty()).filter_map(|d| {
-                d.get("id").and_then(Value::as_str).map(str::to_owned)
-            }));
+            pending.extend(
+                rows.iter()
+                    .filter(|d| !orphaned(d).is_empty())
+                    .filter_map(|d| d.get("id").and_then(Value::as_str).map(str::to_owned)),
+            );
             if last {
                 break;
             }
@@ -393,7 +395,12 @@ async fn lift_orphans(
             metrics::counter!("antares_quality_sweep_total",
                 "tenant" => tenant.clone(), "type" => "", "rule" => rule.clone(), "outcome" => "lift")
             .increment(count);
-            tracing::info!(tenant, rule, count, "quality sweep lifted a mark no rule carries");
+            tracing::info!(
+                tenant,
+                rule,
+                count,
+                "quality sweep lifted a mark no rule carries"
+            );
             out.push(Changed {
                 tenant: tenant.clone(),
                 type_iri: String::new(),

@@ -1111,7 +1111,11 @@ async fn clause_4_22_q_does_not_match_an_expired_instance() {
         let _ = s.delete(&t, id).await;
         assert!(s.create(&t, id, &d).await.expect("create"), "seed {id}");
     }
-    for (term, want) in [("speed>10", vec![kept]), ("speed==30", vec![]), ("speed", vec![kept])] {
+    for (term, want) in [
+        ("speed>10", vec![kept]),
+        ("speed==30", vec![]),
+        ("speed", vec![kept]),
+    ] {
         let ast = antares_ql::parse_q(term).expect("parse");
         let f = antares_sql::store::pg::entity::EntityFilter {
             q: Some(&ast),

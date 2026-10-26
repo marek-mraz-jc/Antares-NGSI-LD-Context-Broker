@@ -2329,7 +2329,11 @@ mod clause_5_8_6_periodic_sweep {
         interval_tick(&st).await;
 
         let bodies = seen.lock().expect("recorded bodies").clone();
-        assert!(bodies.len() > 1, "one Notification per page: {}", bodies.len());
+        assert!(
+            bodies.len() > 1,
+            "one Notification per page: {}",
+            bodies.len()
+        );
         let mut ids: Vec<String> = bodies
             .iter()
             .flat_map(|b| b["data"].as_array().cloned().unwrap_or_default())
@@ -3425,7 +3429,9 @@ mod csource_fanout_share {
         }
         let wait = std::time::Duration::from_millis(300);
         assert!(
-            tokio::time::timeout(wait, fanout_permits(&a)).await.is_err(),
+            tokio::time::timeout(wait, fanout_permits(&a))
+                .await
+                .is_err(),
             "tenant a is at its share"
         );
         assert!(
