@@ -587,26 +587,21 @@ impl Cx<'_> {
         let groups = match set {
             "Sensors" => {
                 let devices = self.referenced(&entities, "refDevice").await?;
-                let mut groups: Vec<Vec<Value>> = entities
-                    .iter()
-                    .map(|e| {
-                        target(&devices, mapping::object(e, "refDevice"))
-                            .and_then(|d| mapping::sensor(&self.base, d))
-                            .into_iter()
-                            .collect()
-                    })
-                    .collect();
+                let mut groups = entities.iter().map(|e| {
+                    target(&devices, mapping::object(e, "refDevice"))
+                        .and_then(|d| mapping::sensor(&self.base, d))
+                        .into_iter()
+                        .collect::<Vec<Value>>()
+                });
                 // The Sensor of the Datastreams whose Entity names no Device, once, first, in
                 // the first Entity's group: a group of its own counted as an Entity served and
                 // the next link skipped one Device (F-ANT5-004).
-                if self.opts.skip == 0 {
-                    let unknown = mapping::unknown_sensor(&self.base);
-                    match groups.first_mut() {
-                        Some(first) => first.insert(0, unknown),
-                        None => groups.push(vec![unknown]),
-                    }
-                }
-                groups
+                let unknown = (self.opts.skip == 0).then(|| mapping::unknown_sensor(&self.base));
+                let head: Vec<Value> = unknown
+                    .into_iter()
+                    .chain(groups.next().into_iter().flatten())
+                    .collect();
+                std::iter::once(head).chain(groups).collect()
             }
             "FeaturesOfInterest" => {
                 let pois = self.referenced(&entities, "refPointOfInterest").await?;

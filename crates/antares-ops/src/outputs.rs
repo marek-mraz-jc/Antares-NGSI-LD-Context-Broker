@@ -109,7 +109,10 @@ impl Filter {
                 "this output fixes its geo-query: georel, geometry, coordinates and geoproperty are its own",
             );
         }
-        if let (Some(_), Some(theirs)) = (&self.q, params.get("q")) {
+        if let (Some(ours), Some(theirs)) = (&self.q, params.get("q")) {
+            // F-ANT4-007: the output's own q must be one group as well, or
+            // `a==1)|(b==2` joined as `(a==1)|(b==2);(theirs)` ORs past it
+            one_q(ours).map_err(|_| "this output's q is no query expression of its own")?;
             one_q(theirs)?;
         }
         if let Some(scope) = self.scope_with(params.get("scopeQ").map(String::as_str))? {
@@ -257,17 +260,6 @@ impl Output {
                 "a filter member is empty, too long or holds control characters".to_owned(),
             ),
             (
-                self.filter.q.as_deref().is_none_or(|q| one_q(q).is_ok()),
-                "filter q is no query expression of its own (TS 104 175 4.9): check its parentheses and quotes".to_owned(),
-            ),
-            (
-                self.filter
-                    .scope_q
-                    .as_deref()
-                    .is_none_or(|q| antares_ql::scope::check_scope_q(q).is_ok()),
-                "filter scopeQ is no scope query (TS 104 175 4.19), e.g. /Madrid/#".to_owned(),
-            ),
-            (
                 !one || !self.filter.has_geo(),
                 format!("an {format} output narrows by q and scopeQ; the geo-query is the caller's"),
             ),
@@ -331,10 +323,10 @@ pub fn listed(listed: Option<&Value>, format: &str) -> Vec<(String, Result<Outpu
         .iter()
         .filter_map(|o| o.get("name").and_then(Value::as_str))
         .collect();
-    let named = names.len();
+    let listed_names = names.len();
     names.sort_unstable();
     names.dedup();
-    let whole = named <= MAX_OUTPUTS && names.len() == named;
+    let whole = listed_names <= MAX_OUTPUTS && names.len() == listed_names;
     all.into_iter()
         .filter_map(|o| {
             let name = o.get("name")?.as_str()?.to_owned();
@@ -401,18 +393,21 @@ mod tests {
     }
 
     /// F-ANT4-007: a filter `q` that closes its own group would OR past the
-    /// caller's once joined as `(filter);(caller's)`: refused at check.
+    /// caller's once joined as `(filter);(caller's)`: the join is refused.
     #[test]
-    fn a_filter_q_or_scope_q_that_does_not_parse_is_refused() {
-        let bad_q = json!({"name": "a", "filter": {"q": "a==1)|(b==2"},
-            "sources": [{"type": "Event"}]});
-        assert!(checked(&bad_q, "geojson").is_err());
-        let bad_scope = json!({"name": "a", "filter": {"scopeQ": "Madrid"},
-            "sources": [{"type": "Event"}]});
-        assert!(checked(&bad_scope, "geojson").is_err());
-        let good = json!({"name": "a", "filter": {"q": "a==1", "scopeQ": "/Madrid/#"},
-            "sources": [{"type": "Event"}]});
-        assert!(checked(&good, "geojson").is_ok());
+    fn a_filter_q_that_is_no_group_of_its_own_is_never_joined() {
+        let filter = Filter {
+            q: Some("a==1)|(b==2".to_owned()),
+            ..Filter::default()
+        };
+        let mut params = BTreeMap::from([("q".to_owned(), "c==3".to_owned())]);
+        assert!(filter.narrow(&mut params).is_err(), "{params:?}");
+        let fine = Filter {
+            q: Some("a==1".to_owned()),
+            ..Filter::default()
+        };
+        assert!(fine.narrow(&mut params).is_ok());
+        assert_eq!(params.get("q").map(String::as_str), Some("(a==1);(c==3)"));
     }
 
     /// F-ANT4-009: an element without a name is skipped; it does not make
@@ -422,7 +417,10 @@ mod tests {
         let list = json!([{"name": "a", "sources": [{"type": "Event"}]}, {"title": {"en": "x"}}]);
         let out = listed(Some(&list), "geojson");
         assert_eq!(out.len(), 1);
-        assert!(out.first().is_some_and(|(n, o)| n == "a" && o.is_ok()));
+        assert_eq!(
+            out.first().map(|(n, o)| (n.as_str(), o.is_ok())),
+            Some(("a", true))
+        );
     }
 
     #[test]
