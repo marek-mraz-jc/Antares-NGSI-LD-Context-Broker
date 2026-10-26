@@ -19,6 +19,10 @@ pub(crate) const TTL: Duration = Duration::from_secs(600);
 /// refused until the oldest expire, so the spent set stays bounded.
 const MAX_SPENT: usize = 100_000;
 
+/// The most confirmations one subject spends within one [`TTL`], so one
+/// caller cannot fill [`MAX_SPENT`] and lock every other caller out.
+const MAX_SPENT_PER_SUBJECT: usize = MAX_SPENT / 100;
+
 /// The codec of this process: the deployment's key, else one drawn at
 /// start. `None` when a key file is named and cannot be used: then no write
 /// is confirmed at all.
@@ -59,8 +63,25 @@ fn codec_of(read: Option<Result<Vec<u8>, String>>) -> Option<RequestStateCodec> 
     codec
 }
 
-/// The confirmations already spent, with when each expires.
-static SPENT: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(Mutex::default);
+/// The confirmations already spent, per subject, with when each expires.
+#[derive(Default)]
+struct Spent {
+    by_subject: HashMap<String, HashMap<String, Instant>>,
+    total: usize,
+}
+
+impl Spent {
+    /// Forget the nonces expired at `now`, and the subjects left without one.
+    fn forget_expired(&mut self, now: Instant) {
+        self.by_subject
+            .values_mut()
+            .for_each(|n| n.retain(|_, until| *until > now));
+        self.by_subject.retain(|_, n| !n.is_empty());
+        self.total = self.by_subject.values().map(HashMap::len).sum();
+    }
+}
+
+static SPENT: LazyLock<Mutex<Spent>> = LazyLock::new(Mutex::default);
 
 /// What a call is bound to: its view, the caller's subject, the tool and
 /// its arguments as sent (a `Map` serializes its members sorted).
@@ -87,33 +108,41 @@ pub(crate) fn seal(bound: &[u8]) -> Option<String> {
 /// has not expired, and was not spent before; it is spent now. Every
 /// failure is the same `false` (rmcp: "map all token-opening failures to a
 /// single client-facing error").
-pub(crate) fn redeem(state: &str, bound: &[u8]) -> bool {
+pub(crate) fn redeem(state: &str, bound: &[u8], subject: &[(String, Vec<u8>)]) -> bool {
     let Some(nonce) = codec()
         .and_then(|c| c.open_with(state, bound).ok())
         .and_then(|n| String::from_utf8(n).ok())
     else {
         return false;
     };
-    spend(&SPENT, nonce, Instant::now())
+    spend(&SPENT, json!(subject).to_string(), nonce, Instant::now())
 }
 
-/// Record `nonce` as spent at `now`: `false` when it was spent before or
-/// the set is full of unexpired ones.
-fn spend(spent: &Mutex<HashMap<String, Instant>>, nonce: String, now: Instant) -> bool {
+/// Record `nonce` as spent by `subject` at `now`: `false` when it was spent
+/// before, or the subject's share or the whole set is full of unexpired ones.
+fn spend(spent: &Mutex<Spent>, subject: String, nonce: String, now: Instant) -> bool {
     // a holder that panicked left the map whole: an insert is one step
     let mut spent = spent
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if spent.contains_key(&nonce) {
+    let held = spent.by_subject.get(&subject);
+    if held.is_some_and(|n| n.contains_key(&nonce)) {
         return false;
     }
-    if spent.len() >= MAX_SPENT {
-        spent.retain(|_, until| *until > now);
-        if spent.len() >= MAX_SPENT {
-            return false;
-        }
+    if spent.total >= MAX_SPENT || held.is_some_and(|n| n.len() >= MAX_SPENT_PER_SUBJECT) {
+        spent.forget_expired(now);
     }
-    spent.insert(nonce, now.checked_add(TTL).unwrap_or(now));
+    let held = spent.by_subject.get(&subject).map_or(0, HashMap::len);
+    if spent.total >= MAX_SPENT || held >= MAX_SPENT_PER_SUBJECT {
+        return false;
+    }
+    let until = now.checked_add(TTL).unwrap_or(now);
+    spent
+        .by_subject
+        .entry(subject)
+        .or_default()
+        .insert(nonce, until);
+    spent.total = spent.total.saturating_add(1);
     true
 }
 
@@ -210,10 +239,10 @@ mod tests {
         let state = seal(&call).unwrap_or_default();
         assert_ne!(state, "");
         let other = bound_to("w", &[], "delete_entity", &Map::new());
-        assert!(!redeem(&state, &other));
-        assert!(redeem(&state, &call));
-        assert!(!redeem(&state, &call));
-        assert!(!redeem("rs1.x.y", &call));
+        assert!(!redeem(&state, &other, &[]));
+        assert!(redeem(&state, &call, &[]));
+        assert!(!redeem(&state, &call, &[]));
+        assert!(!redeem("rs1.x.y", &call, &[]));
     }
 
     #[test]
@@ -221,12 +250,26 @@ mod tests {
         let spent = Mutex::default();
         let start = Instant::now();
         for n in 0..MAX_SPENT {
-            assert!(spend(&spent, n.to_string(), start));
+            let who = (n / MAX_SPENT_PER_SUBJECT).to_string();
+            assert!(spend(&spent, who, n.to_string(), start));
         }
-        assert!(!spend(&spent, "full".into(), start));
-        assert!(!spend(&spent, "0".into(), start));
+        assert!(!spend(&spent, "new".into(), "full".into(), start));
+        assert!(!spend(&spent, "0".into(), "0".into(), start));
         let later = start.checked_add(TTL.saturating_mul(2)).unwrap_or(start);
-        assert!(spend(&spent, "full".into(), later));
+        assert!(spend(&spent, "new".into(), "full".into(), later));
+    }
+
+    #[test]
+    fn one_subject_cannot_spend_the_share_of_another() {
+        let spent = Mutex::default();
+        let start = Instant::now();
+        for n in 0..MAX_SPENT_PER_SUBJECT {
+            assert!(spend(&spent, "a".into(), n.to_string(), start));
+        }
+        assert!(!spend(&spent, "a".into(), "more".into(), start));
+        assert!(spend(&spent, "b".into(), "more".into(), start));
+        let later = start.checked_add(TTL.saturating_mul(2)).unwrap_or(start);
+        assert!(spend(&spent, "a".into(), "more".into(), later));
     }
 
     #[test]

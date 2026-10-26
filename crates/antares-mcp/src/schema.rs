@@ -240,18 +240,29 @@ fn member_names(names: &Names, core: &[&str]) -> Value {
     }
 }
 
-/// An object without `@context`: the surface sets the view's (MCP 3.2).
+/// An object without `@context` at any depth: the surface sets the view's
+/// (MCP 3.2).
 fn object<'v>(arg: &str, v: &'v Value) -> Result<&'v Map<String, Value>, Broken> {
     let o = v
         .as_object()
         .ok_or_else(|| broken(arg, "must be an object"))?;
-    if o.contains_key("@context") {
+    if carries_context(v) {
         return Err(broken(
             arg,
             "carries no @context; the endpoint sets the view's",
         ));
     }
     Ok(o)
+}
+
+/// Whether `v` holds an `@context` member at any depth: a scoped context
+/// inside an Attribute would rename terms past the view's names (F-ANT1-006).
+fn carries_context(v: &Value) -> bool {
+    match v {
+        Value::Object(o) => o.contains_key("@context") || o.values().any(carries_context),
+        Value::Array(items) => items.iter().any(carries_context),
+        _ => false,
+    }
 }
 
 /// An Entity body (`whole`) or an Attribute fragment of one, each member
@@ -369,7 +380,7 @@ pub(crate) enum Checked {
 }
 
 /// The `limit` ceiling: the broker's own setting, read where it reads it (T-4800).
-fn limit_max() -> u64 {
+pub(crate) fn limit_max() -> u64 {
     u64::try_from(*antares_ops::bounds::MAX_LIMIT).unwrap_or(u64::MAX)
 }
 
@@ -746,6 +757,16 @@ mod tests {
             ),
             (
                 json!({"id": "urn:ngsi-ld:Car:1", "type": "Car", "@context": "x"}),
+                "no @context",
+            ),
+            (
+                json!({"id": "urn:ngsi-ld:Car:1", "type": "Car",
+                       "speed": {"value": 1, "@context": {"x": "https://hidden"}}}),
+                "no @context",
+            ),
+            (
+                json!({"id": "urn:ngsi-ld:Car:1", "type": "Car",
+                       "speed": [{"value": {"deep": [{"@context": []}]}}]}),
                 "no @context",
             ),
             (json!([1]), "must be an object"),
