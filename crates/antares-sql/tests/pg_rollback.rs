@@ -70,6 +70,30 @@ async fn a_newer_compatible_migration_boots_and_a_breaking_one_stops_the_boot() 
     };
     clean().execute(&pool).await.expect("clean");
 
+    // F-ANT1-012: a compatible newer version beside an applied older version
+    // this binary never shipped (version 0) still fails the boot.
+    future(newest + 1, "type counts")
+        .execute(&pool)
+        .await
+        .expect("seed compatible");
+    future(0, "another release")
+        .execute(&pool)
+        .await
+        .expect("seed unknown older");
+    let unknown_older = pg::connect(&url, 2)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    clean().execute(&pool).await.expect("clean");
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 0")
+        .execute(&pool)
+        .await
+        .expect("clean older");
+    assert_eq!(
+        unknown_older,
+        Err("migration 0 was previously applied but is missing in the resolved migrations".to_owned())
+    );
+
     assert_eq!(compatible, Ok(()));
     assert_eq!(
         breaking,
