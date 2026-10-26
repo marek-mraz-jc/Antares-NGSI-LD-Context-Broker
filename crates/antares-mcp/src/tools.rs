@@ -4,7 +4,7 @@
 //! arguments only. A write tool runs only after the person confirmed the
 //! call (MCP 3.4, `crate::confirm`).
 
-use crate::schema::{opt, req, Arg, Args, Checked, Kind};
+use crate::schema::{self, opt, req, Arg, Args, Checked, Kind};
 use antares_ops::OperationId;
 use axum::http::Method;
 use serde_json::{json, Value};
@@ -643,15 +643,18 @@ fn query(args: &Args, skip: &[&str], extra: &[(&str, String)]) -> String {
 /// Members a page tool handles itself rather than passing on.
 const PAGING: [&str; 3] = ["count", "limit", "cursor"];
 
-/// The broker's `limit` ceiling: a page this large cannot ask one row more.
-const MAX_LIMIT: u64 = 1000;
-
 /// Whether a page of `limit` asks one row past it instead of the count: a
 /// call without `count` learns from that row whether rows are left, and the
 /// store counts nothing (T-5062: a count per page held 80 % of PostgreSQL's
 /// time at 1 000 distinct reads a second).
 pub(crate) fn probes(args: &Args, limit: u64) -> bool {
-    !matches!(args.get("count"), Some(Checked::Flag(true))) && limit < MAX_LIMIT
+    probes_under(args, limit, schema::limit_max())
+}
+
+/// [`probes`] under the broker's `limit` ceiling `max` (`ANTARES_MAX_LIMIT`):
+/// a page this large cannot ask one row more.
+fn probes_under(args: &Args, limit: u64, max: u64) -> bool {
+    !matches!(args.get("count"), Some(Checked::Flag(true))) && limit < max
 }
 
 /// The paging members of an inner request: one row past the page when
@@ -934,9 +937,13 @@ mod tests {
         assert!(target("query_entities", &counted, 5, 40)
             .unwrap_or_default()
             .ends_with("&limit=6&offset=40&count=false"));
-        assert!(target("query_entities", &a, MAX_LIMIT, 0)
+        assert!(target("query_entities", &a, schema::limit_max(), 0)
             .unwrap_or_default()
             .ends_with("&limit=1000&offset=0&count=true"));
+        // F-ANT1-010: the ceiling is the broker's setting, so a lower
+        // ANTARES_MAX_LIMIT never sees limit + 1 at its maximum
+        assert!(!probes_under(&a, 500, 500));
+        assert!(probes_under(&a, 499, 500));
         let one = args(&[("id", Checked::One("urn:ngsi-ld:Car:a/b?c".into()))]);
         assert_eq!(
             target("get_entity", &one, 0, 0).unwrap_or_default(),

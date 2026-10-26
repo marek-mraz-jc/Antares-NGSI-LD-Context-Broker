@@ -210,6 +210,36 @@ async fn a_write_without_confirmation_writes_nothing() -> Result<(), String> {
     Ok(())
 }
 
+/// A "no" spends nothing (F-ANT1-003): the person may still say yes to the
+/// same question, so declines cannot fill the spent set.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_decline_leaves_the_request_state_unspent() -> Result<(), String> {
+    let f = fixture().await?;
+    let args = json!({"entity": car("w8", 1)});
+    let (state, _) =
+        asked(&confirmable(&f.app, "writes", "create_entity", args.clone(), json!({})).await)?;
+    let no = confirmable(
+        &f.app,
+        "writes",
+        "create_entity",
+        args.clone(),
+        answered(&state, false),
+    )
+    .await;
+    assert!(no.is_error());
+    let yes = confirmable(
+        &f.app,
+        "writes",
+        "create_entity",
+        args,
+        answered(&state, true),
+    )
+    .await;
+    assert!(!yes.is_error(), "{}", yes.text);
+    assert!(exists(&f.app, "urn:ngsi-ld:Car:w8").await);
+    Ok(())
+}
+
 /// MC4, MCP section 10 rule 10: one confirmation answers one call once.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_replayed_request_state_is_refused() -> Result<(), String> {
