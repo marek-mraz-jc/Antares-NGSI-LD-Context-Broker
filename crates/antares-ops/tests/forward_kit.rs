@@ -39,6 +39,7 @@ async fn broker() -> (TestBroker, Ops) {
     let b = TestBroker::new()
         .await
         .unwrap_or_else(|e| unreachable!("{e}"))
+        .with_admin(Router::new().route("/kit", get(|| async { "kit" })))
         .with_forward_transport(move |ops| {
             ops.add_admin(Router::new().route("/probe", get(|| async { "probe" })));
             *keep.lock().unwrap_or_else(PoisonError::into_inner) = Some(ops.clone());
@@ -113,6 +114,8 @@ async fn grant_documents_round_trip_and_an_admin_route_answers_under_q() {
     assert_eq!(ops.grant_docs().await.map(|d| d.len()), Ok(0));
     let (status, _, body) = send(&b.router(), "GET", "/q/probe", "a", None).await;
     assert_eq!((status, body), (StatusCode::OK, json!("probe")));
+    let (status, _, body) = send(&b.router(), "GET", "/q/kit", "a", None).await;
+    assert_eq!((status, body), (StatusCode::OK, json!("kit")));
     assert!(
         b.with_forward_transport(|ops| Arc::new(Through(ops)))
             .is_err(),

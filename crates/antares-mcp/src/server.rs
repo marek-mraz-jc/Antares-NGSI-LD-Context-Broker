@@ -264,34 +264,28 @@ impl Server {
         let subject = self.caller.subject();
         let bound = confirm::bound_to(&self.id, &subject, tool.name, &given);
         let asking = decided::asking();
-        if *asking == decided::Asking::Broken {
-            return refused("this endpoint cannot ask the person now; nothing was written").into();
-        }
         let Some(state) = request.request_state else {
-            let Some((state, nonce)) = confirm::seal(&bound) else {
-                return refused("this endpoint cannot ask the person now; nothing was written")
-                    .into();
-            };
             let message = confirm::question(tool.name, tool.op.id(), &given);
-            let params = match asking {
-                decided::Asking::Page(template) => {
-                    if !decided::ask(&nonce, &subject, &self.id, tool.name, &message) {
-                        return refused("too many questions are open; answer or let one expire, then call again").into();
-                    }
-                    ElicitRequestParams::UrlElicitationParams {
-                        meta: None,
-                        message,
-                        url: decided::page_of(template, &nonce),
-                        elicitation_id: nonce,
-                    }
+            let Some((state, nonce)) = confirm::seal(&bound).filter(|(_, nonce)| {
+                decided::opens(asking, nonce, &subject, (&self.id, tool.name, &message))
+            }) else {
+                return refused(decided::BROKEN).into();
+            };
+            let params = if let decided::Asking::Page(template) = asking {
+                ElicitRequestParams::UrlElicitationParams {
+                    meta: None,
+                    message,
+                    url: decided::page_of(template, &nonce),
+                    elicitation_id: nonce,
                 }
-                _ => ElicitRequestParams::FormElicitationParams {
+            } else {
+                ElicitRequestParams::FormElicitationParams {
                     meta: None,
                     message,
                     requested_schema: ElicitationSchema::builder()
                         .required_bool(confirm::ANSWER)
                         .build_unchecked(),
-                },
+                }
             };
             let ask = ElicitRequest::new(params);
             let asked = [(confirm::ANSWER.to_owned(), InputRequest::Elicitation(ask))];
@@ -300,23 +294,15 @@ impl Server {
         // a decline or an open question spends nothing: only an accepted
         // answer redeems the state; with a decision page only the decision
         // it recorded is an answer, never the client's
-        let answer = if let decided::Asking::Page(_) = asking {
-            match confirm::opened(&state, &bound).map(|nonce| decided::take(&nonce, &subject)) {
-                Some(decided::Found::Accepted) => Ok(()),
-                Some(decided::Found::Waiting) => Err("the person has not decided on the page yet; call again with the same requestState once they have"),
-                Some(decided::Found::Declined) => Err("the person did not confirm; nothing was written"),
-                _ => Err("the requestState does not answer this call; call the tool again without it"),
-            }
-        } else if confirm::accepted(request.input_responses.as_ref()) {
-            Ok(())
-        } else {
-            Err("the person did not confirm; nothing was written")
-        };
-        let confirmed = answer.and_then(|()| {
+        let found = matches!(asking, decided::Asking::Page(_))
+            .then(|| confirm::opened(&state, &bound).map(|n| decided::take(&n, &subject)))
+            .flatten();
+        let form_accepted = confirm::accepted(request.input_responses.as_ref());
+        let confirmed = decided::confirms(asking, found, form_accepted).and_then(|()| {
             if confirm::redeem(&state, &bound, &subject) {
                 Ok(())
             } else {
-                Err("the requestState does not answer this call; call the tool again without it")
+                Err(decided::STALE)
             }
         });
         if let Err(why) = confirmed {

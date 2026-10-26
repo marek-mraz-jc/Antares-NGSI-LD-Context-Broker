@@ -77,12 +77,12 @@ async fn create(app: &Router, person: &str, car: &Value, more: &Value) -> Value 
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{answer}");
-    answer["result"].clone()
+    answer.get("result").cloned().unwrap_or_default()
 }
 
 /// The answer's tool error text, empty when it is none.
 fn refusal(result: &Value) -> &str {
-    if result["isError"] == json!(true) {
+    if result.get("isError") == Some(&json!(true)) {
         result
             .pointer("/content/0/text")
             .and_then(Value::as_str)
@@ -136,11 +136,18 @@ async fn only_the_decision_the_page_recorded_writes() -> Result<(), String> {
 
     // the first call sends the person to the page
     let asked = create(&app, "alice", &car, &json!({})).await;
-    let ask = &asked["inputRequests"]["confirm"]["params"];
-    assert_eq!(ask["mode"], json!("url"), "{asked}");
-    let id = ask["elicitationId"].as_str().unwrap_or_default().to_owned();
-    assert_eq!(ask["url"], json!(PAGE.replace("{id}", &id)));
-    let state = asked["requestState"].clone();
+    let ask = asked
+        .pointer("/inputRequests/confirm/params")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(ask.get("mode"), Some(&json!("url")), "{asked}");
+    let id = ask
+        .get("elicitationId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(ask.get("url"), Some(&json!(PAGE.replace("{id}", &id))));
+    let state = asked.get("requestState").cloned().unwrap_or_default();
 
     // a forged client accept is no decision: nothing is written
     let forged = json!({"requestState": state,
@@ -159,7 +166,10 @@ async fn only_the_decision_the_page_recorded_writes() -> Result<(), String> {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{question}");
-    assert_eq!(question["subject"], json!({"x-jc-subject": ["alice"]}));
+    assert_eq!(
+        question.get("subject"),
+        Some(&json!({"x-jc-subject": ["alice"]}))
+    );
     assert_eq!(
         decide(&app, &id, "accept", "mallory").await,
         StatusCode::NOT_FOUND
@@ -186,8 +196,9 @@ async fn only_the_decision_the_page_recorded_writes() -> Result<(), String> {
     let other = json!({"id": "urn:ngsi-ld:Car:d2", "type": "Car",
         "speed": {"type": "Property", "value": 6}});
     let asked = create(&app, "alice", &other, &json!({})).await;
-    let id = asked["inputRequests"]["confirm"]["params"]["elicitationId"]
-        .as_str()
+    let id = asked
+        .pointer("/inputRequests/confirm/params/elicitationId")
+        .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
     assert_eq!(decide(&app, &id, "decline", "alice").await, StatusCode::OK);
@@ -195,7 +206,7 @@ async fn only_the_decision_the_page_recorded_writes() -> Result<(), String> {
         &app,
         "alice",
         &other,
-        &json!({"requestState": asked["requestState"]}),
+        &json!({"requestState": asked.get("requestState")}),
     )
     .await;
     assert!(refusal(&declined).contains("did not confirm"), "{declined}");

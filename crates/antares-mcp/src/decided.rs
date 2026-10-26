@@ -71,6 +71,53 @@ pub(crate) fn asking_of(raw: Option<&str>) -> Asking {
     }
 }
 
+/// Whether the call of `subject` may be asked now, question `id` about
+/// its view, tool and message opened when `asking` is a page: `false` for
+/// a broken page, or when the open questions or the subject's share of
+/// them are full.
+pub(crate) fn opens(
+    asking: &Asking,
+    id: &str,
+    subject: &[(String, Vec<u8>)],
+    about: (&str, &str, &str),
+) -> bool {
+    match asking {
+        Asking::Form => true,
+        Asking::Page(_) => ask_in(&QUESTIONS, id, subject, about, Instant::now()),
+        Asking::Broken => false,
+    }
+}
+
+/// Whether the retry of a write is confirmed: by the decision a page
+/// recorded for `found` (the question its `requestState` seals, `None` when
+/// it seals none), else by the client's form answer `form_accepted`; a
+/// broken page confirms nothing.
+pub(crate) fn confirms(
+    asking: &Asking,
+    found: Option<Found>,
+    form_accepted: bool,
+) -> Result<(), &'static str> {
+    const DECLINED: &str = "the person did not confirm; nothing was written";
+    match asking {
+        Asking::Form if form_accepted => Ok(()),
+        Asking::Form => Err(DECLINED),
+        Asking::Broken => Err(BROKEN),
+        Asking::Page(_) => match found {
+            Some(Found::Accepted) => Ok(()),
+            Some(Found::Waiting) => Err("the person has not decided on the page yet; call again with the same requestState once they have"),
+            Some(Found::Declined) => Err(DECLINED),
+            _ => Err(STALE),
+        },
+    }
+}
+
+/// The refusal of a write this endpoint cannot ask about.
+pub(crate) const BROKEN: &str = "this endpoint cannot ask the person now; nothing was written";
+
+/// The refusal of a `requestState` that answers no open call.
+pub(crate) const STALE: &str =
+    "the requestState does not answer this call; call the tool again without it";
+
 /// The page of question `id` under `template`.
 pub(crate) fn page_of(template: &str, id: &str) -> String {
     template.replacen(ID, id, 1)
@@ -104,7 +151,7 @@ struct Question {
 }
 
 /// What the retry of a write finds.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Found {
     Accepted,
     Declined,
@@ -114,6 +161,9 @@ pub(crate) enum Found {
     Unknown,
 }
 
+/// Subject headers and their values, as [`antares_ops::Caller::subject`] lists them.
+type Subject = Vec<(String, Vec<u8>)>;
+
 /// The open questions, by id.
 type Questions = Mutex<HashMap<String, Question>>;
 
@@ -122,24 +172,6 @@ static QUESTIONS: LazyLock<Questions> = LazyLock::new(Questions::default);
 fn locked(q: &Questions) -> std::sync::MutexGuard<'_, HashMap<String, Question>> {
     // a holder that panicked left the map whole: each change is one step
     q.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Open question `id` for the call of `subject` on `view`; `false` when
-/// the open questions, or the subject's share of them, are full.
-pub(crate) fn ask(
-    id: &str,
-    subject: &[(String, Vec<u8>)],
-    view: &str,
-    tool: &str,
-    message: &str,
-) -> bool {
-    ask_in(
-        &QUESTIONS,
-        id,
-        subject,
-        (view, tool, message),
-        Instant::now(),
-    )
 }
 
 fn ask_in(
@@ -211,7 +243,8 @@ pub fn routes() -> Router {
 /// The question's JSON: what the page shows the person, and the subject
 /// headers it checks against the person signed in.
 fn shown(id: &str, q: &Question, now: Instant) -> Value {
-    let mut subject: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+    let mut subject: std::collections::BTreeMap<&str, Vec<String>> =
+        std::collections::BTreeMap::default();
     for (name, value) in &q.subject {
         subject
             .entry(name)
@@ -247,12 +280,10 @@ fn decide(questions: &Questions, id: &str, body: &[u8], now: Instant) -> Respons
         Err(why) => return problem(StatusCode::BAD_REQUEST, why),
     };
     let mut map = locked(questions);
-    let Some(q) = map.get_mut(id).filter(|q| {
-        q.until > now
-            && by
-                .iter()
-                .all(|(name, value)| q.subject.iter().any(|(n, v)| n == name && v == value))
-    }) else {
+    let Some(q) = map
+        .get_mut(id)
+        .filter(|q| q.until > now && by.iter().all(|pair| q.subject.contains(pair)))
+    else {
         return problem(StatusCode::NOT_FOUND, "no such open question");
     };
     q.decision = Some(decision);
@@ -261,7 +292,7 @@ fn decide(questions: &Questions, id: &str, body: &[u8], now: Instant) -> Respons
 }
 
 /// The decision and the subject pairs of a decision body.
-fn parse(body: &[u8]) -> Result<(Decision, Vec<(String, Vec<u8>)>), &'static str> {
+fn parse(body: &[u8]) -> Result<(Decision, Subject), &'static str> {
     let Ok(Value::Object(body)) = serde_json::from_slice::<Value>(body) else {
         return Err("the body is no JSON object");
     };
@@ -436,6 +467,54 @@ mod tests {
     }
 
     #[test]
+    fn only_a_recorded_accept_confirms_where_a_page_decides() {
+        let page = Asking::Page("https://p/{id}".to_owned());
+        assert_eq!(confirms(&page, Some(Found::Accepted), false), Ok(()));
+        for found in [
+            Some(Found::Waiting),
+            Some(Found::Declined),
+            Some(Found::Unknown),
+            None,
+        ] {
+            assert!(confirms(&page, found, true).is_err());
+        }
+        assert_eq!(confirms(&Asking::Form, None, true), Ok(()));
+        assert!(confirms(&Asking::Form, Some(Found::Accepted), false).is_err());
+        assert_eq!(
+            confirms(&Asking::Broken, Some(Found::Accepted), true),
+            Err(BROKEN)
+        );
+        let who = person("alice");
+        assert!(opens(&Asking::Form, "f1", &who, ("v", "t", "m")));
+        assert!(!opens(&Asking::Broken, "b1", &who, ("v", "t", "m")));
+        assert!(opens(&page, "p1", &who, ("v", "t", "m")));
+        assert_eq!(take("p1", &who), Found::Waiting);
+    }
+
+    #[test]
+    fn every_open_question_counts_toward_the_whole_bound() {
+        let q = Questions::default();
+        let now = Instant::now();
+        for n in 0..MAX_OPEN {
+            let sub = format!("s{}", n / MAX_OPEN_PER_SUBJECT);
+            assert!(ask_in(
+                &q,
+                &format!("q{n}"),
+                &person(&sub),
+                ("v", "t", "m"),
+                now
+            ));
+        }
+        assert!(!ask_in(
+            &q,
+            "one-more",
+            &person("new"),
+            ("v", "t", "m"),
+            now
+        ));
+    }
+
+    #[test]
     fn the_page_reads_the_question_and_who_asked() {
         let q = Questions::default();
         let now = Instant::now();
@@ -445,9 +524,12 @@ mod tests {
             .get("n1")
             .map(|one| shown("n1", one, now))
             .unwrap_or_default();
-        assert_eq!(shown["subject"], json!({"x-jc-subject": ["alice"]}));
-        assert_eq!(shown["message"], json!("Allow?"));
-        assert_eq!(shown["decision"], Value::Null);
-        assert_eq!(shown["expiresInSeconds"], json!(TTL.as_secs()));
+        assert_eq!(
+            shown.get("subject"),
+            Some(&json!({"x-jc-subject": ["alice"]}))
+        );
+        assert_eq!(shown.get("message"), Some(&json!("Allow?")));
+        assert_eq!(shown.get("decision"), Some(&Value::Null));
+        assert_eq!(shown.get("expiresInSeconds"), Some(&json!(TTL.as_secs())));
     }
 }
