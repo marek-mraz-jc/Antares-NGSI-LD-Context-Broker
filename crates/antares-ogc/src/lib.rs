@@ -460,12 +460,21 @@ async fn write_to(
         .unwrap_or_else(Problem::reply)
 }
 
+/// The schema of `bytes` under this surface's bounds, parsed once per revision on this pod
+/// (F-ANT5-017: every request, each tile, parsed it again).
+fn parsed(
+    revision: u64,
+    bytes: &std::sync::Arc<[u8]>,
+) -> Option<std::sync::Arc<linkml_model::Model>> {
+    linkml_model::cache::read(revision, bytes, &SCHEMA_LIMITS)
+        .0
+        .ok()
+}
+
 /// The collections of the view, if its Tenant has a schema this surface reads.
-/// ponytail: parsed per request; a per-revision cache as `antares-odata` keeps when a profile
-/// shows the parse.
 fn collections(view: &ViewOps) -> Option<BTreeMap<String, Collection>> {
-    let (_, bytes) = view.schema()?;
-    let schema = linkml_model::Model::read(&bytes, &SCHEMA_LIMITS).ok()?;
+    let (revision, bytes) = view.schema()?;
+    let schema = parsed(revision, &bytes)?;
     // A view of `*` names no type; it shows the whole schema (ADR-0023 rule 12).
     let mut all = if view.shows_every_name() {
         model::build(&schema, &schema.slot_iris_by_class())
@@ -881,6 +890,21 @@ impl Here<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-ANT5-017: two requests over one revision share one parse.
+    #[test]
+    fn a_revision_is_parsed_once() {
+        let schema: &std::sync::Arc<[u8]> =
+            &br#"{"id": "https://e.org/ogc-once", "name": "s"}"#[..].into();
+        let first = parsed(9_017, schema);
+        let again = parsed(9_017, schema);
+        assert_eq!(
+            first
+                .zip(again)
+                .map(|(a, b)| std::sync::Arc::ptr_eq(&a, &b)),
+            Some(true)
+        );
+    }
 
     #[test]
     fn the_surface_names_its_endpoint() {

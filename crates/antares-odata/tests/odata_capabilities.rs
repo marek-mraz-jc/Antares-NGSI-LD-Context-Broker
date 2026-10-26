@@ -216,13 +216,10 @@ async fn odata_capabilities_true_but_engine_denies_is_403() {
     let (_b, app) = broker(true).await.expect("broker");
     let (status, xml) = send(&app, Method::GET, &format!("{ROOT}/$metadata"), None).await;
     assert_eq!(status, StatusCode::OK, "{xml}");
-    for claim in [
-        r#"<PropertyValue Property="Countable" Bool="true"/>"#,
-        r#"<PropertyValue Property="Filterable" Bool="true"/>"#,
-        r#"<PropertyValue Property="Sortable" Bool="true"/>"#,
-    ] {
-        assert!(xml.contains(claim), "{claim}: {xml}");
-    }
+    // F-ANT4-003: a caller the engine refuses every read is shown a model
+    // that names nothing it could not read (fail closed)
+    assert!(!xml.contains(r#"Name="Car""#), "{xml}");
+    assert!(!xml.contains("speed"), "{xml}");
     for path in [
         "Car",
         "Car/$count",

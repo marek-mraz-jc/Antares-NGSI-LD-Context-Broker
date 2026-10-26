@@ -19,8 +19,8 @@
 //!   from the initial filtering performed by the temporal query", so the
 //!   window belongs INSIDE the existence test.
 //! * extension leaves (superset-only, see `instance_predicate`): `!=` as
-//!   NOT-of-Eq, `[lang]`/`[*]` via the languageMap wildcard, string
-//!   ordering via `COLLATE "C"` with array pass-through.
+//!   NOT-of-Eq, `[lang]`/`[*]` via the languageMap wildcard; string
+//!   ordering stays TRUE (byte order is not the evaluator's time order).
 //! * negated existence, patterns, dotted/linked paths — TRUE (entity-level
 //!   negation over per-instance rows is not superset-safe to push; regex
 //!   dialects differ).
@@ -180,10 +180,6 @@ fn leaf(
 ///   universal quantification over arrays and p.92's datatype-mismatch-
 ///   matches both fall out of the negation; a deletion instance passes to
 ///   the evaluator (which is why the arm is never exact).
-/// * string ordering — `COLLATE "C"` byte comparison, the SQL spelling of
-///   the p.89 RFC 8259 code-unit SHALL; scalar strings compare exactly,
-///   array values pass through, non-string scalars are a datatype
-///   mismatch on both sides.
 fn instance_predicate(
     path: &QPath,
     cmp: Option<(CmpOp, &QValue)>,
@@ -236,32 +232,10 @@ fn instance_predicate(
         // existence leaves stay inexact: deletion-instance semantics differ
         return Some((l.sql, cmp.is_some()));
     }
-    if let Some((op @ (CmpOp::Gt | CmpOp::Ge | CmpOp::Lt | CmpOp::Le), QValue::Str(sv))) = cmp {
-        let o = match op {
-            CmpOp::Gt => ">",
-            CmpOp::Ge => ">=",
-            CmpOp::Lt => "<",
-            _ => "<=",
-        };
-        let mut parts = Vec::new();
-        for key in [
-            "value",
-            "object",
-            "vocab",
-            "json",
-            "valueList",
-            "objectList",
-        ] {
-            let n = first.saturating_add(binds.len());
-            binds.push(sv.clone());
-            parts.push(format!(
-                "(jsonb_typeof(qi.data->'{key}') = 'string' \
-                 AND (qi.data->>'{key}') COLLATE \"C\" {o} ${n}::text) \
-                 OR jsonb_typeof(qi.data->'{key}') = 'array'"
-            ));
-        }
-        return Some((format!("({})", parts.join(" OR ")), false));
-    }
+    // String ordering is NOT narrowed: a byte compare puts `…00.500Z`
+    // below `…00Z` (the evaluator orders temporal strings by time) and
+    // misses a typed `{"@value"}` instance, so it would drop rows `eval_q`
+    // keeps. `antares_ql::sql::cmp_filter` declines it for the same reason.
     None
 }
 
@@ -408,13 +382,26 @@ mod tests {
             c.binds
         );
         assert!(pf(r#"label[*]=="hi""#).is_some());
-        // string ordering — COLLATE "C" scalar compare + array pass-through
-        let c = pf(r#"name>"m""#).expect("compiles");
-        assert!(c.sql.contains("COLLATE \"C\" >"), "{}", c.sql);
-        assert!(c.sql.contains("= 'array'"), "{}", c.sql);
-        // all three are superset-only: never page-exact
+        // string ordering never narrows (F-ANT1-002): byte order is not
+        // the evaluator's temporal order, and a typed @value would be missed
+        for q in [
+            r#"name>"m""#,
+            r#"t>"2020-01-01T00:00:00Z""#,
+            r#"t<="2020-01-01T00:00:00Z""#,
+        ] {
+            assert!(pf(q).is_none(), "{q} must not narrow");
+        }
+        // an AND keeps the other leaf
+        let c = pf(r#"speed>25;t>"2020-01-01T00:00:00Z""#).expect("compiles");
+        assert!(!c.sql.contains("->>'value'"), "{}", c.sql);
+        assert!(
+            !c.binds.contains(&"2020-01-01T00:00:00Z".to_owned()),
+            "{:?}",
+            c.binds
+        );
+        // both remaining extensions are superset-only: never page-exact
         let r = between();
-        for q in [r#"name>"m""#, "speed!=10", r#"label[en]=="hi""#] {
+        for q in ["speed!=10", r#"label[en]=="hi""#] {
             assert!(
                 !prefilter_exact(&parse_q(q).expect("parse"), Some(&r), &ex),
                 "{q} must stay inexact"

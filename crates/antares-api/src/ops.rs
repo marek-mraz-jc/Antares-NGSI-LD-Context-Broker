@@ -706,6 +706,13 @@ pub(super) async fn tenant_purge(
                 crate::snapshots::snap_remove(&st, &tenant, id, meta).await;
             }
         }
+        // 5.13.1: a Hosted @context belongs to the Tenant that stored it.
+        // Its rows go first, while the store still lists them: this pass
+        // also drops the loader's warm copy of each, which the store purge
+        // below cannot reach (F-ANT2-004: run after it, the pass listed
+        // nothing and a Tenant recreated under the name resolved the old
+        // term mappings).
+        crate::contexts::purge_tenant(&st, &tenant).await?;
         st.temporal.purge_tenant(&tenant).await?;
         st.store.purge_tenant(&tenant).await?;
         st.known_tenants.forget(&tenant);
@@ -728,12 +735,6 @@ pub(super) async fn tenant_purge(
         Ok::<(), NgsiError>(())
     };
     if let Err(e) = run.await {
-        return ApiError::from(e).into_response();
-    }
-    // 5.13.1: a Hosted @context belongs to the Tenant that stored it, and
-    // the row carries that owner inside the document — `jsonld_contexts`
-    // has no tenant column, so the tenant-keyed purge above cannot see it.
-    if let Err(e) = crate::contexts::purge_tenant(&st, &tenant).await {
         return ApiError::from(e).into_response();
     }
     st.tenant_bytes

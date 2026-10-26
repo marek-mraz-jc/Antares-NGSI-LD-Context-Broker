@@ -587,18 +587,21 @@ impl Cx<'_> {
         let groups = match set {
             "Sensors" => {
                 let devices = self.referenced(&entities, "refDevice").await?;
-                // The Sensor of the Datastreams whose Entity names no Device, once, first.
-                let unknown =
-                    (self.opts.skip == 0).then(|| vec![mapping::unknown_sensor(&self.base)]);
-                unknown
+                let mut groups = entities.iter().map(|e| {
+                    target(&devices, mapping::object(e, "refDevice"))
+                        .and_then(|d| mapping::sensor(&self.base, d))
+                        .into_iter()
+                        .collect::<Vec<Value>>()
+                });
+                // The Sensor of the Datastreams whose Entity names no Device, once, first, in
+                // the first Entity's group: a group of its own counted as an Entity served and
+                // the next link skipped one Device (F-ANT5-004).
+                let unknown = (self.opts.skip == 0).then(|| mapping::unknown_sensor(&self.base));
+                let head: Vec<Value> = unknown
                     .into_iter()
-                    .chain(entities.iter().map(|e| {
-                        target(&devices, mapping::object(e, "refDevice"))
-                            .and_then(|d| mapping::sensor(&self.base, d))
-                            .into_iter()
-                            .collect()
-                    }))
-                    .collect()
+                    .chain(groups.next().into_iter().flatten())
+                    .collect();
+                std::iter::once(head).chain(groups).collect()
             }
             "FeaturesOfInterest" => {
                 let pois = self.referenced(&entities, "refPointOfInterest").await?;

@@ -2937,6 +2937,90 @@ mod delivery_share {
             *DELIVERY_WIDTH
         );
     }
+
+    /// F-ANT3-007: the periodic Context Source notifications take the
+    /// Tenant's share of the delivery width too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_tenant_takes_a_share_of_the_csource_delivery_width() {
+        crate::allow_private();
+        // accepts and never answers: each connection is held for the whole
+        // endpoint timeout, so the connections open at once ARE the
+        // deliveries in flight
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&opened);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                held.push(s);
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let st = AppState::new("antares-share-csub-test".into());
+        let tenant = TenantId::new("hog").expect("tenant");
+        // a periodic Context Source notification carries the matching
+        // registrations, and one with none sends nothing
+        st.store
+            .create(
+                &tenant,
+                Kind::Registration,
+                "urn:ngsi-ld:ContextSourceRegistration:share",
+                json!({
+                    "id": "urn:ngsi-ld:ContextSourceRegistration:share",
+                    "type": "ContextSourceRegistration",
+                    "information": [{"entities": [{
+                        "type": "https://uri.etsi.org/ngsi-ld/default-context/Vehicle"
+                    }]}],
+                    "endpoint": "http://127.0.0.1:9",
+                }),
+            )
+            .await
+            .expect("seed registration");
+        // more subscriptions than the whole width, so an unbounded tenant
+        // would hold every slot
+        let subs = *DELIVERY_WIDTH + *DELIVERY_WIDTH_PER_TENANT;
+        for i in 0..subs {
+            let id = format!("urn:ngsi-ld:Subscription:csub-share-{i}");
+            st.store
+                .create(
+                    &tenant,
+                    Kind::CSourceSubscription,
+                    &id,
+                    json!({
+                        "id": id,
+                        "type": "ContextSourceRegistrationSubscription",
+                        "status": "active",
+                        "timeInterval": 1,
+                        "createdAt": "2020-01-01T00:00:00Z",
+                        "entities": [{
+                            "type": "https://uri.etsi.org/ngsi-ld/default-context/Vehicle"
+                        }],
+                        // long enough that nothing in the first round has
+                        // timed out and freed its slot while this is counted
+                        "notification": {"endpoint": {
+                            "uri": format!("http://{addr}/notify"),
+                            "timeout": 30_000,
+                        }},
+                    }),
+                )
+                .await
+                .expect("seed subscription");
+        }
+        let sweep = tokio::spawn(async move { interval_tick(&st).await });
+        let settle = 400 * crate::state::slow_factor();
+        tokio::time::sleep(std::time::Duration::from_millis(settle)).await;
+        let in_flight = opened.load(std::sync::atomic::Ordering::SeqCst);
+        sweep.abort();
+        assert!(in_flight > 0, "the sweep delivered nothing at all");
+        assert!(
+            in_flight <= *DELIVERY_WIDTH_PER_TENANT,
+            "one tenant held {in_flight} of the {} delivery slots",
+            *DELIVERY_WIDTH
+        );
+    }
 }
 
 /// The drain's memo of resolved `@contexts`.

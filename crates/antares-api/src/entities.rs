@@ -1911,7 +1911,7 @@ pub async fn delete_entity(
         // the client meant, and the delete then removes an Entity the
         // client's selector excluded.
         let ctx = request_context(&st.loader, &headers).await?;
-        let pre = crate::policy::pre_image(&st, &tenant, &id, None).await;
+        let pre = crate::policy::pre_image(&st, &tenant, &id, None).await?;
         let granted = gate!(
             st, &tenant, &headers, "5.6.6",
             ids: &[&id],
@@ -2397,7 +2397,7 @@ async fn merge_entity_inner(
             ..Default::default()
         },
     )?;
-    let pre = crate::policy::pre_image(st, &tenant, id, Some(&fragment)).await;
+    let pre = crate::policy::pre_image(st, &tenant, id, Some(&fragment)).await?;
     let granted = gate!(
         st, &tenant, headers, "5.6.17",
         ids: &[id],
@@ -2798,6 +2798,17 @@ impl KeptTypes<'_> {
 
 /// JSON Merge-Patch over internal docs (5.5.12).
 pub fn merge_into(doc: &mut Value, fragment: &Value, ts: &str) {
+    merge_with(doc, fragment, ts, false);
+}
+
+/// 5.6.9 Update (5.6.3 per Entity): as [`merge_into`], but an instance the
+/// fragment names replaces the stored one whole (its `createdAt` kept), so a
+/// member the update leaves out (`unitCode`) is gone, never merged over.
+pub fn update_into(doc: &mut Value, fragment: &Value, ts: &str) {
+    merge_with(doc, fragment, ts, true);
+}
+
+fn merge_with(doc: &mut Value, fragment: &Value, ts: &str, replace: bool) {
     // The Entity as a backfill names it (T-4665): id and type, before the merge.
     let shell = serde_json::json!({"id": doc.get("id"), "type": doc.get("type")});
     let (Some(target), Some(frag)) = (doc.as_object_mut(), fragment.as_object()) else {
@@ -2865,7 +2876,21 @@ pub fn merge_into(doc: &mut Value, fragment: &Value, ts: &str) {
                         (true, None) => {}
                         (false, Some(p)) => {
                             if let Some(ci) = cur.get_mut(p) {
-                                if !crate::history::backfilled(&shell, k, ci, &fi) {
+                                if crate::history::backfilled(&shell, k, ci, &fi) {
+                                    // older than the stored one: history only
+                                } else if replace {
+                                    let created = ci.get("createdAt").cloned();
+                                    let mut ni = Value::Array(vec![fi.clone()]);
+                                    crate::stamp::stamp_instances(&mut ni, ts);
+                                    if let Some(Value::Object(mut o)) =
+                                        ni.as_array_mut().and_then(Vec::pop)
+                                    {
+                                        if let Some(c) = created {
+                                            o.insert("createdAt".into(), c);
+                                        }
+                                        *ci = Value::Object(o);
+                                    }
+                                } else {
                                     merge_instance(ci, &fi, ts);
                                 }
                             }
@@ -2987,7 +3012,7 @@ pub async fn replace_entity(
                 }),
             None => None,
         };
-        let pre = crate::policy::pre_image(&st, &tenant, &id, shown.as_ref()).await;
+        let pre = crate::policy::pre_image(&st, &tenant, &id, shown.as_ref()).await?;
         let granted = gate!(
             st, &tenant, &headers, "5.6.18",
             ids: &[&id],

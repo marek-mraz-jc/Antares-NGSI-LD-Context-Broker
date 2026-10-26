@@ -112,23 +112,28 @@ async fn parse_batch(
     // nothing — so only those are counted.
     let mut named_contexts: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut count_context = |c: &Value| -> Result<(), ApiError> {
-        if matches!(c, Value::Object(_) | Value::Null) {
-            return Ok(());
-        }
-        let key = c.to_string();
-        if named_contexts.contains(&key) {
-            return Ok(());
-        }
-        // At the ceiling nothing more is remembered either: the set is keyed
-        // by client-supplied text, so it may not grow past the cap it guards.
-        if named_contexts.len() >= crate::bounds::MAX_CONTEXT_FETCHES {
+        // an array names each of its URLs: count them one by one, inline
+        // objects fetch nothing
+        let named: std::collections::HashSet<&str> = match c {
+            Value::String(u) => std::iter::once(u.as_str()).collect(),
+            Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+            _ => std::collections::HashSet::new(),
+        };
+        let fresh: Vec<&str> = named
+            .into_iter()
+            .filter(|u| !named_contexts.contains(*u))
+            .collect();
+        // Past the ceiling nothing more is remembered either: the set is
+        // keyed by client-supplied text, so it may not grow past the cap it
+        // guards.
+        if named_contexts.len().saturating_add(fresh.len()) > crate::bounds::MAX_CONTEXT_FETCHES {
             return Err(NgsiError::BadRequestData(format!(
                 "batch names more than {} distinct @contexts",
                 crate::bounds::MAX_CONTEXT_FETCHES
             ))
             .into());
         }
-        named_contexts.insert(key);
+        named_contexts.extend(fresh.into_iter().map(str::to_owned));
         Ok(())
     };
     for item in items {

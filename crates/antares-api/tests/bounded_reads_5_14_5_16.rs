@@ -452,3 +452,36 @@ async fn clause_5_8_6_a_periodic_subscription_with_an_unparseable_q_reads_nothin
         "the sweep read the Entities for a q that matches nothing"
     );
 }
+
+/// F-ANT3-009: under bus=nats the claim stamps `lastNotification`; a stored
+/// `q` that no longer parses sends nothing, so it claims nothing either.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unparseable_q_claims_no_periodic_firing() {
+    let mut st = AppState::new("test".into());
+    st.nats = true;
+    let tenant = antares_model::TenantId::new("default").expect("tenant");
+    let id = "urn:ngsi-ld:Subscription:stale-q-claim";
+    let created = chrono::Utc::now() - chrono::Duration::seconds(10);
+    let sub = json!({"id": id, "type": "Subscription", "timeInterval": 1,
+        "createdAt": created.to_rfc3339(),
+        "entities": [{"type": "https://uri.etsi.org/ngsi-ld/default-context/Vehicle"}],
+        "q": "((",
+        "notification": {"endpoint": {"uri": "http://127.0.0.1:9/n"}}});
+    st.store
+        .create(&tenant, antares_store::Kind::Subscription, id, sub.clone())
+        .await
+        .expect("subscription row");
+    if let Some(m) = &st.sub_mirror {
+        m.apply(tenant.as_str(), id, Some(sub));
+    }
+
+    antares_api::notify::interval_tick(&st).await;
+
+    let stored = st
+        .store
+        .get(&tenant, antares_store::Kind::Subscription, id)
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(stored.pointer("/notification/lastNotification"), None);
+}

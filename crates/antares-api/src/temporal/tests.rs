@@ -1379,3 +1379,21 @@ mod t4794_held_values_scopes_and_versions {
         );
     }
 }
+
+#[cfg(test)]
+mod f_ant2_014_scope_window {
+    use super::*;
+    use serde_json::json;
+
+    /// An instance observed half a second after its scope was set lies
+    /// inside the scope's validity: the comparison is temporal, not byte
+    /// order (`…00.500Z` sorts below `…00Z` as a raw string).
+    #[test]
+    fn a_fractional_instance_after_the_scope_is_kept() {
+        let mut doc = json!({"id": "urn:e", "type": "T",
+            "scope": [{"type": "Property", "value": "/a", "observedAt": "2026-01-01T00:00:00Z"}],
+            "speed": [{"type": "Property", "value": 1, "observedAt": "2026-01-01T00:00:00.500Z"}]});
+        assert!(scope_window_retain(&mut doc, "/a", None, "observedAt"));
+        assert_eq!(doc["speed"].as_array().map(Vec::len), Some(1));
+    }
+}

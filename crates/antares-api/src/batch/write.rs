@@ -191,7 +191,7 @@ impl BatchRun<'_> {
         let Some(engine) = &st.policy else {
             return Ok(());
         };
-        let shown = self.pre_images(members(items)).await;
+        let shown = self.pre_images(members(items)).await?;
         let attrs: Vec<Vec<String>> = shown
             .iter()
             .map(|(_, _, b)| written_attrs(b.as_ref()))
@@ -237,9 +237,12 @@ impl BatchRun<'_> {
 
     /// Each member with its pre-image, from one read for every member's
     /// stored Entity and, under a view, every Relationship target the batch
-    /// names (T-4085); a store failure reads as absent, as the per-member
-    /// read did.
-    async fn pre_images(&mut self, members: Vec<(Option<String>, Option<Value>)>) -> Vec<Shown> {
+    /// names (T-4085); a store failure fails the batch (fail-closed,
+    /// F-ANT2-009), never reads as absent.
+    async fn pre_images(
+        &mut self,
+        members: Vec<(Option<String>, Option<Value>)>,
+    ) -> Result<Vec<Shown>, NgsiError> {
         let mut wanted: Vec<&str> = members.iter().filter_map(|(id, _)| id.as_deref()).collect();
         #[cfg(feature = "views")]
         if self.st.view.is_some() {
@@ -255,11 +258,7 @@ impl BatchRun<'_> {
         let stored = if wanted.is_empty() {
             HashMap::new()
         } else {
-            self.st
-                .store
-                .get_entities(&self.tenant, &wanted)
-                .await
-                .unwrap_or_default()
+            self.st.store.get_entities(&self.tenant, &wanted).await?
         };
         let shown: Vec<Shown> = members
             .into_iter()
@@ -283,7 +282,7 @@ impl BatchRun<'_> {
                 .filter(|(id, _)| !written.contains(id.as_str()))
                 .collect();
         }
-        shown
+        Ok(shown)
     }
 
     /// Expansion and validation per member, ahead of every store operation:
@@ -518,6 +517,8 @@ impl BatchRun<'_> {
                     if append_new_instances(doc, expanded, ts)? {
                         skipped.insert(id.to_owned());
                     }
+                } else if opts.mode == BatchMode::Update {
+                    crate::entities::update_into(doc, expanded, ts);
                 } else {
                     merge_into(doc, expanded, ts);
                 }
@@ -765,7 +766,13 @@ fn append_new_instances(doc: &mut Value, expanded: &Value, ts: &str) -> Result<b
         ) {
             continue;
         }
-        let incoming: Vec<Value> = v.as_array().cloned().unwrap_or_default();
+        // stamped as every other write path stamps a new instance
+        let mut incoming = v.clone();
+        crate::stamp::stamp_instances(&mut incoming, ts);
+        let incoming: Vec<Value> = match incoming {
+            Value::Array(a) => a,
+            _ => Vec::new(),
+        };
         match target.get_mut(k).and_then(Value::as_array_mut) {
             None => {
                 target.insert(k.clone(), Value::Array(incoming));
