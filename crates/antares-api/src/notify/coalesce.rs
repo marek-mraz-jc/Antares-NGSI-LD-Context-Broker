@@ -333,19 +333,48 @@ pub(super) async fn read_entities(
     }
 }
 
-/// One `get_entities` over the union of `ids`.
+/// The union of `ids` in reads of at most `chunk` ids each (F-ANT3-021):
+/// a large fan-out of folded deliveries never becomes one statement.
+fn read_batches<'a>(ids: impl Iterator<Item = &'a String>, chunk: usize) -> Vec<Vec<&'a str>> {
+    let union: std::collections::BTreeSet<&str> = ids.map(String::as_str).collect();
+    let union: Vec<&str> = union.into_iter().collect();
+    union.chunks(chunk.max(1)).map(<[&str]>::to_vec).collect()
+}
+
+/// `get_entities` over the union of `ids`, one batch at a time; a failed
+/// batch fails the whole read, since a partial map would read as deletions.
 async fn read<'a>(
     st: &AppState,
     tenant: &TenantId,
     ids: impl Iterator<Item = &'a String>,
 ) -> Option<Arc<HashMap<String, Value>>> {
-    let union: std::collections::BTreeSet<&str> = ids.map(String::as_str).collect();
-    let union: Vec<&str> = union.into_iter().collect();
-    match st.store.get_entities(tenant, &union).await {
-        Ok(found) => Some(Arc::new(found)),
-        Err(e) => {
-            tracing::warn!("notification path: reading the notified Entities failed: {e}");
-            None
+    let mut found = HashMap::new();
+    for batch in read_batches(ids, *crate::bounds::MAX_BATCH_ITEMS) {
+        match st.store.get_entities(tenant, &batch).await {
+            Ok(part) => found.extend(part),
+            Err(e) => {
+                tracing::warn!("notification path: reading the notified Entities failed: {e}");
+                return None;
+            }
         }
+    }
+    Some(Arc::new(found))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_batches;
+
+    /// 1000 asks of 256 ids each, overlapping, read as their union in
+    /// batches no larger than the chunk.
+    #[test]
+    fn a_large_union_is_read_in_bounded_batches() {
+        let asks: Vec<Vec<String>> = (0..1000)
+            .map(|a| (0..256).map(|i| format!("urn:x:{}", a * 100 + i)).collect())
+            .collect();
+        let batches = read_batches(asks.iter().flatten(), 1000);
+        assert!(batches.iter().all(|b| b.len() <= 1000));
+        let total: usize = batches.iter().map(Vec::len).sum();
+        assert_eq!(total, 999 * 100 + 256, "each id of the union once");
     }
 }

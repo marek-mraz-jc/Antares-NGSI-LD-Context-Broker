@@ -271,6 +271,9 @@ enum Client {
 struct Conn {
     client: Client,
     pump: tokio::task::JoinHandle<()>,
+    /// One `()` per PUBACK or PUBCOMP the broker sent: a connection is
+    /// checked out by one publish at a time, so the next one answers it.
+    acks: tokio::sync::mpsc::Receiver<()>,
     last_used: Instant,
 }
 
@@ -315,14 +318,22 @@ impl MqttSink {
         // one retry with a fresh connection: a pooled client whose broker
         // restarted fails the first publish; a dead broker fails both.
         for attempt in 0..2 {
-            let conn = match self.checkout(&key) {
+            let mut conn = match self.checkout(&key) {
                 Some(c) => c,
                 None => self.connect(ep, params).await?,
             };
-            let published = tokio::time::timeout(
-                self.timeout,
-                Self::publish(&conn.client, &ep.topic, params.qos, message),
-            )
+            // an ack a timed-out publish left behind answers nothing now
+            while conn.acks.try_recv().is_ok() {}
+            let (client, acks) = (&conn.client, &mut conn.acks);
+            // QoS 1 and 2 are delivered once the broker acknowledged them
+            // (PUBACK, PUBCOMP), not once rumqttc queued them (F-ANT3-022)
+            let published = tokio::time::timeout(self.timeout, async {
+                Self::publish(client, &ep.topic, params.qos, message).await?;
+                if params.qos > 0 && acks.recv().await.is_none() {
+                    return Err("connection lost before the broker acknowledged".to_owned());
+                }
+                Ok(())
+            })
             .await;
             match published {
                 Ok(Ok(())) if !conn.pump.is_finished() => {
@@ -437,10 +448,24 @@ impl MqttSink {
             .await
             .map_err(|_| refused("connect timeout".into()))?
             .map_err(refused)?;
-            let pump = tokio::spawn(async move { while eventloop.poll().await.is_ok() {} });
+            let (ack, acks) = tokio::sync::mpsc::channel(16);
+            let pump = tokio::spawn(async move {
+                while let Ok(event) = eventloop.poll().await {
+                    if matches!(
+                        event,
+                        rumqttc::v5::Event::Incoming(
+                            rumqttc::v5::mqttbytes::v5::Packet::PubAck(_)
+                                | rumqttc::v5::mqttbytes::v5::Packet::PubComp(_)
+                        )
+                    ) {
+                        let _ = ack.try_send(());
+                    }
+                }
+            });
             Ok(Conn {
                 client: Client::V5(client),
                 pump,
+                acks,
                 last_used: Instant::now(),
             })
         } else {
@@ -465,10 +490,23 @@ impl MqttSink {
             .await
             .map_err(|_| refused("connect timeout".into()))?
             .map_err(refused)?;
-            let pump = tokio::spawn(async move { while eventloop.poll().await.is_ok() {} });
+            let (ack, acks) = tokio::sync::mpsc::channel(16);
+            let pump = tokio::spawn(async move {
+                while let Ok(event) = eventloop.poll().await {
+                    if matches!(
+                        event,
+                        rumqttc::Event::Incoming(
+                            rumqttc::Packet::PubAck(_) | rumqttc::Packet::PubComp(_)
+                        )
+                    ) {
+                        let _ = ack.try_send(());
+                    }
+                }
+            });
             Ok(Conn {
                 client: Client::V3(client),
                 pump,
+                acks,
                 last_used: Instant::now(),
             })
         }
@@ -799,6 +837,63 @@ mod tests {
             std::sync::Arc::ptr_eq(&a, &b),
             "each call built a fresh trust store instead of sharing one"
         );
+    }
+
+    /// A stub MQTT 3.1.1 broker on loopback: it accepts every CONNECT and
+    /// answers a QoS 1 PUBLISH with its PUBACK only when `ack` holds.
+    async fn stub_broker(ack: bool) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        let Some(packet) = buf.get(..n).filter(|p| !p.is_empty()) else {
+                            return;
+                        };
+                        let reply: Vec<u8> = match packet.first().map(|b| b >> 4) {
+                            Some(1) => vec![0x20, 0x02, 0x00, 0x00],
+                            // header, one-byte length, topic length + topic, pkid
+                            Some(3) if ack => {
+                                let topic = usize::from(packet.get(3).copied().unwrap_or(0));
+                                let at = 4usize.saturating_add(topic);
+                                let pkid = packet.get(at..at.saturating_add(2)).unwrap_or(&[0, 1]);
+                                [&[0x40, 0x02][..], pkid].concat()
+                            }
+                            _ => continue,
+                        };
+                        if s.write_all(&reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// F-ANT3-022: a QoS 1 publish is delivered once the broker sent its
+    /// PUBACK; a broker that never acknowledges fails it within the timeout.
+    #[tokio::test]
+    async fn a_qos1_publish_waits_for_the_puback() {
+        let params = MqttParams { qos: 1, v5: false };
+        let sink = MqttSink::new(2, Duration::from_millis(300));
+        let silent = MqttEndpoint::parse(&format!("mqtt://127.0.0.1:{}/t", stub_broker(false).await))
+            .expect("parse");
+        let started = Instant::now();
+        let err = sink
+            .publish_message(&silent, params, b"{}")
+            .await
+            .expect_err("no PUBACK, no delivery");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        let acking = MqttEndpoint::parse(&format!("mqtt://127.0.0.1:{}/t", stub_broker(true).await))
+            .expect("parse");
+        sink.publish_message(&acking, params, b"{}")
+            .await
+            .expect("the PUBACK delivers");
     }
 
     /// The MQTT destination is client-supplied (`notification.endpoint.uri`,
