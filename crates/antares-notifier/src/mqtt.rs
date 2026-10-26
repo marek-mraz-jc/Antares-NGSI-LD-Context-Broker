@@ -843,7 +843,9 @@ mod tests {
     /// answers a QoS 1 PUBLISH with its PUBACK only when `ack` holds.
     async fn stub_broker(ack: bool) -> u16 {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         tokio::spawn(async move {
             while let Ok((mut s, _)) = listener.accept().await {
@@ -880,17 +882,23 @@ mod tests {
     async fn a_qos1_publish_waits_for_the_puback() {
         let params = MqttParams { qos: 1, v5: false };
         let sink = MqttSink::new(2, Duration::from_millis(300));
-        let silent = MqttEndpoint::parse(&format!("mqtt://127.0.0.1:{}/t", stub_broker(false).await))
-            .expect("parse");
+        let silent =
+            MqttEndpoint::parse(&format!("mqtt://127.0.0.1:{}/t", stub_broker(false).await))
+                .expect("parse");
         let started = Instant::now();
         let err = sink
             .publish_message(&silent, params, b"{}")
             .await
             .expect_err("no PUBACK, no delivery");
         assert!(err.to_string().contains("timed out"), "{err}");
-        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
-        let acking = MqttEndpoint::parse(&format!("mqtt://127.0.0.1:{}/t", stub_broker(true).await))
-            .expect("parse");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        let acking =
+            MqttEndpoint::parse(&format!("mqtt://127.0.0.1:{}/t", stub_broker(true).await))
+                .expect("parse");
         sink.publish_message(&acking, params, b"{}")
             .await
             .expect("the PUBACK delivers");

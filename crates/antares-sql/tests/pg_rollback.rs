@@ -91,7 +91,10 @@ async fn a_newer_compatible_migration_boots_and_a_breaking_one_stops_the_boot() 
         .expect("clean older");
     assert_eq!(
         unknown_older,
-        Err("migration 0 was previously applied but is missing in the resolved migrations".to_owned())
+        Err(
+            "migration 0 was previously applied but is missing in the resolved migrations"
+                .to_owned()
+        )
     );
 
     assert_eq!(compatible, Ok(()));
