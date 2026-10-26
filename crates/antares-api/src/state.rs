@@ -912,7 +912,33 @@ impl AppState {
             .map_err(|e| e.to_string())
     }
 
-    /// One page of Tenant `t`'s Entities of one of `types`, each holding only
+    /// Every Tenant the store knows, sorted; `None` when the store keeps
+    /// no inventory. For maintenance sweeps that must reach a Tenant no
+    /// document names any more (F-ANT4-011).
+    #[cfg(feature = "views")]
+    pub async fn tenant_names(&self) -> Option<Vec<String>> {
+        self.store.tenant_ids().await.ok()
+    }
+
+    /// The Entity types Tenant `t`'s live Entities carry, expanded and
+    /// sorted, read from the store's type list; `None` when the store keeps
+    /// none. For a surface over a view of every type (F-ANT5-010).
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn stored_type_names(
+        &self,
+        t: &antares_model::TenantId,
+    ) -> Result<Option<Vec<String>>, String> {
+        self.store
+            .entity_type_names(t)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// One page of Tenant `t`'s Entities of one of `types` (of any type when
+    /// `types` is empty), each holding only
     /// `attrs` (expanded IRIs), from match `offset` on; a store that cannot
     /// page answers every match and the page is cut here. For maintenance
     /// sweeps (T-4018): no view, no policy, no read hook.
@@ -928,10 +954,11 @@ impl AppState {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<serde_json::Value>, String> {
-        // OR-of-AND groups (4.17): one group per type, so any of them matches.
+        // OR-of-AND groups (4.17): one group per type, so any of them
+        // matches; no type at all reads every type
         let types: Vec<Vec<String>> = types.iter().map(|t| vec![t.clone()]).collect();
         let filter = antares_store::filter::EntityFilter {
-            types: Some(&types),
+            types: (!types.is_empty()).then_some(types.as_slice()),
             attrs: Some(attrs),
             page: Some(antares_store::filter::Page {
                 offset: i64::try_from(offset).unwrap_or(i64::MAX),

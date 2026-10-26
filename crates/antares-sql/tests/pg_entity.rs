@@ -1087,6 +1087,47 @@ async fn clause_4_9_a_typed_value_is_not_dropped_by_the_pushdown() {
     }
 }
 
+/// 4.22 / F-ANT1-007: `q` judges what a read may see. An Entity whose only
+/// matching instance has expired is no match, while one whose expired
+/// instance sits beside a live matching one still is.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_4_22_q_does_not_match_an_expired_instance() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let s = PgEntityStore::new(pool.clone());
+    let t = TenantId::new("pgqexpired").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let gone = "urn:ngsi-ld:Vehicle:gone";
+    let kept = "urn:ngsi-ld:Vehicle:kept";
+    let mut a = expanded(gone, "Vehicle", json!({}));
+    a[ex("speed")] = json!([{"type": "Property", "value": 20,
+                             "expiresAt": "2000-01-01T00:00:00Z"}]);
+    let mut b = expanded(kept, "Vehicle", json!({}));
+    b[ex("speed")] = json!([
+        {"type": "Property", "value": 30, "expiresAt": "2000-01-01T00:00:00Z", "datasetId": "urn:d:1"},
+        {"type": "Property", "value": 40}
+    ]);
+    for (id, d) in [(gone, a), (kept, b)] {
+        let _ = s.delete(&t, id).await;
+        assert!(s.create(&t, id, &d).await.expect("create"), "seed {id}");
+    }
+    for (term, want) in [
+        ("speed>10", vec![kept]),
+        ("speed==30", vec![]),
+        ("speed", vec![kept]),
+    ] {
+        let ast = antares_ql::parse_q(term).expect("parse");
+        let f = antares_sql::store::pg::entity::EntityFilter {
+            q: Some(&ast),
+            expand: &ex,
+            ..Default::default()
+        };
+        let out = s.query(&t, &f).await.expect("query");
+        assert!(out.decided, "{term}");
+        assert_eq!(ids_of(&out.rows), want, "{term}");
+    }
+}
+
 /// T-4610: the type list reads the `types` column, sorted and distinct, of
 /// the Tenant's live Entities alone: an expired Entity and another Tenant's
 /// add nothing, and a type an Entity carries beside another is listed.
@@ -1539,4 +1580,41 @@ async fn id_segments_and_prefixes_read_exact_byte_ranges() {
         ..Default::default()
     };
     assert!(s.query(&t, &f).await.expect("query").rows.is_empty());
+}
+
+/// F-ANT1-011: `list_slice` is never refused for volume (the driver
+/// contract): a Tenant past the undecided-row ceiling still answers a window
+/// and the exact total.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slice_of_a_tenant_past_the_ceiling_is_served() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let store = antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(
+        pool.clone(),
+    ));
+    let s = PgEntityStore::new(pool.clone());
+    let t = TenantId::new("pgslicebig").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let n = pg::entity::MAX_UNDECIDED_ROWS.saturating_add(1);
+    let items: Vec<(String, serde_json::Value)> = (0..n)
+        .map(|i| {
+            let id = format!("urn:ngsi-ld:Test:{i:06}");
+            let d = doc(&id, i);
+            (id, d)
+        })
+        .collect();
+    for chunk in items.chunks(2000) {
+        s.batch_create(&t, chunk).await.expect("seed");
+    }
+    let (rows, total) = store
+        .list_slice(&t, antares_sql::store::Kind::Entity, 10, 5)
+        .await
+        .expect("a window is never refused for volume");
+    assert_eq!(total, usize::try_from(n).expect("n"));
+    assert_eq!(
+        ids_of(&rows),
+        (10..15)
+            .map(|i| format!("urn:ngsi-ld:Test:{i:06}"))
+            .collect::<Vec<_>>()
+    );
 }

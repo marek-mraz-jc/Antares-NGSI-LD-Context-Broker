@@ -68,20 +68,22 @@ pub(crate) async fn prepare_csource_jobs(
     // client kind in the internal id namespace is a leftover of a release
     // that stored the internal ones there, and drives nothing.
     let client = read_or_warn(
-        st.store.list(tenant, Kind::CSourceSubscription).await,
+        docs_where(st, tenant, Kind::CSourceSubscription, |d| {
+            sub_str(d, "id")
+                .is_some_and(|id| crate::registry::csr_kind(id) == Kind::CSourceSubscription)
+        })
+        .await,
         "the Context Source Registration Subscriptions of a changed registration",
     )
-    .into_iter()
-    .filter(|d| {
-        sub_str(d, "id")
-            .is_some_and(|id| crate::registry::csr_kind(id) == Kind::CSourceSubscription)
-    });
+    .into_iter();
     let internal = read_or_warn(
-        st.store.list(tenant, Kind::DistSub).await,
+        docs_where(st, tenant, Kind::DistSub, |d| {
+            d.get("type").and_then(Value::as_str) == Some("Subscription")
+        })
+        .await,
         "the internal Registration Subscriptions of a changed registration",
     )
-    .into_iter()
-    .filter(|d| d.get("type").and_then(Value::as_str) == Some("Subscription"));
+    .into_iter();
     for sub in client.chain(internal) {
         if !is_active(&sub) || sub.get("timeInterval").is_some() {
             continue;
@@ -150,6 +152,41 @@ pub(super) const CSOURCE_FANOUT_WIDTH: usize = 64;
 pub(super) static CSOURCE_FANOUT: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(CSOURCE_FANOUT_WIDTH);
 
+/// The fan-out slots one tenant may hold at once (F-ANT3-006): a tenant
+/// whose CSource subscription endpoints hang keeps at most this many of the
+/// [`CSOURCE_FANOUT_WIDTH`] busy, so another tenant's registration writes
+/// still find a slot.
+pub(super) const CSOURCE_FANOUT_PER_TENANT: usize = CSOURCE_FANOUT_WIDTH / 8;
+
+type FanoutShares =
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Semaphore>>>;
+static FANOUT_SHARES: std::sync::LazyLock<FanoutShares> =
+    std::sync::LazyLock::new(FanoutShares::default);
+
+/// Both permits one fan-out holds until its sends settle: the tenant's
+/// share first, as `delivery_permits` takes it, so a tenant at its share
+/// waits there and never inside the broker's slots. A share lives only
+/// while a fan-out holds it: creating one drops every entry nothing holds,
+/// so the map is bounded by the width, not by the tenants ever seen.
+pub(super) async fn fanout_permits(tenant: &TenantId) -> impl Sized {
+    let shares = {
+        // a poisoned map is a past panic; what it holds is rebuildable
+        let mut map = FANOUT_SHARES.lock().unwrap_or_else(|p| p.into_inner());
+        match map.get(tenant.as_str()) {
+            Some(s) => std::sync::Arc::clone(s),
+            None => {
+                map.retain(|_, s| std::sync::Arc::strong_count(s) > 1);
+                let s = std::sync::Arc::new(tokio::sync::Semaphore::new(CSOURCE_FANOUT_PER_TENANT));
+                map.insert(tenant.as_str().to_owned(), std::sync::Arc::clone(&s));
+                s
+            }
+        }
+    };
+    // never closed, so acquire only fails if it were — then send unbounded
+    let share = shares.acquire_owned().await.ok();
+    (share, CSOURCE_FANOUT.acquire().await.ok())
+}
+
 /// Registration create/update/delete → prepare in the request path, send
 /// spawned (the ack must not block on the receiver), bounded as above.
 pub(crate) async fn csource_fanout(
@@ -158,8 +195,7 @@ pub(crate) async fn csource_fanout(
     before: Option<Value>,
     after: Option<Value>,
 ) {
-    // never closed, so acquire only fails if it were — then send unbounded
-    let permit = CSOURCE_FANOUT.acquire().await.ok();
+    let permit = fanout_permits(tenant).await;
     let jobs = prepare_csource_jobs(st, tenant, before, after).await;
     let (st2, t2) = (st.clone(), tenant.clone());
     crate::spawn(async move {
@@ -216,11 +252,13 @@ pub(crate) async fn csource_initial(st: &AppState, tenant: &TenantId, sub_id: &s
     let ctx = sub_context(st, tenant, &sub).await;
     let spec = crate::registry::spec_for_subscription(&sub);
     let data: Vec<Value> = read_or_warn(
-        st.store.list(tenant, Kind::Registration).await,
+        docs_where(st, tenant, Kind::Registration, |r| {
+            crate::registry::csr_matches_subscription(&sub, r, &ctx)
+        })
+        .await,
         "the registrations an initial Context Source Notification carries",
     )
     .into_iter()
-    .filter(|r| crate::registry::csr_matches_subscription(&sub, r, &ctx))
     .map(|r| {
         let mut p =
             crate::registry::present_registration(&filter_csr(&spec, &r, &ctx), &ctx, false);

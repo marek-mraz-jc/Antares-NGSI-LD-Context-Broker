@@ -238,3 +238,57 @@ async fn a_q_with_the_context_is_decided_in_the_store() {
     );
     assert_eq!(out.rows.len(), 3, "type-narrowed, unpaged");
 }
+
+/// 4.22 / F-ANT1-007: a decided `q` judges what a read may see. An Entity
+/// whose only matching instance expired is no match and is not counted; one
+/// with a live matching instance beside an expired one still is.
+#[tokio::test]
+async fn a_q_never_matches_an_expired_instance() {
+    const DC: &str = "https://uri.etsi.org/ngsi-ld/default-context";
+    let s = AnyStore::Mem(Store::default());
+    let t = TenantId::new("mempushexp").expect("tenant");
+    let gone = json!([{"type": "Property", "value": 20, "expiresAt": "2000-01-01T00:00:00Z"}]);
+    let kept = json!([
+        {"type": "Property", "value": 30, "expiresAt": "2000-01-01T00:00:00Z", "datasetId": "urn:d:1"},
+        {"type": "Property", "value": 40}
+    ]);
+    for (id, speed) in [
+        ("urn:ngsi-ld:Vehicle:gone", gone),
+        ("urn:ngsi-ld:Vehicle:kept", kept),
+    ] {
+        let doc =
+            json!({"id": id, "type": [format!("{DC}/Vehicle")], format!("{DC}/speed"): speed});
+        assert!(s.create(&t, Kind::Entity, id, doc).await.expect("create"));
+    }
+    let ctx = antares_jsonld::core_context();
+    for (term, want) in [
+        ("speed>10", vec!["urn:ngsi-ld:Vehicle:kept"]),
+        ("speed==30", vec![]),
+        ("speed==20", vec![]),
+    ] {
+        let q = antares_ql::parse_q(term).expect("q");
+        let out = s
+            .query_entities(
+                &t,
+                &EntityFilter {
+                    q: Some(&q),
+                    ctx: Some(&ctx),
+                    page: Some(Page {
+                        offset: 0,
+                        limit: 10,
+                        count: true,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("query");
+        assert!(out.decided, "{term}");
+        assert_eq!(ids(&out.rows), want, "{term}");
+        assert_eq!(
+            out.total,
+            Some(i64::try_from(want.len()).expect("len")),
+            "{term}"
+        );
+    }
+}

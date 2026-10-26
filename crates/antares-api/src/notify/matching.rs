@@ -665,6 +665,27 @@ pub(super) fn selector_ids(sub: &Value) -> Option<Vec<String>> {
 /// store could not be read looks exactly like one with nothing to send — so
 /// the failure is named and the path continues on the empty set it would
 /// have continued on anyway.
+/// Every document of `kind` in `tenant` that `keep` accepts, read a page
+/// at a time (F-ANT3-019): the whole-tenant `list` carries the client-query
+/// row ceiling (5.5.6), and past it a notification path would read nothing
+/// and send an empty or no notification. Only the kept documents are held.
+pub(crate) async fn docs_where(
+    st: &AppState,
+    tenant: &TenantId,
+    kind: Kind,
+    keep: impl Fn(&Value) -> bool,
+) -> Result<Vec<Value>, antares_model::NgsiError> {
+    let mut out = Vec::new();
+    crate::csource::walk_docs(st, tenant, kind, |doc| {
+        if keep(&doc) {
+            out.push(doc);
+        }
+        Ok(())
+    })
+    .await?;
+    Ok(out)
+}
+
 pub(super) fn read_or_warn<T>(res: Result<Vec<T>, antares_model::NgsiError>, what: &str) -> Vec<T> {
     res.unwrap_or_else(|e| {
         tracing::warn!("notification path: reading {what} failed: {e}");

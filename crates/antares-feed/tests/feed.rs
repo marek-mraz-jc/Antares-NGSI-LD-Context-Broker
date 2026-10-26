@@ -490,3 +490,27 @@ async fn a_list_of_more_than_twenty_outputs_or_a_repeated_name_serves_nobody() {
         "a broken sibling does not stop this output: {body}"
     );
 }
+
+/// F-ANT5-010: a view of every type pushes the output's types, so a Tenant
+/// holding more Entities of another type than one read may scan still
+/// serves its Events.
+#[tokio::test]
+async fn a_view_of_every_type_reads_only_the_outputs_types() {
+    let app = fixture().await;
+    let n = antares_ops::RESIDUAL_SCAN.saturating_add(1);
+    let noise: Vec<Value> = (0..n)
+        .map(|i| json!({"id": format!("urn:ngsi-ld:A:n{i:06}"), "type": "Noise"}))
+        .collect();
+    for chunk in noise.chunks(1000) {
+        let body = Value::Array(chunk.to_vec()).to_string();
+        let (status, b) = send(&app, "POST", "/ngsi-ld/v1/entityOperations/create", &body).await;
+        assert_eq!(status, StatusCode::CREATED, "{b}");
+    }
+    let (status, body) = send(&app, "GET", "/x/views/every/feed/v1/vsetky/feed.json", "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let got = ids("feed.json", &body);
+    assert!(
+        got.iter().any(|id| id.ends_with("urn:ngsi-ld:Event:e2")),
+        "{got:?}"
+    );
+}
