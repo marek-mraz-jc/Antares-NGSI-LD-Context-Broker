@@ -45,6 +45,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 pub use throttle::*;
 
+/// `notification.endpoint.uri` of a Subscription.
+pub(crate) fn endpoint_uri(sub: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
+    sub.get("notification")?
+        .get("endpoint")?
+        .get("uri")?
+        .as_str()
+}
+
 const DEFAULT_TRIGGERS: &[&str] = &["attributeCreated", "attributeUpdated"];
 /// Depth of the change→matcher queue, the same ring size the local bus uses.
 /// Held with the other published ceilings so `/q/health` reports it.

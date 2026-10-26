@@ -2025,6 +2025,63 @@ impl PolicyEngine for Slow<'_> {
     }
 }
 
+/// The most id segments a probe narrows by; past them it narrows by the
+/// literal alone.
+const MAX_ID_SEGMENTS: usize = 64;
+
+/// The exact id prefixes a rule's one id pattern forces, from the segments
+/// the Tenant's ids show ([`antares_store::filter::id_pattern_segments`]):
+/// the store reads them as ranges of an index in their own order, where the
+/// literal of [`id_narrowing`] filtered a walk of the whole type, which for
+/// a few late matches still took 10 s on dev (T-5661). `None` when the
+/// pattern does not split or the store keeps no segments.
+pub(crate) async fn id_prefixes(
+    st: &crate::state::AppState,
+    tenant: &antares_model::TenantId,
+    rule: Option<&Rule>,
+) -> Result<Option<Vec<String>>, antares_model::NgsiError> {
+    let Some(seg) =
+        rule.filter(|r| r.ids.is_empty())
+            .and_then(|r| match r.id_patterns.as_slice() {
+                [p] => antares_store::filter::id_pattern_segments(p),
+                _ => None,
+            })
+    else {
+        return Ok(None);
+    };
+    Ok(st
+        .store
+        .entity_id_segments(tenant, &seg.lead, seg.sep, MAX_ID_SEGMENTS)
+        .await?
+        .map(|segs| {
+            segs.into_iter()
+                .map(|s| format!("{s}{}", seg.tail))
+                .collect()
+        }))
+}
+
+/// The exact id prefixes every rule of `rules` forces, united: a necessary
+/// condition of the rules' OR, as [`id_prefixes`] is of one rule. A query
+/// under a dataset view whose Policy narrows by one `idPattern` walked every
+/// Entity of the type for its few matches, the regex judged per row: 10 s and
+/// the gateway's 503 for `limit=1` over 128 678 KPIs on prod (T-5787).
+/// `None` when a rule that holds for anything does not split.
+pub(crate) async fn rules_id_prefixes(
+    st: &crate::state::AppState,
+    tenant: &antares_model::TenantId,
+    rules: &[Rule],
+) -> Result<Option<Vec<String>>, antares_model::NgsiError> {
+    let mut all = Vec::new();
+    // a rule naming no type holds for nothing (`Rule::types`)
+    for rule in rules.iter().filter(|r| !r.types.is_empty()) {
+        match id_prefixes(st, tenant, Some(rule)).await? {
+            Some(ps) => all.extend(ps),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(all).filter(|a| !a.is_empty()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

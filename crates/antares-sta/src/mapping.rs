@@ -1025,23 +1025,6 @@ mod tests {
             self_link(BASE, "Things", "urn:a'b"),
             format!("{BASE}/Things('urn:a''b')")
         );
-        for (id, key) in [
-            ("urn:a/NO2#ds", "urn:a%2FNO2%23ds"),
-            ("urn:a%2FNO2", "urn:a%252FNO2"),
-            ("urn:a?b", "urn:a%3Fb"),
-            ("urn:a b", "urn:a%20b"),
-            ("urn:á", "urn:%C3%A1"),
-            ("urn:a')/../x", "urn:a''%29%2F..%2Fx"),
-        ] {
-            let link = self_link(BASE, "Datastreams", id);
-            assert_eq!(link, format!("{BASE}/Datastreams('{key}')"), "{id}");
-            // what the route does with it: decode the path once, then read the key
-            let path = link.strip_prefix(BASE).unwrap_or_default();
-            let decoded = antares_ops::percent::decoded(path).unwrap_or_default();
-            let steps = crate::query::steps(&decoded);
-            let keys: Vec<_> = steps.iter().map(|s| s.key.as_deref()).collect();
-            assert_eq!(keys, [Some(id)], "{id}: {decoded}");
-        }
         assert_eq!(object(&car(), "at"), Some("urn:ngsi-ld:Stop:1"));
         assert_eq!(object(&car(), "home"), None);
         assert!(is_uri("https://example.org/a"));

@@ -6,6 +6,7 @@
 //! winning. An Entity without a title or an `updated` time it can read is no entry, and its
 //! reason is counted (EP-126). Text is kept as text; the writers escape it.
 
+use antares_ops::outputs::is_name;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::Value;
@@ -138,38 +139,16 @@ impl Paths {
     }
 }
 
-/// The NGSI-LD query an output adds to the view's.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Filter {
-    /// An NGSI-LD `q`.
-    #[serde(default)]
-    pub q: Option<String>,
-    /// An NGSI-LD `scopeQ`.
-    #[serde(default, rename = "scopeQ")]
-    pub scope_q: Option<String>,
-    /// `georel` of a geo query.
-    #[serde(default)]
-    pub georel: Option<String>,
-    /// `geometry` of a geo query.
-    #[serde(default)]
-    pub geometry: Option<String>,
-    /// `coordinates` of a geo query.
-    #[serde(default)]
-    pub coordinates: Option<String>,
-    /// `geoproperty` of a geo query.
-    #[serde(default)]
-    pub geoproperty: Option<String>,
-}
+pub use antares_ops::outputs::Filter;
 
-impl Filter {
-    /// Whether the filter names a geo query, which a request may then not name.
-    #[must_use]
-    pub fn has_geo(&self) -> bool {
-        [&self.georel, &self.geometry, &self.coordinates]
-            .iter()
-            .any(|o| o.is_some())
-    }
+/// Whether the filter fixes the area a request may then not name: a `georel`, `geometry` or
+/// `coordinates` of its own. A `geoproperty` alone names which `GeoProperty` a request's geo
+/// query reads.
+#[must_use]
+pub fn fixes_area(filter: &Filter) -> bool {
+    [&filter.georel, &filter.geometry, &filter.coordinates]
+        .iter()
+        .any(|o| o.is_some())
 }
 
 /// An output checked: its sources' roles resolved over their presets.
@@ -204,16 +183,6 @@ fn is_slug(name: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && !name.starts_with('-')
-}
-
-/// An NGSI-LD name: a letter or `_`, then letters, digits and `_`, at most 128.
-fn is_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    name.len() <= 128
-        && chars
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// A type: a name, or an http(s) IRI.
@@ -677,8 +646,13 @@ mod tests {
     fn instances_languages_and_scalar_values_read_as_text() -> Result<(), String> {
         let p = plan(&json!({"name": "a", "sources": [{"type": "Event", "preset": "event"}]}))?;
         let filter = json!({"georel": "near;maxDistance==1"});
-        assert!(serde_json::from_value::<Filter>(filter).is_ok_and(|f| f.has_geo()));
-        assert!(!Filter::default().has_geo());
+        assert!(serde_json::from_value::<Filter>(filter).is_ok_and(|f| fixes_area(&f)));
+        assert!(!fixes_area(&Filter::default()));
+        let geoproperty = Filter {
+            geoproperty: Some("location".into()),
+            ..Filter::default()
+        };
+        assert!(!fixes_area(&geoproperty));
         let entity = json!({"id": "urn:ngsi-ld:Event:1", "type": "Event", "modifiedAt": "2026-10-01T10:00:00Z",
             "name": [{"type": "LanguageProperty", "datasetId": "urn:x", "languageMap": {"en": "Other"}},
                      {"type": "LanguageProperty", "languageMap": {"sk": "Koncert"}}],

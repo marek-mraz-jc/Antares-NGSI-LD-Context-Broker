@@ -1683,7 +1683,7 @@ pub async fn filter_entities_paged(
     // dataset view of 70 KPIs walked the Tenant's 128 678 and timed out at
     // the gateway, even for `limit=1` (T-5787). The rules still decide.
     let rule_prefixes = match rules.filter(|_| judged.is_none() && ids.is_none()) {
-        Some(f) => crate::types_attrs::rules_id_prefixes(st, tenant, &f.rules).await?,
+        Some(f) => crate::policy::rules_id_prefixes(st, tenant, &f.rules).await?,
         None => None,
     };
     'scan: loop {

@@ -54,7 +54,7 @@ pub use antares_ql::PRIMER;
 /// The residual of a standard query (ADR-0028 rule 2), re-exported so a surface compiles into
 /// it through `antares-ops` alone (rule M2).
 pub use antares_residual as residual;
-pub use error::{Refusal, CONTEXT_DETAIL, INNER_DETAIL};
+pub use error::{Problem, Refusal, CONTEXT_DETAIL, INNER_DETAIL};
 pub use operation::OperationId;
 pub use scan::{pickable, Page, Pushdown, Scanned, RESIDUAL_SCAN, TOO_COMPLEX};
 

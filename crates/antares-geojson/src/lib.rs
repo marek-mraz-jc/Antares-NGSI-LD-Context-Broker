@@ -253,13 +253,7 @@ fn plain(attribute: &Value) -> Value {
 
 /// A refusal of the surface's own, with a fixed title that never names what a view hides.
 fn problem(status: StatusCode, title: &str) -> Response {
-    let body = json!({ "title": title, "status": status.as_u16() });
-    (
-        status,
-        [(CONTENT_TYPE, "application/problem+json")],
-        body.to_string(),
-    )
-        .into_response()
+    antares_ops::Problem::new(status, title).reply()
 }
 
 /// Whether `view` shows the type `ty`.

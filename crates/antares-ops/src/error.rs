@@ -163,3 +163,68 @@ impl Refusal {
         r
     }
 }
+
+/// A feed surface's refusal (`antares-feed`, `antares-ical`): its status and a
+/// fixed message that never names what the view hides.
+#[derive(Debug)]
+pub enum Problem {
+    /// The surface's own refusal.
+    Own(StatusCode, String),
+    /// The NGSI-LD refusal of the query the surface ran.
+    Refused(Refusal),
+    /// The store's own answer to that query (a broken `q`: 400).
+    Answer(Box<Response>),
+}
+
+impl Problem {
+    /// The surface's own refusal with a fixed `title`.
+    pub fn new(status: StatusCode, title: impl Into<String>) -> Self {
+        Self::Own(status, title.into())
+    }
+
+    /// The answer: `application/problem+json` for the surface's own refusal,
+    /// [`Refusal::ngsi_ld`] for the query's, the store's answer unchanged.
+    ///
+    /// ```
+    /// use antares_ops::Problem;
+    /// use axum::http::StatusCode;
+    /// assert_eq!(Problem::new(StatusCode::NOT_FOUND, "no such feed").reply().status(), 404);
+    /// ```
+    #[must_use]
+    pub fn reply(self) -> Response {
+        match self {
+            Self::Own(status, title) => {
+                let body = serde_json::json!({ "title": title, "status": status.as_u16() });
+                (
+                    status,
+                    [(header::CONTENT_TYPE, "application/problem+json")],
+                    body.to_string(),
+                )
+                    .into_response()
+            }
+            Self::Refused(refusal) => refusal.ngsi_ld(),
+            Self::Answer(answer) => *answer,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_problem_answers_as_its_kind() {
+        let own = Problem::new(StatusCode::BAD_REQUEST, "bad limit").reply();
+        assert_eq!(own.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            own.headers()
+                .get(header::CONTENT_TYPE)
+                .map(HeaderValue::as_bytes),
+            Some(&b"application/problem+json"[..])
+        );
+        let refused = Problem::Refused(Refusal::NotFound).reply();
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+        let answer = Problem::Answer(Box::new(StatusCode::IM_A_TEAPOT.into_response())).reply();
+        assert_eq!(answer.status(), StatusCode::IM_A_TEAPOT);
+    }
+}

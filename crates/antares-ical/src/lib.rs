@@ -36,7 +36,7 @@ pub mod zone;
 
 use antares_ops::percent::{decoded, encode};
 use antares_ops::{
-    Caller, OperationId, Ops, Page, Pushdown, Refusal, Scanned, Surface, ViewOps, RESIDUAL_SCAN,
+    Caller, OperationId, Ops, Page, Problem, Pushdown, Scanned, Surface, ViewOps, RESIDUAL_SCAN,
 };
 use axum::extract::{Query, Request};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
@@ -120,38 +120,6 @@ impl Surface for Ical {
                     async move { preview(&ops, &caller, req).await }
                 }),
             )
-    }
-}
-
-/// A refusal: its status and a fixed message that never names what the view hides.
-enum Problem {
-    /// The surface's own refusal.
-    Own(StatusCode, String),
-    /// The NGSI-LD refusal of the query the feed ran.
-    Refused(Refusal),
-    /// The store's own answer to that query (a broken `q`: 400).
-    Answer(Box<Response>),
-}
-
-impl Problem {
-    fn new(status: StatusCode, title: impl Into<String>) -> Self {
-        Self::Own(status, title.into())
-    }
-
-    fn reply(self) -> Response {
-        match self {
-            Self::Own(status, title) => {
-                let body = json!({ "title": title, "status": status.as_u16() });
-                (
-                    status,
-                    [(CONTENT_TYPE, "application/problem+json")],
-                    body.to_string(),
-                )
-                    .into_response()
-            }
-            Self::Refused(refusal) => refusal.ngsi_ld(),
-            Self::Answer(answer) => *answer,
-        }
     }
 }
 

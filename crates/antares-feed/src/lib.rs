@@ -27,7 +27,7 @@ pub mod write;
 
 use antares_ops::percent::{decoded, encode};
 use antares_ops::{
-    Caller, OperationId, Ops, Page, Pushdown, Refusal, Scanned, Surface, ViewOps, RESIDUAL_SCAN,
+    Caller, OperationId, Ops, Page, Problem, Pushdown, Scanned, Surface, ViewOps, RESIDUAL_SCAN,
 };
 use axum::extract::{Query, Request};
 use axum::http::header::{
@@ -98,38 +98,6 @@ impl Surface for Feed {
                 async move { serve(&ops, &caller, req).await }
             }),
         )
-    }
-}
-
-/// A refusal: its status and a fixed message that never names what the view hides.
-enum Problem {
-    /// The surface's own refusal.
-    Own(StatusCode, String),
-    /// The NGSI-LD refusal of the query the feed ran.
-    Refused(Refusal),
-    /// The store's own answer to that query (a broken `q`: 400).
-    Answer(Box<Response>),
-}
-
-impl Problem {
-    fn new(status: StatusCode, title: impl Into<String>) -> Self {
-        Self::Own(status, title.into())
-    }
-
-    fn reply(self) -> Response {
-        match self {
-            Self::Own(status, title) => {
-                let body = json!({ "title": title, "status": status.as_u16() });
-                (
-                    status,
-                    [(CONTENT_TYPE, "application/problem+json")],
-                    body.to_string(),
-                )
-                    .into_response()
-            }
-            Self::Refused(refusal) => refusal.ngsi_ld(),
-            Self::Answer(answer) => *answer,
-        }
     }
 }
 
@@ -363,7 +331,7 @@ fn pushdown(
     let lang = get("lang").map(str::to_owned).or_else(|| plan.lang.clone());
     add("lang", lang);
     let geo_asked = GEO.iter().any(|k| asked.seen.contains_key(*k));
-    if filter.has_geo() && geo_asked {
+    if output::fixes_area(filter) && geo_asked {
         return Err(bad(
             "this feed fixes its area: leave out georel, geometry and coordinates",
         ));

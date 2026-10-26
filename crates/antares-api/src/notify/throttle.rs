@@ -471,9 +471,7 @@ pub(super) fn fold(job: LaneJob, rx: &mut tokio::sync::mpsc::Receiver<LaneJob>) 
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn tell_lost(st: &AppState, g: &Matched) {
     if let (Some(uri), Some(id)) = (
-        g.sub
-            .as_object()
-            .and_then(crate::subscriptions::endpoint_uri),
+        g.sub.as_object().and_then(super::endpoint_uri),
         g.sub.get("id").and_then(Value::as_str),
     ) {
         if let Some(sink) = st.sinks.sink_for_uri(uri) {
@@ -579,7 +577,7 @@ pub(super) async fn delivery_permits(tenant: &TenantId) -> impl Sized {
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn in_process_sink(st: &AppState, sub: &Value) -> bool {
     sub.as_object()
-        .and_then(crate::subscriptions::endpoint_uri)
+        .and_then(super::endpoint_uri)
         .is_some_and(|uri| {
             in_process(st, uri).is_some()
                 || st.sinks.sink_for_uri(uri).is_some_and(|s| !s.network())

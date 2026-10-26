@@ -172,6 +172,23 @@ fn pool_key(ep: &MqttEndpoint, params: MqttParams) -> String {
     )
 }
 
+/// The client options of one MQTT endpoint, for either protocol version
+/// (rumqttc has one options type per version, with the same setters): 30 s
+/// keep-alive, the endpoint's credentials, TLS when it is `mqtts`.
+macro_rules! options {
+    ($ty:ty, $id:expr, $dial:expr, $port:expr, $ep:expr) => {{
+        let mut opts = <$ty>::new($id, $dial, $port);
+        opts.set_keep_alive(Duration::from_secs(30));
+        if let Some(u) = &$ep.username {
+            opts.set_credentials(u, $ep.password.as_deref().unwrap_or(""));
+        }
+        if $ep.secure {
+            opts.set_transport(rumqttc::Transport::Tls(shared_tls_config()?));
+        }
+        opts
+    }};
+}
+
 /// The mqtts trust store, built ONCE per process. Loading the platform
 /// certificate store on every connect is wasted work, and rumqttc's
 /// `TlsConfiguration::default()` panics when the store is unreadable — a
@@ -425,14 +442,7 @@ impl MqttSink {
         let addr = checked_addr(&ep.host, ep.port, egress_policy(), self.timeout).await?;
         let dial = dial_host(ep, addr);
         if params.v5 {
-            let mut opts = rumqttc::v5::MqttOptions::new(id, dial, addr.port());
-            opts.set_keep_alive(Duration::from_secs(30));
-            if let Some(u) = &ep.username {
-                opts.set_credentials(u, ep.password.as_deref().unwrap_or(""));
-            }
-            if ep.secure {
-                opts.set_transport(rumqttc::Transport::Tls(shared_tls_config()?));
-            }
+            let opts = options!(rumqttc::v5::MqttOptions, id, dial, addr.port(), ep);
             let (client, mut eventloop) = rumqttc::v5::AsyncClient::new(opts, 16);
             tokio::time::timeout(self.timeout, async {
                 loop {
@@ -469,14 +479,7 @@ impl MqttSink {
                 last_used: Instant::now(),
             })
         } else {
-            let mut opts = rumqttc::MqttOptions::new(id, dial, addr.port());
-            opts.set_keep_alive(Duration::from_secs(30));
-            if let Some(u) = &ep.username {
-                opts.set_credentials(u, ep.password.as_deref().unwrap_or(""));
-            }
-            if ep.secure {
-                opts.set_transport(rumqttc::Transport::Tls(shared_tls_config()?));
-            }
+            let opts = options!(rumqttc::MqttOptions, id, dial, addr.port(), ep);
             let (client, mut eventloop) = rumqttc::AsyncClient::new(opts, 16);
             tokio::time::timeout(self.timeout, async {
                 loop {
@@ -552,14 +555,13 @@ pub async fn listen(
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let addr = checked_addr(&ep.host, ep.port, egress_policy(), timeout).await?;
-    let mut opts = rumqttc::v5::MqttOptions::new(id, dial_host(ep, addr), addr.port());
-    opts.set_keep_alive(Duration::from_secs(30));
-    if let Some(u) = &ep.username {
-        opts.set_credentials(u, ep.password.as_deref().unwrap_or(""));
-    }
-    if ep.secure {
-        opts.set_transport(rumqttc::Transport::Tls(shared_tls_config()?));
-    }
+    let opts = options!(
+        rumqttc::v5::MqttOptions,
+        id,
+        dial_host(ep, addr),
+        addr.port(),
+        ep
+    );
     let (client, mut eventloop) = rumqttc::v5::AsyncClient::new(opts, 16);
     let filter = format!("$share/{group}/{}", ep.topic);
     let refused =

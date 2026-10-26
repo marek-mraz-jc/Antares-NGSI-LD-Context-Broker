@@ -15,6 +15,7 @@
 //! Subscription. A sample that is one of those notifications is dropped, so
 //! a Channel and a Subscription on the same topic cannot loop.
 
+use crate::attrs::{Intent, INTENT};
 use crate::negotiate::{tenant_from, ApiError, ApiResult};
 use crate::state::AppState;
 use antares_model::{NgsiError, TenantId};
@@ -49,36 +50,6 @@ pub const MAX_BYTES: u32 = 65_536;
 const MAX_TOPIC: usize = 256;
 /// Samples waiting for one Channel's worker; a full queue drops the newest.
 const QUEUE: usize = 256;
-
-/// Why an in-process write runs: the bind probe decides the write and writes
-/// nothing; a relay sample notifies and stores nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Intent {
-    Bind,
-    Relay,
-}
-
-tokio::task_local! {
-    static INTENT: Intent;
-}
-
-/// The intent of the in-process write running in this task. Set only by
-/// this module around [`AppState::call`]; a request off the socket has none.
-pub(crate) fn intent() -> Option<Intent> {
-    INTENT.try_with(|i| *i).ok()
-}
-
-/// A relayed sample's change, handed to the Subscription matcher without a
-/// store write: no Entity row and no history row (ADR-0031 section 3).
-pub(crate) fn relay(st: &AppState, tenant: &TenantId, before: Value, after: Value) {
-    if let Some(flush) = &st.change_flush {
-        flush(vec![(
-            tenant.as_str().to_owned(),
-            Some(before),
-            Some(after),
-        )]);
-    }
-}
 
 /// One message a bridge received on a topic.
 #[derive(Debug, Clone, PartialEq)]

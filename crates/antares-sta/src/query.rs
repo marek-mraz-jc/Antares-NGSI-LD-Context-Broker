@@ -625,6 +625,30 @@ pub fn selected(mut item: Value, select: &[String]) -> Value {
 mod tests {
     use super::*;
 
+    /// A self link's key, percent-encoded by `mapping::self_link`, is the
+    /// key the route reads back: decode the path once, then split it.
+    #[test]
+    fn a_self_links_key_reads_back_through_the_route_steps() {
+        const BASE: &str = "http://h/x/views/v/sta/v1.1";
+        for (id, key) in [
+            ("urn:a/NO2#ds", "urn:a%2FNO2%23ds"),
+            ("urn:a%2FNO2", "urn:a%252FNO2"),
+            ("urn:a?b", "urn:a%3Fb"),
+            ("urn:a b", "urn:a%20b"),
+            ("urn:á", "urn:%C3%A1"),
+            ("urn:a')/../x", "urn:a''%29%2F..%2Fx"),
+        ] {
+            let link = crate::mapping::self_link(BASE, "Datastreams", id);
+            assert_eq!(link, format!("{BASE}/Datastreams('{key}')"), "{id}");
+            // what the route does with it: decode the path once, then read the key
+            let path = link.strip_prefix(BASE).unwrap_or_default();
+            let decoded = antares_ops::percent::decoded(path).unwrap_or_default();
+            let steps = steps(&decoded);
+            let keys: Vec<_> = steps.iter().map(|s| s.key.as_deref()).collect();
+            assert_eq!(keys, [Some(id)], "{id}: {decoded}");
+        }
+    }
+
     fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
         list.iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
