@@ -35,7 +35,9 @@ jobs:
     # same cold job peaks at 1.2 GB locally. The msrv and shared-crate jobs
     # keep the arm runner, they run fine there.
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 45, not 30: unit-junit alone takes 21-23 min, so a green run ended at
+    # ~29 min and trains 20261026-1835, -1915-2 and -2228 were cancelled at 30.
+    timeout-minutes: 45
     env: &workspace-env
       # Live PostGIS for the antares-sql integration tests — without this
       # they skip vacuously and CI proves nothing about the Pg store.
