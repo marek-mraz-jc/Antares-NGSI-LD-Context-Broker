@@ -1234,7 +1234,13 @@ fn invert_comparison(
     match d {
         Derivation::Rename => Ok(QNode::Cmp { path, op, value }),
         Derivation::UnitConversion { factor, offset } => {
+            // Eq/Ne round away the float noise of the division, so a typed
+            // 1.1 meets the stored decimal; an ordering keeps the exact
+            // quotient, whose 9-digit rounding moved the boundary to either
+            // side (factor 3, `t>1`: a source of 0.3333333331 matched)
+            let exact = matches!(op, CmpOp::Gt | CmpOp::Ge | CmpOp::Lt | CmpOp::Le);
             let back = |v: QValue| match v {
+                QValue::Num(n) if exact => Ok(QValue::Num((n - offset) / factor)),
                 QValue::Num(n) => Ok(QValue::Num(rounded((n - offset) / factor))),
                 _ => Err(NOT_COMPARABLE),
             };
