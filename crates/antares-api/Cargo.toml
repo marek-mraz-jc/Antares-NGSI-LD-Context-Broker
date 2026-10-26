@@ -126,6 +126,11 @@ name = "csource_notification_bound"
 path = "tests/csource_notification_bound.rs"
 
 [[test]]
+# own process: sets ANTARES_DISCOVERY_SCAN_MAX (F-ANT2-010)
+name = "scan_bound_rules"
+path = "tests/scan_bound_rules.rs"
+
+[[test]]
 # own process: sets ANTARES_HISTORY_BACKFILL
 name = "temporal_backfill"
 path = "tests/temporal_backfill.rs"
