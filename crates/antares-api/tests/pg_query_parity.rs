@@ -831,6 +831,26 @@ async fn temporal_q_prefilter_narrows_but_never_drops() {
                 a("speed"): [inst(prop(json!(5)), IN, "m1"), m2],
             })
         }),
+        // F-ANT1-002: a fractional stamp sorts below `…00Z` in byte order
+        // but after it in time, and a typed @value is no JSON string; the
+        // evaluator keeps both for `seen>"2026-03-01T00:00:00Z"`
+        (
+            "urn:tq:frac",
+            json!({
+                "id": "urn:tq:frac", "type": [format!("{NS}Vehicle")],
+                "createdAt": OUT, "modifiedAt": IN,
+                a("seen"): [inst(prop(json!("2026-03-01T00:00:00.500Z")), IN, "t1")],
+            }),
+        ),
+        (
+            "urn:tq:typed",
+            json!({
+                "id": "urn:tq:typed", "type": [format!("{NS}Vehicle")],
+                "createdAt": OUT, "modifiedAt": IN,
+                a("seen"): [inst(prop(json!({"@type": "DateTime",
+                                             "@value": "2027-01-01T00:00:00Z"})), IN, "t2")],
+            }),
+        ),
         // everything out-of-window: never part of any windowed result
         (
             "urn:tq:nowin",
@@ -919,12 +939,10 @@ async fn temporal_q_prefilter_narrows_but_never_drops() {
             r#"label[*]=="hi""#,
             vec!["urn:tq:fast", "urn:tq:slow", "urn:tq:nowin", "urn:tq:multi"],
         ),
-        // string ordering: COLLATE "C" byte compare (p.89 SHALL), arrays
-        // pass through to the evaluator
-        (
-            r#"name>="m""#,
-            vec!["urn:tq:fast", "urn:tq:slow", "urn:tq:nowin", "urn:tq:multi"],
-        ),
+        // string ordering never narrows (F-ANT1-002): byte order is not
+        // the evaluator's time order and misses a typed @value
+        (r#"name>="m""#, vec![]),
+        (r#"seen>"2026-03-01T00:00:00Z""#, vec![]),
         (r#"label=="hi""#, vec![]), // languageMap semantics stay in memory? superset holds either way
         ("speed==10..40", vec!["urn:tq:nowin", "urn:tq:shapes"]),
         (
