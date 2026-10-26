@@ -63,10 +63,9 @@ pub(crate) fn asking_of(raw: Option<&str>) -> Asking {
     if usable {
         Asking::Page(raw.to_owned())
     } else {
-        tracing::error!(
-            env = CONFIRM_URL_ENV,
-            "mcp decision page is no http(s) URL with one {{id}}; write tools refuse every call"
-        );
+        let why =
+            "mcp decision page is no http(s) URL with one {id}; write tools refuse every call";
+        tracing::error!(env = CONFIRM_URL_ENV, "{why}");
         Asking::Broken
     }
 }
@@ -383,6 +382,12 @@ mod tests {
             page_of(good, "abc"),
             "https://portal.example.org/mcp-confirmations/abc"
         );
+    }
+
+    #[test]
+    fn a_plain_http_page_serves_a_cluster_inside() {
+        let plain = "http://portal.local/c/{id}";
+        assert_eq!(asking_of(Some(plain)), Asking::Page(plain.to_owned()));
     }
 
     #[test]
