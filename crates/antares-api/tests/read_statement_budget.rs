@@ -172,6 +172,7 @@ async fn counted(
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[ignore = "flaky on dev: T-5502, run 40239706032 (an interval-notifier tick inside the counted window)"]
 async fn each_read_shape_sends_its_pinned_statements() {
     let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
         eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
