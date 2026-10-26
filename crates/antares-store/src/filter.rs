@@ -30,6 +30,11 @@ pub struct EntityFilter<'a> {
     /// narrows on it, the caller's regex still decides. Absent when `id=` is
     /// given (id takes precedence over idPattern).
     pub id_literal: Option<IdLiteral<'a>>,
+    /// The id starts with one of these (T-5661), a necessary condition of
+    /// the caller's id selection, which still decides. With it a store that
+    /// takes it walks the match set and `after_id` in byte order, the order
+    /// of the C-collated id index that answers the prefixes.
+    pub id_prefixes: Option<&'a [String]>,
     /// Entity Type Selection (4.17) as OR-of-AND groups, expanded IRIs
     pub types: Option<&'a [Vec<String>]>,
     /// `attrs=`: the entity must carry at least one, expanded IRIs
@@ -75,6 +80,7 @@ impl Default for EntityFilter<'_> {
         Self {
             ids: None,
             id_literal: None,
+            id_prefixes: None,
             types: None,
             attrs: None,
             q: None,
@@ -657,6 +663,81 @@ pub fn id_pattern_required(pattern: &str) -> Option<(String, bool)> {
     best
 }
 
+/// An anchored `idPattern` read as `lead`, then a run of characters none of
+/// which is `sep`, then `tail` (which starts with `sep`), as in
+/// `^urn:ngsi-ld:KPI:[a-z0-9.-]+:helsinki:stat-…`. Every id it selects
+/// starts with `lead + s + tail`, `s` being the text between `lead` and the
+/// first `sep` after it, so the few values of `s` a Tenant's ids show turn
+/// the pattern into exact id prefixes (T-5661).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdSegments {
+    /// the literal every match starts with
+    pub lead: String,
+    /// the first character of `tail`, which the run never holds
+    pub sep: char,
+    /// the literal right after the run
+    pub tail: String,
+}
+
+/// [`IdSegments`] of `pattern` read as a policy rule reads it
+/// (`^(?:pattern)$`); `None` unless its top-level sequence starts with a
+/// literal, a class or a repetition of one that excludes an ASCII `sep`,
+/// and a literal starting with `sep`.
+pub fn id_pattern_segments(pattern: &str) -> Option<IdSegments> {
+    use regex_syntax::hir::{Class, HirKind, Look};
+    let hir = regex_syntax::Parser::new()
+        .parse(&format!("^(?:{pattern})$"))
+        .ok()?;
+    let HirKind::Concat(parts) = hir.kind() else {
+        return None;
+    };
+    let mut body = parts
+        .iter()
+        .skip_while(|h| matches!(h.kind(), HirKind::Look(Look::Start)));
+    let text = |h: Option<&regex_syntax::hir::Hir>| match h.map(|h| h.kind()) {
+        Some(HirKind::Literal(l)) => std::str::from_utf8(&l.0).ok().map(str::to_owned),
+        _ => None,
+    };
+    let lead = text(body.next())?;
+    let run = body.next()?;
+    let tail = text(body.next())?;
+    let sep = tail.chars().next().filter(char::is_ascii)?;
+    let class = match run.kind() {
+        HirKind::Repetition(r) => r.sub.kind(),
+        k => k,
+    };
+    let holds_sep = match class {
+        HirKind::Class(Class::Unicode(c)) => c
+            .ranges()
+            .iter()
+            .any(|r| (r.start()..=r.end()).contains(&sep)),
+        HirKind::Class(Class::Bytes(c)) => {
+            let b = u8::try_from(sep).ok()?;
+            c.ranges()
+                .iter()
+                .any(|r| (r.start()..=r.end()).contains(&b))
+        }
+        _ => return None,
+    };
+    (!holds_sep).then_some(IdSegments { lead, sep, tail })
+}
+
+/// The least string that sorts, byte by byte, after every string starting
+/// with `prefix`; `None` when nothing does (an empty prefix, or one of
+/// `char::MAX` only). With it `[prefix, end)` is exactly the strings that
+/// start with `prefix` under `COLLATE "C"`.
+pub fn prefix_end(prefix: &str) -> Option<String> {
+    let mut s = prefix.to_owned();
+    while let Some(c) = s.pop() {
+        let next = (u32::from(c).saturating_add(1)..=u32::from(char::MAX)).find_map(char::from_u32);
+        if let Some(n) = next {
+            s.push(n);
+            return Some(s);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod id_literal_tests {
     use super::*;
@@ -752,6 +833,56 @@ mod id_literal_tests {
                     sample.contains(l.text)
                 },
                 "{p}: {sample}"
+            );
+        }
+    }
+
+    /// T-5661: a pattern's segments are exact prefixes of every id it
+    /// selects, and `prefix_end` bounds exactly the strings with a prefix.
+    #[test]
+    fn segments_split_a_pattern_at_its_first_run() {
+        let kpi = "^urn:ngsi-ld:KeyPerformanceIndicator:[a-z0-9.-]+:helsinki:stat-environment-[A-Za-z0-9._-]+$";
+        let s = id_pattern_segments(kpi).expect("segments");
+        assert_eq!(s.lead, "urn:ngsi-ld:KeyPerformanceIndicator:");
+        assert_eq!(s.sep, ':');
+        assert_eq!(s.tail, ":helsinki:stat-environment-");
+        let id = "urn:ngsi-ld:KeyPerformanceIndicator:hel.fi:helsinki:stat-environment-a1";
+        let re = regex::Regex::new(&format!("^(?:{kpi})$")).expect("re");
+        assert!(re.is_match(id));
+        let run = &id[s.lead.len()..];
+        let seg = &run[..run.find(s.sep).expect("sep")];
+        assert!(id.starts_with(&format!("{}{seg}{}", s.lead, s.tail)));
+        assert_eq!(
+            id_pattern_segments("urn:x:[a-z]:t").map(|s| s.tail),
+            Some(":t".to_owned())
+        );
+        // the run may hold the separator: no split
+        assert_eq!(id_pattern_segments("urn:x:.+:t"), None);
+        assert_eq!(id_pattern_segments("urn:x:[a-z:]+:t"), None);
+        // no literal after the run, a run first, alternation, case folding
+        assert_eq!(id_pattern_segments("urn:x:[a-z]+"), None);
+        assert_eq!(id_pattern_segments("[a-z]+:t"), None);
+        assert_eq!(id_pattern_segments("urn:(a|b):t"), None);
+        assert_eq!(id_pattern_segments("(?i)urn:[a-z]+:t"), None);
+        assert_eq!(id_pattern_segments("(unclosed"), None);
+
+        assert_eq!(prefix_end("ab:").as_deref(), Some("ab;"));
+        assert_eq!(prefix_end("a\u{10FFFF}").as_deref(), Some("b"));
+        assert_eq!(prefix_end("a\u{D7FF}").as_deref(), Some("a\u{E000}"));
+        assert_eq!(prefix_end(""), None);
+        assert_eq!(prefix_end("\u{10FFFF}"), None);
+        let end = prefix_end("ab:").expect("end");
+        for (s, inside) in [
+            ("ab:", true),
+            ("ab:\u{10FFFF}z", true),
+            ("ab;", false),
+            ("ab", false),
+            ("ab9", false),
+        ] {
+            assert_eq!(
+                s.as_bytes() >= b"ab:".as_slice() && s.as_bytes() < end.as_bytes(),
+                inside,
+                "{s}"
             );
         }
     }

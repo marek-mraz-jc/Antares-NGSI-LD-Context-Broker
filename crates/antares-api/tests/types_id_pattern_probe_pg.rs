@@ -2,7 +2,9 @@
 //! `GET /types` through a view of one type and one `idPattern` on Postgres
 //! (T-5661). The probe used to read every Entity of the type into the broker
 //! and judge the regex there: 9-10 s on dev, cut by the gateway at 10 s. It
-//! now pushes the literal the pattern forces into SQL. The guard counts the
+//! now reads the exact id prefixes the pattern forces, one per id segment
+//! the Tenant shows (`jc.example` and the decoy's `UPPER` here), as ranges
+//! of the C-collated id index; `pg_explain` pins that plan. The guard counts the
 //! Entity rows Postgres returns to the broker during the cold call, from
 //! sqlx's own `sqlx::query` events (`rows_returned`): the fixed probe gets
 //! only the decoy, the old one every KeyPerformanceIndicator up to the fold
