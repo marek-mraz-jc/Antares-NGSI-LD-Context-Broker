@@ -447,6 +447,18 @@ mod tests {
     }
 
     #[test]
+    fn every_subject_pair_the_page_names_must_be_the_askers() {
+        let q = Questions::default();
+        let now = Instant::now();
+        asked(&q, "n1", "alice", now);
+        let wider = json!({"decision": "accept",
+            "subject": {"x-jc-subject": "alice", "x-jc-group": "admins"}});
+        let answer = decide(&q, "n1", wider.to_string().as_bytes(), now);
+        assert_eq!(answer.status(), StatusCode::NOT_FOUND);
+        assert_eq!(take_in(&q, "n1", &person("alice"), now), Found::Waiting);
+    }
+
+    #[test]
     fn the_open_questions_are_bounded_per_subject() {
         let q = Questions::default();
         let now = Instant::now();

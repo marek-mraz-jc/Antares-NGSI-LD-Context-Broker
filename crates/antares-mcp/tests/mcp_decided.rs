@@ -118,10 +118,14 @@ async fn decide(app: &Router, id: &str, decision: &str, person: &str) -> StatusC
     .0
 }
 
-#[tokio::test]
-async fn only_the_decision_the_page_recorded_writes() -> Result<(), String> {
-    std::env::set_var(antares_mcp::CONFIRM_URL_ENV, PAGE);
-    std::env::set_var("ANTARES_POLICY_SUBJECT_HEADERS", "x-jc-subject");
+/// A broker with the decision page and a `writes` view of Cars; the
+/// process statics are set once, before either test reads them.
+async fn writes() -> Result<(TestBroker, Router), String> {
+    static ENV: std::sync::Once = std::sync::Once::new();
+    ENV.call_once(|| {
+        std::env::set_var(antares_mcp::CONFIRM_URL_ENV, PAGE);
+        std::env::set_var("ANTARES_POLICY_SUBJECT_HEADERS", "x-jc-subject");
+    });
     let broker = TestBroker::new()
         .await?
         .with_admin(antares_mcp::confirmations());
@@ -131,6 +135,12 @@ async fn only_the_decision_the_page_recorded_writes() -> Result<(), String> {
         "operations": ["create_entity", "query_entities"]});
     let (status, text) = send(&app, "PUT", "/q/views/writes", &[], &view).await;
     assert_eq!(status, StatusCode::CREATED, "{text}");
+    Ok((broker, app))
+}
+
+#[tokio::test]
+async fn only_the_decision_the_page_recorded_writes() -> Result<(), String> {
+    let (_broker, app) = writes().await?;
     let car = json!({"id": "urn:ngsi-ld:Car:d1", "type": "Car",
         "speed": {"type": "Property", "value": 5}});
 
@@ -211,5 +221,37 @@ async fn only_the_decision_the_page_recorded_writes() -> Result<(), String> {
     .await;
     assert!(refusal(&declined).contains("did not confirm"), "{declined}");
     assert_eq!(cars(&app).await, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_page_needs_a_client_that_opens_it_and_bounds_each_person() -> Result<(), String> {
+    let (_broker, app) = writes().await?;
+    let other = json!({"id": "urn:ngsi-ld:Car:d3", "type": "Car",
+        "speed": {"type": "Property", "value": 7}});
+
+    // a client that only asks by form cannot send the person to the page
+    let form_only = json!({"_meta": {
+        "io.modelcontextprotocol/protocolVersion": MODERN,
+        "io.modelcontextprotocol/clientInfo": {"name": "t", "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": {"elicitation": {"form": {}}}
+    }});
+    let unasked = create(&app, "carol", &other, &form_only).await;
+    assert!(
+        refusal(&unasked).contains("needs a client that can ask the person"),
+        "{unasked}"
+    );
+
+    // one subject's open questions are bounded: past them nothing is asked
+    for _ in 0..100 {
+        let open = create(&app, "bob", &other, &json!({})).await;
+        assert_eq!(refusal(&open), "", "{open}");
+    }
+    let full = create(&app, "bob", &other, &json!({})).await;
+    assert!(
+        refusal(&full).contains("cannot ask the person now"),
+        "{full}"
+    );
+    assert_eq!(cars(&app).await, 0);
     Ok(())
 }

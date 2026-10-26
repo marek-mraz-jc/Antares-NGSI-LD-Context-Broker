@@ -197,14 +197,6 @@ branches = 1
 reason = "tracing::info! repeats the fields in its `log` fallback, which runs only with no subscriber set (ws_log covers the subscriber path and asserts what it logs); and the branch where detach finds the connection taken over, see Conn::detach"
 
 [[exclusion]]
-crate = "antares-mcp"
-file = "src/server.rs"
-function = "Server::write" # v0 mangling puts the impl between the crate and the type
-lines = 1
-branches = 1
-reason = "a deployment key file or decision page that cannot be used, or a full set of open questions: the codec and the page are process statics, so a test run with a working key never reaches the refusal; confirm::codec_of's refusals and decided::opens are unit-tested"
-
-[[exclusion]]
 crate = "antares-linkml"
 file = "src/render.rs"
 function = "Cache::get" # v0 mangling puts the impl between the crate and the type
