@@ -185,3 +185,50 @@ async fn a_chain_of_forwards_past_the_depth_bound_is_cut() {
     let (status, _, body) = send(&app, "POST", "/ngsi-ld/v1/entities", "w0", Some(car)).await;
     assert_eq!(status, StatusCode::LOOP_DETECTED, "{body}");
 }
+
+/// F-ANT5-010/011: the `type=` a surface pushes. A view naming its types
+/// offers the shown ones of the wanted names, none when it shows none; a
+/// view of every type offers the Tenant's stored types of those names, and
+/// the wanted names themselves when no Entity of them is stored yet.
+#[tokio::test]
+async fn a_surface_pushes_the_stored_types_of_a_view_of_every_type() {
+    let (b, ops) = broker().await;
+    let named = json!({"id": "named", "tenant": "t0", "selector": ["Vehicle"],
+                       "rules": [{"types": ["Vehicle"], "attributes": ["speed"]}],
+                       "operations": ["query_entities"]});
+    let every = json!({"id": "every", "tenant": "t0", "selector": ["*"],
+                       "rules": [{"types": ["*"], "attributes": ["*"]}],
+                       "operations": ["query_entities"]});
+    b.store_view_doc("named", named).await.expect("stored");
+    b.store_view_doc("every", every).await.expect("stored");
+    let app = b.router();
+    for (id, ty) in [
+        ("urn:ngsi-ld:Event:1", "https://example.org/Event"),
+        ("urn:ngsi-ld:Noise:1", "Noise"),
+    ] {
+        let (status, _, body) = send(
+            &app,
+            "POST",
+            "/ngsi-ld/v1/entities",
+            "t0",
+            Some(json!({"id": id, "type": ty})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let named = ops.view("named").expect("named view");
+    assert_eq!(
+        named.type_selector(&["Vehicle"]).await.as_deref(),
+        Some("type=Vehicle")
+    );
+    assert_eq!(named.type_selector(&["Event"]).await, None);
+    let every = ops.view("every").expect("every view");
+    assert_eq!(
+        every.type_selector(&["Event"]).await.as_deref(),
+        Some("type=https%3A%2F%2Fexample.org%2FEvent")
+    );
+    assert_eq!(
+        every.type_selector(&["Article"]).await.as_deref(),
+        Some("type=Article")
+    );
+}

@@ -311,86 +311,21 @@ async fn lift_orphans(
     tenants.sort();
     tenants.dedup();
     let ts = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let attrs = [QUARANTINE_RULES.to_owned()];
     let mut out = Vec::new();
-    for tenant in tenants {
-        let Ok(t) = TenantId::new(&tenant) else {
-            continue;
-        };
+    for t in tenants.iter().filter_map(|n| TenantId::new(n).ok()) {
+        let tenant = t.as_str().to_owned();
         let current: Vec<&str> = rules
             .iter()
             .filter(|(rt, _)| *rt == t)
             .flat_map(|(_, list)| list.iter().map(|r| r.name.as_str()))
             .collect();
-        let orphaned = |doc: &Value| -> Vec<String> {
-            marked_by(doc)
-                .into_iter()
-                .filter(|n| !current.contains(&n.as_str()))
-                .collect()
+        let lifted = match lift_in(state, &t, &current, &ts).await {
+            Ok(lifted) => lifted,
+            Err(e) => {
+                tracing::warn!(tenant, error = %e, "quality sweep failed");
+                continue;
+            }
         };
-        let mut pending: Vec<String> = Vec::new();
-        for round in 0..ROUNDS {
-            let rows = match state
-                .scan_entities(&t, &[], &attrs, round.saturating_mul(PAGE), PAGE)
-                .await
-            {
-                Ok(rows) => rows,
-                Err(e) => {
-                    tracing::warn!(tenant, error = %e, "quality sweep failed");
-                    break;
-                }
-            };
-            let last = rows.len() < PAGE;
-            pending.extend(
-                rows.iter()
-                    .filter(|d| !orphaned(d).is_empty())
-                    .filter_map(|d| d.get("id").and_then(Value::as_str).map(str::to_owned)),
-            );
-            if last {
-                break;
-            }
-        }
-        let mut lifted: BTreeMap<String, u64> = BTreeMap::new();
-        for batch in pending.chunks(PAGE) {
-            // the names each Entity lost, by id: a rerun closure overwrites
-            let mut gone_by: BTreeMap<String, Vec<String>> = BTreeMap::new();
-            let written = state
-                .mutate_entities(&t, batch, |id, doc| {
-                    let gone = orphaned(doc);
-                    if gone.is_empty() {
-                        return false;
-                    }
-                    let keep: Vec<String> = marked_by(doc)
-                        .into_iter()
-                        .filter(|n| !gone.contains(n))
-                        .collect();
-                    let Some(object) = doc.as_object_mut() else {
-                        return false;
-                    };
-                    if keep.is_empty() {
-                        object.remove(QUARANTINED_AT);
-                        object.remove(QUARANTINE_RULES);
-                    } else {
-                        object.insert(QUARANTINE_RULES.to_owned(), property(&json!(keep), &ts));
-                    }
-                    gone_by.insert(id.to_owned(), gone);
-                    true
-                })
-                .await;
-            let written = match written {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::warn!(tenant, error = %e, "quality sweep failed");
-                    break;
-                }
-            };
-            for (id, _) in batch.iter().zip(written).filter(|(_, w)| *w) {
-                for name in gone_by.remove(id.as_str()).unwrap_or_default() {
-                    let n = lifted.entry(name).or_default();
-                    *n = n.saturating_add(1);
-                }
-            }
-        }
         for (rule, count) in lifted {
             metrics::counter!("antares_quality_sweep_total",
                 "tenant" => tenant.clone(), "type" => "", "rule" => rule.clone(), "outcome" => "lift")
@@ -411,6 +346,81 @@ async fn lift_orphans(
         }
     }
     out
+}
+
+/// The names in `doc`'s `quarantineRules` that none of `current` carries.
+fn orphaned(doc: &Value, current: &[&str]) -> Vec<String> {
+    marked_by(doc)
+        .into_iter()
+        .filter(|n| !current.contains(&n.as_str()))
+        .collect()
+}
+
+/// Takes the orphaned names off `doc`, stamped `ts`, and the quarantine with
+/// the last one; the names it took, empty when it changed nothing.
+fn strip_orphans(doc: &mut Value, current: &[&str], ts: &str) -> Vec<String> {
+    let gone = orphaned(doc, current);
+    let keep: Vec<String> = marked_by(doc)
+        .into_iter()
+        .filter(|n| !gone.contains(n))
+        .collect();
+    match doc.as_object_mut() {
+        Some(object) if !gone.is_empty() => {
+            if keep.is_empty() {
+                object.remove(QUARANTINED_AT);
+                object.remove(QUARANTINE_RULES);
+            } else {
+                object.insert(QUARANTINE_RULES.to_owned(), property(&json!(keep), ts));
+            }
+            gone
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// [`lift_orphans`] in one Tenant: how many Entities lost each name.
+async fn lift_in(
+    state: &AppState,
+    t: &TenantId,
+    current: &[&str],
+    ts: &str,
+) -> Result<BTreeMap<String, u64>, String> {
+    let attrs = [QUARANTINE_RULES.to_owned()];
+    let mut pending: Vec<String> = Vec::new();
+    for round in 0..ROUNDS {
+        let rows = state
+            .scan_entities(t, &[], &attrs, round.saturating_mul(PAGE), PAGE)
+            .await?;
+        let last = rows.len() < PAGE;
+        pending.extend(
+            rows.iter()
+                .filter(|d| !orphaned(d, current).is_empty())
+                .filter_map(|d| d.get("id").and_then(Value::as_str).map(str::to_owned)),
+        );
+        if last {
+            break;
+        }
+    }
+    let mut lifted: BTreeMap<String, u64> = BTreeMap::new();
+    for batch in pending.chunks(PAGE) {
+        // the names each Entity lost, by id: a rerun closure overwrites
+        let mut gone_by: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let written = state
+            .mutate_entities(t, batch, |id, doc| {
+                let gone = strip_orphans(doc, current, ts);
+                let changed = !gone.is_empty();
+                gone_by.insert(id.to_owned(), gone);
+                changed
+            })
+            .await?;
+        for (id, _) in batch.iter().zip(written).filter(|(_, w)| *w) {
+            for name in gone_by.remove(id.as_str()).unwrap_or_default() {
+                let n = lifted.entry(name).or_default();
+                *n = n.saturating_add(1);
+            }
+        }
+    }
+    Ok(lifted)
 }
 
 /// The Entities of `rule`'s types in Tenant `t` whose mark the rule would
@@ -520,6 +530,25 @@ mod tests {
 
     const V: &str = "https://e.org/Vehicle";
     const LOCATION: &str = "https://e.org/location";
+
+    /// F-ANT4-011: only names no current rule carries leave; the last one
+    /// takes the quarantine along, and a document that is no object stays.
+    #[test]
+    fn strip_orphans_takes_only_orphaned_names() {
+        let ts = "2026-10-26T00:00:00.000Z";
+        let mut doc = json!({ QUARANTINED_AT: property(&json!("x"), ts),
+            QUARANTINE_RULES: property(&json!(["a", "b"]), ts) });
+        assert_eq!(strip_orphans(&mut doc, &["a"], ts), ["b"]);
+        assert_eq!(marked_by(&doc), ["a"]);
+        assert_eq!(strip_orphans(&mut doc, &["a"], ts), Vec::<String>::new());
+        assert_eq!(strip_orphans(&mut doc, &[], ts), ["a"]);
+        assert_eq!(doc.get(QUARANTINED_AT), None);
+        assert_eq!(doc.get(QUARANTINE_RULES), None);
+        assert_eq!(
+            strip_orphans(&mut json!([1]), &[], ts),
+            Vec::<String>::new()
+        );
+    }
 
     fn rule() -> Rule {
         Rule {
