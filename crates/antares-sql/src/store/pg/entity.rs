@@ -1085,11 +1085,25 @@ impl PgEntityStore {
                 Err(w) => wheres.push(w),
             }
         }
-        // `attrs`: the entity carries at least one of them — jsonb `?|`,
-        // exactly the evaluator's `any(|a| doc.get(a).is_some())`.
+        // `attrs`: the entity holds at least one of them NOW — the
+        // evaluator's `has_live_attr` after 4.22 stripped expired instances.
+        // `?|` alone also matched an Attribute whose every instance expired.
+        // Only a row with an expired instance (`attrs_expire_at` past, rare)
+        // pays for the per-instance check, so the predicate stays decided
+        // and the page stays pushed down.
         if let Some(attrs) = f.attrs {
             binds.push(Bind::TextArr(super::storable(attrs)));
-            wheres.push(format!("entity ?| ${}", binds.len()));
+            let n = binds.len();
+            wheres.push(format!(
+                "entity ?| ${n} AND (attrs_expire_at IS NULL OR attrs_expire_at >= now() \
+                 OR EXISTS (SELECT 1 FROM unnest(${n}::text[]) AS w(a) \
+                  WHERE entity ? w.a AND (jsonb_typeof(entity -> w.a) <> 'array' \
+                   OR strpos(w.a, ':') = 0 OR jsonb_array_length(entity -> w.a) = 0 \
+                   OR EXISTS (SELECT 1 FROM jsonb_array_elements(entity -> w.a) AS i(v) \
+                    WHERE jsonb_typeof(i.v -> 'expiresAt') IS DISTINCT FROM 'string' \
+                     OR try_timestamptz(i.v ->> 'expiresAt') IS NULL \
+                     OR try_timestamptz(i.v ->> 'expiresAt') >= now()))))"
+            ));
             probes.extend(attrs_probe(tenant, attrs));
         }
         if let Some(node) = f.q {

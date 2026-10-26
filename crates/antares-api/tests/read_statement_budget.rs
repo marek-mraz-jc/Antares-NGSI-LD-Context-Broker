@@ -289,15 +289,14 @@ async fn each_read_shape_sends_its_pinned_statements() {
     assert_eq!(c.len(), 3, "statements: {c:#?}");
 
     // (d) the page with a Link to the Cached @context the warm-up fetched:
-    // two transactions of the @context write-through
-    // the hit still runs (state.rs `set_cache_writer`: `hosted_row_id`'s
-    // SELECT on jsonld_contexts, then `context_put`'s INSERT ... ON
-    // CONFLICT), each set_config ... COMMIT, then the page's own three. A
-    // warm hit should write nothing; pinned here as today's cost, the
-    // change that stops the rewrite lowers both numbers.
+    // one transaction of the @context write-through the hit still runs
+    // (state.rs `set_cache_writer`: `context_mutate`'s set_config, SELECT
+    // ... FOR UPDATE, UPDATE, COMMIT), then the page's own three. A warm hit
+    // should write nothing; pinned here as today's cost, the change that
+    // stops the rewrite lowers both numbers.
     let (body, d) = counted(&st, &log, page, &tenant, Some(&link)).await;
     assert_eq!(body.as_array().map(Vec::len), Some(20), "{body}");
-    assert_eq!(d.len(), 9, "statements: {d:#?}");
+    assert_eq!(d.len(), 7, "statements: {d:#?}");
     let context_writes: Vec<&String> = d
         .iter()
         .filter(|q| q.contains("jsonld_contexts") && !q.starts_with("SELECT"))

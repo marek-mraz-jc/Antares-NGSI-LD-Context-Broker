@@ -1083,6 +1083,15 @@ impl AnyStore {
         tenant: &TenantId,
         items: Vec<(String, Value)>,
     ) -> Result<Vec<bool>, NgsiError> {
+        // Each id once per call, on every arm: Postgres refuses an ON CONFLICT
+        // row affected twice and the memory arm would keep the last, so a
+        // repeat is the caller's bug (the API splits repeats into rounds).
+        let mut seen = std::collections::HashSet::with_capacity(items.len());
+        if let Some((id, _)) = items.iter().find(|(id, _)| !seen.insert(id.as_str())) {
+            return Err(NgsiError::InternalError(format!(
+                "batch_upsert names {id} twice"
+            )));
+        }
         match self {
             AnyStore::Mem(s) => {
                 let mut out = Vec::with_capacity(items.len());
@@ -1387,6 +1396,14 @@ impl AnyStore {
                 "@context belongs to another tenant".into(),
             ));
         }
+        // 5.13.1 names three kinds and the row's kind decides who reaches it
+        // (ADR-0021): a row without one would be Cached to Postgres and
+        // nothing at all to the memory arm.
+        if doc.get("kind").and_then(Value::as_str).is_none() {
+            return Err(NgsiError::InternalError(
+                "@context row without a kind".into(),
+            ));
+        }
         match self {
             AnyStore::Mem(s) => s.context_put(tenant, id, doc),
             #[cfg(feature = "postgres")]
@@ -1413,6 +1430,30 @@ impl AnyStore {
             AnyStore::Mem(s) => Ok(s.context_get(tenant, id)),
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => p.docs.context_get(tenant, id).await.map_err(db),
+        }
+    }
+
+    pub async fn context_mutate(
+        &self,
+        tenant: Option<&TenantId>,
+        id: &str,
+        f: antares_store::MutateFn<'_>,
+    ) -> Result<Option<Result<(), ()>>, NgsiError> {
+        // the row a closure leaves must still be one this caller may store,
+        // and keep its kind: the same two checks context_put makes
+        let guarded = move |doc: &mut Value| {
+            let kind = doc.get("kind").cloned();
+            f(doc)?;
+            if doc.get("kind") != kind.as_ref() || !antares_store::context_row_visible(doc, tenant)
+            {
+                return Err(());
+            }
+            Ok(())
+        };
+        match self {
+            AnyStore::Mem(s) => Ok(s.context_mutate(tenant, id, guarded)),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p.docs.context_mutate(tenant, id, guarded).await.map_err(db),
         }
     }
 
@@ -1867,6 +1908,14 @@ impl antares_store::CurrentStateDriver for AnyStore {
         id: &str,
     ) -> Result<Option<Value>, NgsiError> {
         AnyStore::context_get(self, tenant, id).await
+    }
+    async fn context_mutate<'a>(
+        &self,
+        tenant: Option<&TenantId>,
+        id: &str,
+        f: antares_store::MutateFn<'a>,
+    ) -> Result<Option<Result<(), ()>>, NgsiError> {
+        AnyStore::context_mutate(self, tenant, id, f).await
     }
     async fn context_delete(&self, tenant: Option<&TenantId>, id: &str) -> Result<bool, NgsiError> {
         AnyStore::context_delete(self, tenant, id).await

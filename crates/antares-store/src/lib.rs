@@ -753,6 +753,17 @@ pub trait CurrentStateDriver: Send + Sync {
         tenant: Option<&TenantId>,
         id: &str,
     ) -> Result<Option<Value>, NgsiError>;
+    /// Read-modify-write of one stored @context document under its row lock:
+    /// `None` = absent or owned by another Tenant (never an insert),
+    /// `Some(Err)` = the closure rejected and nothing was committed. A usage
+    /// bump or a refetch racing a delete must leave the row deleted, and two
+    /// racing bumps must both count (5.13.3.5).
+    async fn context_mutate<'a>(
+        &self,
+        tenant: Option<&TenantId>,
+        id: &str,
+        f: MutateFn<'a>,
+    ) -> Result<Option<Result<(), ()>>, NgsiError>;
     /// Delete a stored @context document; `false` if it was absent or owned
     /// by another Tenant.
     async fn context_delete(&self, tenant: Option<&TenantId>, id: &str) -> Result<bool, NgsiError>;
@@ -1564,6 +1575,14 @@ mod tests {
             _t: Option<&TenantId>,
             _id: &str,
         ) -> Result<Option<Value>, NgsiError> {
+            Ok(None)
+        }
+        async fn context_mutate<'a>(
+            &self,
+            _t: Option<&TenantId>,
+            _id: &str,
+            _f: MutateFn<'a>,
+        ) -> Result<Option<Result<(), ()>>, NgsiError> {
             Ok(None)
         }
         async fn context_delete(
