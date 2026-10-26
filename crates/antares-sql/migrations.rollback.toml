@@ -112,3 +112,7 @@ note = "entity_attrs and its trigger stay; an older release never reads them and
 [0026]
 rollback = "compatible"
 note = "views gains the generated digest column; an older release names its columns on INSERT and computes the digest in its own query, the same value, so it reads and writes views as before while the column stays current for the roll-forward"
+
+[0027]
+rollback = "compatible"
+note = "a new index on entities (tenant_id, id COLLATE \"C\"); an older release never names it and its writes keep it current"

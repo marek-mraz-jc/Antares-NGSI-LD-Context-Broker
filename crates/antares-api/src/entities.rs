@@ -1690,6 +1690,7 @@ pub async fn filter_entities_paged(
             } else {
                 None
             },
+            id_prefixes: None,
             types: judged.as_deref().or(type_sel.as_deref()),
             attrs: if split_agg {
                 None

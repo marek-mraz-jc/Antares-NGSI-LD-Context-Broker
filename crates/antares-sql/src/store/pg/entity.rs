@@ -522,6 +522,39 @@ fn count_sql(wheres: &[String], split: Option<&TypeSplit>) -> String {
     format!("SELECT {}", counts.join(" + "))
 }
 
+/// `id_prefixes` as SQL: the bounding byte range of every prefix, which the
+/// C-collated id index (0027) answers in its order, ANDed with the OR of
+/// each prefix's own range. Prefixes with a NUL match nothing (`storable`).
+fn prefix_ranges(prefixes: &[String], binds: &mut Vec<Bind>) -> String {
+    const C: &str = "id COLLATE \"C\"";
+    let mut ps: Vec<&String> = prefixes.iter().filter(|p| !p.contains('\0')).collect();
+    ps.sort_unstable();
+    let Some(lo) = ps.first() else {
+        return "false".to_owned();
+    };
+    let mut range = |lo: &str, hi: Option<String>| {
+        binds.push(Bind::Text(lo.to_owned()));
+        let mut sql = format!("{C} >= ${}", binds.len());
+        if let Some(hi) = hi {
+            binds.push(Bind::Text(hi));
+            sql.push_str(&format!(" AND {C} < ${}", binds.len()));
+        }
+        sql
+    };
+    // unbounded above when one prefix has no end
+    let hi_end = ps
+        .iter()
+        .map(|p| antares_store::filter::prefix_end(p))
+        .collect::<Option<Vec<_>>>()
+        .and_then(|ends| ends.into_iter().max());
+    let bound = range(lo, hi_end);
+    let each: Vec<String> = ps
+        .iter()
+        .map(|p| format!("({})", range(p, antares_store::filter::prefix_end(p))))
+        .collect();
+    format!("({bound} AND ({}))", each.join(" OR "))
+}
+
 /// The statement, split out of `query` so its pagination shape is
 /// assertable without a database. Either LIMIT/OFFSET over an exactly
 /// decided set or a `query_candidates` walk (`true`; one row past the page answers "is there a next
@@ -534,6 +567,7 @@ fn query_sql(
     split: Option<&TypeSplit>,
     page: Option<&Page>,
     decided: bool,
+    order: &str,
     binds: &mut Vec<Bind>,
 ) -> (String, bool) {
     let page = page.filter(|_| decided);
@@ -554,18 +588,22 @@ fn query_sql(
     // type walked 5 000 jsonb rows for 100).
     if let Some(p) = page.filter(|p| p.offset > 0) {
         let ids = match arms.as_slice() {
-            [w] => format!("SELECT id FROM entities WHERE {w} ORDER BY id LIMIT ${lim}{offset}"),
+            [w] => {
+                format!("SELECT id FROM entities WHERE {w} ORDER BY {order} LIMIT ${lim}{offset}")
+            }
             _ => {
                 binds.push(Bind::Int(limit.saturating_add(p.offset)));
                 let each = binds.len();
                 let parts: Vec<String> = arms
                     .iter()
                     .map(|w| {
-                        format!("(SELECT id FROM entities WHERE {w} ORDER BY id LIMIT ${each})")
+                        format!(
+                            "(SELECT id FROM entities WHERE {w} ORDER BY {order} LIMIT ${each})"
+                        )
                     })
                     .collect();
                 format!(
-                    "SELECT id FROM ({}) AS arms ORDER BY id LIMIT ${lim}{offset}",
+                    "SELECT id FROM ({}) AS arms ORDER BY {order} LIMIT ${lim}{offset}",
                     parts.join(" UNION ALL ")
                 )
             }
@@ -573,14 +611,14 @@ fn query_sql(
         return (
             format!(
                 "SELECT {select} AS entity FROM entities \
-                 WHERE tenant_id = $1 AND id IN ({ids}) ORDER BY id"
+                 WHERE tenant_id = $1 AND id IN ({ids}) ORDER BY {order}"
             ),
             true,
         );
     }
     let sql = match arms.as_slice() {
         [w] => format!(
-            "SELECT {select} AS entity FROM entities WHERE {w} ORDER BY id LIMIT ${lim}{offset}"
+            "SELECT {select} AS entity FROM entities WHERE {w} ORDER BY {order} LIMIT ${lim}{offset}"
         ),
         _ => {
             let each = match page {
@@ -593,12 +631,12 @@ fn query_sql(
             let parts: Vec<String> = arms
                 .iter()
                 .map(|w| {
-                    format!("(SELECT id, entity FROM entities WHERE {w} ORDER BY id LIMIT ${each})")
+                    format!("(SELECT id, entity FROM entities WHERE {w} ORDER BY {order} LIMIT ${each})")
                 })
                 .collect();
             format!(
                 "SELECT {select} AS entity FROM ({}) AS entities \
-                 ORDER BY id LIMIT ${lim}{offset}",
+                 ORDER BY {order} LIMIT ${lim}{offset}",
                 parts.join(" UNION ALL ")
             )
         }
@@ -872,6 +910,58 @@ impl PgEntityStore {
         self.catalogued(tenant, Some(any_of)).await
     }
 
+    /// [`antares_store::Store::entity_id_segments`] over the C-collated id
+    /// index (0027): one seek per segment, the next one past the segment's
+    /// own bound, so the cost follows the segments, not the ids (T-5661).
+    /// Expired Entities count too: a segment only narrows, never decides.
+    pub async fn id_segments(
+        &self,
+        tenant: &TenantId,
+        lead: &str,
+        sep: char,
+        max: usize,
+    ) -> Result<Option<Vec<String>>, sqlx::Error> {
+        use antares_store::filter::prefix_end;
+        let Some(end) = prefix_end(lead).filter(|_| !lead.contains('\0')) else {
+            return Ok(None);
+        };
+        let mut tx = super::begin(&self.pool).await?;
+        crate::store::pg::set_tenant(&mut tx, tenant).await?;
+        let mut from = lead.to_owned();
+        let mut out = Vec::new();
+        // a step per segment and per id that holds no `sep` after `lead`
+        for _ in 0..=max {
+            let id: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM entities WHERE tenant_id = $1
+                   AND id COLLATE \"C\" >= $2 AND id COLLATE \"C\" < $3
+                 ORDER BY id COLLATE \"C\" LIMIT 1",
+            )
+            .bind(tenant.as_str())
+            .bind(&from)
+            .bind(&end)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(id) = id else {
+                tx.commit().await?;
+                return Ok(Some(out));
+            };
+            let at = id.get(lead.len()..).and_then(|rest| rest.find(sep));
+            from = match at.map(|k| &id[..lead.len().saturating_add(k)]) {
+                Some(seg) => {
+                    out.push(seg.to_owned());
+                    match prefix_end(&format!("{seg}{sep}")) {
+                        Some(next) => next,
+                        None => break,
+                    }
+                }
+                // no id is greater than `id` and less than this one
+                None => format!("{id}\u{1}"),
+            };
+        }
+        tx.commit().await?;
+        Ok(None)
+    }
+
     /// Several Entities in one transaction (T-4085): one per id that exists,
     /// keyed by id. A write's Relationship targets are read this way, so a
     /// fragment with five Relationships costs one BEGIN, not five.
@@ -1055,10 +1145,22 @@ impl PgEntityStore {
             binds.push(Bind::TextArr(super::storable(ids)));
             wheres.push(format!("id = ANY(${})", binds.len()));
         }
+        // T-5661: exact id prefixes as byte ranges of the C-collated id
+        // index (0027). Their bounding range is that index's condition and
+        // its order the walk's, so a probe reads the range and never walks
+        // a whole type in id order for a few late matches; each prefix's
+        // own range decides.
+        let order = match f.id_prefixes {
+            Some(ps) => {
+                wheres.push(prefix_ranges(ps, &mut binds));
+                "id COLLATE \"C\""
+            }
+            None => "id",
+        };
         // keyset: the pkey (tenant_id, id) seeks straight to the next page
         if let Some(after) = f.after_id {
             binds.push(Bind::Text(after.to_owned()));
-            wheres.push(format!("id > ${}", binds.len()));
+            wheres.push(format!("{order} > ${}", binds.len()));
         }
         // 5.2.33 idPattern: the literal the regex forces is a plain string
         // test on the id column, exact as a narrowing; the regex itself stays
@@ -1212,6 +1314,7 @@ impl PgEntityStore {
             split.as_ref(),
             f.page.as_ref(),
             decided || candidates,
+            order,
             &mut binds,
         );
         // sqlx 0.9 makes dynamic SQL opt-in. The assertion holds by
@@ -2342,6 +2445,7 @@ mod tests {
             None,
             Some(&page(20, 10)),
             true,
+            "id",
             &mut binds,
         );
         assert!(paged);
@@ -2361,6 +2465,7 @@ mod tests {
             None,
             Some(&page(0, 10)),
             true,
+            "id",
             &mut binds,
         );
         assert!(
@@ -2373,6 +2478,49 @@ mod tests {
     /// T-4781: one named type reads two leakproof index arms, each in id
     /// order and bounded by what the page can need, never `types @>` alone
     /// (which RLS keeps out of every index condition).
+    /// T-5661: id prefixes are one bounding byte range ANDed with each
+    /// prefix's own, and a page over them orders by bytes, the C-collated
+    /// index's order; no prefix selects nothing.
+    #[test]
+    fn id_prefixes_are_byte_ranges_in_byte_order() {
+        let mut binds = vec![Bind::Text("t".to_owned())];
+        let ps = ["b:".to_owned(), "a:".to_owned(), "z\0".to_owned()];
+        let w = prefix_ranges(&ps, &mut binds);
+        let c = "id COLLATE \"C\"";
+        assert_eq!(
+            w,
+            format!(
+                "({c} >= $2 AND {c} < $3 AND (({c} >= $4 AND {c} < $5) OR ({c} >= $6 AND {c} < $7)))"
+            )
+        );
+        let texts: Vec<&str> = binds
+            .iter()
+            .filter_map(|b| match b {
+                Bind::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["t", "a:", "b;", "a:", "a;", "b:", "b;"]);
+        assert_eq!(prefix_ranges(&[], &mut binds), "false");
+        assert_eq!(prefix_ranges(&["\0".to_owned()], &mut binds), "false");
+        let mut binds = vec![Bind::Text("t".to_owned())];
+        let (sql, _) = query_sql(
+            "entity",
+            &["tenant_id = $1".to_owned()],
+            None,
+            Some(&page(0, 10)),
+            true,
+            c,
+            &mut binds,
+        );
+        assert_eq!(
+            sql,
+            format!(
+                "SELECT entity AS entity FROM entities WHERE tenant_id = $1 ORDER BY {c} LIMIT $2 OFFSET $3"
+            )
+        );
+    }
+
     #[test]
     fn one_type_pages_through_two_bounded_arms() {
         let mut binds = vec![Bind::Text("t".to_owned())];
@@ -2384,6 +2532,7 @@ mod tests {
             Some(&split),
             Some(&page(20, 10)),
             true,
+            "id",
             &mut binds,
         );
         assert!(paged);
@@ -2405,7 +2554,15 @@ mod tests {
         // the undecided ceiling bounds each arm and the merge alike
         let mut binds = vec![Bind::Text("t".to_owned())];
         let split = type_selection(&[vec!["T".to_owned()]], &mut binds).expect("split");
-        let (sql, paged) = query_sql("entity", &wheres(), Some(&split), None, false, &mut binds);
+        let (sql, paged) = query_sql(
+            "entity",
+            &wheres(),
+            Some(&split),
+            None,
+            false,
+            "id",
+            &mut binds,
+        );
         assert!(!paged);
         assert_eq!(sql.matches("LIMIT $5").count(), 3, "{sql}");
         assert!(!sql.contains("OFFSET"), "{sql}");
@@ -2551,7 +2708,7 @@ mod tests {
             limit: 10,
             count: false,
         };
-        let (sql, paged) = query_sql("entity", &wheres(), None, Some(&p), true, &mut binds);
+        let (sql, paged) = query_sql("entity", &wheres(), None, Some(&p), true, "id", &mut binds);
         assert!(paged);
         assert!(!sql.contains("count(*) OVER ()"), "{sql}");
         assert!(sql.contains("LIMIT $2 OFFSET $3"), "{sql}");
@@ -2573,7 +2730,7 @@ mod tests {
             limit: i64::MAX,
             count: false,
         };
-        let (sql, paged) = query_sql("entity", &wheres(), None, Some(&p), true, &mut binds);
+        let (sql, paged) = query_sql("entity", &wheres(), None, Some(&p), true, "id", &mut binds);
         assert!(paged);
         assert!(sql.contains("LIMIT $2"), "{sql}");
         assert!(
@@ -2595,6 +2752,7 @@ mod tests {
             None,
             Some(&page(20, 10)),
             false,
+            "id",
             &mut binds,
         );
         assert!(!paged);
@@ -2612,13 +2770,13 @@ mod tests {
     #[test]
     fn a_query_without_a_page_falls_back_to_the_ceiling() {
         let mut binds = vec![Bind::Text("t".to_owned())];
-        let (sql, paged) = query_sql("entity", &wheres(), None, None, false, &mut binds);
+        let (sql, paged) = query_sql("entity", &wheres(), None, None, false, "id", &mut binds);
         assert!(!paged);
         assert!(sql.contains("LIMIT $2"), "{sql}");
         assert!(matches!(binds[1], Bind::Int(MAX_UNDECIDED_ROWS)));
         // an exactly decided query with no page is materialized whole too
         let mut binds = vec![Bind::Text("t".to_owned())];
-        let (sql, _) = query_sql("entity", &wheres(), None, None, true, &mut binds);
+        let (sql, _) = query_sql("entity", &wheres(), None, None, true, "id", &mut binds);
         assert!(sql.contains("LIMIT $2"), "{sql}");
     }
 
