@@ -630,6 +630,41 @@ fn id_narrowing(rule: Option<&crate::policy::Rule>) -> (Option<Vec<&str>>, Optio
     }
 }
 
+/// The most id segments a probe narrows by; past them it narrows by the
+/// literal alone.
+const MAX_ID_SEGMENTS: usize = 64;
+
+/// The exact id prefixes a rule's one id pattern forces, from the segments
+/// the Tenant's ids show ([`antares_store::filter::id_pattern_segments`]):
+/// the store reads them as ranges of an index in their own order, where the
+/// literal of [`id_narrowing`] filtered a walk of the whole type, which for
+/// a few late matches still took 10 s on dev (T-5661). `None` when the
+/// pattern does not split or the store keeps no segments.
+async fn id_prefixes(
+    st: &AppState,
+    tenant: &antares_model::TenantId,
+    rule: Option<&crate::policy::Rule>,
+) -> Result<Option<Vec<String>>, NgsiError> {
+    let Some(seg) =
+        rule.filter(|r| r.ids.is_empty())
+            .and_then(|r| match r.id_patterns.as_slice() {
+                [p] => antares_store::filter::id_pattern_segments(p),
+                _ => None,
+            })
+    else {
+        return Ok(None);
+    };
+    Ok(st
+        .store
+        .entity_id_segments(tenant, &seg.lead, seg.sep, MAX_ID_SEGMENTS)
+        .await?
+        .map(|segs| {
+            segs.into_iter()
+                .map(|s| format!("{s}{}", seg.tail))
+                .collect()
+        }))
+}
+
 /// One probe of [`first_visible`] up to `max` Entities read: [`PROBE_PAGE`]
 /// first, then [`SCAN_PAGE`] at a time by keyset, so a walk for an
 /// Attribute few Entities carry reads each Entity once (T-4934).
@@ -645,6 +680,7 @@ async fn probe(
     let expand = |t: &str| ctx.expand_key(t);
     let attrs: Vec<String> = one.attr.into_iter().map(str::to_owned).collect();
     let (ids, literal) = id_narrowing(one.rule);
+    let prefixes = id_prefixes(st, tenant, one.rule).await?;
     let mut read = 0usize;
     let mut last: Option<String> = None;
     let mut head: Option<String> = None;
@@ -660,6 +696,7 @@ async fn probe(
                     text,
                     anchored: *anchored,
                 }),
+            id_prefixes: prefixes.as_deref(),
             types: Some(one.groups),
             attrs: one.attr.map(|_| &attrs[..]),
             q: one.rule.and_then(|r| r.q.as_deref()),

@@ -1439,3 +1439,104 @@ async fn a_one_type_page_merges_both_arms_in_id_order_with_the_exact_count() {
     assert_eq!(ids(&out), ["urn:ngsi-ld:X:3", "urn:ngsi-ld:X:4"]);
     assert_eq!(out.total, Some(5), "uncounted: one past the page");
 }
+
+/// T-5661: `id_segments` lists each distinct segment after the lead once,
+/// in byte order, from this Tenant only, and gives up past `max`;
+/// `id_prefixes` keeps exactly the ids with one of the prefixes and walks
+/// them, keyset included, in byte order.
+#[tokio::test(flavor = "multi_thread")]
+async fn id_segments_and_prefixes_read_exact_byte_ranges() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let s = PgEntityStore::new(pool.clone());
+    let t = TenantId::new("pgsegments").expect("tenant");
+    let other = TenantId::new("pgsegments-other").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    pg::ensure_tenant(&pool, &other).await.expect("tenant row");
+    let lead = "urn:ngsi-ld:Kpi:";
+    let ids = [
+        "urn:ngsi-ld:Kpi:b.org:hel:env-1",
+        "urn:ngsi-ld:Kpi:b.org:hel:env-2",
+        "urn:ngsi-ld:Kpi:b.org:hel:serv-1",
+        "urn:ngsi-ld:Kpi:a+b:hel:env-3",
+        "urn:ngsi-ld:Kpi:a",
+        "urn:ngsi-ld:Kpi:a-c:hel:env-4",
+        "urn:ngsi-ld:Kpj:z:hel:env-5",
+        "urn:ngsi-ld:Room:b.org:hel:env-6",
+    ];
+    for id in ids {
+        let _ = s.delete(&t, id).await;
+        assert!(
+            s.create(&t, id, &expanded(id, "Kpi", json!({})))
+                .await
+                .expect("create"),
+            "seed {id}"
+        );
+    }
+    let alien = "urn:ngsi-ld:Kpi:alien:hel:env-7";
+    let _ = s.delete(&other, alien).await;
+    assert!(s
+        .create(&other, alien, &expanded(alien, "Kpi", json!({})))
+        .await
+        .expect("create"));
+
+    let segs = s.id_segments(&t, lead, ':', 10).await.expect("segments");
+    let want = [
+        "urn:ngsi-ld:Kpi:a+b",
+        "urn:ngsi-ld:Kpi:a-c",
+        "urn:ngsi-ld:Kpi:b.org",
+    ];
+    assert_eq!(segs.as_deref(), Some(&want.map(str::to_owned)[..]));
+    // three segments and one id without a separator are four steps
+    assert_eq!(
+        s.id_segments(&t, lead, ':', 3).await.expect("segments"),
+        None
+    );
+    assert_eq!(
+        s.id_segments(&t, "urn:ngsi-ld:Nothing:", ':', 3)
+            .await
+            .expect("segments"),
+        Some(Vec::new())
+    );
+
+    let ex = |t: &str| t.to_owned();
+    let prefixes: Vec<String> = want.iter().map(|p| format!("{p}:hel:env-")).collect();
+    let query = |after: Option<&'static str>| {
+        let prefixes = &prefixes;
+        let s = &s;
+        let t = &t;
+        let ex = &ex;
+        async move {
+            let f = antares_sql::store::pg::entity::EntityFilter {
+                id_prefixes: Some(prefixes),
+                after_id: after,
+                expand: ex,
+                ..Default::default()
+            };
+            ids_of(&s.query(t, &f).await.expect("query").rows)
+        }
+    };
+    assert_eq!(
+        query(None).await,
+        [
+            "urn:ngsi-ld:Kpi:a+b:hel:env-3",
+            "urn:ngsi-ld:Kpi:a-c:hel:env-4",
+            "urn:ngsi-ld:Kpi:b.org:hel:env-1",
+            "urn:ngsi-ld:Kpi:b.org:hel:env-2",
+        ]
+    );
+    assert_eq!(
+        query(Some("urn:ngsi-ld:Kpi:a-c:hel:env-4")).await,
+        [
+            "urn:ngsi-ld:Kpi:b.org:hel:env-1",
+            "urn:ngsi-ld:Kpi:b.org:hel:env-2"
+        ]
+    );
+    let none: [String; 0] = [];
+    let f = antares_sql::store::pg::entity::EntityFilter {
+        id_prefixes: Some(&none),
+        expand: &ex,
+        ..Default::default()
+    };
+    assert!(s.query(&t, &f).await.expect("query").rows.is_empty());
+}

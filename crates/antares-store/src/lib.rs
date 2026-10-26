@@ -569,6 +569,22 @@ pub trait CurrentStateDriver: Send + Sync {
         let _ = (tenant, any_of);
         Ok(None)
     }
+    /// Each distinct `lead + s` the Tenant's ids start with, `s` being the
+    /// text after `lead` up to the first `sep` (an id without one stands
+    /// for itself), sorted by bytes (T-5661): with
+    /// [`filter::id_pattern_segments`] they turn an id pattern into exact
+    /// prefixes. `None` when the backend has no such read or more than
+    /// `max` exist.
+    async fn entity_id_segments(
+        &self,
+        tenant: &TenantId,
+        lead: &str,
+        sep: char,
+        max: usize,
+    ) -> Result<Option<Vec<String>>, NgsiError> {
+        let _ = (tenant, lead, sep, max);
+        Ok(None)
+    }
     /// The (type, member name) pairs the Tenant's Entities carry, sorted
     /// (T-4934): `/types` with details and `/attributes` probe these instead
     /// of folding every Entity. The list may name a pair no live Entity

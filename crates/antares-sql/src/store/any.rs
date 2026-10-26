@@ -876,6 +876,29 @@ impl AnyStore {
         }
     }
 
+    /// The id segments the Pg arm reads by its C-collated id index
+    /// (T-5661); the memory arm keeps none and its probes narrow by literal.
+    pub async fn entity_id_segments(
+        &self,
+        tenant: &TenantId,
+        lead: &str,
+        sep: char,
+        max: usize,
+    ) -> Result<Option<Vec<String>>, NgsiError> {
+        match self {
+            AnyStore::Mem(_) => {
+                let _ = (tenant, lead, sep, max);
+                Ok(None)
+            }
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p
+                .entities
+                .id_segments(tenant, lead, sep, max)
+                .await
+                .map_err(db),
+        }
+    }
+
     /// Query Temporal Evolution with entity narrowing, instance-window
     /// pruning AND entity paging pushed down. Same
     /// contract: the API's window() is the arbiter; the memory arm returns
@@ -1718,6 +1741,15 @@ impl antares_store::CurrentStateDriver for AnyStore {
         AnyStore::entity_types_beside(self, tenant, any_of)
             .await
             .map(Some)
+    }
+    async fn entity_id_segments(
+        &self,
+        tenant: &TenantId,
+        lead: &str,
+        sep: char,
+        max: usize,
+    ) -> Result<Option<Vec<String>>, NgsiError> {
+        AnyStore::entity_id_segments(self, tenant, lead, sep, max).await
     }
     async fn mutate_boxed<'a>(
         &self,
