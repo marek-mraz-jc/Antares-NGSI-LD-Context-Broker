@@ -108,7 +108,13 @@ pub(super) async fn retrieve_temporal_inner(
         params,
         map,
     };
-    let tf = retrieve_filter(tq.as_ref(), trepr.page, types_rule.as_deref(), &timeprop);
+    let tf = retrieve_filter(
+        tq.as_ref(),
+        trepr.page,
+        default_page(st, &tenant, &trepr),
+        types_rule.as_deref(),
+        &timeprop,
+    );
     let mut warnings: Vec<String> = Vec::new();
     let doc = load_evolution(&req, &tf, &timeprop, &mut warnings).await?;
     let not_found = || NgsiError::ResourceNotFound(format!("temporal entity {id} not found"));
@@ -209,6 +215,7 @@ struct RetrieveReq<'a> {
 fn retrieve_filter<'a>(
     tq: Option<&'a TemporalQ>,
     page_n: InstancePage,
+    default: Option<usize>,
     types_rule: Option<&crate::policy::Filter>,
     timeprop: &'a str,
 ) -> antares_store::filter::TemporalFilter<'a> {
@@ -223,8 +230,8 @@ fn retrieve_filter<'a>(
                 timeproperty: &t.timeproperty,
             }),
         last_n: page_n
-            .store_cap()
-            .filter(|_| cap_keeps_shown(types_rule, &page_n, timeprop)),
+            .store_cap(default)
+            .filter(|_| cap_keeps_shown(types_rule, &page_n, timeprop, range_start(tq))),
         oldest_first: !page_n.desc,
         timeproperty: timeprop,
         ..Default::default()

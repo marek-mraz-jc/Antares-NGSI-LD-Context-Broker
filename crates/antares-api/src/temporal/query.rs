@@ -771,9 +771,17 @@ async fn fetch_temporal(
         range: qry
             .instance_range()
             .filter(|_| !replays_state(qry.types_rule.as_deref())),
-        last_n: page_n.store_cap().filter(|_| {
-            plan.exact && cap_keeps_shown(qry.types_rule.as_deref(), &page_n, &qry.timeprop)
-        }),
+        last_n: page_n
+            .store_cap(default_page(req.st, req.tenant, trepr))
+            .filter(|_| {
+                plan.exact
+                    && cap_keeps_shown(
+                        qry.types_rule.as_deref(),
+                        &page_n,
+                        &qry.timeprop,
+                        range_start(qry.tq.as_ref()),
+                    )
+            }),
         oldest_first: !page_n.desc,
         timeproperty: &qry.timeprop,
         page: plan.page.then_some(antares_store::filter::Page {
