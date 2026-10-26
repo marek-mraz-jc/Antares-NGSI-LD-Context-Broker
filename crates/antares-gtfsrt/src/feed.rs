@@ -6,7 +6,7 @@
 
 use antares_ops::default_instance as attribute;
 use chrono::{DateTime, Duration, Utc};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 /// `FeedMessage`: the header and one entity per vehicle.
 #[derive(Clone, PartialEq, prost::Message)]
@@ -297,7 +297,8 @@ mod tests {
 
     /// `base` with each member of `extra` set, or removed when it is `null`.
     fn with(base: Value, extra: &Value) -> Value {
-        let mut map: Map<String, Value> = serde_json::from_value(base).unwrap_or_default();
+        let mut map: serde_json::Map<String, Value> =
+            serde_json::from_value(base).unwrap_or_default();
         for (k, v) in extra.as_object().into_iter().flatten() {
             if v.is_null() {
                 map.remove(k);

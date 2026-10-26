@@ -896,9 +896,14 @@ mod tests {
     fn a_revision_is_parsed_once() {
         let schema: &std::sync::Arc<[u8]> =
             &br#"{"id": "https://e.org/ogc-once", "name": "s"}"#[..].into();
-        let first = parsed(9_017, schema).expect("reads");
-        let again = parsed(9_017, schema).expect("reads");
-        assert!(std::sync::Arc::ptr_eq(&first, &again));
+        let first = parsed(9_017, schema);
+        let again = parsed(9_017, schema);
+        assert_eq!(
+            first
+                .zip(again)
+                .map(|(a, b)| std::sync::Arc::ptr_eq(&a, &b)),
+            Some(true)
+        );
     }
 
     #[test]
