@@ -630,6 +630,7 @@ pub(crate) struct Page {
 /// One page through [`ViewOps::scan`] (ADR-0028 rules 4 and 5): each part read from the
 /// token's upstream offset until the page holds `limit`, the `next` token the part and the
 /// upstream offset just past the last Feature served; a short page with `next` is a page.
+/// Current state only: `features::page` sends a history collection to `history::page`.
 pub(crate) async fn page(
     view: &ViewOps,
     caller: &Caller,
@@ -638,9 +639,6 @@ pub(crate) async fn page(
     digest: u64,
     refs: Refs<'_>,
 ) -> Result<Page, Problem> {
-    if c.history {
-        return crate::history::page(view, caller, c, p, digest, refs).await;
-    }
     let terms = Terms::of(c);
     // One geoQ per request (4.10): the filter's spatial conjunct is pushed only when neither
     // `bbox` nor an `ngsild.geo*` option holds it.
@@ -970,7 +968,7 @@ fn refer(value: &Value, render: &dyn Fn(&str) -> Value) -> Value {
 
 /// One Feature by its id, if the view shows it and it is of the collection's type (C19): a
 /// Query Entities by id and type, so the view and its engine narrow it like a page. An id that
-/// is no URI names no Feature either.
+/// is no URI names no Feature either. Current state only, as [`page`].
 pub(crate) async fn one(
     view: &ViewOps,
     caller: &Caller,
@@ -979,9 +977,6 @@ pub(crate) async fn one(
     p: &Params,
     refs: Refs<'_>,
 ) -> Result<Map<String, Value>, Problem> {
-    if c.history {
-        return crate::history::one(view, caller, c, id, p, refs).await;
-    }
     let terms = Terms::of(c);
     let pushdown = Pushdown {
         query: format!(

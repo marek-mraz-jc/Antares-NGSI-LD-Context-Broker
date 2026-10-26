@@ -311,6 +311,7 @@ pub const PRESET_TYPES: [&str; 3] = ["Event", "CouncilMeeting", "OfficeHours"];
 
 /// The output contract every format shares (docs API/11, T-5216).
 pub use antares_ops::outputs::{is_language_tag, is_output_name, Filter, MAX_OUTPUTS};
+use antares_ops::outputs::{is_name, is_plain};
 
 /// The zone of an output that names none.
 pub const DEFAULT_ZONE: Tz = chrono_tz::Europe::Bratislava;
@@ -551,22 +552,8 @@ fn preset(preset: Preset) -> BTreeMap<Field, Remap> {
     fields
 }
 
-/// An NGSI-LD name: a letter or `_`, then letters, digits and `_`, at most 128.
-fn is_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    name.len() <= 128
-        && chars
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
 fn is_path(path: &str) -> bool {
     path.split('.').count() <= 3 && path.split('.').all(is_name)
-}
-
-fn is_plain(value: &str, max: usize) -> bool {
-    !value.is_empty() && value.chars().count() <= max && !value.chars().any(char::is_control)
 }
 
 /// One field compiled: its remap and its zone.
