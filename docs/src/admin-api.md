@@ -379,6 +379,31 @@ another pair than the path (nothing is stored).
 `204`, or `404` when there is no such grant. The next forward that needed it
 is not made.
 
+## MCP write decisions
+
+Only in a broker built with the `mcp` feature and started with
+`ANTARES_MCP_CONFIRM_URL` set (T-5816): the deployment's decision page reads
+the question a write tool asked and records the person's decision on it. See
+[MCP](mcp.md) section 3. Questions live ten minutes in the process that
+asked them; bound: 4 KiB per decision body.
+
+### GET /q/mcp-confirmations/{id}
+
+`{"id", "view", "tool", "message", "subject", "expiresInSeconds",
+"decision"}`: the question the client was handed, the subject headers of
+the call that asked (`{"x-jc-subject": ["…"]}`), and `decision` `null`,
+`"accept"` or `"decline"`; `404` for an unknown, answered or expired id.
+
+### PUT /q/mcp-confirmations/{id}
+
+`{"decision": "accept" | "decline", "subject": {"<header>": "<value>"}}`:
+the page names the person who decided by the subject headers it vouches
+for, and each must be one of the asking call's. `200` with the question;
+`404` when the id is unknown, answered or expired, or the person is not the
+one who asked (the same answer, so a page learns nothing of another
+person's questions); `400` for any other body. A second decision before
+the client's retry replaces the first.
+
 ## Policy rule documents
 
 Only in a broker built with the `views` feature and started with a policy

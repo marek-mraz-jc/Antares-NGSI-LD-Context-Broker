@@ -5,6 +5,7 @@
 use crate::area::{self, Shape, TypePart};
 use crate::budget;
 use crate::confirm;
+use crate::decided;
 use crate::listen::{self, LIFETIME, MAX_URIS, SCHEME};
 use crate::schema::{self, Checked, Names};
 use crate::summary::{self, Basis};
@@ -260,30 +261,64 @@ impl Server {
         if !asks {
             return refused("this tool needs a client that can ask the person").into();
         }
-        let bound = confirm::bound_to(&self.id, &self.caller.subject(), tool.name, &given);
+        let subject = self.caller.subject();
+        let bound = confirm::bound_to(&self.id, &subject, tool.name, &given);
+        let asking = decided::asking();
+        if *asking == decided::Asking::Broken {
+            return refused("this endpoint cannot ask the person now; nothing was written").into();
+        }
         let Some(state) = request.request_state else {
-            let Some(state) = confirm::seal(&bound) else {
+            let Some((state, nonce)) = confirm::seal(&bound) else {
                 return refused("this endpoint cannot ask the person now; nothing was written")
                     .into();
             };
-            let ask = ElicitRequest::new(ElicitRequestParams::FormElicitationParams {
-                meta: None,
-                message: confirm::question(tool.name, tool.op.id(), &given),
-                requested_schema: ElicitationSchema::builder()
-                    .required_bool(confirm::ANSWER)
-                    .build_unchecked(),
-            });
+            let message = confirm::question(tool.name, tool.op.id(), &given);
+            let params = match asking {
+                decided::Asking::Page(template) => {
+                    if !decided::ask(&nonce, &subject, &self.id, tool.name, &message) {
+                        return refused("too many questions are open; answer or let one expire, then call again").into();
+                    }
+                    ElicitRequestParams::UrlElicitationParams {
+                        meta: None,
+                        message,
+                        url: decided::page_of(template, &nonce),
+                        elicitation_id: nonce,
+                    }
+                }
+                _ => ElicitRequestParams::FormElicitationParams {
+                    meta: None,
+                    message,
+                    requested_schema: ElicitationSchema::builder()
+                        .required_bool(confirm::ANSWER)
+                        .build_unchecked(),
+                },
+            };
+            let ask = ElicitRequest::new(params);
             let asked = [(confirm::ANSWER.to_owned(), InputRequest::Elicitation(ask))];
             return InputRequiredResult::new(Some(asked.into_iter().collect()), Some(state)).into();
         };
-        // a decline spends nothing: only an accepted answer redeems the state
-        let confirmed = if !confirm::accepted(request.input_responses.as_ref()) {
-            Err("the person did not confirm; nothing was written")
-        } else if !confirm::redeem(&state, &bound, &self.caller.subject()) {
-            Err("the requestState does not answer this call; call the tool again without it")
-        } else {
+        // a decline or an open question spends nothing: only an accepted
+        // answer redeems the state; with a decision page only the decision
+        // it recorded is an answer, never the client's
+        let answer = if let decided::Asking::Page(_) = asking {
+            match confirm::opened(&state, &bound).map(|nonce| decided::take(&nonce, &subject)) {
+                Some(decided::Found::Accepted) => Ok(()),
+                Some(decided::Found::Waiting) => Err("the person has not decided on the page yet; call again with the same requestState once they have"),
+                Some(decided::Found::Declined) => Err("the person did not confirm; nothing was written"),
+                _ => Err("the requestState does not answer this call; call the tool again without it"),
+            }
+        } else if confirm::accepted(request.input_responses.as_ref()) {
             Ok(())
+        } else {
+            Err("the person did not confirm; nothing was written")
         };
+        let confirmed = answer.and_then(|()| {
+            if confirm::redeem(&state, &bound, &subject) {
+                Ok(())
+            } else {
+                Err("the requestState does not answer this call; call the tool again without it")
+            }
+        });
         if let Err(why) = confirmed {
             tracing::info!(view = %self.id, tool = tool.name, "mcp write not confirmed");
             return refused(why).into();
@@ -1178,10 +1213,14 @@ impl ServerHandler for Server {
         }
         if tool.write {
             // a form, which an empty `elicitation` declares too (2025-11-25)
+            // and a decision page needs a client that opens a URL
             let asks = context
                 .client_capabilities()
                 .and_then(|c| c.elicitation)
-                .is_some_and(|e| e.form.is_some() || e.url.is_none());
+                .is_some_and(|e| match decided::asking() {
+                    decided::Asking::Page(_) => e.url.is_some(),
+                    _ => e.form.is_some() || e.url.is_none(),
+                });
             return Ok(self.write(tool, request, asks).await);
         }
         let given = request.arguments.unwrap_or_default();

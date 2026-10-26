@@ -1428,6 +1428,14 @@ pub mod test_kit {
             })
         }
 
+        /// Serve `routes` on the admin surface, as the composition root's
+        /// [`super::Ops::add_admin`] does.
+        #[must_use]
+        pub fn with_admin(self, routes: axum::Router) -> Self {
+            self.state.views.add_admin(routes);
+            self
+        }
+
         /// The same broker with `/q` behind the admin credential (T-3569).
         #[must_use]
         pub fn with_admin_auth(self, auth: antares_api::admin_auth::AdminAuth) -> Self {

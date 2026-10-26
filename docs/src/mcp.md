@@ -210,6 +210,20 @@ cancel is a tool error too.
   start: a retry that reaches another replica is refused, and the client
   asks again. A named file that cannot be read or is too short refuses
   every write and logs one error; the key itself is never logged.
+- **A decision page.** With `ANTARES_MCP_CONFIRM_URL` set, the client's
+  answer confirms nothing, so an AI client cannot approve its own write
+  (T-5816). The first call answers a URL-mode `elicitation/create` under
+  `confirm`: the page URL with the question's id, and the id as
+  `elicitationId`. The person decides on that page, which records the
+  decision through the admin route `PUT /q/mcp-confirmations/{id}`
+  ([Admin API](admin-api.md)) for the subject headers of the person signed
+  in there. The retry with the same `requestState` runs once the recorded
+  decision is an accept, by the caller who asked; before the person decided
+  it is the tool error `the person has not decided on the page yet` and the
+  state stays usable; a decline ends it. `inputResponses` is ignored. A
+  client must declare `elicitation` with `url`. Questions live in the
+  process that asked, ten minutes, at most 10 000 at a time and 100 per
+  subject.
 - **Spent states** are remembered per process until they expire, at most
   100 000 at a time; past that a confirmation is refused until the oldest
   expire.
