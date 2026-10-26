@@ -143,10 +143,24 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     BACKGROUND.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let counted = Counted;
     tokio::spawn(async move {
+        let _counted = counted;
         fut.await;
-        BACKGROUND.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     });
+}
+
+/// One [`BACKGROUND`] task, uncounted when it ends however it ends: a task
+/// that panicked or was cancelled left the count up and every later
+/// shutdown drain waiting for its whole deadline (F-ANT2-019).
+#[cfg(not(target_arch = "wasm32"))]
+struct Counted;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for Counted {
+    fn drop(&mut self) {
+        BACKGROUND.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Work a request left behind after its response — the remote leg of a
@@ -2096,4 +2110,32 @@ mod clause_6_3_11 {
 #[cfg(test)]
 pub(crate) fn allow_private() {
     antares_jsonld::allow_private_egress(true);
+}
+
+#[cfg(test)]
+mod f_ant2_019_background_count {
+    /// A request-born task that panics is still uncounted when it ends: 64
+    /// of them left the count 64 up for good, and a shutdown drain waited
+    /// its whole deadline for them. Other tests' tasks are few and short.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicked_task_leaves_the_count() {
+        const N: usize = 64;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(N);
+        for _ in 0..N {
+            let tx = tx.clone();
+            super::spawn(async move {
+                drop(tx);
+                std::panic::resume_unwind(Box::new("background task fails"));
+            });
+        }
+        drop(tx);
+        // every sender gone: every task ran to its panic
+        assert!(rx.recv().await.is_none());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            super::background_tasks() < N,
+            "{}",
+            super::background_tasks()
+        );
+    }
 }

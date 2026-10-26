@@ -607,6 +607,41 @@ async fn an_id_pattern_probe_reads_its_type_through_the_type_index() {
     }
 }
 
+/// T-5661: with the exact id prefixes a view's idPattern forces, the probe
+/// page reads them as a range of i_entities_id_bytes (0027) in that index's
+/// order, at the start and past a keyset. The matches here (T1 ids
+/// `…:0009…`) sit at the end of their type, where the literal alone had the
+/// planner walk i_entities_first_type_id through the whole type for them.
+#[tokio::test]
+async fn an_id_prefix_probe_seeks_its_byte_range() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    seed_rls(&pool).await;
+    let c = "id COLLATE \"C\"";
+    let range = format!("{c} >= 'urn:ngsi-ld:T1:0009' AND {c} < 'urn:ngsi-ld:T1:000:'");
+    let w = format!(
+        "tenant_id = '{RLS_A}' AND (expires_at IS NULL OR expires_at > now()) \
+         AND ({range} AND (({range})))"
+    );
+    for page in [
+        type_page(&w, &[&["https://x/T1"]], 20),
+        type_page(
+            &format!("{w} AND {c} > 'urn:ngsi-ld:T1:00090001'"),
+            &[&["https://x/T1"]],
+            500,
+        ),
+    ] {
+        let page = page.replace("ORDER BY id LIMIT", &format!("ORDER BY {c} LIMIT"));
+        let plan = plan_of(&pool, RLS_A, &page).await;
+        assert!(
+            !plan.contains("Seq Scan")
+                && plan.contains("i_entities_id_bytes")
+                && !plan.contains("i_entities_first_type_id"),
+            "an id prefix probe walks its type instead of seeking its range:\n{plan}"
+        );
+    }
+}
+
 /// T-4852 Security: the new arms and the geohash cover isolate Tenants as
 /// the policy does. Both Tenants hold the same ids at the same places; the
 /// broker's role, set to Tenant A, gets only A's rows for a type list, a
@@ -1329,4 +1364,54 @@ async fn the_temporal_page_qualification_reads_each_station_newest_first() {
         "the probe fetched {refused} rows the window refused for {STATIONS} stations — plan:\n{plan}"
     );
     assert_eq!(qualified, STATIONS, "every station has rows in the window");
+}
+
+/// F-ANT1-016: the query geometry's validity probe runs on the query's own
+/// transaction and its failure fails the query. It used to take a second
+/// pool connection and read a pool timeout as "invalid", so a busy pool cost
+/// the spatial pushdown (a scan of the candidates) and every geoquery waited
+/// out the 5 s acquire wall twice. With the only connection held, the read
+/// now fails once, on its own acquire, as the pool timeout a 503 answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_busy_pool_fails_a_geoquery_once() {
+    use antares_jsonld::core_context;
+    use antares_model::TenantId;
+    use antares_sql::compile::geo::{GeoSpec, Rel};
+    use antares_sql::store::pg::entity::{EntityFilter, PgEntityStore};
+    let url = require_db!();
+    let pool = pg::connect(&url, 1).await.expect("connect");
+    let store = PgEntityStore::new(pool.clone());
+    let t = TenantId::new("pgbusygeo").expect("tenant");
+    let held = pool.acquire().await.expect("the only connection");
+    let ctx = core_context();
+    let expand = |term: &str| ctx.expand_key(term);
+    let area = serde_json::json!([[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]]]);
+    let geo = [GeoSpec {
+        rel: Rel::Within,
+        geometry: "Polygon",
+        coordinates: &area,
+        geoproperty_iri: "",
+    }];
+    let started = std::time::Instant::now();
+    let out = store
+        .query(
+            &t,
+            &EntityFilter {
+                geo: &geo,
+                expand: &expand,
+                ..Default::default()
+            },
+        )
+        .await;
+    let waited = started.elapsed();
+    drop(held);
+    assert!(
+        matches!(out, Err(sqlx::Error::PoolTimedOut)),
+        "{:?}",
+        out.map(|o| o.rows.len())
+    );
+    assert!(
+        waited < std::time::Duration::from_secs(8),
+        "one acquire wall, not two: {waited:?}"
+    );
 }

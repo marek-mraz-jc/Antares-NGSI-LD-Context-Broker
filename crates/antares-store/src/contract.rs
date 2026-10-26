@@ -654,7 +654,51 @@ pub async fn run_current_state_contract(
         json!(5),
         "a comma seconds-fraction is an instant, not a byte string"
     );
+    // attrs= asks for an Entity that holds one of them NOW: an Attribute
+    // whose every instance expired is not held (4.22), so an answer that
+    // claims to be decided must not name the Entity for it. An undecided
+    // one is re-judged by the caller over the served (stripped) rows.
+    let only_gone = [iri("gone")];
+    let by_attr = d
+        .query_entities(
+            a,
+            &crate::filter::EntityFilter {
+                attrs: Some(&only_gone),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query_entities");
+    assert!(
+        !by_attr.decided || by_attr.rows.iter().all(|r| r["id"] != exp_a.as_str()),
+        "attrs= over an Attribute whose only instance expired: a decided \
+         answer named the Entity"
+    );
+    assert!(
+        by_attr
+            .rows
+            .iter()
+            .filter(|r| r["id"] == exp_a.as_str())
+            .all(|r| r.get(iri("gone")).is_none()),
+        "a query served an expired Attribute"
+    );
     d.delete(a, Kind::Entity, &exp_a).await.expect("delete");
+
+    // batch_upsert takes each id once: the API splits repeats into rounds
+    // (5.6.8 / 5.6.10), and what a backend does with a repeat inside one
+    // call is its own guess (Postgres refuses an ON CONFLICT row affected
+    // twice). A repeat is refused on every arm, and nothing is written.
+    let dup = format!("urn:ngsi-ld:{prefix}:dup");
+    assert!(
+        d.batch_upsert(a, vec![(dup.clone(), doc(&dup)), (dup.clone(), doc(&dup))])
+            .await
+            .is_err(),
+        "batch_upsert with an id twice must be refused"
+    );
+    assert!(
+        d.get(a, Kind::Entity, &dup).await.expect("get").is_none(),
+        "a refused batch_upsert wrote nothing"
+    );
 
     // 5.8.6: an expired SUBSCRIPTION is not deleted and stays retrievable —
     // the API turns the stamp into status "expired" and keeps it updatable.
@@ -976,12 +1020,144 @@ pub async fn run_current_state_contract(
         "and the Cached copy by anyone"
     );
 
+    context_rows_are_locked(d, a, b, prefix).await;
+
     for id in [&e1, &e2] {
         assert!(
             d.delete(a, Kind::Entity, id).await.expect("delete"),
             "the contract's own rows must be removable"
         );
     }
+}
+
+/// Drive two futures to completion together on the calling task, so their
+/// store calls interleave (the crate carries no executor of its own).
+async fn both<A: std::future::Future, B: std::future::Future>(
+    x: A,
+    y: B,
+) -> (A::Output, B::Output) {
+    let (mut x, mut y) = (Box::pin(x), Box::pin(y));
+    let (mut xo, mut yo) = (None, None);
+    std::future::poll_fn(|cx| {
+        if xo.is_none() {
+            if let std::task::Poll::Ready(v) = std::future::Future::poll(x.as_mut(), cx) {
+                xo = Some(v);
+            }
+        }
+        if yo.is_none() {
+            if let std::task::Poll::Ready(v) = std::future::Future::poll(y.as_mut(), cx) {
+                yo = Some(v);
+            }
+        }
+        match (xo.take(), yo.take()) {
+            (Some(a), Some(b)) => std::task::Poll::Ready((a, b)),
+            (a, b) => {
+                xo = a;
+                yo = b;
+                std::task::Poll::Pending
+            }
+        }
+    })
+    .await
+}
+
+/// 5.13.3.5 + ADR-0021 for the @context rows: a row has a kind, and a
+/// read-modify-write of one holds its lock, so a usage bump racing a
+/// delete leaves it deleted and two racing bumps both count.
+async fn context_rows_are_locked(
+    d: &dyn CurrentStateDriver,
+    a: &TenantId,
+    b: &TenantId,
+    prefix: &str,
+) {
+    let id = format!("{prefix}-ctx-bumped");
+    assert!(
+        d.context_put(None, &id, json!({"localId": id, "body": {"@context": {}}}))
+            .await
+            .is_err(),
+        "a row without a kind must be refused"
+    );
+    let bump = || -> crate::MutateFn<'static> {
+        Box::new(|row| {
+            let o = row.as_object_mut().ok_or(())?;
+            let n = o.get("numberOfHits").and_then(Value::as_u64).unwrap_or(0);
+            o.insert("numberOfHits".into(), json!(n.saturating_add(1)));
+            Ok(())
+        })
+    };
+    assert!(
+        d.context_mutate(None, &id, bump())
+            .await
+            .expect("context_mutate")
+            .is_none(),
+        "context_mutate of an absent row must answer None"
+    );
+    assert!(
+        d.context_get(None, &id)
+            .await
+            .expect("context_get")
+            .is_none(),
+        "context_mutate of an absent row must not insert it"
+    );
+    d.context_put(
+        None,
+        &id,
+        json!({"localId": id, "kind": "Cached", "numberOfHits": 0, "body": {"@context": {}}}),
+    )
+    .await
+    .expect("context_put");
+    let (x, y) = both(
+        d.context_mutate(Some(a), &id, bump()),
+        d.context_mutate(Some(b), &id, bump()),
+    )
+    .await;
+    assert!(
+        matches!((x, y), (Ok(Some(Ok(()))), Ok(Some(Ok(()))))),
+        "both bumps of a Cached row must apply"
+    );
+    let hits = d
+        .context_get(None, &id)
+        .await
+        .expect("context_get")
+        .map(|r| r["numberOfHits"].clone());
+    assert_eq!(hits, Some(json!(2)), "two racing bumps must both count");
+
+    let hosted = format!("{prefix}-ctx-owned");
+    d.context_put(
+        Some(a),
+        &hosted,
+        json!({"localId": hosted, "kind": "Hosted", "owner": a.as_str(), "body": {"@context": {}}}),
+    )
+    .await
+    .expect("context_put");
+    assert!(
+        d.context_mutate(Some(b), &hosted, bump())
+            .await
+            .expect("context_mutate")
+            .is_none(),
+        "another tenant's @context must be as absent to a mutate as to a read"
+    );
+    assert!(
+        d.context_delete(Some(a), &hosted)
+            .await
+            .expect("context_delete"),
+        "the owner removes its @context"
+    );
+    assert!(
+        d.context_mutate(Some(a), &hosted, bump())
+            .await
+            .expect("context_mutate")
+            .is_none(),
+        "a bump after the delete must find nothing"
+    );
+    assert!(
+        d.context_get(Some(a), &hosted)
+            .await
+            .expect("context_get")
+            .is_none(),
+        "a bump racing a delete must leave the row deleted"
+    );
+    assert!(d.context_delete(None, &id).await.expect("context_delete"));
 }
 
 /// Hold a temporal driver to the same shape. A driver that answers

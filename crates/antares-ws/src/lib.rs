@@ -241,6 +241,25 @@ fn handshake(req: &mut Request) -> Result<(String, hyper::upgrade::OnUpgrade), R
     Ok((accept, on_upgrade))
 }
 
+/// The Tenant the client named (6.3.14): one valid client Tenant, or none;
+/// else the `BadRequestData` detail.
+fn asked_tenant(headers: &axum::http::HeaderMap) -> Result<Option<String>, &'static str> {
+    let mut named = headers.get_all("ngsild-tenant").iter();
+    Ok(match (named.next(), named.next()) {
+        (None, _) => None,
+        (Some(t), None) => match t.to_str() {
+            // 6.3.14 grammar, and no client names one of the broker's own
+            // tenants (`snap-…`, the view and grant stores): F-ANT3-005
+            Ok(t) if antares_ops::TenantId::new(t).is_err() => {
+                return Err("NGSILD-Tenant is not a valid client Tenant (6.3.14)")
+            }
+            Ok(t) => Some(t.to_owned()),
+            Err(_) => return Err("NGSILD-Tenant is not text"),
+        },
+        (Some(_), Some(_)) => return Err("one NGSILD-Tenant (6.3.14)"),
+    })
+}
+
 /// The upgrade (rules 2, 8 and 10): the handshake, the `Origin` allowlist,
 /// the Tenant (or the view's), the admission caps, then the socket.
 fn upgrade(
@@ -269,26 +288,9 @@ fn upgrade(
             );
         }
     }
-    let mut named = headers.get_all("ngsild-tenant").iter();
-    let asked = match (named.next(), named.next()) {
-        (None, _) => None,
-        (Some(t), None) => match t.to_str() {
-            Ok(t) => Some(t.to_owned()),
-            Err(_) => {
-                return problem(
-                    StatusCode::BAD_REQUEST,
-                    "BadRequestData",
-                    "NGSILD-Tenant is not text",
-                )
-            }
-        },
-        (Some(_), Some(_)) => {
-            return problem(
-                StatusCode::BAD_REQUEST,
-                "BadRequestData",
-                "one NGSILD-Tenant (6.3.14)",
-            )
-        }
+    let asked = match asked_tenant(headers) {
+        Ok(asked) => asked,
+        Err(detail) => return problem(StatusCode::BAD_REQUEST, "BadRequestData", detail),
     };
     let (tenant, runner) = match &view {
         None => (

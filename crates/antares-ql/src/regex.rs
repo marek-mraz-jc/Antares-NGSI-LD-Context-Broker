@@ -118,6 +118,7 @@ fn evict_lru_half<V>(map: &mut HashMap<Box<str>, Entry<V>>) {
 type Cache<V> = LazyLock<RwLock<HashMap<Box<str>, Entry<V>>>>;
 
 static CACHE: Cache<(Outcome, usize)> = LazyLock::new(|| RwLock::new(HashMap::new()));
+#[cfg(test)]
 thread_local! {
     /// Compilations on this thread. Per thread, so a test counts its own cache misses and never
     /// those of a test running beside it (T-3534); a compile runs on the caller's thread.
@@ -142,6 +143,7 @@ pub fn compile(pattern: &str) -> Result<Arc<regex::Regex>, String> {
     {
         return hit.map_err(String::from);
     }
+    #[cfg(test)]
     COMPILES.with(|n| n.set(n.get().saturating_add(1)));
     // Compiled OUTSIDE the lock — a pattern compile must never serialize the
     // matcher — and a poisoned lock degrades to "compile every time", never
@@ -182,7 +184,8 @@ pub fn cached(pattern: &str) -> Option<Arc<regex::Regex>> {
 }
 
 /// Compilations performed on the calling thread (i.e. its cache misses).
-pub fn compiles() -> u64 {
+#[cfg(test)]
+fn compiles() -> u64 {
     COMPILES.with(std::cell::Cell::get)
 }
 

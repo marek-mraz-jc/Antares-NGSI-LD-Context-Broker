@@ -1762,3 +1762,32 @@ fn a_slot_whose_source_no_rule_shows_is_listed_as_hidden() {
         vec!["t".to_owned(), "u".to_owned()]
     );
 }
+
+/// F-ANT4-010: an ordering keeps the exact inverse of a unit conversion, so
+/// the source just below the boundary is no match; equality still rounds.
+#[test]
+fn an_inverted_ordering_keeps_the_exact_boundary() {
+    let d = Derivation::UnitConversion {
+        factor: 3.0,
+        offset: 0.0,
+    };
+    let at =
+        |op, n| match invert_comparison(&d, QPath::dotted(vec!["t".into()]), op, QValue::Num(n)) {
+            Ok(QNode::Cmp {
+                value: QValue::Num(b),
+                ..
+            }) => b,
+            other => panic!("not one comparison: {other:?}"),
+        };
+    let below: f64 = 0.333_333_333_1;
+    for op in [CmpOp::Gt, CmpOp::Ge] {
+        let b = at(op, 1.0);
+        assert!(
+            below < b,
+            "{below} matches {op:?} {b} but converts to {}",
+            below * 3.0
+        );
+        assert!((b * 3.0 - 1.0).abs() < 1e-15);
+    }
+    assert_eq!(at(CmpOp::Eq, 1.0), 0.333_333_333);
+}

@@ -152,21 +152,52 @@ async fn snap_insert(
     Ok(())
 }
 
-/// Write back the output-only members (5.2.41 Table 5.2.41-2) of a snapshot
-/// that already exists; a snapshot deleted meanwhile is not resurrected.
-async fn snap_put(st: &AppState, tenant: &TenantId, meta: Value) {
-    let id = meta
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    let _ = st
-        .store
-        .mutate(tenant, Kind::Snapshot, &id, |d| {
-            *d = meta.clone();
-            Ok::<_, std::convert::Infallible>(())
+/// Members `finish` owns (5.2.41 Table 5.2.41-2, output only).
+const FINISH_MEMBERS: &[&str] = &[
+    "snapshotStatus",
+    "modifiedAt",
+    "snapshotQueriesDetails",
+    "snapshotTemporalQueriesDetails",
+];
+
+/// Members an Update Snapshot (5.16.4.4) writes.
+const UPDATE_MEMBERS: &[&str] = &[
+    "snapshotLifetime",
+    "snapshotPriority",
+    "endpoint",
+    "receiverInfo",
+    "expiresAt",
+    "modifiedAt",
+];
+
+/// Write `members` of `meta` back onto a snapshot that already exists (a
+/// member `meta` lacks is removed); a snapshot deleted meanwhile is not
+/// resurrected. Only the named members are written, so a fill finishing
+/// beside an Update Snapshot keeps the other's members: each writer read
+/// the document before the other wrote it. Returns the stored document.
+async fn snap_put(
+    st: &AppState,
+    tenant: &TenantId,
+    meta: &Value,
+    members: &[&str],
+) -> Option<Value> {
+    let id = meta.get("id").and_then(Value::as_str)?;
+    st.store
+        .mutate(tenant, Kind::Snapshot, id, |d| {
+            if let Some(o) = d.as_object_mut() {
+                for k in members {
+                    match meta.get(*k) {
+                        Some(v) => o.insert((*k).to_owned(), v.clone()),
+                        None => o.remove(*k),
+                    };
+                }
+            }
+            Ok::<_, std::convert::Infallible>(d.clone())
         })
-        .await;
+        .await
+        .ok()
+        .flatten()
+        .and_then(Result::ok)
 }
 
 /// Remove a snapshot everywhere: doc, synth-tenant index, data purge.
@@ -772,6 +803,27 @@ async fn run_temporal_query(
     for k in ["limit", "offset", "count"] {
         vp.remove(k);
     }
+    // The copy holds what the query selects: its attrs and its window. A
+    // whole Evolution would hand a snapshot reader history the query never
+    // asked for.
+    let tq = crate::temporalq::TemporalQ::from_params(&vp, true)?;
+    let ctx = st.loader.core();
+    let attrs: Option<Vec<String>> = vp
+        .get("attrs")
+        .map(|a| a.split(',').map(|t| ctx.expand_key(t.trim())).collect());
+    let tf = antares_store::filter::TemporalFilter {
+        attrs: attrs.as_deref(),
+        range: tq.as_ref().map(|t| antares_store::filter::InstanceRange {
+            timerel: &t.timerel,
+            time_at: &t.time_at,
+            end_time_at: t.end_time_at.as_deref(),
+            timeproperty: &t.timeproperty,
+        }),
+        timeproperty: tq
+            .as_ref()
+            .map_or("observedAt", |t| t.timeproperty.as_str()),
+        ..Default::default()
+    };
     let mut headers = HeaderMap::new();
     if let Ok(v) = tenant.as_str().parse() {
         headers.insert("NGSILD-Tenant", v);
@@ -837,12 +889,9 @@ async fn run_temporal_query(
             // history the source has many of — and report the query a success.
             let held = st
                 .temporal
-                .get_temporal(
-                    tenant,
-                    eid,
-                    &antares_store::filter::TemporalFilter::default(),
-                )
-                .await?;
+                .get_temporal(tenant, eid, &tf)
+                .await?
+                .map(|doc| selected(doc, attrs.as_deref(), tq.as_ref()));
             // Nothing local means the Evolution came from a registered
             // Context Source (5.7.4.4). The query's merged answer is every
             // instance of it this broker was given, so it is what the
@@ -868,6 +917,31 @@ async fn run_temporal_query(
     Ok(n)
 }
 
+/// An Evolution cut to the Attributes `attrs` names and the instances in
+/// `tq`'s window; meta members stay. The store's window prunes too, but only
+/// as a narrowing a backend may skip.
+fn selected(
+    mut doc: Value,
+    attrs: Option<&[String]>,
+    tq: Option<&crate::temporalq::TemporalQ>,
+) -> Value {
+    if let Some(o) = doc.as_object_mut() {
+        o.retain(|k, v| {
+            if antares_model::is_meta(k) {
+                return true;
+            }
+            if attrs.is_some_and(|want| !want.iter().any(|w| w == k)) {
+                return false;
+            }
+            if let (Some(tq), Some(insts)) = (tq, v.as_array_mut()) {
+                insts.retain(|i| tq.instance_matches(i));
+            }
+            true
+        });
+    }
+    doc
+}
+
 async fn finish(
     st: &AppState,
     tenant: &TenantId,
@@ -890,8 +964,9 @@ async fn finish(
             }
         }
     }
-    snap_put(st, tenant, meta.clone()).await;
-    send_notification(st, &meta).await;
+    if let Some(meta) = snap_put(st, tenant, &meta, FINISH_MEMBERS).await {
+        send_notification(st, &meta).await;
+    }
 }
 
 /// 5.16.6 / 5.3.4 SnapshotNotification (sent only when endpoint is set).
@@ -1091,7 +1166,9 @@ pub async fn update_snapshot(
             }
             o.insert("modifiedAt".into(), Value::String(now_iso()));
         }
-        snap_put(&st, &tenant, meta.clone()).await;
+        let meta = snap_put(&st, &tenant, &meta, UPDATE_MEMBERS)
+            .await
+            .ok_or_else(|| NgsiError::ResourceNotFound(format!("snapshot {id} not found")))?;
         // 5.16.6: notifications are also sent after any status update
         let (st2, meta2) = (st.clone(), meta.clone());
         crate::spawn(async move {
@@ -1174,48 +1251,42 @@ pub async fn clone_snapshot(
 }
 
 /// 5.16.2.4 background copy: all Entity and Temporal data of the source.
+/// A source still `preparing` is waited for (its copy is not complete
+/// until its fill finishes), for as long as both snapshots exist; a source
+/// that ends in `failure` or disappears makes the clone a `failure`. The
+/// copy stops at the same ceiling a fill does (5.5.6).
 async fn clone_fill(st: &AppState, tenant: &TenantId, src_id: &str, new_id: &str) {
-    let (Some(src), Some(new)) = (
-        snap_get(st, tenant, src_id).await,
-        snap_get(st, tenant, new_id).await,
+    let src = loop {
+        let Some(src) = snap_get(st, tenant, src_id).await else {
+            finish(st, tenant, new_id, "failure", None).await;
+            return;
+        };
+        if src.get("snapshotStatus").and_then(Value::as_str) != Some("preparing") {
+            break src;
+        }
+        if snap_get(st, tenant, new_id).await.is_none() {
+            return;
+        }
+        // the browser's own timer on wasm32 (tokio time has no reactor there)
+        #[cfg(not(target_arch = "wasm32"))]
+        tokio::time::sleep(std::time::Duration::from_millis(CLONE_POLL_MS.into())).await;
+        #[cfg(target_arch = "wasm32")]
+        gloo_timers::future::TimeoutFuture::new(CLONE_POLL_MS).await;
+    };
+    let (Some(from), Some(to)) = (
+        synth_tenant(&src),
+        snap_get(st, tenant, new_id)
+            .await
+            .as_ref()
+            .and_then(synth_tenant),
     ) else {
         finish(st, tenant, new_id, "failure", None).await;
         return;
     };
-    let (Some(from), Some(to)) = (synth_tenant(&src), synth_tenant(&new)) else {
-        finish(st, tenant, new_id, "failure", None).await;
-        return;
-    };
-    let mut failed = false;
-    match st.store.list(&from, Kind::Entity).await {
-        Ok(docs) => {
-            for doc in docs {
-                if let Some(id) = doc.get("id").and_then(Value::as_str) {
-                    if st
-                        .store
-                        .create(&to, Kind::Entity, id, doc.clone())
-                        .await
-                        .is_err()
-                    {
-                        failed = true;
-                    }
-                }
-            }
-        }
-        Err(_) => failed = true,
-    }
-    match st.temporal.list(&from).await {
-        Ok(docs) => {
-            for doc in docs {
-                if let Some(id) = doc.get("id").and_then(Value::as_str) {
-                    if st.temporal.create(&to, id, doc.clone()).await.is_err() {
-                        failed = true;
-                    }
-                }
-            }
-        }
-        Err(_) => failed = true,
-    }
+    let failed = src.get("snapshotStatus").and_then(Value::as_str) == Some("failure")
+        || copy_snapshot_data(st, &from, &to, fill_cap(st))
+            .await
+            .is_err();
     if fill_cancelled(st, tenant, new_id, &to).await {
         return;
     }
@@ -1227,6 +1298,60 @@ async fn clone_fill(st: &AppState, tenant: &TenantId, src_id: &str, new_id: &str
         None,
     )
     .await;
+}
+
+/// How often a clone looks whether its source finished preparing.
+const CLONE_POLL_MS: u32 = 50;
+
+/// Copy every Entity (one `list_page` at a time) and every Temporal
+/// Evolution of `from` into `to`, at most `cap` documents of each. An
+/// Evolution REPLACES what `to` holds: copying an Entity fires the 5.6.11
+/// auto-record hook, which leaves a stub Evolution of one instance.
+async fn copy_snapshot_data(
+    st: &AppState,
+    from: &TenantId,
+    to: &TenantId,
+    cap: usize,
+) -> Result<(), NgsiError> {
+    let mut n = 0usize;
+    let mut after: Option<String> = None;
+    loop {
+        let page = st
+            .store
+            .list_page(from, Kind::Entity, after.as_deref(), st.max_limit)
+            .await?;
+        let Some(last) = page
+            .last()
+            .and_then(|d| d.get("id"))
+            .and_then(Value::as_str)
+        else {
+            break;
+        };
+        after = Some(last.to_owned());
+        n = n.saturating_add(page.len());
+        if n > cap {
+            return Err(too_many(n, cap));
+        }
+        let full = page.len() >= st.max_limit;
+        for doc in page {
+            if let Some(id) = doc.get("id").and_then(Value::as_str) {
+                st.store.create(to, Kind::Entity, id, doc.clone()).await?;
+            }
+        }
+        if !full {
+            break;
+        }
+    }
+    let docs = st.temporal.list(from).await?;
+    if docs.len() > cap {
+        return Err(too_many(docs.len(), cap));
+    }
+    for doc in docs {
+        if let Some(id) = doc.get("id").and_then(Value::as_str) {
+            st.temporal.upsert(to, id, doc.clone()).await?;
+        }
+    }
+    Ok(())
 }
 
 // ---------- 6.3.22: NGSILD-Snapshot scoping middleware ----------
@@ -2020,5 +2145,251 @@ mod clause_5_16 {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         panic!("the copy of an expired snapshot was not freed");
+    }
+
+    const DEF: &str = "https://uri.etsi.org/ngsi-ld/default-context/";
+
+    /// A Snapshot document held directly, with its synthetic tenant.
+    async fn seeded_snapshot(st: &AppState, id: &str, status: &str) -> TenantId {
+        let synth = format!("snap-default-{}", id.rsplit(':').next().unwrap_or("x"));
+        st.store
+            .create(
+                &TenantId::default(),
+                Kind::Snapshot,
+                id,
+                json!({"id": id, "type": "Snapshot", "__tenant": synth,
+                       "snapshotStatus": status, "expiresAt": "2999-01-01T00:00:00Z"}),
+            )
+            .await
+            .expect("seed snapshot");
+        synth_tenant(&stored(st, id).await).expect("__tenant")
+    }
+
+    async fn vehicle_in(st: &AppState, t: &TenantId, n: usize) {
+        let id = format!("urn:ngsi-ld:Vehicle:c{n}");
+        st.store
+            .create(
+                t,
+                Kind::Entity,
+                &id,
+                json!({"id": id, "type": format!("{DEF}Vehicle")}),
+            )
+            .await
+            .expect("seed entity");
+    }
+
+    /// POST .../clone and the clone's id.
+    async fn clone_of(st: &AppState, sid: &str) -> String {
+        let (status, headers, body) = send(
+            st,
+            "POST",
+            &format!("/ngsi-ld/v1/snapshots/{sid}/clone"),
+            Some(("application/json", String::new())),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let loc = header(&headers, "Location").expect("Location");
+        loc.rsplit('/').next().expect("clone id").to_owned()
+    }
+
+    async fn settled(st: &AppState, id: &str) -> Value {
+        for _ in 0..200 {
+            let meta = stored(st, id).await;
+            if meta["snapshotStatus"] != "preparing" {
+                return meta;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("snapshot {id} never left preparing");
+    }
+
+    /// 5.16.2.4 (F-ANT5-005): the clone holds the source's whole Temporal
+    /// Evolution, never the one-instance stub its own Entity copy recorded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clause_5_16_2_4_clone_copies_every_temporal_instance() {
+        let st = state().await;
+        let sid = "urn:ngsi-ld:Snapshot:tsrc";
+        let from = seeded_snapshot(&st, sid, "success").await;
+        let eid = "urn:ngsi-ld:Vehicle:c0";
+        let insts: Vec<Value> = (1..=5)
+            .map(|d| {
+                json!({"type": "Property", "value": d,
+                            "observedAt": format!("2026-01-0{d}T00:00:00Z")})
+            })
+            .collect();
+        st.temporal
+            .upsert(
+                &from,
+                eid,
+                json!({"id": eid, "type": format!("{DEF}Vehicle"),
+                                        format!("{DEF}speed"): insts.clone()}),
+            )
+            .await
+            .expect("seed evolution");
+        vehicle_in(&st, &from, 0).await;
+        let cid = clone_of(&st, sid).await;
+        assert_eq!(settled(&st, &cid).await["snapshotStatus"], "success");
+        let to = synth_tenant(&stored(&st, &cid).await).expect("__tenant");
+        let doc = st
+            .temporal
+            .get(&to, eid)
+            .await
+            .expect("store")
+            .expect("evolution");
+        assert_eq!(
+            doc[format!("{DEF}speed")].as_array().map(Vec::len),
+            Some(5),
+            "the clone kept a stub: {doc}"
+        );
+        // the stub the 5.6.11 hook leaves when it records the Entity copy
+        let stubbed = TenantId::new_internal("snap-default-stubbed").expect("tenant");
+        st.temporal
+            .upsert(
+                &stubbed,
+                eid,
+                json!({"id": eid, format!("{DEF}speed"): [insts.first().cloned().expect("an instance")]}),
+            )
+            .await
+            .expect("seed stub");
+        copy_snapshot_data(&st, &from, &stubbed, fill_cap(&st))
+            .await
+            .expect("copy");
+        let doc = st
+            .temporal
+            .get(&stubbed, eid)
+            .await
+            .expect("store")
+            .expect("evolution");
+        assert_eq!(
+            doc[format!("{DEF}speed")].as_array().map(Vec::len),
+            Some(5),
+            "the copy kept the hook's stub: {doc}"
+        );
+    }
+
+    /// 5.16.2.4 (F-ANT5-007): a clone of a source still preparing waits for
+    /// the source's fill and copies what it ends with; a source that fails
+    /// fails the clone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clause_5_16_2_4_clone_waits_for_a_preparing_source() {
+        let st = state().await;
+        let sid = "urn:ngsi-ld:Snapshot:psrc";
+        let from = seeded_snapshot(&st, sid, "preparing").await;
+        vehicle_in(&st, &from, 1).await;
+        let cid = clone_of(&st, sid).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(stored(&st, &cid).await["snapshotStatus"], "preparing");
+        vehicle_in(&st, &from, 2).await;
+        let _ = st
+            .store
+            .mutate(&TenantId::default(), Kind::Snapshot, sid, |d| {
+                d["snapshotStatus"] = json!("success");
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .await;
+        assert_eq!(settled(&st, &cid).await["snapshotStatus"], "success");
+        let to = synth_tenant(&stored(&st, &cid).await).expect("__tenant");
+        assert_eq!(
+            st.store.list(&to, Kind::Entity).await.expect("list").len(),
+            2
+        );
+
+        let fid = "urn:ngsi-ld:Snapshot:fsrc";
+        seeded_snapshot(&st, fid, "failure").await;
+        let cid = clone_of(&st, fid).await;
+        assert_eq!(settled(&st, &cid).await["snapshotStatus"], "failure");
+    }
+
+    /// 5.5.6 (F-ANT5-019): a clone stops at the fill ceiling of its own
+    /// broker, whatever the source was filled under.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clause_5_5_6_clone_stops_at_the_result_ceiling() {
+        let mut st = state().await;
+        st.max_limit = 1;
+        let sid = "urn:ngsi-ld:Snapshot:big";
+        let from = seeded_snapshot(&st, sid, "success").await;
+        for n in 0..=fill_cap(&st) {
+            vehicle_in(&st, &from, n).await;
+        }
+        let cid = clone_of(&st, sid).await;
+        assert_eq!(settled(&st, &cid).await["snapshotStatus"], "failure");
+    }
+
+    /// 5.16.4.4 (F-ANT5-006): a fill finishing with a document it read
+    /// before an Update Snapshot keeps the update's expiresAt, and the
+    /// update keeps the fill's status.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clause_5_16_4_4_finish_and_update_keep_each_others_members() {
+        let st = state().await;
+        let t = TenantId::default();
+        let sid = "urn:ngsi-ld:Snapshot:race";
+        seeded_snapshot(&st, sid, "preparing").await;
+        let mut read_by_fill = snap_get(&st, &t, sid).await.expect("meta");
+        let (status, _, b) = send(
+            &st,
+            "PATCH",
+            &format!("/ngsi-ld/v1/snapshots/{sid}"),
+            Some((
+                "application/json",
+                json!({"snapshotLifetime": "PT1H"}).to_string(),
+            )),
+            &[],
+        )
+        .await;
+        assert!(status.is_success(), "{status} {b}");
+        let updated = stored(&st, sid).await["expiresAt"].clone();
+        assert_ne!(updated, json!("2999-01-01T00:00:00Z"));
+        read_by_fill["snapshotStatus"] = json!("success");
+        snap_put(&st, &t, &read_by_fill, FINISH_MEMBERS).await;
+        let meta = stored(&st, sid).await;
+        assert_eq!(
+            meta["expiresAt"], updated,
+            "the fill wrote back a stale expiresAt"
+        );
+        assert_eq!(meta["snapshotStatus"], "success");
+    }
+
+    /// 5.16.1.4 (F-ANT5-008): a temporal snapshot query's attrs and window
+    /// bound what the snapshot holds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clause_5_16_1_4_temporal_copy_keeps_the_query_attrs_and_window() {
+        let st = state().await;
+        let eid = "urn:ngsi-ld:Vehicle:tq";
+        let inst = |v: i64, d: u8| {
+            json!({"type": "Property", "value": v,
+                                          "observedAt": format!("2026-01-0{d}T00:00:00Z")})
+        };
+        let ent = json!({"id": eid, "type": "Vehicle",
+            "a": [inst(1, 1), inst(2, 3), inst(3, 5)], "b": [inst(9, 3)]});
+        let (status, _, b) = post_json(&st, "/ngsi-ld/v1/temporal/entities", &ent).await;
+        assert!(status.is_success(), "{status} {b}");
+        let doc = json!({"type": "Snapshot", "snapshotTemporalQueries": [{
+            "type": "Query", "entities": [{"type": "Vehicle"}], "attrs": ["a"],
+            "temporalQ": {"timerel": "between", "timeAt": "2026-01-02T00:00:00Z",
+                          "endTimeAt": "2026-01-04T00:00:00Z"}}]});
+        let (status, headers, b) = post_json(&st, "/ngsi-ld/v1/snapshots", &doc).await;
+        assert_eq!(status, StatusCode::CREATED, "{b}");
+        let sid = header(&headers, "Location")
+            .and_then(|l| l.rsplit('/').next())
+            .expect("id")
+            .to_owned();
+        assert_eq!(settled(&st, &sid).await["snapshotStatus"], "success");
+        let synth = synth_tenant(&stored(&st, &sid).await).expect("__tenant");
+        let held = st
+            .temporal
+            .get(&synth, eid)
+            .await
+            .expect("store")
+            .expect("copy");
+        assert!(
+            held.get(format!("{DEF}b")).is_none(),
+            "b is outside attrs: {held}"
+        );
+        assert_eq!(
+            held[format!("{DEF}a")].as_array().map(Vec::len),
+            Some(1),
+            "instances outside the window: {held}"
+        );
     }
 }

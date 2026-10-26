@@ -109,7 +109,10 @@ impl Filter {
                 "this output fixes its geo-query: georel, geometry, coordinates and geoproperty are its own",
             );
         }
-        if let (Some(_), Some(theirs)) = (&self.q, params.get("q")) {
+        if let (Some(ours), Some(theirs)) = (&self.q, params.get("q")) {
+            // F-ANT4-007: the output's own q must be one group as well, or
+            // `a==1)|(b==2` joined as `(a==1)|(b==2);(theirs)` ORs past it
+            one_q(ours).map_err(|_| "this output's q is no query expression of its own")?;
             one_q(theirs)?;
         }
         if let Some(scope) = self.scope_with(params.get("scopeQ").map(String::as_str))? {
@@ -314,13 +317,16 @@ pub fn listed(listed: Option<&Value>, format: &str) -> Vec<(String, Result<Outpu
         .into_iter()
         .flatten()
         .collect();
+    // judged over the elements served: one without a name is skipped, not a
+    // reason to refuse the named ones
     let mut names: Vec<&str> = all
         .iter()
         .filter_map(|o| o.get("name").and_then(Value::as_str))
         .collect();
+    let listed_names = names.len();
     names.sort_unstable();
     names.dedup();
-    let whole = all.len() <= MAX_OUTPUTS && names.len() == all.len();
+    let whole = listed_names <= MAX_OUTPUTS && names.len() == listed_names;
     all.into_iter()
         .filter_map(|o| {
             let name = o.get("name")?.as_str()?.to_owned();
@@ -384,6 +390,37 @@ mod tests {
         listed(Some(&json!([output])), format)
             .pop()
             .map_or(Err("skipped".to_owned()), |(_, o)| o)
+    }
+
+    /// F-ANT4-007: a filter `q` that closes its own group would OR past the
+    /// caller's once joined as `(filter);(caller's)`: the join is refused.
+    #[test]
+    fn a_filter_q_that_is_no_group_of_its_own_is_never_joined() {
+        let filter = Filter {
+            q: Some("a==1)|(b==2".to_owned()),
+            ..Filter::default()
+        };
+        let mut params = BTreeMap::from([("q".to_owned(), "c==3".to_owned())]);
+        assert!(filter.narrow(&mut params).is_err(), "{params:?}");
+        let fine = Filter {
+            q: Some("a==1".to_owned()),
+            ..Filter::default()
+        };
+        assert!(fine.narrow(&mut params).is_ok());
+        assert_eq!(params.get("q").map(String::as_str), Some("(a==1);(c==3)"));
+    }
+
+    /// F-ANT4-009: an element without a name is skipped; it does not make
+    /// the named one beside it a list "with a name twice".
+    #[test]
+    fn a_nameless_element_does_not_refuse_the_named_ones() {
+        let list = json!([{"name": "a", "sources": [{"type": "Event"}]}, {"title": {"en": "x"}}]);
+        let out = listed(Some(&list), "geojson");
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out.first().map(|(n, o)| (n.as_str(), o.is_ok())),
+            Some(("a", true))
+        );
     }
 
     #[test]

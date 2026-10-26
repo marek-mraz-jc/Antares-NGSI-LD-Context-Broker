@@ -642,3 +642,29 @@ async fn a_rule_on_a_named_type_refuses_the_reads_that_name_it() {
         );
     }
 }
+
+/// F-ANT2-023: a purge (5.6.21) shows the engine its whole selection, so a
+/// rule on a type or an Attribute sees what the purge names.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_purge_names_its_types_attributes_and_query() {
+    let (st, seen) = state().await;
+    seed(&st).await;
+    let code = send(
+        &st,
+        "DELETE",
+        "/ngsi-ld/v1/entities?type=Vehicle&attrs=speed&q=speed%3E0&id=urn:ngsi-ld:Vehicle:v",
+        None,
+    )
+    .await;
+    assert!(code.is_success(), "purge: {code}");
+    let s = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|s| s.clause == "5.6.21")
+        .cloned()
+        .expect("the purge was decided");
+    assert_eq!(s.types, vec![iri("Vehicle")]);
+    assert_eq!(s.attrs, vec![iri("speed")]);
+    assert!(s.q, "the purge's q");
+}

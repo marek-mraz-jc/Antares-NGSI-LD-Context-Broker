@@ -569,6 +569,22 @@ pub trait CurrentStateDriver: Send + Sync {
         let _ = (tenant, any_of);
         Ok(None)
     }
+    /// Each distinct `lead + s` the Tenant's ids start with, `s` being the
+    /// text after `lead` up to the first `sep` (an id without one stands
+    /// for itself), sorted by bytes (T-5661): with
+    /// [`filter::id_pattern_segments`] they turn an id pattern into exact
+    /// prefixes. `None` when the backend has no such read or more than
+    /// `max` exist.
+    async fn entity_id_segments(
+        &self,
+        tenant: &TenantId,
+        lead: &str,
+        sep: char,
+        max: usize,
+    ) -> Result<Option<Vec<String>>, NgsiError> {
+        let _ = (tenant, lead, sep, max);
+        Ok(None)
+    }
     /// The (type, member name) pairs the Tenant's Entities carry, sorted
     /// (T-4934): `/types` with details and `/attributes` probe these instead
     /// of folding every Entity. The list may name a pair no live Entity
@@ -753,6 +769,17 @@ pub trait CurrentStateDriver: Send + Sync {
         tenant: Option<&TenantId>,
         id: &str,
     ) -> Result<Option<Value>, NgsiError>;
+    /// Read-modify-write of one stored @context document under its row lock:
+    /// `None` = absent or owned by another Tenant (never an insert),
+    /// `Some(Err)` = the closure rejected and nothing was committed. A usage
+    /// bump or a refetch racing a delete must leave the row deleted, and two
+    /// racing bumps must both count (5.13.3.5).
+    async fn context_mutate<'a>(
+        &self,
+        tenant: Option<&TenantId>,
+        id: &str,
+        f: MutateFn<'a>,
+    ) -> Result<Option<Result<(), ()>>, NgsiError>;
     /// Delete a stored @context document; `false` if it was absent or owned
     /// by another Tenant.
     async fn context_delete(&self, tenant: Option<&TenantId>, id: &str) -> Result<bool, NgsiError>;
@@ -1564,6 +1591,14 @@ mod tests {
             _t: Option<&TenantId>,
             _id: &str,
         ) -> Result<Option<Value>, NgsiError> {
+            Ok(None)
+        }
+        async fn context_mutate<'a>(
+            &self,
+            _t: Option<&TenantId>,
+            _id: &str,
+            _f: MutateFn<'a>,
+        ) -> Result<Option<Result<(), ()>>, NgsiError> {
             Ok(None)
         }
         async fn context_delete(

@@ -9,6 +9,10 @@
 //! production. Statements are counted from sqlx's own `sqlx::query`
 //! events, as in antares-sql/tests/pg_batch_statements.rs (T-5050); this
 //! file is its own test binary because the subscriber is process-wide.
+//! Only statements inside the counted request's span count: the interval
+//! notifier `wire` spawns polls csource_subscriptions on its own clock, and
+//! under CI load its ticks landed in the counted window (runs 40222431822,
+//! 40239706032).
 //! A task that removes a statement lowers its number here in the same commit.
 //! Skips loudly without ANTARES_TEST_DATABASE_URL.
 #![cfg(feature = "postgres")]
@@ -24,8 +28,13 @@ use axum::http::{Request, StatusCode};
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt;
+use tracing::Instrument;
 use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
+
+/// The target and name of the span around a counted request.
+const COUNTED: &str = "read_statement_budget";
 
 const DEFAULT: &str = "https://uri.etsi.org/ngsi-ld/default-context/";
 
@@ -55,9 +64,12 @@ impl tracing::field::Visit for Sql {
     }
 }
 
-impl<S: tracing::Subscriber> Layer<S> for Statements {
-    fn on_event(&self, e: &tracing::Event<'_>, _: Context<'_, S>) {
-        if e.metadata().target() == "sqlx::query" {
+impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Statements {
+    fn on_event(&self, e: &tracing::Event<'_>, ctx: Context<'_, S>) {
+        let in_request = ctx
+            .event_scope(e)
+            .is_some_and(|mut scope| scope.any(|span| span.name() == COUNTED));
+        if e.metadata().target() == "sqlx::query" && in_request {
             let mut sql = Sql(String::new(), String::new());
             e.record(&mut sql);
             let text = if sql.1.is_empty() { sql.0 } else { sql.1 };
@@ -166,7 +178,9 @@ async fn counted(
     let (code, body) = get(st, uri, tenant, link).await;
     assert_eq!(code, StatusCode::OK, "{uri} warm-up: {body}");
     log.take();
-    let (code, body) = get(st, uri, tenant, link).await;
+    let (code, body) = get(st, uri, tenant, link)
+        .instrument(tracing::info_span!(target: COUNTED, COUNTED))
+        .await;
     assert_eq!(code, StatusCode::OK, "{uri}: {body}");
     (body, log.take())
 }
@@ -182,7 +196,8 @@ async fn each_read_shape_sends_its_pinned_statements() {
         tracing_subscriber::registry().with(
             log.clone().with_filter(
                 tracing_subscriber::filter::Targets::new()
-                    .with_target("sqlx::query", tracing::Level::TRACE),
+                    .with_target("sqlx::query", tracing::Level::TRACE)
+                    .with_target(COUNTED, tracing::Level::INFO),
             ),
         ),
     )
@@ -274,15 +289,14 @@ async fn each_read_shape_sends_its_pinned_statements() {
     assert_eq!(c.len(), 3, "statements: {c:#?}");
 
     // (d) the page with a Link to the Cached @context the warm-up fetched:
-    // two transactions of the @context write-through
-    // the hit still runs (state.rs `set_cache_writer`: `hosted_row_id`'s
-    // SELECT on jsonld_contexts, then `context_put`'s INSERT ... ON
-    // CONFLICT), each set_config ... COMMIT, then the page's own three. A
-    // warm hit should write nothing; pinned here as today's cost, the
-    // change that stops the rewrite lowers both numbers.
+    // one transaction of the @context write-through the hit still runs
+    // (state.rs `set_cache_writer`: `context_mutate`'s set_config, SELECT
+    // ... FOR UPDATE, UPDATE, COMMIT), then the page's own three. A warm hit
+    // should write nothing; pinned here as today's cost, the change that
+    // stops the rewrite lowers both numbers.
     let (body, d) = counted(&st, &log, page, &tenant, Some(&link)).await;
     assert_eq!(body.as_array().map(Vec::len), Some(20), "{body}");
-    assert_eq!(d.len(), 9, "statements: {d:#?}");
+    assert_eq!(d.len(), 7, "statements: {d:#?}");
     let context_writes: Vec<&String> = d
         .iter()
         .filter(|q| q.contains("jsonld_contexts") && !q.starts_with("SELECT"))

@@ -82,8 +82,9 @@ pub(super) async fn query_temporal_outer(
                 .filter_map(|d| d.get("id").and_then(Value::as_str).map(str::to_owned)),
         );
     }
+    let mut stale: Vec<String> = Vec::new();
     if let Some(emap) = map.get_mut("entityMap").and_then(Value::as_object_mut) {
-        let stale: Vec<String> = candidates
+        stale = candidates
             .iter()
             .filter(|eid| {
                 emap.get(eid.as_str())
@@ -93,11 +94,11 @@ pub(super) async fn query_temporal_outer(
             })
             .cloned()
             .collect();
-        for k in stale {
-            emap.remove(&k);
+        for k in &stale {
+            emap.remove(k);
         }
     }
-    crate::entity_map::map_put(st, &tenant, map.clone()).await?;
+    crate::entity_map::map_prune(st, &tenant, &map_id, &stale).await?;
     // fix the query to the candidates that survived the recheck (5.5.14)
     let ids: Vec<&str> = candidates
         .iter()
@@ -771,13 +772,15 @@ async fn fetch_temporal(
             .instance_range()
             .filter(|_| !replays_state(qry.types_rule.as_deref())),
         last_n: page_n
-            .instance_cap(
-                trepr.aggregated,
-                req.st.temporal_default_instances,
-                req.st.temporal_instance_limit,
-            )
+            .store_cap(default_page(req.st, req.tenant, trepr))
             .filter(|_| {
-                plan.exact && cap_keeps_shown(qry.types_rule.as_deref(), &page_n, &qry.timeprop)
+                plan.exact
+                    && cap_keeps_shown(
+                        qry.types_rule.as_deref(),
+                        &page_n,
+                        &qry.timeprop,
+                        range_start(qry.tq.as_ref()),
+                    )
             }),
         oldest_first: !page_n.desc,
         timeproperty: &qry.timeprop,

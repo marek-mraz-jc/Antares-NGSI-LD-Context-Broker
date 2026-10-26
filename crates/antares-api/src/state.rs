@@ -306,7 +306,7 @@ tokio::task_local! {
     /// How many [`AppState::call`] frames this task is already inside, held
     /// against [`crate::bounds::MAX_IN_PROCESS_CALL_DEPTH`]. Absent outside a
     /// façade call, which reads as zero.
-    static INPROCESS_DEPTH: usize;
+    pub(crate) static INPROCESS_DEPTH: usize;
 }
 
 /// The broker's state as every handler and layer receives it. Cloned at
@@ -522,6 +522,9 @@ impl std::ops::Deref for AppState {
 
 impl std::ops::DerefMut for AppState {
     fn deref_mut(&mut self) -> &mut Shared {
+        // the memoised in-process router captured the settings about to
+        // change: a later call must build one over the new ones
+        self.inbound = Arc::new(std::sync::OnceLock::new());
         Arc::make_mut(&mut self.shared)
     }
 }
@@ -606,36 +609,41 @@ impl AppState {
                     }
                     let id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, url.as_bytes());
                     // A refetch (staleness, delete+reload) must keep the row's
-                    // identity and hit counters — only the body is new.
+                    // identity and hit counters — only the body is new — and
+                    // it swaps the body under the row lock, so a bump racing
+                    // it keeps its count. Only a row that is not there is
+                    // written whole.
                     // The row this writes is `Cached` and belongs to no Tenant
                     // (ADR-0021), but the call still acts for the Tenant whose
                     // resolution triggered the fetch: that is what lets the guard
                     // above see this Tenant's own Hosted rows.
-                    let prior = store
-                        .context_get(tenant, &id.to_string())
-                        .await
-                        .ok()
-                        .flatten();
-                    let field = |k: &str| {
-                        prior
-                            .as_ref()
-                            .and_then(|p| p[k].as_str())
-                            .map(str::to_owned)
-                    };
-                    let created = field("createdAt").unwrap_or_else(now_iso);
+                    let id = id.to_string();
+                    let body = serde_json::json!({"@context": ctx_value});
+                    let refetched = store
+                        .context_mutate(
+                            tenant,
+                            &id,
+                            Box::new(|row| {
+                                row.as_object_mut()
+                                    .ok_or(())?
+                                    .insert("body".into(), body.clone());
+                                Ok(())
+                            }),
+                        )
+                        .await;
+                    if matches!(refetched, Ok(Some(Ok(())))) {
+                        return;
+                    }
                     let doc = serde_json::json!({
                         "url": url,
-                        "localId": id.to_string(),
+                        "localId": id,
                         "kind": "Cached",
-                        "createdAt": created,
-                        "numberOfHits": prior
-                            .as_ref()
-                            .and_then(|p| p["numberOfHits"].as_u64())
-                            .unwrap_or(0),
-                        "lastUsage": field("lastUsage"),
-                        "body": {"@context": ctx_value},
+                        "createdAt": now_iso(),
+                        "numberOfHits": 0,
+                        "lastUsage": null,
+                        "body": body,
                     });
-                    if let Err(e) = store.context_put(tenant, &id.to_string(), doc).await {
+                    if let Err(e) = store.context_put(tenant, &id, doc).await {
                         // a client-named @context URL may carry userinfo
                         tracing::warn!(
                             "@context write-through failed for {}: {e}",
@@ -659,24 +667,19 @@ impl AppState {
                     if Loader::is_pinned_core(url) {
                         return true;
                     }
-                    // One read, not two: a bump runs on every counted use of a
-                    // non-pinned @context, and the hosted probe already carries
-                    // the row it found.
-                    let held = hosted_row(&*store, tenant, url).await;
-                    let (id, row) = match held {
-                        Some((id, row)) => (id, Ok(Some(row))),
-                        None => {
-                            let id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, url.as_bytes())
-                                .to_string();
-                            let row = store.context_get(tenant, &id).await;
-                            (id, row)
-                        }
+                    let id = match hosted_row_id(&*store, tenant, url).await {
+                        Some(id) => id,
+                        None => uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, url.as_bytes())
+                            .to_string(),
                     };
-                    match row {
-                        // the row is what the store handed back; a row that
-                        // cannot carry the counters is left uncounted
-                        Ok(Some(mut doc)) if doc.is_object() => {
-                            if let Some(o) = doc.as_object_mut() {
+                    // under the row lock: a bump racing a delete leaves the row
+                    // deleted, and two racing bumps both count
+                    let bumped = store
+                        .context_mutate(
+                            tenant,
+                            &id,
+                            Box::new(|row| {
+                                let o = row.as_object_mut().ok_or(())?;
                                 let hits = o
                                     .get("numberOfHits")
                                     .and_then(serde_json::Value::as_u64)
@@ -684,21 +687,24 @@ impl AppState {
                                     .saturating_add(1);
                                 o.insert("numberOfHits".into(), serde_json::json!(hits));
                                 o.insert("lastUsage".into(), serde_json::json!(now_iso()));
-                            }
-                            if let Err(e) = store.context_put(tenant, &id, doc).await {
-                                tracing::warn!(
-                                    "@context hit bump failed for {}: {e}",
-                                    antares_notifier::redact_userinfo(url)
-                                );
-                            }
-                            true
-                        }
+                                Ok(())
+                            }),
+                        )
+                        .await;
+                    match bumped {
+                        Ok(Some(Ok(()))) => true,
                         // a row that cannot carry the counters is left
                         // uncounted, and still exists: it must not be evicted
-                        Ok(Some(_)) => true,
+                        Ok(Some(Err(()))) => true,
                         Ok(None) => false,
                         // a store hiccup must never evict a healthy cache entry
-                        Err(_) => true,
+                        Err(e) => {
+                            tracing::warn!(
+                                "@context hit bump failed for {}: {e}",
+                                antares_notifier::redact_userinfo(url)
+                            );
+                            true
+                        }
                     }
                 })
             }));
@@ -716,7 +722,18 @@ impl AppState {
             loader.set_local_lookup(Arc::new(move |tenant, url| {
                 let store = store.clone();
                 Box::pin(async move {
-                    let (_, row) = hosted_row(&*store, tenant, url).await?;
+                    // A miss for a named Tenant still asks the DEFAULT one: a
+                    // fetch of this URL would reach the serve endpoint with no
+                    // NGSILD-Tenant, get the default Tenant's row and cache it
+                    // for everyone (F-ANT4-002). Found here, it keeps its owner.
+                    let default = antares_model::TenantId::default();
+                    let (_, row) = match hosted_row(&*store, tenant, url).await {
+                        Some(found) => found,
+                        None if tenant.is_some_and(|t| *t != default) => {
+                            hosted_row(&*store, Some(&default), url).await?
+                        }
+                        None => return None,
+                    };
                     // Ownership is one rule for the whole broker (ADR-0021): a
                     // Cached row is a copy of a public document and belongs to no
                     // Tenant, everything else belongs to its `owner` — with the
@@ -1534,6 +1551,135 @@ mod jsonld_context_locality_5_13 {
         );
     }
 
+    /// F-ANT4-002: the default Tenant's Hosted @context is not fetched for
+    /// another Tenant through the broker's own (tenant-less) serve URL.
+    #[tokio::test]
+    async fn a_default_tenant_context_is_not_fetched_for_another_tenant() {
+        let st = AppState::new("me".into());
+        let owner = antares_model::TenantId::default();
+        let (url, fetches) = context_server("/ngsi-ld/v1/jsonldContexts/local-d");
+        st.store
+            .context_put(
+                Some(&owner),
+                "local-d",
+                serde_json::json!({
+                    "url": url, "localId": "local-d", "kind": "Hosted",
+                    "owner": owner.as_str(), "createdAt": now_iso(),
+                    "body": {"@context": {"peerTemp": "http://example.org/peerTemp"}},
+                }),
+            )
+            .await
+            .expect("seed hosted row");
+        let beta = antares_model::TenantId::new("beta").expect("tenant");
+        let user = serde_json::json!(url);
+        for _ in 0..2 {
+            let e = st.loader.resolve_for(&beta, &user).await;
+            assert!(
+                matches!(e, Err(antares_model::NgsiError::LdContextNotAvailable(_))),
+                "{e:?}"
+            );
+        }
+        assert_eq!(fetch_count(&fetches), 0, "never fetched over HTTP");
+        st.loader
+            .resolve_for(&owner, &user)
+            .await
+            .expect("owner resolves");
+    }
+
+    /// F-ANT2-008: a Cached @context serves every Tenant, so a named Tenant
+    /// may neither delete nor reload it; the default Tenant may.
+    #[tokio::test]
+    async fn only_the_default_tenant_deletes_a_cached_context() {
+        let st = AppState::new("me".into());
+        let (url, _) = context_server("/shared.jsonld");
+        let alpha = antares_model::TenantId::new("alpha").expect("tenant");
+        st.loader
+            .resolve_for(&alpha, &serde_json::json!(url))
+            .await
+            .expect("cached");
+        let path = format!(
+            "/ngsi-ld/v1/jsonldContexts/{}",
+            url.replace(':', "%3A").replace('/', "%2F")
+        );
+        let send = |method: &str, uri: String, tenant: Option<&str>| {
+            let mut b = axum::http::Request::builder().method(method).uri(uri);
+            if let Some(t) = tenant {
+                b = b.header("NGSILD-Tenant", t);
+            }
+            let req = b.body(axum::body::Body::empty()).expect("request");
+            tower::ServiceExt::oneshot(crate::router(st.clone()), req)
+        };
+        for uri in [path.clone(), format!("{path}?reload=true")] {
+            let refused = send("DELETE", uri, Some("beta")).await.expect("response");
+            assert_eq!(refused.status(), axum::http::StatusCode::FORBIDDEN);
+        }
+        let details = send("GET", format!("{path}?details=true"), None)
+            .await
+            .expect("response");
+        assert_eq!(
+            details.status(),
+            axum::http::StatusCode::OK,
+            "the row is kept"
+        );
+        let deleted = send("DELETE", path, None).await.expect("response");
+        assert_eq!(deleted.status(), axum::http::StatusCode::NO_CONTENT);
+    }
+
+    /// F-ANT2-004: a Tenant purge drops its Hosted @context from the loader
+    /// too, so the name recreated is not served the old term mappings.
+    #[tokio::test]
+    async fn a_purged_tenants_hosted_context_resolves_no_more() {
+        let st = AppState::new("me".into());
+        let t = antares_model::TenantId::new("purgectx").expect("tenant");
+        let (url, fetches) = context_server("/ngsi-ld/v1/jsonldContexts/local-p");
+        st.store
+            .context_put(
+                Some(&t),
+                "local-p",
+                serde_json::json!({
+                    "url": url, "localId": "local-p", "kind": "Hosted",
+                    "owner": t.as_str(), "createdAt": now_iso(),
+                    "body": {"@context": {"peerTemp": "http://example.org/peerTemp"}},
+                }),
+            )
+            .await
+            .expect("seed hosted row");
+        let user = serde_json::json!(url);
+        st.loader
+            .resolve_for(&t, &user)
+            .await
+            .expect("owner resolves");
+        let req = |m: &str, uri: &str, body: &str| {
+            axum::http::Request::builder()
+                .method(m)
+                .uri(uri)
+                .header("NGSILD-Tenant", "purgectx")
+                .header("Content-Type", "application/json")
+                .header("Content-Length", body.len())
+                .body(axum::body::Body::from(body.to_owned()))
+                .expect("request")
+        };
+        let entity = r#"{"id": "urn:ngsi-ld:Room:p", "type": "Room"}"#;
+        let made = tower::ServiceExt::oneshot(
+            crate::router(st.clone()),
+            req("POST", "/ngsi-ld/v1/entities", entity),
+        )
+        .await
+        .expect("response");
+        assert_eq!(made.status(), axum::http::StatusCode::CREATED);
+        let purged = tower::ServiceExt::oneshot(
+            crate::router(st.clone()),
+            req("DELETE", "/q/tenants/purgectx", ""),
+        )
+        .await
+        .expect("response");
+        assert_eq!(purged.status(), axum::http::StatusCode::NO_CONTENT);
+        // the purge released the loader's entry for the row while it still
+        // listed it; run after the store purge it listed nothing
+        assert!(st.loader.usage_get(&url).await.is_none());
+        assert_eq!(fetch_count(&fetches), 0);
+    }
+
     /// 5.13.3.5 counts uses of an @context this broker hosts on its own
     /// stored row — no second, Cached copy of the same document, and no
     /// fetch of its URL: the row holds the document (5.13.1 "Hosted").
@@ -1755,5 +1901,24 @@ mod clone_cost {
         c.max_limit = 7;
         assert_eq!((a.max_limit, c.max_limit), (1000, 7));
         assert!(!std::ptr::eq(&a.http, &c.http));
+    }
+
+    /// F-ANT2-024: a setting written after an in-process call reaches the
+    /// next call; the memoised router of the clone was built over the old
+    /// settings and answered `limit=5` as if `max_limit` were still 1000.
+    #[tokio::test]
+    async fn a_write_after_a_call_reaches_the_next_call() {
+        let call = |st: &AppState| {
+            let req = axum::http::Request::get("/ngsi-ld/v1/entities?type=T&limit=5")
+                .body(axum::body::Body::empty())
+                .expect("request");
+            let st = st.clone();
+            async move { st.call(&axum::http::HeaderMap::new(), req).await.status() }
+        };
+        let a = AppState::new("antares-test".into());
+        assert_eq!(call(&a).await, axum::http::StatusCode::OK);
+        let mut c = a.clone();
+        c.max_limit = 1;
+        assert_eq!(call(&c).await, axum::http::StatusCode::FORBIDDEN);
     }
 }

@@ -367,8 +367,45 @@ fn tenant_req(method: &str, uri: &str, tenant: &str, body: Option<Value>) -> Req
     }
 }
 
+/// Creates `tenant` (5.5.10: a create operation creates its Tenant) with
+/// one Entity.
+async fn ensure_tenant(st: &AppState, tenant: &str) {
+    let entity = json!({"id": format!("urn:ngsi-ld:Seed:{tenant}"), "type": "Seed"});
+    let req = tenant_req("POST", "/ngsi-ld/v1/entities", tenant, Some(entity));
+    let (status, _, body) = send(st, req).await;
+    assert!(
+        status == StatusCode::CREATED || status == StatusCode::CONFLICT,
+        "{status} {body}"
+    );
+}
+
+/// F-ANT2-006: adding an @context stores a Hosted row its Tenant owns, so
+/// a Tenant that does not exist answers 404 and nothing is stored.
+#[tokio::test]
+async fn clause_5_13_2_a_context_is_not_added_for_a_tenant_that_does_not_exist() {
+    let st = AppState::new("me".into());
+    let doc = json!({"@context": {"ghostTerm": "urn:ngsi-ld:attributes:ghostTerm"}});
+    let req = tenant_req("POST", "/ngsi-ld/v1/jsonldContexts", "ghost", Some(doc));
+    let (status, _, body) = send(&st, req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (_, _, listed) = send(
+        &st,
+        tenant_req(
+            "GET",
+            "/ngsi-ld/v1/jsonldContexts?details=true",
+            "ghost",
+            None,
+        ),
+    )
+    .await;
+    assert!(!listed.to_string().contains("ghostTerm"), "{listed}");
+    ensure_tenant(&st, "ghost").await;
+    add_hosted_as(&st, "ghost", "ghostTerm").await;
+}
+
 /// Add a Hosted @context on behalf of `tenant`, returning its Location path.
 async fn add_hosted_as(st: &AppState, tenant: &str, term: &str) -> String {
+    ensure_tenant(st, tenant).await;
     let (status, headers, _) = send(
         st,
         tenant_req(

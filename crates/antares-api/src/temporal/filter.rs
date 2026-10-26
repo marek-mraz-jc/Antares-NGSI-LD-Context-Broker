@@ -12,26 +12,47 @@ pub(super) fn replays_state(rules: Option<&crate::policy::Filter>) -> bool {
 }
 
 /// Whether the store's per-Attribute cap keeps every instance `rules` would
-/// show of the page: with no rules always; under rules only for lastN, when
-/// no rule reads state and every window stays open towards now, so the
-/// rules keep the newest instances of what they show. A window that closes
-/// before now, or firstN, would have the store keep instances the rules
-/// then drop (T-4246). Rule windows judge observedAt, so a window under a
-/// cap ordered by another `timeproperty` (a backfill: new createdAt, old
-/// observedAt) keeps the cap in the API too.
+/// show of the page: with no rules always; under rules only when no rule
+/// reads state and every rule window stays open on the page's side: towards
+/// now for lastN, and from no later than the query's `start` (its `after`
+/// or `between` instant) oldest first, so the rules keep a leading run of
+/// what the store kept. A window that closes before now under lastN, or
+/// opens after the start oldest first, would have the store keep instances
+/// the rules then drop (T-4246, T-5777). Rule windows judge observedAt, so
+/// a window under a cap ordered by another `timeproperty` (a backfill: new
+/// createdAt, old observedAt) keeps the cap in the API too.
 pub(super) fn cap_keeps_shown(
     rules: Option<&crate::policy::Filter>,
     page: &InstancePage,
     timeprop: &str,
+    start: Option<&str>,
 ) -> bool {
+    // an `Ago` bound resolved an hour late: the rules resolve theirs after
+    // the store answered, by then a little later than now
+    let late = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::hours(1))
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC);
     rules.is_none_or(|r| {
-        page.desc
-            && !replays_state(Some(r))
+        !replays_state(Some(r))
             && r.rules.iter().all(|rule| {
                 rule.temporal.is_empty()
-                    || (timeprop == "observedAt" && rule.temporal.iter().all(|w| w.to.is_none()))
+                    || (timeprop == "observedAt"
+                        && rule.temporal.iter().all(|w| {
+                            if page.desc {
+                                w.to.is_none()
+                            } else {
+                                start.is_some_and(|s| w.opens_by(s, late))
+                            }
+                        }))
             })
     })
+}
+
+/// The instant a window read oldest first starts at: `timeAt` of `after`
+/// and `between`; `before` and no window start at the beginning of time.
+pub(super) fn range_start(tq: Option<&TemporalQ>) -> Option<&str> {
+    tq.filter(|t| matches!(t.timerel.as_str(), "after" | "between"))
+        .map(|t| t.time_at.as_str())
 }
 
 /// 5.7.4.4 S2/S3: the values filter and the geoquery are judged on the
@@ -256,19 +277,27 @@ pub(super) fn scope_window_retain(
     tq: Option<&TemporalQ>,
     timeprop: &str,
 ) -> bool {
-    let iv = scope_match_intervals(doc, sq);
+    // every comparison on dt_key: raw strings put `…00.500Z` below `…00Z`
+    let iv: Vec<(String, Option<String>)> = scope_match_intervals(doc, sq)
+        .into_iter()
+        .map(|(s, e)| (dt_key(&s), e.as_deref().map(dt_key)))
+        .collect();
     let (wstart, wend) = match tq {
         Some(t) => match t.timerel.as_str() {
-            "before" => (None, Some(t.time_at.as_str())),
-            "after" => (Some(t.time_at.as_str()), None),
-            "between" => (Some(t.time_at.as_str()), t.end_time_at.as_deref()),
+            "before" => (None, Some(dt_key(&t.time_at))),
+            "after" => (Some(dt_key(&t.time_at)), None),
+            "between" => (
+                Some(dt_key(&t.time_at)),
+                t.end_time_at.as_deref().map(dt_key),
+            ),
             _ => (None, None),
         },
         None => (None, None),
     };
     let intersects = iv.iter().any(|(s, e)| {
-        wend.is_none_or(|w| s.as_str() < w)
-            && e.as_deref().is_none_or(|e| wstart.is_none_or(|w| e > w))
+        wend.as_deref().is_none_or(|w| s.as_str() < w)
+            && e.as_deref()
+                .is_none_or(|e| wstart.as_deref().is_none_or(|w| e > w))
     });
     if !intersects {
         return false;
@@ -280,10 +309,14 @@ pub(super) fn scope_window_retain(
             }
             if let Some(arr) = v.as_array_mut() {
                 arr.retain(|inst| {
-                    inst.get(timeprop).and_then(Value::as_str).is_some_and(|t| {
-                        iv.iter()
-                            .any(|(s, e)| t >= s.as_str() && e.as_deref().is_none_or(|e| t < e))
-                    })
+                    inst.get(timeprop)
+                        .and_then(Value::as_str)
+                        .map(dt_key)
+                        .is_some_and(|t| {
+                            let t = t.as_str();
+                            iv.iter()
+                                .any(|(s, e)| t >= s.as_str() && e.as_deref().is_none_or(|e| t < e))
+                        })
                 });
             }
         }

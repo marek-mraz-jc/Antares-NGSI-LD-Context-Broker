@@ -650,6 +650,7 @@ async fn query_entities_outer(
     );
     let chunk_size = limit.max(20);
     let mut page_ids: Vec<String> = Vec::new();
+    let mut stale: Vec<String> = Vec::new();
     let (mut skipped, mut total, mut more, mut visited) = (0usize, 0usize, false, 0usize);
     for chunk in ids.chunks(chunk_size) {
         let mut p = params.clone();
@@ -678,6 +679,7 @@ async fn query_entities_outer(
                     .is_some_and(|a| matches!(a.as_slice(), [only] if only == "@none"));
                 if local_only && !matched.contains(id.as_str()) {
                     emap.remove(id);
+                    stale.push(id.clone());
                 }
             }
         }
@@ -706,7 +708,7 @@ async fn query_entities_outer(
     if count {
         more = total > offset.saturating_add(limit);
     }
-    crate::entity_map::map_put(st, &tenant, map.clone()).await?;
+    crate::entity_map::map_prune(st, &tenant, &map_id, &stale).await?;
     // fix the final fetch to exactly the page's survivors (5.5.14: an empty
     // set is fixed to nothing); one extra page-sized fetch keeps the whole
     // repr pipeline shared instead of forked
@@ -1688,6 +1690,7 @@ pub async fn filter_entities_paged(
             } else {
                 None
             },
+            id_prefixes: None,
             types: judged.as_deref().or(type_sel.as_deref()),
             attrs: if split_agg {
                 None
@@ -1844,8 +1847,9 @@ pub async fn filter_entities_paged(
         if (enough.is_none() && counting.is_none()) || !store_paged || got < read.1 {
             break;
         }
-        // a walk over candidates is bounded as the flat read it replaces was
-        if (counting.is_some() || undecidable) && rows >= *crate::bounds::MAX_FOLD_DOCS {
+        // a walk over candidates is bounded as the flat read it replaces was,
+        // a window that never fills (rules admitting nothing) too (F-ANT2-010)
+        if rows >= *crate::bounds::MAX_FOLD_DOCS {
             return Err(NgsiError::TooManyResults(format!(
                 "this query read more than {} entities; narrow it",
                 *crate::bounds::MAX_FOLD_DOCS
@@ -1909,7 +1913,7 @@ pub async fn delete_entity(
         // the client meant, and the delete then removes an Entity the
         // client's selector excluded.
         let ctx = request_context(&st.loader, &headers).await?;
-        let pre = crate::policy::pre_image(&st, &tenant, &id, None).await;
+        let pre = crate::policy::pre_image(&st, &tenant, &id, None).await?;
         let granted = gate!(
             st, &tenant, &headers, "5.6.6",
             ids: &[&id],
@@ -2215,8 +2219,23 @@ async fn purge_inner(
         ],
     )?;
     let ctx = request_context(&st.loader, headers).await?;
-    gate!(st, &tenant, headers, "5.6.21", scope_q: params.get("scopeQ").map(String::as_str))
-        .await?;
+    // The engine sees the whole request (F-ANT2-023); 5.6.21 stays one
+    // tenant-wide grant (ADR-0020), so nothing narrows the purge itself.
+    let named = ReadMembers::with_ctx(st, params, &ctx);
+    let ids: Vec<&str> = params
+        .get("id")
+        .map(|s| s.split(',').map(str::trim).collect())
+        .unwrap_or_default();
+    gate!(
+        st, &tenant, headers, "5.6.21",
+        ids: &ids,
+        q: named.q.as_ref(),
+        scope_q: params.get("scopeQ").map(String::as_str),
+        types: &named.types,
+        attrs: &named.attrs,
+        geo: named.geo.as_ref(),
+    )
+    .await?;
     // 5.6.21.4: exactly five qualifying conditions —
     //   a) selector of Entity Types
     //   b) list of Attribute names, including at least one non-system Attribute
@@ -2395,7 +2414,7 @@ async fn merge_entity_inner(
             ..Default::default()
         },
     )?;
-    let pre = crate::policy::pre_image(st, &tenant, id, Some(&fragment)).await;
+    let pre = crate::policy::pre_image(st, &tenant, id, Some(&fragment)).await?;
     let granted = gate!(
         st, &tenant, headers, "5.6.17",
         ids: &[id],
@@ -2796,6 +2815,17 @@ impl KeptTypes<'_> {
 
 /// JSON Merge-Patch over internal docs (5.5.12).
 pub fn merge_into(doc: &mut Value, fragment: &Value, ts: &str) {
+    merge_with(doc, fragment, ts, false);
+}
+
+/// 5.6.9 Update (5.6.3 per Entity): as [`merge_into`], but an instance the
+/// fragment names replaces the stored one whole (its `createdAt` kept), so a
+/// member the update leaves out (`unitCode`) is gone, never merged over.
+pub fn update_into(doc: &mut Value, fragment: &Value, ts: &str) {
+    merge_with(doc, fragment, ts, true);
+}
+
+fn merge_with(doc: &mut Value, fragment: &Value, ts: &str, replace: bool) {
     // The Entity as a backfill names it (T-4665): id and type, before the merge.
     let shell = serde_json::json!({"id": doc.get("id"), "type": doc.get("type")});
     let (Some(target), Some(frag)) = (doc.as_object_mut(), fragment.as_object()) else {
@@ -2863,7 +2893,21 @@ pub fn merge_into(doc: &mut Value, fragment: &Value, ts: &str) {
                         (true, None) => {}
                         (false, Some(p)) => {
                             if let Some(ci) = cur.get_mut(p) {
-                                if !crate::history::backfilled(&shell, k, ci, &fi) {
+                                if crate::history::backfilled(&shell, k, ci, &fi) {
+                                    // older than the stored one: history only
+                                } else if replace {
+                                    let created = ci.get("createdAt").cloned();
+                                    let mut ni = Value::Array(vec![fi.clone()]);
+                                    crate::stamp::stamp_instances(&mut ni, ts);
+                                    if let Some(Value::Object(mut o)) =
+                                        ni.as_array_mut().and_then(Vec::pop)
+                                    {
+                                        if let Some(c) = created {
+                                            o.insert("createdAt".into(), c);
+                                        }
+                                        *ci = Value::Object(o);
+                                    }
+                                } else {
                                     merge_instance(ci, &fi, ts);
                                 }
                             }
@@ -2985,7 +3029,7 @@ pub async fn replace_entity(
                 }),
             None => None,
         };
-        let pre = crate::policy::pre_image(&st, &tenant, &id, shown.as_ref()).await;
+        let pre = crate::policy::pre_image(&st, &tenant, &id, shown.as_ref()).await?;
         let granted = gate!(
             st, &tenant, &headers, "5.6.18",
             ids: &[&id],

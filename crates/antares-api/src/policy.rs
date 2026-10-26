@@ -422,6 +422,15 @@ impl Window {
                 .to
                 .is_none_or(|b| t < antares_model::dt_key(&b.render(now, false)))
     }
+
+    /// Whether every instance observed at or after `start` is past this
+    /// window's start, the bound resolved against `now`.
+    #[must_use]
+    pub fn opens_by(&self, start: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.from.is_none_or(|b| {
+            antares_model::dt_key(start) >= antares_model::dt_key(&b.render(now, true))
+        })
+    }
 }
 
 /// The text of a [`Filter::warning`]: printable ASCII on one line, at most
@@ -1522,17 +1531,18 @@ pub(crate) async fn pre_image(
     tenant: &antares_model::TenantId,
     id: &str,
     body: Option<&Value>,
-) -> PreImage {
+) -> Result<PreImage, antares_model::NgsiError> {
     if st.policy.is_none() {
-        return PreImage::default();
+        return Ok(PreImage::default());
     }
+    // A failed read is the request's failure, never an absent Entity: a
+    // missing pre-image would let a rule keyed on the stored types or
+    // headers decide over nothing (fail-closed, ADR-0020; F-ANT2-009).
     let stored = st
         .store
         .get(tenant, antares_store::Kind::Entity, id)
-        .await
-        .ok()
-        .flatten();
-    image(stored, body)
+        .await?;
+    Ok(image(stored, body))
 }
 
 /// The [`PreImage`] of a temporal write by id (5.6.12 to 5.6.16, T-3607):
@@ -1543,12 +1553,12 @@ pub(crate) async fn temporal_pre_image(
     st: &crate::state::AppState,
     tenant: &antares_model::TenantId,
     id: &str,
-) -> PreImage {
+) -> Result<PreImage, antares_model::NgsiError> {
     if st.policy.is_none() {
-        return PreImage::default();
+        return Ok(PreImage::default());
     }
-    match st.temporal.get(tenant, id).await.ok().flatten() {
-        Some(evolution) => image(Some(evolution), None),
+    match st.temporal.get(tenant, id).await? {
+        Some(evolution) => Ok(image(Some(evolution), None)),
         None => pre_image(st, tenant, id, None).await,
     }
 }
@@ -3324,13 +3334,17 @@ mod tests {
             .create(&tenant, antares_store::Kind::Entity, id, stored)
             .await
             .expect("create");
-        let none = pre_image(&bare, &tenant, id, Some(&body)).await;
+        let none = pre_image(&bare, &tenant, id, Some(&body))
+            .await
+            .expect("read");
         assert!(
             none.types.is_empty() && none.stored.is_none(),
             "no engine, no read"
         );
         let st = bare.with_policy(std::sync::Arc::new(AllowAll));
-        let image = pre_image(&st, &tenant, id, Some(&body)).await;
+        let image = pre_image(&st, &tenant, id, Some(&body))
+            .await
+            .expect("read");
         assert_eq!(image.types, vec![iri("Car"), iri("Vehicle")]);
         assert_eq!(
             image.stored.map(|s| s.attribute_names),

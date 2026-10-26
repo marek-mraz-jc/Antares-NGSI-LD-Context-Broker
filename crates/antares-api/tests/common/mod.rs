@@ -190,7 +190,7 @@ impl Double {
         }
     }
 
-    /// The INSERT of one document fails while the rest of the store keeps
+    /// The INSERT (create or upsert) of one document fails while the rest of the store keeps
     /// working — a backend that refuses one write, or loses the connection
     /// between two of them. A caller that discards the result writes nothing
     /// and reports the document as stored.
@@ -380,6 +380,7 @@ impl CurrentStateDriver for Double {
         doc: Value,
     ) -> Result<bool, NgsiError> {
         self.pool_wall()?;
+        self.refused_create(kind, id)?;
         self.inner.upsert(tenant, kind, id, doc).await
     }
     async fn get(
@@ -495,6 +496,14 @@ impl CurrentStateDriver for Double {
         id: &str,
     ) -> Result<Option<Value>, NgsiError> {
         self.inner.context_get(tenant, id).await
+    }
+    async fn context_mutate<'a>(
+        &self,
+        tenant: Option<&TenantId>,
+        id: &str,
+        f: antares_store::MutateFn<'a>,
+    ) -> Result<Option<Result<(), ()>>, NgsiError> {
+        self.inner.context_mutate(tenant, id, f).await
     }
     async fn context_delete(&self, tenant: Option<&TenantId>, id: &str) -> Result<bool, NgsiError> {
         self.inner.context_delete(tenant, id).await

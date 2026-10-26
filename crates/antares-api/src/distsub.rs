@@ -518,11 +518,11 @@ pub(crate) async fn on_csource_notification(
         {
             continue;
         }
-        let Some(endpoint) = reg.get("endpoint").and_then(Value::as_str).map(|e| {
-            e.trim_end_matches('/')
-                .trim_end_matches("/ngsi-ld/v1")
-                .to_owned()
-        }) else {
+        let Some(endpoint) = reg
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .map(crate::federation::endpoint_base)
+        else {
             continue;
         };
         let mapped = ds_remotes(&ds_get(st, tenant, own_id).await)
@@ -710,7 +710,10 @@ fn reduced_copy(
                 .map(|n| ctx.expand_key(n))
         })
         .collect();
-    if !reg_attrs.is_empty() {
+    // a periodic Subscription watches nothing (5.2.12 forbids the pair):
+    // its copy gets no watchedAttributes either, or the source refuses it
+    let periodic = o.contains_key("timeInterval");
+    if !reg_attrs.is_empty() && !periodic {
         let watch: Vec<Value> = match o.get("watchedAttributes").and_then(Value::as_array) {
             Some(w) => w
                 .iter()
@@ -1001,17 +1004,67 @@ async fn remote_notify_inner(st: &AppState, body: &[u8]) -> ApiResult<Response> 
         }
     }
     // 5.8.6: forward to the original subscriber under the OWN subscriptionId
+    let split = sub.get("splitEntities").and_then(Value::as_bool) == Some(true);
     let (st2, sub2, t2) = (st.clone(), sub.clone(), tenant.clone());
     crate::spawn(async move {
         let ctx = crate::notify::sub_context(&st2, &t2, &sub2).await;
+        // split_merge shaped its Entities already
+        let data = if split {
+            data
+        } else {
+            project_forwarded(&sub2, data, &ctx)
+        };
         crate::notify::deliver(&st2, &t2, &sub2, data, &ctx).await;
     });
     Ok(StatusCode::OK.into_response())
 }
 
+/// The local Subscription's projection (attributes, pick, omit, format)
+/// over Entities a Context Source notified (F-ANT3-013): the source answers
+/// its own copy's projection, which need not be the subscriber's. Each is
+/// read back into the storage form, shaped and compacted as the local
+/// notify path does; one that does not read is dropped.
+fn project_forwarded(sub: &Value, data: Vec<Value>, ctx: &antares_jsonld::Context) -> Vec<Value> {
+    let shape = crate::notify::notif_shape(sub, ctx);
+    data.iter()
+        .filter_map(Value::as_object)
+        .filter_map(|obj| {
+            antares_jsonld::expand_entity(
+                obj,
+                ctx,
+                antares_jsonld::ExpandOpts {
+                    allow_null: true,
+                    sys: true,
+                    ..Default::default()
+                },
+            )
+            .ok()
+        })
+        .map(|doc| {
+            let shaped = crate::repr::apply(&doc, &shape.repr);
+            crate::repr::compact_for(&shape.repr, &shaped, ctx)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-ANT3-013: a forwarded notification carries what the local
+    /// Subscription projects, not what the source sent.
+    #[test]
+    fn a_forwarded_notification_takes_the_local_projection() {
+        let ctx = antares_jsonld::core_context();
+        let sub = json!({"notification": {"attributes": [format!("{DC}speed")]}});
+        let data = vec![json!({"id": "urn:ngsi-ld:Vehicle:1", "type": "Vehicle",
+            "speed": {"type": "Property", "value": 1},
+            "brand": {"type": "Property", "value": "x"}})];
+        let out = project_forwarded(&sub, data, &ctx);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["speed"]["value"], 1, "{}", out[0]);
+        assert!(out[0].get("brand").is_none(), "{}", out[0]);
+    }
 
     /// The default @context prefix every Term expands to (5.5.7).
     const DC: &str = "https://uri.etsi.org/ngsi-ld/default-context/";
@@ -1065,6 +1118,29 @@ mod tests {
                 "lastFailure": "2026-01-02T00:00:00Z",
             },
         })
+    }
+
+    /// F-ANT3-014: a periodic Subscription that watches everything gets no
+    /// watchedAttributes in its copy: 5.2.12 forbids the pair with
+    /// timeInterval, so the source refused every such copy.
+    #[test]
+    fn a_periodic_copy_watches_nothing() {
+        let st = AppState::new("antares-ds-periodic".into());
+        let mut sub = sub_doc();
+        if let Some(o) = sub.as_object_mut() {
+            o.remove("watchedAttributes");
+            o.insert("timeInterval".into(), json!(10));
+        }
+        let copy = reduced_copy(
+            &st,
+            &sub,
+            &reg_doc(),
+            "urn:ngsi-ld:Subscription:remote1",
+            &st.loader.core(),
+        )
+        .expect("a copy the registration covers");
+        assert_eq!(copy.get("watchedAttributes"), None, "{copy}");
+        assert_eq!(copy.get("timeInterval"), Some(&json!(10)));
     }
 
     /// 5.8.1.4: "a copy of the original Subscription shall be reduced to

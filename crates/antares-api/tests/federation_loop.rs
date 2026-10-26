@@ -684,6 +684,58 @@ async fn clause_5_6_3_4_append_forwards_only_the_registered_attributes() {
     );
 }
 
+/// 5.6.2.4: an Update Attributes fragment names its Entity in the path; an
+/// `id` member inside the fragment names nothing. The ETSI payload
+/// vehicle-speed-different-attribute.jsonld carries
+/// `"id": "urn:ngsi-ld:Vehicle:randomUUID"`, and D004_01_exc expects the
+/// exclusive source to receive the PATCH all the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn clause_5_6_2_4_a_fragment_id_does_not_unmatch_the_registration() {
+    let st = state();
+    let (status, _) = post_json(&st, "/ngsi-ld/v1/entities", vehicle(&[])).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let m = mock_replying("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+    let ops = ["updateEntity", "retrieveEntity"];
+    register_doc(
+        &st,
+        csr("urn:CSR:UpdExcl", "exclusive", &ops, &["speed"], m.port),
+    )
+    .await;
+    let body = serde_json::json!({
+        "id": "urn:ngsi-ld:Vehicle:randomUUID",
+        "type": "Vehicle",
+        "speed": {"type": "Property", "value": 66},
+    })
+    .to_string();
+    let req = Request::builder()
+        .method("PATCH")
+        .uri(format!("/ngsi-ld/v1/entities/{ENTITY}/attrs/"))
+        .header("Content-Type", "application/json")
+        .header("Content-Length", body.len())
+        .body(Body::from(body))
+        .expect("request");
+    let res = send(&st, req).await;
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    let doc = String::from_utf8_lossy(&bytes);
+    assert_eq!(status, StatusCode::NO_CONTENT, "{doc}");
+    assert_eq!(
+        m.hits.load(Ordering::SeqCst),
+        1,
+        "the source gets the PATCH"
+    );
+    let sent: serde_json::Value =
+        serde_json::from_str(&m.last_body.lock().expect("lock")).expect("forwarded json");
+    assert_eq!(sent["speed"]["value"], 66, "{sent}");
+    assert_eq!(
+        sent.get("id"),
+        None,
+        "the placeholder id stays here: {sent}"
+    );
+}
+
 /// 5.2.18 UpdateResult updated: "List of Attributes (represented by their
 /// name) that were appended or updated." A source answering its own 207
 /// UpdateResult is unfolded: what it updated is updated, what it refused is

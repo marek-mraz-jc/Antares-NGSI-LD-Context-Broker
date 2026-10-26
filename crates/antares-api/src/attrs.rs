@@ -148,7 +148,7 @@ async fn write_attrs(
             ..Default::default()
         },
     )?;
-    let pre = crate::policy::pre_image(st, &tenant, id, Some(&fragment)).await;
+    let pre = crate::policy::pre_image(st, &tenant, id, Some(&fragment)).await?;
     let granted = gate!(
         st, &tenant, headers, mode.clause,
         ids: &[id],
@@ -681,9 +681,7 @@ fn combine_attr_parts(
     if updated.is_empty()
         && !matches!(local, LocalOutcome::Ok)
         && !any_fed_ok
-        && fed_parts
-            .iter()
-            .any(|p| p.detail.contains("does not accept"))
+        && fed_parts.iter().any(|p| p.conflict)
     {
         let mut resp = (
             axum::http::StatusCode::CONFLICT,
@@ -906,7 +904,7 @@ async fn partial_update_inner(
     // valid Attribute name, and lands on a member of the stored document
     // that is not an Attribute.
     let attr_iri = antares_jsonld::expand_attr_name(attr, &parsed.ctx)?;
-    let pre = crate::policy::pre_image(st, &tenant, id, None).await;
+    let pre = crate::policy::pre_image(st, &tenant, id, None).await?;
     let granted = gate!(
         st, &tenant, headers, "5.6.4",
         ids: &[id],
@@ -1112,7 +1110,7 @@ pub async fn replace_attr(
                 ..Default::default()
             },
         )?;
-        let pre = crate::policy::pre_image(&st, &tenant, &id, None).await;
+        let pre = crate::policy::pre_image(&st, &tenant, &id, None).await?;
         let granted = gate!(
             st, &tenant, &headers, "5.6.19",
             ids: &[&id],
@@ -1309,7 +1307,7 @@ async fn set_attr_value_inner(
         .map(|si| with_value(si, attr, &attr_iri, &value, &ctx, observed))
         .transpose()?
         .map(|i| serde_json::json!({ attr_iri.clone(): [i] }));
-    let pre = crate::policy::pre_image(st, &tenant, id, None).await;
+    let pre = crate::policy::pre_image(st, &tenant, id, None).await?;
     let granted = gate!(
         st, &tenant, headers, "5.6.19",
         ids: &[id],
@@ -1544,7 +1542,7 @@ async fn delete_attr_inner(
             iri => iri,
         }
     };
-    let pre = crate::policy::pre_image(st, &tenant, id, None).await;
+    let pre = crate::policy::pre_image(st, &tenant, id, None).await?;
     let granted = gate!(
         st, &tenant, headers, "5.6.5",
         ids: &[id],

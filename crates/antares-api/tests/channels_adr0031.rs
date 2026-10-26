@@ -431,3 +431,38 @@ async fn a_sample_is_decided_again_after_the_bind() {
     assert_eq!(samples(&ch, "refused"), 1, "{ch}");
     assert_eq!(samples(&ch, "written"), 0, "{ch}");
 }
+
+/// F-ANT3-011: a rebind whose store write fails leaves the old binding
+/// running: the new Channel replaces the running one only once it is stored.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebind_the_store_refuses_keeps_the_old_binding_running() {
+    let (mut st, lo) = broker(false).await;
+    let (status, body) = send(
+        &st,
+        "PUT",
+        "/x/channels/bus-speed",
+        Some(channel("speed", "bus/1/speed", "mirror")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let key = format!("{}:bus-speed", antares_model::TenantId::DEFAULT);
+    st.store = Arc::new(crate::common::Double::refusing_create(
+        st.store.clone(),
+        antares_store::Kind::View,
+        &key,
+    ));
+    let (status, body) = send(
+        &st,
+        "PUT",
+        "/x/channels/bus-speed",
+        Some(channel("speed", "bus/9/speed", "mirror")),
+    )
+    .await;
+    assert!(status.is_server_error(), "{status} {body}");
+    lo.publish("bus/1/speed", "42");
+    let e = until(&st, &format!("/ngsi-ld/v1/entities/{BUS}"), |v| {
+        v["speed"]["value"] == 42
+    })
+    .await;
+    assert_eq!(e["speed"]["value"], 42, "the old binding still runs: {e}");
+}

@@ -122,6 +122,28 @@ async fn health_and_readiness_answer_without_the_secret() {
     }
 }
 
+/// F-ANT2-005: the open health body keeps its status code and gives the
+/// per-Tenant view, schema and rule-document reports as counts; the admin
+/// bearer reads them whole.
+#[cfg(feature = "views")]
+#[tokio::test]
+async fn health_names_tenants_only_to_the_admin() {
+    let st = secured(false);
+    st.views
+        .set_policy_report(json!({"acme": {"revision": "r1", "state": "loaded"}}));
+    let (status, _, open) = call(antares_api::router(st.clone()), "GET", "/q/health", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!open.to_string().contains("acme"), "{open}");
+    assert_eq!(open["policy"]["documents"], json!({"count": 1}), "{open}");
+    let good = format!("Bearer {SECRET}");
+    let (status, _, admin) = call(antares_api::router(st), "GET", "/q/health", Some(&good)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        admin["policy"]["documents"]["acme"]["revision"], "r1",
+        "{admin}"
+    );
+}
+
 #[tokio::test]
 async fn metrics_left_open_answer_without_the_secret() {
     let open = secured(true);

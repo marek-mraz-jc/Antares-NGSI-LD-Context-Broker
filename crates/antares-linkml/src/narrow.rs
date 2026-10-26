@@ -215,9 +215,16 @@ fn with_any(schema: &mut Schema, any: &str) {
 /// The class an inlined slot whose class is hidden ranges over.
 const ANY: &str = "Any";
 
+/// The annotation naming the slot that holds a navigation's foreign key
+/// (antares-odata `edm::REFERENCE_TAG`): the one annotation whose value names
+/// another slot.
+const REFERENCE_TAG: &str = "odata_referential_constraint";
+
 /// `slot` as the narrowed schema states it: a range to a hidden class is
 /// `uriorcurie` with the kind it implied stated (LK1), or `any` (`linkml:Any`)
-/// when the slot holds the object inlined; an `inverse` to a hidden slot is dropped.
+/// when the slot holds the object inlined; an `inverse` to a hidden slot is dropped,
+/// and so is a referential constraint naming one, so no annotation names a slot
+/// the view hides.
 fn rewrite(
     source: &Model,
     kept: &BTreeSet<&str>,
@@ -226,6 +233,8 @@ fn rewrite(
     slot: &Slot,
 ) -> Slot {
     let mut out = slot.clone();
+    out.annotations
+        .retain(|tag, a| tag != REFERENCE_TAG || slot_names.contains(a.value.as_str()));
     if let Range::Class(target) = source.range(slot) {
         let link = matches!(source.kind(slot), "Relationship" | "ListRelationship");
         if !kept.contains(target) && (slot.inlined == Some(true) || !link) {
@@ -383,6 +392,26 @@ mod tests {
         assert_eq!(car.is_a.as_deref(), Some("Thing"));
         assert_eq!(car.slot_usage["speed"].required, Some(true));
         assert!(!linkml_model::yaml(&m).contains("Person"));
+    }
+
+    #[test]
+    fn a_referential_constraint_naming_a_hidden_slot_goes() {
+        let source = model(&SOURCE.replace(
+            r#""owner": {"range": "Person", "inverse": "car"}"#,
+            r#""owner": {"range": "Person", "inverse": "car", "annotations": {"odata_referential_constraint": {"tag": "odata_referential_constraint", "value": "vin"}}}"#,
+        ));
+        let hidden = visible(&["Car", "Thing"], &["name", "speed", "owner"]);
+        let (m, _) = narrow(&source, &hidden, "cars").expect("narrowed");
+        assert!(!m.schema().slots["owner"]
+            .annotations
+            .contains_key(REFERENCE_TAG));
+        assert!(!linkml_model::yaml(&m).contains("vin"));
+        let shown = visible(&["Car", "Thing"], &["name", "speed", "owner", "vin"]);
+        let (m, _) = narrow(&source, &shown, "cars").expect("narrowed");
+        assert_eq!(
+            m.schema().slots["owner"].annotations[REFERENCE_TAG].value,
+            "vin"
+        );
     }
 
     #[test]

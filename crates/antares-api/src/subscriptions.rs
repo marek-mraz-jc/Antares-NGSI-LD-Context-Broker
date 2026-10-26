@@ -595,6 +595,14 @@ fn check_subscription_members(out: &Map<String, Value>, is_patch: bool) -> Resul
             return Err(bad("notification is required (5.2.12)".into()));
         }
     }
+    check_exclusive_pairs(out)
+}
+
+/// The Table 5.2.12-1 member pairs a Subscription may not carry together,
+/// checked on a fragment and again on the Subscription it updates
+/// (F-ANT3-016).
+fn check_exclusive_pairs(out: &Map<String, Value>) -> Result<(), NgsiError> {
+    let bad = NgsiError::BadRequestData;
     if out.contains_key("timeInterval") && out.contains_key("watchedAttributes") {
         return Err(bad(
             "timeInterval and watchedAttributes are mutually exclusive (5.2.12)".into(),
@@ -738,6 +746,15 @@ const MASKED: &str = "***";
 /// header, the Authorization header the example). No read answers them: the keys stay, the
 /// values are [`MASKED`] (T-5565, CC-06).
 fn mask_receiver_info(notification: &mut Map<String, Value>) {
+    // 7.2 userinfo in the endpoint URI is a credential too (F-ANT3-004).
+    if let Some(uri) = notification
+        .get_mut("endpoint")
+        .and_then(|e| e.get_mut("uri"))
+    {
+        if let Some(masked) = uri.as_str().and_then(masked_uri) {
+            *uri = Value::String(masked);
+        }
+    }
     let pairs = notification
         .get_mut("endpoint")
         .and_then(|e| e.get_mut("receiverInfo"))
@@ -749,10 +766,38 @@ fn mask_receiver_info(notification: &mut Map<String, Value>) {
     }
 }
 
+/// The endpoint URI with its userinfo replaced by [`MASKED`]; `None` when it
+/// carries none.
+fn masked_uri(uri: &str) -> Option<String> {
+    let bare = antares_notifier::redact_userinfo(uri);
+    if bare == uri {
+        return None;
+    }
+    let (scheme, host) = bare.split_once("//")?;
+    Some(format!("{scheme}//{MASKED}@{host}"))
+}
+
 /// A client that reads a Subscription and writes its `notification` back sends the
 /// [`MASKED`] values it was answered. Such a value keeps the credential stored under the same
 /// key instead of overwriting it; a key the stored endpoint lacks keeps the literal value.
 fn keep_masked_receiver_info(fragment: &mut Map<String, Value>, stored: &Map<String, Value>) {
+    // The masked URI it was answered keeps the stored one, credentials and all.
+    let stored_uri = stored
+        .get("notification")
+        .and_then(|n| n.get("endpoint"))
+        .and_then(|e| e.get("uri"))
+        .and_then(Value::as_str);
+    if let (Some(stored_uri), Some(uri)) = (
+        stored_uri,
+        fragment
+            .get_mut("notification")
+            .and_then(|n| n.get_mut("endpoint"))
+            .and_then(|e| e.get_mut("uri")),
+    ) {
+        if masked_uri(stored_uri).as_deref() == uri.as_str() {
+            *uri = Value::String(stored_uri.to_owned());
+        }
+    }
     let held = stored
         .get("notification")
         .and_then(|n| n.get("endpoint"))
@@ -941,7 +986,8 @@ fn own_socket(st: &AppState, uri: Option<&str>) -> bool {
     uri.is_some_and(|u| u.starts_with(SOCKET_ENDPOINT) && st.sinks.require(u, &[]).is_ok())
 }
 
-fn endpoint_uri(sub: &Map<String, Value>) -> Option<&str> {
+/// `notification.endpoint.uri` of a Subscription.
+pub(crate) fn endpoint_uri(sub: &Map<String, Value>) -> Option<&str> {
     sub.get("notification")?
         .get("endpoint")?
         .get("uri")?
@@ -1200,6 +1246,7 @@ pub async fn list(
         &format!("/ngsi-ld/v1/{}", resource_path(kind)),
         accept,
         total,
+        kind == Kind::CSourceSubscription,
     )?;
     let sys = sys_attrs_asked(params);
     let payload: Vec<Value> = page
@@ -1229,7 +1276,6 @@ pub async fn update(
         .map_err(|_| NgsiError::BadRequestData(format!("invalid subscription id {id:?}")))?;
     check_params(params, &["local"])?;
     let clause = clause_on(st, &tenant, kind, id, "5.8.2", "5.11.3").await?;
-    gate!(st, &tenant, headers, clause, ids: &[id]).await?;
     let parsed = parse_body(st, headers, body, BodyKind::MergePatch).await?;
     let obj = parsed.object(NgsiError::BadRequestData(
         "fragment must be a JSON object".into(),
@@ -1243,9 +1289,42 @@ pub async fn update(
     // a fragment that moves the endpoint off the socket is no watch
     let mut watch = clause == WATCH;
     if watch && endpoint_uri(&norm).is_some_and(|u| !own_socket(st, Some(u))) {
-        gate!(st, &tenant, headers, "5.8.2", ids: &[id]).await?;
         watch = false;
     }
+    // F-ANT3-002: the engine decides the Subscription as it will be, as
+    // create does, so a fragment cannot move a permitted Subscription onto
+    // types, attributes or a q the engine refuses; one that moved the
+    // endpoint off the socket is a plain 5.8.2.
+    // ponytail: decided on the stored document read here; an update racing
+    // between this read and the write below is decided on its own merge.
+    let decided = if clause == WATCH && !watch {
+        "5.8.2"
+    } else {
+        clause
+    };
+    let mut stored = match &st.policy {
+        Some(_) => st.store.get(&tenant, kind, id).await?,
+        None => None,
+    };
+    let merged = match stored.as_mut() {
+        Some(doc) => {
+            let merged = antares_store::stored_object(doc)?;
+            crate::apply_doc_fragment(merged, &norm, &now_iso());
+            Some(merged)
+        }
+        None => None,
+    };
+    let shown = merged.as_deref().map(sub_members).unwrap_or_default();
+    gate!(
+        st, &tenant, headers, decided,
+        ids: &[id],
+        types: &shown.types,
+        attrs: &shown.attrs,
+        q: shown.q.as_ref(),
+        scope_q: merged.as_deref().and_then(|m| m.get("scopeQ")).and_then(Value::as_str),
+        geo: shown.geo.as_ref(),
+    )
+    .await?;
     check_endpoint(st, &norm)?;
     check_jsonld_context(st, &tenant, &norm).await?;
     #[cfg(feature = "views")]
@@ -1282,7 +1361,7 @@ pub async fn update(
                     "one of entities or watchedAttributes is required (5.2.12)".into(),
                 ));
             }
-            Ok::<(), NgsiError>(())
+            check_exclusive_pairs(target)
         })
         .await?;
     match res {
@@ -1503,6 +1582,37 @@ mod tests {
         let expected =
             json!([{"key": "X-New", "value": MASKED}, {"key": "A", "value": "Bearer s"}]);
         assert_eq!(fragment, receiver_info(expected));
+    }
+
+    /// F-ANT3-004: a read masks the endpoint URI's userinfo, and the masked
+    /// URI written back keeps the stored credentials.
+    #[test]
+    fn the_endpoint_uri_credentials_are_masked_and_kept() {
+        let mut n = json!({"endpoint": {"uri": "mqtt://u:secret@h:1883/t"}})
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        mask_receiver_info(&mut n);
+        assert_eq!(n["endpoint"]["uri"], "mqtt://***@h:1883/t");
+        let stored = json!({"notification": {"endpoint": {"uri": "mqtt://u:secret@h:1883/t"}}})
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let mut back = json!({"notification": n})
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        keep_masked_receiver_info(&mut back, &stored);
+        assert_eq!(
+            back["notification"]["endpoint"]["uri"],
+            "mqtt://u:secret@h:1883/t"
+        );
+        let mut plain = json!({"endpoint": {"uri": "http://h/n"}})
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        mask_receiver_info(&mut plain);
+        assert_eq!(plain["endpoint"]["uri"], "http://h/n");
     }
 
     /// Table 5.2.33-1 `type`: "To indicate a request for all Entities (with

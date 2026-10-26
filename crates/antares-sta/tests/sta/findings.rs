@@ -251,3 +251,40 @@ async fn the_type_selector_and_the_count_alone_hold_at_their_edges() -> Result<(
     assert_eq!(nowhere.status, StatusCode::NOT_FOUND);
     Ok(())
 }
+
+/// F-ANT5-004: the unknown Sensor heading the first page is no Entity served, so the next link
+/// resumes at the second Entity and every Device is listed once over the pages.
+#[tokio::test]
+async fn sensor_pages_list_every_device_once() -> Result<(), String> {
+    let mut entities = Vec::new();
+    for i in 1..=3 {
+        let device = format!("urn:ngsi-ld:Device:{i}");
+        entities.push(json!({"id": format!("urn:ngsi-ld:Car:{i}"), "type": "Car",
+            "refDevice": {"type": "Relationship", "object": device}}));
+        entities.push(json!({"id": device, "type": "Device",
+            "name": {"type": "Property", "value": format!("radar {i}")}}));
+    }
+    let f = fixture_with(TestBroker::new().await?, &entities, &[]).await?;
+    let mut seen = Vec::new();
+    let mut path = "/Sensors?$top=1".to_owned();
+    for _ in 0..10 {
+        let page = sta(&f.app, &path).await;
+        seen.extend(ids(&page.body));
+        match at(&page.body, "/@iot.nextLink").as_str() {
+            Some(link) => {
+                path = local(link).replace("/x/views/city/sta/v1.1", "");
+            }
+            None => break,
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            "unknown",
+            "urn:ngsi-ld:Device:1",
+            "urn:ngsi-ld:Device:2",
+            "urn:ngsi-ld:Device:3"
+        ]
+    );
+    Ok(())
+}

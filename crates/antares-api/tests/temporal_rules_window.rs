@@ -80,6 +80,19 @@ fn conditional() -> Rule {
 struct Recording {
     inner: Arc<dyn TemporalDriver>,
     ranged: Mutex<Vec<(bool, bool)>>,
+    /// instances the store answered each query with
+    served: Mutex<Vec<usize>>,
+}
+
+/// The Attribute instances of `docs`, every Attribute and dataset.
+fn instances(docs: &[Value]) -> usize {
+    docs.iter()
+        .filter_map(Value::as_object)
+        .flat_map(|o| o.iter())
+        .filter(|(k, _)| !matches!(k.as_str(), "type" | "@type" | "scope"))
+        .filter_map(|(_, v)| v.as_array())
+        .map(Vec::len)
+        .sum()
 }
 
 #[async_trait::async_trait]
@@ -102,7 +115,9 @@ impl TemporalDriver for Recording {
             .lock()
             .expect("lock")
             .push((f.range.is_some(), f.last_n.is_some()));
-        self.inner.query_temporal(t, f).await
+        let out = self.inner.query_temporal(t, f).await?;
+        self.served.lock().expect("lock").push(instances(&out.rows));
+        Ok(out)
     }
     async fn get_temporal(
         &self,
@@ -158,6 +173,7 @@ async fn state_with(rule: Rule, more: &[Value]) -> (AppState, Arc<Recording>) {
     let recording = Arc::new(Recording {
         inner: st.temporal.clone(),
         ranged: Mutex::new(Vec::new()),
+        served: Mutex::new(Vec::new()),
     });
     st.temporal = recording.clone();
     st.policy = Some(Arc::new(Ruled(vec![rule])));
@@ -165,7 +181,19 @@ async fn state_with(rule: Rule, more: &[Value]) -> (AppState, Arc<Recording>) {
 }
 
 async fn send(st: &AppState, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
-    let b = Request::builder().uri(uri);
+    send_as(st, None, uri, body).await
+}
+
+async fn send_as(
+    st: &AppState,
+    tenant: Option<&str>,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let mut b = Request::builder().uri(uri);
+    if let Some(t) = tenant {
+        b = b.header("NGSILD-Tenant", t);
+    }
     let req = match body {
         Some(v) => {
             let payload = v.to_string();
@@ -227,6 +255,87 @@ async fn a_rule_without_a_condition_reads_only_the_window_and_shows_the_same() {
     assert_eq!(status, StatusCode::OK, "{one}");
     assert_eq!(speeds(&one), vec![7, 8, 9, 10], "{one}");
 
+    // the window opens before the query's start: the default page's cap
+    // reaches the store too (T-5777)
+    assert_eq!(
+        *recording.ranged.lock().expect("lock"),
+        vec![(true, true), (true, true)]
+    );
+}
+
+/// A chart's plain window read, paged by offsetN: each page asks the store
+/// for its own instances only, never the whole window again, and the pages
+/// are the ones the uncapped read served (T-5777: a week of five-minute
+/// weather took 2-3 s per page through a view).
+#[tokio::test(flavor = "multi_thread")]
+async fn offset_pages_of_a_window_read_reach_the_store_capped() {
+    let (mut st, recording) = state(plain()).await;
+    st.temporal_default_instances = 3;
+    let mut pages = Vec::new();
+    for offset in [0, 3] {
+        let (status, body) = send(
+            &st,
+            &format!("/ngsi-ld/v1/temporal/entities?type=Vehicle&{AFTER}&offsetN={offset}"),
+            None,
+        )
+        .await;
+        pages.push((status, speeds(&body[0])));
+        let (status, one) = send(
+            &st,
+            &format!("/ngsi-ld/v1/temporal/entities/{CAR}?{AFTER}&offsetN={offset}"),
+            None,
+        )
+        .await;
+        pages.push((status, speeds(&one)));
+    }
+    let cut = StatusCode::PARTIAL_CONTENT;
+    assert_eq!(
+        pages,
+        vec![
+            (cut, vec![7, 8, 9]),
+            (cut, vec![7, 8, 9]),
+            (StatusCode::OK, vec![10]),
+            (StatusCode::OK, vec![10]),
+        ]
+    );
+    assert_eq!(
+        *recording.ranged.lock().expect("lock"),
+        vec![(true, true); 4]
+    );
+}
+
+/// Oldest first, a rule window that opens after the query's start drops the
+/// oldest instances the store would keep: the cap stays in the API and the
+/// answer is the oldest the rule shows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_window_opening_after_the_start_keeps_the_cap_out_of_the_store() {
+    let late = Rule {
+        temporal: vec![Window {
+            from: Some(TimeBound::At(
+                "2026-01-01T00:00:09Z".parse().expect("instant"),
+            )),
+            to: None,
+        }],
+        ..plain()
+    };
+    let (mut st, recording) = state(late).await;
+    st.temporal_default_instances = 1;
+    let (status, body) = send(
+        &st,
+        &format!("/ngsi-ld/v1/temporal/entities?type=Vehicle&{AFTER}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT, "{body}");
+    assert_eq!(speeds(&body[0]), vec![9], "{body}");
+    let (status, one) = send(
+        &st,
+        &format!("/ngsi-ld/v1/temporal/entities/{CAR}?{AFTER}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT, "{one}");
+    assert_eq!(speeds(&one), vec![9], "{one}");
     assert_eq!(
         *recording.ranged.lock().expect("lock"),
         vec![(true, false), (true, false)]
@@ -356,4 +465,73 @@ async fn last_n_by_another_timeproperty_stays_out_of_the_store() {
     );
     let asked = recording.ranged.lock().expect("lock").clone();
     assert_eq!(asked, vec![(true, false), (true, false)]);
+}
+
+/// The chart's read on PostgreSQL: a type's window of 600 speed and zone
+/// instances, oldest first in default pages, through a view's plain rule.
+/// The store answers each page with its own instances and one more per
+/// Attribute; without the cap it answered the whole window, 1 200
+/// instances, for every page (T-5777). Skips without a database.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_window_page_reads_only_its_instances_from_postgres() {
+    let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
+        eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
+        return;
+    };
+    let pool = antares_sql::store::pg::connect(&url, 5)
+        .await
+        .expect("connect");
+    let store = Arc::new(antares_sql::store::any::AnyStore::Pg(
+        antares_sql::store::any::PgBackend::new(pool),
+    ));
+    let mut st = AppState::with_store("me".into(), store, "postgres");
+    antares_api::wire(&mut st).await;
+    let tenant = format!("rw{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    let at = |i: u32| format!("2026-01-01T{:02}:{:02}:00Z", i / 60, i % 60);
+    let speed: Vec<Value> = (0..600)
+        .map(|i| json!({"type": "Property", "value": i, "observedAt": at(i)}))
+        .collect();
+    let zone: Vec<Value> = (0..600)
+        .map(|i| json!({"type": "Property", "value": "A", "observedAt": at(i)}))
+        .collect();
+    let doc = json!({"id": CAR, "type": "Vehicle", "speed": speed, "zone": zone});
+    let (status, body) = send_as(
+        &st,
+        Some(&tenant),
+        "/ngsi-ld/v1/temporal/entities",
+        Some(doc),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let recording = Arc::new(Recording {
+        inner: st.temporal.clone(),
+        ranged: Mutex::new(Vec::new()),
+        served: Mutex::new(Vec::new()),
+    });
+    st.temporal = recording.clone();
+    st.policy = Some(Arc::new(Ruled(vec![plain()])));
+    let mut firsts = Vec::new();
+    for offset in [0, 100, 500] {
+        let uri = format!(
+            "/ngsi-ld/v1/temporal/entities?type=Vehicle&timerel=after&timeAt=2026-01-01T00:00:00Z&offsetN={offset}"
+        );
+        let (status, body) = send_as(&st, Some(&tenant), &uri, None).await;
+        let shown = speeds(&body[0]);
+        assert_eq!(shown.len(), 100, "{body}");
+        firsts.push((status, shown.first().copied()));
+    }
+    let cut = StatusCode::PARTIAL_CONTENT;
+    assert_eq!(
+        firsts,
+        vec![
+            (cut, Some(0)),
+            (cut, Some(100)),
+            (StatusCode::OK, Some(500))
+        ]
+    );
+    assert_eq!(
+        *recording.served.lock().expect("lock"),
+        vec![2 * 101, 2 * 201, 2 * 600],
+        "each page reads its own instances and one more per Attribute"
+    );
 }

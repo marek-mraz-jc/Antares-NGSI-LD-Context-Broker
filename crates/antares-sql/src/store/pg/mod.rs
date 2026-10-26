@@ -76,6 +76,13 @@ fn tolerate_newer(
     }
 }
 
+/// The first applied version at or below this binary's newest that `known`
+/// (the versions [`MIGRATOR`] ships) lacks: a history from another release,
+/// which the lenient run below would otherwise pass over (F-ANT1-012).
+fn first_unknown_older(applied: &[i64], known: &[i64]) -> Option<i64> {
+    applied.iter().copied().find(|v| !known.contains(v))
+}
+
 /// Version and description of each applied migration above `newest`.
 async fn newer_migrations(
     conn: &mut sqlx::PgConnection,
@@ -115,6 +122,17 @@ async fn migrate(conn: &mut sqlx::PgConnection) -> Result<(), sqlx::Error> {
          serving it as a rollback; roll forward again or restore the pre-release backup \
          before applying another schema change"
     );
+    let applied: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE version <= $1")
+            .bind(newest)
+            .fetch_all(&mut *conn)
+            .await?;
+    let known: Vec<i64> = MIGRATOR.iter().map(|m| m.version).collect();
+    if let Some(v) = first_unknown_older(&applied, &known) {
+        return Err(sqlx::Error::Migrate(Box::new(
+            sqlx::migrate::MigrateError::VersionMissing(v),
+        )));
+    }
     let mut lenient = sqlx::migrate::Migrator::with_migrations(MIGRATOR.iter().cloned().collect());
     lenient.set_ignore_missing(true);
     lenient.run(conn).await.map_err(Into::into)
@@ -409,7 +427,19 @@ pub async fn ensure_tenant(pool: &PgPool, tenant: &TenantId) -> Result<(), sqlx:
 
 #[cfg(test)]
 mod tests {
-    use super::{bypasses, is_schema_mismatch, migrate_enabled, tolerate_newer};
+    use super::{
+        bypasses, first_unknown_older, is_schema_mismatch, migrate_enabled, tolerate_newer,
+    };
+
+    /// F-ANT1-012: the lenient run of a rollback ignores missing versions,
+    /// so an applied version at or below the newest that this binary lacks
+    /// is found before it runs.
+    #[test]
+    fn a_rollback_still_refuses_an_unknown_older_version() {
+        assert_eq!(first_unknown_older(&[1, 2, 3], &[1, 2, 3]), None);
+        assert_eq!(first_unknown_older(&[1, 5, 2], &[1, 2, 3]), Some(5));
+        assert_eq!(first_unknown_older(&[], &[1]), None);
+    }
 
     /// The RLS probe answers a security gate: a probe that errors must read as
     /// "unsafe", never as "the role does not bypass RLS".

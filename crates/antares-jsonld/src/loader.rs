@@ -1043,7 +1043,7 @@ impl Loader {
 
     /// Resolve a user-supplied `@context` value (string URL, object, or array)
     /// into a merged Context with the core context merged last. No Tenant in
-    /// scope: locally stored @contexts of every Tenant resolve, so a
+    /// scope: a locally stored @context a Tenant owns does not resolve, so a
     /// resolution serving a request must use `resolve_for` instead (5.5.10).
     pub async fn resolve(&self, user: &Value) -> Result<Arc<Context>, NgsiError> {
         self.resolve_counted(None, user, true).await

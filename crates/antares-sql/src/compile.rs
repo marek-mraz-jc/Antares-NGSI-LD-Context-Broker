@@ -3,7 +3,8 @@
 //! this module; every value a client supplied travels as a bind.
 
 pub mod geo;
-pub mod q;
+/// The `q=` SQL lowering, shared with a gateway through `antares_ql`.
+pub use antares_ql::sql as q;
 pub mod qprefilter;
 pub mod scope;
 pub mod temporal;
