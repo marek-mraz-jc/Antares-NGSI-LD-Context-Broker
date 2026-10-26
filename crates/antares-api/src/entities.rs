@@ -1678,6 +1678,14 @@ pub async fn filter_entities_paged(
             .unwrap_or(if counting.is_some() { 1024 } else { 0 }),
     );
     let mut matched = 0usize;
+    // Rules the loop below decides row by row, each narrowing by one
+    // `idPattern`, hand the store the id prefixes those patterns force: a
+    // dataset view of 70 KPIs walked the Tenant's 128 678 and timed out at
+    // the gateway, even for `limit=1` (T-5787). The rules still decide.
+    let rule_prefixes = match rules.filter(|_| judged.is_none() && ids.is_none()) {
+        Some(f) => crate::types_attrs::rules_id_prefixes(st, tenant, &f.rules).await?,
+        None => None,
+    };
     'scan: loop {
         let f = antares_store::filter::EntityFilter {
             ids: ids.as_deref(),
@@ -1690,7 +1698,7 @@ pub async fn filter_entities_paged(
             } else {
                 None
             },
-            id_prefixes: None,
+            id_prefixes: rule_prefixes.as_deref(),
             types: judged.as_deref().or(type_sel.as_deref()),
             attrs: if split_agg {
                 None
