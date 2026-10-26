@@ -31,7 +31,7 @@ struct Keys {
     /// `history_cutover`, cached once set: only a migration sets it, but a
     /// pod that started before a rolling deploy's migration sees it unset, so
     /// an unset value is read again on every write until it is set
-    /// (F-ANT1-013). A test store pins it with [`PgTemporalStore::with_cutover`].
+    /// (F-ANT1-013). A test store pins it with `PgTemporalStore::with_cutover`.
     cutover: tokio::sync::OnceCell<Option<chrono::DateTime<chrono::Utc>>>,
     /// (Tenant, IRI) pairs a committed `iri_ids` row holds. A write sends the
     /// dictionary insert only for an IRI missing here, so a warm process
