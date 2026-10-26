@@ -306,7 +306,7 @@ tokio::task_local! {
     /// How many [`AppState::call`] frames this task is already inside, held
     /// against [`crate::bounds::MAX_IN_PROCESS_CALL_DEPTH`]. Absent outside a
     /// façade call, which reads as zero.
-    static INPROCESS_DEPTH: usize;
+    pub(crate) static INPROCESS_DEPTH: usize;
 }
 
 /// The broker's state as every handler and layer receives it. Cloned at
