@@ -263,13 +263,13 @@ mod tests {
     /// first one, so the cell stays in the cube.
     #[test]
     fn a_named_only_kpi_value_is_still_a_cell() {
-        let mut e = kpi("SK0", "2024", None, &json!(1));
-        if let Some(m) = e.as_object_mut() {
-            m.insert(
-                "kpiValue".into(),
-                json!([{"type": "Property", "datasetId": "urn:ngsi-ld:Dataset:sus", "value": 7}]),
-            );
-        }
+        let mut m: Map<String, Value> =
+            serde_json::from_value(kpi("SK0", "2024", None, &json!(1))).unwrap_or_default();
+        m.insert(
+            "kpiValue".into(),
+            json!([{"type": "Property", "datasetId": "urn:ngsi-ld:Dataset:sus", "value": 7}]),
+        );
+        let e = Value::Object(m);
         let (d, skipped) = dataset("t", &[e]);
         assert_eq!(skipped, 0);
         assert_eq!(at(&d, "/value"), json!([7]));
