@@ -2297,6 +2297,49 @@ mod clause_5_8_6_periodic_sweep {
         }
     }
 
+    /// F-ANT3-020: a type-only selector reads its match set a page at a
+    /// time and sends each page as its own Notification: three pages of
+    /// Vehicles arrive whole, in more than one Notification.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn periodic_sweep_pages_a_large_match_set() {
+        crate::allow_private();
+        let (uri, seen) = recording_endpoint().await;
+        let (mut st, _mirror, tenant) = state_with_mirror("antares-periodic-paged");
+        st.max_limit = 4;
+        let n = 12;
+        for i in 0..n {
+            let id = format!("urn:ngsi-ld:Vehicle:p{i:02}");
+            st.store
+                .create(&tenant, Kind::Entity, &id, entity(&id, "Vehicle"))
+                .await
+                .expect("entity row");
+        }
+        install(
+            &st,
+            &tenant,
+            &periodic(
+                "urn:ngsi-ld:Subscription:paged",
+                &uri,
+                json!([{"type": format!("{DC}/Vehicle")}]),
+                10,
+            ),
+        )
+        .await;
+
+        interval_tick(&st).await;
+
+        let bodies = seen.lock().expect("recorded bodies").clone();
+        assert!(bodies.len() > 1, "one Notification per page: {}", bodies.len());
+        let mut ids: Vec<String> = bodies
+            .iter()
+            .flat_map(|b| b["data"].as_array().cloned().unwrap_or_default())
+            .filter_map(|d| d["id"].as_str().map(str::to_owned))
+            .collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "every Vehicle is notified: {ids:?}");
+    }
+
     /// The sweep clock: 5.8.6 sends the periodic Notification "when the time
     /// interval (in seconds) specified in such value field is reached", so a
     /// tick before the earliest such instant cannot fire and must not sweep —
