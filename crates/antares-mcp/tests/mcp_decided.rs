@@ -255,3 +255,52 @@ async fn a_page_needs_a_client_that_opens_it_and_bounds_each_person() -> Result<
     assert_eq!(cars(&app).await, 0);
     Ok(())
 }
+
+/// The decision routes sit behind the admin credential like every other
+/// `/q` route: no secret, a wrong one or the bare secret is refused, the
+/// secret is served, and no other method is (`antares-icsr`'s
+/// `q_admin_sweep` lists them as proved here).
+#[tokio::test]
+async fn the_decision_routes_refuse_a_caller_without_the_admin_secret() -> Result<(), String> {
+    const SECRET: &str = "the-mcp-decision-secret-of-at-least-32-bytes";
+    let auth = antares_ops::test_kit::AdminAuth::new(SECRET, false)?;
+    let app = TestBroker::new()
+        .await?
+        .with_admin(antares_mcp::confirmations())
+        .with_admin_auth(auth)
+        .serve(antares_mcp::Mcp)?;
+    let good = format!("Bearer {SECRET}");
+    let path = "/q/mcp-confirmations/q1";
+    let body = json!({"decision": "accept", "subject": {"x-jc-subject": "alice"}});
+    for method in ["GET", "PUT", "POST", "PATCH", "DELETE"] {
+        let served = matches!(method, "GET" | "PUT");
+        for bad in [None, Some("Bearer not-the-secret"), Some(SECRET)] {
+            let (got, _) = send(&app, method, path, &auth_header(bad), &body).await;
+            if served {
+                assert_eq!(got, StatusCode::UNAUTHORIZED, "{method} {bad:?}");
+            } else {
+                assert!(
+                    matches!(
+                        got,
+                        StatusCode::UNAUTHORIZED | StatusCode::METHOD_NOT_ALLOWED
+                    ),
+                    "{method} {bad:?}: {got}"
+                );
+            }
+        }
+        let (with, text) = send(&app, method, path, &auth_header(Some(&good)), &body).await;
+        if served {
+            // an unknown question: the page is told so, past the guard
+            assert_eq!(with, StatusCode::NOT_FOUND, "{method}: {text}");
+        } else {
+            assert_eq!(with, StatusCode::METHOD_NOT_ALLOWED, "{method}: {text}");
+        }
+    }
+    Ok(())
+}
+
+fn auth_header(value: Option<&str>) -> Vec<(&'static str, &str)> {
+    value
+        .map(|v| vec![("authorization", v)])
+        .unwrap_or_default()
+}
