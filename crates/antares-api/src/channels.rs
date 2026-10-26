@@ -870,8 +870,9 @@ async fn bind_inner(
     }
     let k = key(&tenant, id);
     let store = store_tenant()?;
-    if let Some(old) = st.store.get(&store, Kind::View, &k).await? {
-        if !crate::policy::belongs_to(&old, &subject) {
+    let old = st.store.get(&store, Kind::View, &k).await?;
+    if let Some(old) = &old {
+        if !crate::policy::belongs_to(old, &subject) {
             return Err(NgsiError::AlreadyExists(format!(
                 "channel {id} is bound by another subject"
             ))
@@ -882,17 +883,17 @@ async fn bind_inner(
     if let (Some(o), Some(s)) = (doc.as_object_mut(), crate::policy::subject_member(&subject)) {
         o.insert(crate::policy::SUBJECT_MEMBER.into(), s);
     }
-    // started before it is stored: a bridge that refuses binds nothing
-    start(st, shared, k.clone(), ch, subject.headers, true)
-        .await
-        .map_err(|e| NgsiError::InternalError(format!("channel {id} is not bound: {e}")))?;
-    let replaced = match st.store.upsert(&store, Kind::View, &k, doc).await {
-        Ok(r) => r,
-        Err(e) => {
-            lock(&shared.running).remove(&k);
-            return Err(e.into());
-        }
-    };
+    // stored before it replaces the running Channel: a refused write leaves
+    // the old binding running and stored (F-ANT3-011); a bridge that refuses
+    // the new one puts the old document back, so nothing new is bound
+    let replaced = st.store.upsert(&store, Kind::View, &k, doc).await?;
+    if let Err(e) = start(st, shared, k.clone(), ch, subject.headers, true).await {
+        match old {
+            Some(old) => st.store.upsert(&store, Kind::View, &k, old).await.map(drop),
+            None => st.store.delete(&store, Kind::View, &k).await.map(drop),
+        }?;
+        return Err(NgsiError::InternalError(format!("channel {id} is not bound: {e}")).into());
+    }
     let mut resp = if replaced {
         StatusCode::NO_CONTENT.into_response()
     } else {
