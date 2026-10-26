@@ -77,11 +77,16 @@ IOP_EXT_ERR_01_02 A Stalling Peer Times Out Into Warning 199
     Should Contain    ${warning}    199
     Wait And Ignore Request
 
-IOP_EXT_ERR_01_03 A Redirect-Only Retrieve With A Dead Source Is 404 Plus Warning
-    [Documentation]    6.3.17: reads surface abnormal sources as
-    ...    NGSILD-Warning (the 508/504/502 list is the unsafe-methods
-    ...    paragraph) — with no data anywhere the retrieve ends
-    ...    ResourceNotFound, the warning preserved.
+IOP_EXT_ERR_01_03 A Redirect-Only Retrieve With A Dead Source Is 502 Plus Warning
+    [Documentation]    6.3.17 (TS 104 176 6.3.5): "In the case of an
+    ...    exclusive or redirect registration, where all of the data is
+    ...    held outside of the Context Broker and held in a single
+    ...    registered source, the following errors shall be returned"
+    ...    — "502 Bad Gateway - if the single forwarded request fails for
+    ...    any other reason". The list names no method, so a Retrieve
+    ...    Entity is no exception (Coraine
+    ...    csource-reg-distops-retrieve-upstream-error); the abnormal
+    ...    source is still named in NGSILD-Warning.
     [Tags]    iop    iop-ext    6_3_17    5_7_1    since_v1.9.1
     ${info}=    Evaluate
     ...    [{"entities": [{"id": $entity_id, "type": $etype}], "propertyNames": ["speed"]}]
@@ -91,7 +96,7 @@ IOP_EXT_ERR_01_03 A Redirect-Only Retrieve With A Dead Source Is 404 Plus Warnin
     Check Response Status Code    201    ${created.status_code}
 
     ${response}=    Get Entity Via Broker    ${b1_url}    ${entity_id}
-    Check Response Status Code    404    ${response.status_code}
+    Check Response Status Code    502    ${response.status_code}
     ${warning}=    Evaluate    $response.headers.get('NGSILD-Warning', '')
     Should Not Be Empty    ${warning}
     Should Not Contain    ${response.text}    speed

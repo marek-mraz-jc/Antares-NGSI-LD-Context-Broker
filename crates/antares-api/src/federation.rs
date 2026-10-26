@@ -2982,6 +2982,12 @@ pub fn reduce_to_scope(obj: &Map<String, Value>, reg: &FedReg, ctx: &Context) ->
     any.then_some(Value::Object(out))
 }
 
+fn without_id(obj: &Map<String, Value>) -> Map<String, Value> {
+    let mut o = obj.clone();
+    o.remove("id");
+    o
+}
+
 /// 508 Loop Detected (6.3.17): the inbound Via chain already names us and a
 /// registration would forward the operation right back.
 pub fn loop_508(tenant: &TenantId) -> Response {
@@ -3179,7 +3185,11 @@ pub async fn fed_attr_parts(
             continue;
         }
         let body = match (&body, fragment) {
-            (Some(Value::Object(o)), true) => match reduce_to_scope(o, reg, ctx) {
+            // The path names the Entity, and `write_plan` matched the
+            // registrations on it; an `id` inside the fragment names
+            // nothing (the ETSI payloads carry "urn:ngsi-ld:Vehicle:randomUUID"),
+            // so it neither decides the scope nor goes to the source.
+            (Some(Value::Object(o)), true) => match reduce_to_scope(&without_id(o), reg, ctx) {
                 Some(b) => Some(b),
                 None => {
                     parts.push(not_forwarded("no Attribute of the registration".into()));

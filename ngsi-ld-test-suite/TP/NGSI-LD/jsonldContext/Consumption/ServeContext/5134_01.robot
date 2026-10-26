@@ -99,7 +99,19 @@ ${PRIVATE_TERM}=    TenantPrivateTerm
 
 *** Keywords ***
 Random Tenant
+    [Documentation]    A fresh Tenant that exists: Create Entity creates
+    ...    it (7.8.2). Add @context is not a creating operation, so the
+    ...    broker refuses it under a Tenant that never existed (404,
+    ...    5.5.10).
     ${tenant}=    Evaluate    'tp5134' + str(random.randint(10000, 99999))    modules=random
+    &{headers}=    Create Dictionary    NGSILD-Tenant=${tenant}    Content-Type=application/json
+    ${entity}=    Evaluate    {"id": "urn:ngsi-ld:TenantSeed:${tenant}", "type": "TenantSeed"}
+    ${response}=    POST
+    ...    url=${url}/entities
+    ...    json=${entity}
+    ...    headers=${headers}
+    ...    expected_status=any
+    Check Response Status Code    201    ${response.status_code}
     RETURN    ${tenant}
 
 Add A Hosted @context As Tenant
