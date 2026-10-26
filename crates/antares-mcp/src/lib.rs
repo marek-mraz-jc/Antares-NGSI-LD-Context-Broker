@@ -25,6 +25,7 @@ mod area;
 mod budget;
 mod confirm;
 mod cursor;
+mod decided;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
 mod guide;
@@ -93,6 +94,7 @@ pub const ENV_KEYS: &[&str] = &[
     ALLOWED_HOSTS_ENV,
     ALLOWED_ORIGINS_ENV,
     AREA_MAX_KM2_ENV,
+    CONFIRM_URL_ENV,
     MAX_RESULT_BYTES_ENV,
     REQUEST_STATE_KEY_FILE_ENV,
     SUBSCRIPTION_ENDPOINTS_ENV,
@@ -108,6 +110,7 @@ pub const ENV_KEYS: &[&str] = &[
 ];
 
 pub use antares_ops::PRIMER;
+pub use decided::{routes as confirmations, CONFIRM_URL_ENV};
 pub use listen::Sink;
 pub use schema::SUBSCRIPTION_ENDPOINTS_ENV;
 

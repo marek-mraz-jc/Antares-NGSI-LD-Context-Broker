@@ -94,14 +94,23 @@ pub(crate) fn bound_to(
     json!([view, subject, tool, given]).to_string().into_bytes()
 }
 
-/// A fresh `requestState` for the call `bound` names, or `None` when the
-/// process has no usable key.
-pub(crate) fn seal(bound: &[u8]) -> Option<String> {
+/// A fresh `requestState` for the call `bound` names and the nonce it
+/// seals, or `None` when the process has no usable key.
+pub(crate) fn seal(bound: &[u8]) -> Option<(String, String)> {
     let nonce = uuid::Uuid::new_v4().simple().to_string();
-    Some(codec()?.seal_with(
+    let state = codec()?.seal_with(
         nonce.as_bytes(),
         &SealOptions::new().associated_data(bound).ttl(TTL),
-    ))
+    );
+    Some((state, nonce))
+}
+
+/// The nonce `state` seals when this process sealed it for the call
+/// `bound` names and it has not expired; spent or not.
+pub(crate) fn opened(state: &str, bound: &[u8]) -> Option<String> {
+    codec()
+        .and_then(|c| c.open_with(state, bound).ok())
+        .and_then(|n| String::from_utf8(n).ok())
 }
 
 /// Whether `state` was sealed by this process for the call `bound` names,
@@ -109,10 +118,7 @@ pub(crate) fn seal(bound: &[u8]) -> Option<String> {
 /// failure is the same `false` (rmcp: "map all token-opening failures to a
 /// single client-facing error").
 pub(crate) fn redeem(state: &str, bound: &[u8], subject: &[(String, Vec<u8>)]) -> bool {
-    let Some(nonce) = codec()
-        .and_then(|c| c.open_with(state, bound).ok())
-        .and_then(|n| String::from_utf8(n).ok())
-    else {
+    let Some(nonce) = opened(state, bound) else {
         return false;
     };
     spend(&SPENT, json!(subject).to_string(), nonce, Instant::now())
@@ -236,7 +242,7 @@ mod tests {
     #[test]
     fn a_state_opens_for_its_own_call_once() {
         let call = bound_to("v", &[], "delete_entity", &Map::new());
-        let state = seal(&call).unwrap_or_default();
+        let (state, _) = seal(&call).unwrap_or_default();
         assert_ne!(state, "");
         let other = bound_to("w", &[], "delete_entity", &Map::new());
         assert!(!redeem(&state, &other, &[]));

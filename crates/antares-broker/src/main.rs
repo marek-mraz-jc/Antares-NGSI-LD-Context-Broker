@@ -1160,6 +1160,10 @@ async fn run(
     // reload hands it its rule documents (ADR-0020 amendment).
     #[cfg(feature = "views")]
     antares_ops::views::install(&state).await?;
+    // The MCP write decisions a deployment's decision page records
+    // (`/q/mcp-confirmations/{id}`, T-5816), behind the admin credential.
+    #[cfg(feature = "mcp")]
+    state.views.add_admin(antares_mcp::confirmations());
     // Internal context sources (ADR-0025): a registration whose endpoint is
     // a self URL is served in process under the target's export grant, and
     // `/q/grants` joins the admin surface. No self URL, no transport: every
@@ -1671,6 +1675,7 @@ mod config_key_tests {
         for key in [
             antares_mcp::ALLOWED_HOSTS_ENV,
             antares_mcp::ALLOWED_ORIGINS_ENV,
+            antares_mcp::CONFIRM_URL_ENV,
             antares_mcp::MAX_RESULT_BYTES_ENV,
             antares_mcp::REQUEST_STATE_KEY_FILE_ENV,
             antares_mcp::SUBSCRIPTION_ENDPOINTS_ENV,

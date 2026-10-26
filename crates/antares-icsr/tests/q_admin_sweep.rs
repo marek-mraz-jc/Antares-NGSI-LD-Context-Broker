@@ -86,6 +86,15 @@ const ROUTES: &[(&str, &str, &[&str])] = &[
     ),
 ];
 
+/// Guarded `/q` routes of a surface this crate may not link (module rule
+/// surface-dev): the template, and the file and test of that surface that
+/// sweeps them as [`every_q_route_refuses_without_the_secret_and_serves_with_it`] does.
+const PROVED_ELSEWHERE: &[(&str, &str, &str)] = &[(
+    "/mcp-confirmations/{id}",
+    "crates/antares-mcp/tests/mcp_decided.rs",
+    "the_decision_routes_refuse_a_caller_without_the_admin_secret",
+)];
+
 const OPEN: [&str; 2] = ["/q/health", "/q/ready"];
 
 async fn app(metrics_open: bool) -> axum::Router {
@@ -249,6 +258,7 @@ fn routes_equals_what_the_sources_mount() {
     assert_eq!(
         adders,
         BTreeSet::from([
+            "crates/antares-broker/src/main.rs".to_owned(),
             "crates/antares-icsr/src/lib.rs".to_owned(),
             "crates/antares-ops/src/lib.rs".to_owned(),
             "crates/antares-ops/src/views.rs".to_owned(),
@@ -303,6 +313,7 @@ fn routes_equals_what_the_sources_mount() {
         "crates/antares-ops/src/views/rule_documents.rs",
         "crates/antares-ops/src/views/retention.rs",
         "crates/antares-icsr/src/grant.rs",
+        "crates/antares-mcp/src/decided.rs",
     ] {
         let found = route_literals(&read(rel))
             .unwrap_or_else(|| unreachable!("{rel}: a .route( without a path literal"));
@@ -311,5 +322,12 @@ fn routes_equals_what_the_sources_mount() {
     }
     let mut listed: BTreeSet<String> = ROUTES.iter().map(|(t, _, _)| (*t).to_owned()).collect();
     listed.extend(OPEN.map(|p| p.trim_start_matches("/q").to_owned()));
+    for (template, rel, test) in PROVED_ELSEWHERE {
+        assert!(
+            read(rel).contains(&format!("async fn {test}(")),
+            "{template}: {rel} lost its admin sweep {test}"
+        );
+        listed.insert((*template).to_owned());
+    }
     assert_eq!(listed, mounted);
 }
