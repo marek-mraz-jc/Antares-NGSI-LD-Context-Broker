@@ -116,6 +116,12 @@ async fn a_views_type_list_over_100k_entities_probes_no_empty_group() {
         .execute(&mut *tx)
         .await
         .expect("tenant setting");
+    // the seed is setup, not the read under test: CI runners took over the
+    // pool's 30 s statement_timeout writing 100 000 rows (57014)
+    antares_sql::sqlx::query("SET LOCAL statement_timeout = 0")
+        .execute(&mut *tx)
+        .await
+        .expect("seed timeout");
     antares_sql::sqlx::query(
         "INSERT INTO entities (tenant_id, id, entity, types, created_at, modified_at)
          SELECT $1, 'urn:ngsi-ld:' || t || ':' || lpad(n::text, 6, '0'),
@@ -255,6 +261,12 @@ async fn type_details_over_100k_entities_read_each_row_once() {
         .execute(&mut *tx)
         .await
         .expect("tenant setting");
+    // the seed is setup, not the read under test: CI runners took over the
+    // pool's 30 s statement_timeout writing 100 000 rows (57014)
+    antares_sql::sqlx::query("SET LOCAL statement_timeout = 0")
+        .execute(&mut *tx)
+        .await
+        .expect("seed timeout");
     antares_sql::sqlx::query(
         "INSERT INTO entities (tenant_id, id, entity, types, created_at, modified_at)
          SELECT $1, 'urn:ngsi-ld:' || t || ':' || lpad(n::text, 6, '0'),
