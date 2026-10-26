@@ -195,10 +195,12 @@ pub(crate) fn params(c: &Collection, pairs: &[(String, String)]) -> Result<Param
             "ngsild.pick and ngsild.omit both select the properties; name one",
         ));
     }
+    // `ngsild.q` is joined as `(filter);(datetime);(q)`: one that does not parse alone would
+    // close its group and OR past the other conjuncts, an output filter or not (F-ANT5-012)
+    if let Some(q) = p.option("q") {
+        antares_ops::outputs::one_q(q).map_err(bad)?;
+    }
     if let Some(o) = &c.output {
-        if let (Some(_), Some(q)) = (&o.filter.q, p.option("q")) {
-            antares_ops::outputs::one_q(q).map_err(bad)?;
-        }
         o.filter.scope_with(p.option("scopeQ")).map_err(bad)?;
     }
     p.filter = crate::filter::read(c, &raw)?;
@@ -1044,7 +1046,7 @@ mod tests {
     }
 
     #[test]
-    fn a_q_that_closes_its_group_is_refused_beside_an_output_filter() {
+    fn a_q_that_closes_its_group_is_refused_with_or_without_an_output_filter() {
         let output = serde_json::from_value(json!({"name": "fast", "filter": {"q": "speed>9"},
                                                    "sources": [{"type": "Car"}]}));
         let filtered = Collection {
@@ -1054,7 +1056,8 @@ mod tests {
         let escape = pairs(&[("ngsild.q", "speed<1)|(speed>0")]);
         assert!(params(&filtered, &escape).is_err());
         assert!(params(&filtered, &pairs(&[("ngsild.q", "speed<1")])).is_ok());
-        assert!(params(&car(), &escape).is_ok());
+        // F-ANT5-012: without one too, it would OR past the filter's conjunct
+        assert!(params(&car(), &escape).is_err());
     }
 
     #[test]

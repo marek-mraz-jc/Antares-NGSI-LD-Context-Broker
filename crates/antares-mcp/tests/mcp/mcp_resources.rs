@@ -37,7 +37,12 @@ async fn the_views_types_and_entities_are_resources() -> Result<(), String> {
         .pointer("/contents/0/text")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let doc: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    // the JSON sits inside the data fence under the preface (F-ANT1-004)
+    let lines: Vec<&str> = text.lines().collect();
+    let inner = lines
+        .get(2..lines.len().saturating_sub(1))
+        .unwrap_or_default();
+    let doc: Value = serde_json::from_str(&inner.join("\n")).map_err(|e| e.to_string())?;
     assert_eq!(doc.get("id"), Some(&json!("urn:ngsi-ld:Car:1")));
     assert!(doc.get("secret").is_none(), "{doc}");
     let escaped = rpc(

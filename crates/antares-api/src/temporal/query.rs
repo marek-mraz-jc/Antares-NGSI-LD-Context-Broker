@@ -671,6 +671,8 @@ struct Pushdown {
     narrowed_now: bool,
     offset: usize,
     limit: usize,
+    /// with `page` under rules: the Attributes an Entity qualifies through
+    page_attrs: Option<Vec<String>>,
 }
 
 impl Pushdown {
@@ -709,8 +711,21 @@ impl Pushdown {
         // 5.7.4.4 + 5.5.9: pagination applies to the MERGED federated union, so
         // the store may only pre-page when nothing will federate — otherwise
         // page 1 is local-page + every remote row (matrix-9 IOP_EXT_TMP_03_04).
+        // under rules only where their verdict on an Entity is the store's,
+        // and the request's own q and geoquery, read on the shown history,
+        // are absent
+        let ruled = match qry.types_rule.as_deref() {
+            None => Some(None),
+            Some(_) if qry.client_q.is_some() || qry.own_geo.is_some() => None,
+            Some(rules) => page_attrs(
+                rules,
+                qry.types.as_deref(),
+                qry.tq.as_ref(),
+                qry.shown_attrs.as_deref(),
+            ),
+        };
         let page = (exact || (no_geo && qry.scope_q.is_none() && q_page_exact))
-            && qry.types_rule.is_none()
+            && ruled.is_some()
             && qry.id_pattern.is_none()
             && params.get("orderBy").is_none()
             && params.get("datasetId").is_none()
@@ -719,7 +734,8 @@ impl Pushdown {
             && !narrowed_now
             && !crate::federation::would_federate(st, req.tenant, req.ctx, params, req.headers)
                 .await?;
-        let agg = exact && page && store_aggregates(req, &qry.trepr);
+        // the store aggregates every Attribute it reads: never one the rules hide
+        let agg = exact && page && qry.types_rule.is_none() && store_aggregates(req, &qry.trepr);
         Ok(Self {
             exact,
             page,
@@ -727,6 +743,7 @@ impl Pushdown {
             narrowed_now,
             offset,
             limit,
+            page_attrs: ruled.flatten(),
         })
     }
 }
@@ -789,6 +806,7 @@ async fn fetch_temporal(
             limit: plan.limit as i64,
             count: true,
         }),
+        page_attrs: plan.page_attrs.as_deref().filter(|_| plan.page),
         q: qry.q_ast.as_ref(),
         expand: &expand,
         geo: &geo_pre,

@@ -173,3 +173,60 @@ mod o7 {
         }
     }
 }
+
+/// F-ANT5-001: a member path through a self-referencing single-valued navigation is walked in a
+/// loop, each segment one level of `max_expr_depth`, so 4000 segments are a refusal, not a stack
+/// overflow on a small thread.
+#[cfg(test)]
+mod member_path_depth {
+    use odata_url::{parse, LimitKind, Limits, Member, Model, UrlError, UrlErrorKind};
+
+    struct SelfRef;
+
+    impl Model for SelfRef {
+        fn entity_set(&self, name: &str) -> Option<&str> {
+            (name == "Nodes").then_some("N")
+        }
+
+        fn member(&self, ty: &str, name: &str) -> Option<Member<'_>> {
+            match (ty, name) {
+                ("N", "p") => Some(Member::Navigation {
+                    ty: "N",
+                    collection: false,
+                }),
+                ("N", "x") => Some(Member::Primitive { collection: false }),
+                _ => None,
+            }
+        }
+    }
+
+    fn parse_deep(segments: usize) -> Result<(), UrlError> {
+        let uri = format!("Nodes?$filter={}x eq 1", "p/".repeat(segments));
+        parse(&uri, &SelfRef, &Limits::strict()).map(|_| ())
+    }
+
+    #[test]
+    fn a_long_self_referencing_path_is_refused_on_a_small_stack() {
+        let worker = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| parse_deep(4000));
+        let answer = worker.map(std::thread::JoinHandle::join);
+        let refused = matches!(
+            answer,
+            Ok(Ok(Err(UrlError {
+                kind: UrlErrorKind::LimitExceeded {
+                    limit: LimitKind::ExprDepth,
+                    ..
+                },
+                ..
+            })))
+        );
+        assert!(refused, "{answer:?}");
+    }
+
+    #[test]
+    fn a_short_self_referencing_path_still_parses() {
+        let short = parse_deep(8);
+        assert!(short.is_ok(), "{short:?}");
+    }
+}

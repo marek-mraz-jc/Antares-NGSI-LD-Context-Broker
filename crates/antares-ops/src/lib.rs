@@ -54,7 +54,7 @@ pub use antares_ql::PRIMER;
 /// The residual of a standard query (ADR-0028 rule 2), re-exported so a surface compiles into
 /// it through `antares-ops` alone (rule M2).
 pub use antares_residual as residual;
-pub use error::{Problem, Refusal, CONTEXT_DETAIL, INNER_DETAIL};
+pub use error::{Problem, Refusal, CONTEXT_DETAIL, INNER_DETAIL, TIMEOUT_DETAIL};
 pub use operation::OperationId;
 pub use scan::{pickable, Page, Pushdown, Scanned, RESIDUAL_SCAN, TOO_COMPLEX};
 
@@ -573,7 +573,21 @@ async fn answered(op: OperationId, answer: Response) -> Result<Response, Refusal
     if context_not_available(status, &detail) {
         return Err(Refusal::ContextNotAvailable);
     }
+    // antares-sql logged the cancelled statement already
+    if statement_timeout(status, &detail) {
+        return Err(Refusal::StatementTimeout);
+    }
     Err(inner_failure(op, status, &detail))
+}
+
+/// Whether an inner answer is the NGSI-LD API's 500 for a query the database
+/// cancelled at the statement timeout (`antares-sql` maps SQLSTATE 57014).
+fn statement_timeout(status: StatusCode, body: &str) -> bool {
+    status == StatusCode::INTERNAL_SERVER_ERROR
+        && serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|p| p.get("detail")?.as_str().map(str::to_owned))
+            .is_some_and(|d| d == error::TIMEOUT_DETAIL)
 }
 
 /// Whether an inner answer is the NGSI-LD API's 504 `LdContextNotAvailable`
@@ -1635,6 +1649,14 @@ mod tests {
                 retry_after: Some(HeaderValue::from_static("6"))
             })
         );
+        // T-5616: the statement timeout keeps its fixed detail through a view
+        let timeout = r#"{"type":"https://uri.etsi.org/ngsi-ld/errors/InternalError","title":"InternalError","status":500,"detail":"database statement timeout"}"#;
+        assert_eq!(
+            answered(op, answer(StatusCode::INTERNAL_SERVER_ERROR, timeout))
+                .await
+                .err(),
+            Some(Refusal::StatementTimeout)
+        );
         let ld = r#"{"type":"https://uri.etsi.org/ngsi-ld/errors/LdContextNotAvailable"}"#;
         assert_eq!(
             answered(op, answer(StatusCode::GATEWAY_TIMEOUT, ld))
@@ -1648,6 +1670,10 @@ mod tests {
                 r#"{"type":"https://uri.etsi.org/ngsi-ld/errors/InternalError","detail":"forward to http://10.0.0.1 timed out"}"#,
             ),
             (StatusCode::INTERNAL_SERVER_ERROR, "store said no"),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"detail":"database statement timeout, said a forward"}"#,
+            ),
         ] {
             match answered(op, answer(status, body)).await.err() {
                 Some(Refusal::Inner { request_id }) => {

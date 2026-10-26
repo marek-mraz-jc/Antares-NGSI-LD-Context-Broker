@@ -50,6 +50,11 @@ pub enum Refusal {
         /// How many the query selects.
         size: usize,
     },
+    /// The database cancelled the operation at its statement timeout. The
+    /// detail is fixed and names no query, so it reaches the caller: the
+    /// same request asks the same again, and the gateway answers it as a
+    /// `504` that says to ask for less (T-5616).
+    StatementTimeout,
     /// The broker is overloaded: try again after `retry_after` seconds.
     Overloaded {
         /// The `Retry-After` the broker answered with.
@@ -59,6 +64,9 @@ pub enum Refusal {
 
 /// The fixed detail of [`Refusal::ContextNotAvailable`].
 pub const CONTEXT_DETAIL: &str = "a JSON-LD @context the request names could not be retrieved";
+
+/// The fixed detail of [`Refusal::StatementTimeout`], the NGSI-LD API's own.
+pub const TIMEOUT_DETAIL: &str = "database statement timeout";
 
 /// The fixed detail of an inner failure.
 pub const INNER_DETAIL: &str = "the operation failed inside the broker";
@@ -80,7 +88,7 @@ impl Refusal {
             Self::Denied(_) => StatusCode::FORBIDDEN,
             Self::Malformed(_) | Self::TooManyResults { .. } => StatusCode::BAD_REQUEST,
             Self::Limit(_) => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::Inner { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Inner { .. } | Self::StatementTimeout => StatusCode::INTERNAL_SERVER_ERROR,
             Self::ContextNotAvailable => StatusCode::GATEWAY_TIMEOUT,
             Self::Overloaded { .. } => StatusCode::SERVICE_UNAVAILABLE,
         }
@@ -128,6 +136,11 @@ impl Refusal {
                 "https://uri.etsi.org/ngsi-ld/errors/InternalError",
                 "InternalError",
                 format!("{INNER_DETAIL}; request id {request_id}"),
+            ),
+            Self::StatementTimeout => (
+                "https://uri.etsi.org/ngsi-ld/errors/InternalError",
+                "InternalError",
+                TIMEOUT_DETAIL.to_owned(),
             ),
             Self::ContextNotAvailable => (
                 "https://uri.etsi.org/ngsi-ld/errors/LdContextNotAvailable",

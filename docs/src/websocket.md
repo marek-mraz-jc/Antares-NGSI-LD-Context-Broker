@@ -44,7 +44,8 @@ apply as on HTTP, and the body is the HTTP sink's for the same change
 
 ## 2. Delivery and the queue
 
-Each connection has one queue of `ANTARES_WS_QUEUE` notifications. A
+Each connection has one queue of `ANTARES_WS_QUEUE` notifications, which
+with the resume ring holds at most `ANTARES_WS_QUEUE_BYTES` (16 MiB). A
 single-entity notification without `showChanges` replaces the queued one
 for the same Subscription and Entity, and then says so: its metadata
 carries `x-coalesced`, the number of changes it replaced. A consumer that

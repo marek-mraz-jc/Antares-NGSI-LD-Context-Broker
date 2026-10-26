@@ -333,13 +333,24 @@ fn history(tenant: &str, entity: &str) -> String {
 /// rows oldest first from the widened column bound and fetched every row the
 /// text predicate then refused: ~115 rows an Entity on the helsinki-bikes
 /// history, past the 30 s statement timeout for 577 Entities (T-5616).
-pub fn has_history(preds: &str, dir: &str) -> String {
+/// `attrs`, the bind of the Attribute IRIs a policy shows, keeps the probe to
+/// their rows.
+pub fn has_history(preds: &str, dir: &str, attrs: Option<usize>) -> String {
+    let (x, r) = attrs.map_or_else(Default::default, |n| {
+        (
+            format!(" AND ai.attr_id = ANY(${n})"),
+            format!(
+                " AND ai.attr_no IN (SELECT i.id FROM iri_ids i \
+                 WHERE i.tenant_id = m.tenant_id AND i.iri = ANY(${n}))"
+            ),
+        )
+    });
     format!(
         "((SELECT true FROM attr_instances ai \
-           WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id{preds} \
+           WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id{x}{preds} \
            ORDER BY ai.attr_id {dir}, ai.observed_at {dir} LIMIT 1) IS NOT NULL \
          OR (SELECT true FROM attr_rows ai \
-           WHERE ai.tenant_id = m.tenant_id AND ai.entity_no = iri_no(m.tenant_id, m.id){preds} \
+           WHERE ai.tenant_id = m.tenant_id AND ai.entity_no = iri_no(m.tenant_id, m.id){r}{preds} \
            ORDER BY ai.attr_no {dir}, ai.observed_at {dir} LIMIT 1) IS NOT NULL)"
     )
 }
@@ -528,6 +539,14 @@ async fn insert_rows(
         .collect();
     in_dataset.sort_unstable();
     in_dataset.dedup();
+    // The newest instance whose observedAt the rank may order unlike
+    // observed_at (migration 0028): lastN reads past its N newest only there.
+    let offset_until = rows
+        .iter()
+        .filter(|r| !utc_observed(&r["data"]))
+        .filter_map(|r| r["observed_at"].as_str())
+        .filter_map(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .max();
     let (keyed, text): (Vec<Value>, Vec<Value>) = if short {
         (rows, Vec::new())
     } else {
@@ -553,6 +572,18 @@ async fn insert_rows(
             return Err(e);
         }
     }
+    if let Some(t) = offset_until {
+        // Every caller writes the Entity's temporal row before its instances.
+        sqlx::query(
+            "UPDATE temporal_entities SET offset_until = $3
+             WHERE tenant_id = $1 AND id = $2 AND offset_until < $3",
+        )
+        .bind(tenant.as_str())
+        .bind(entity_id)
+        .bind(t)
+        .execute(&mut *tx)
+        .await?;
+    }
     if !in_dataset.is_empty() {
         // Every caller writes the Entity's temporal row before its instances.
         sqlx::query(
@@ -567,6 +598,21 @@ async fn insert_rows(
         .await?;
     }
     Ok(())
+}
+
+/// Whether an instance's `observedAt` is a UTC RFC 3339 stamp, whose text
+/// key (`dt_key`) orders exactly like its instant. Any other instance, one
+/// without observedAt included, may rank unlike `observed_at` in lastN.
+fn utc_observed(data: &Value) -> bool {
+    data.get("observedAt")
+        .and_then(Value::as_str)
+        // `dt_key` reads the first 19 bytes as the wall time: only the `T`
+        // spelling of the separator orders with the rest
+        .filter(|t| t.ends_with('Z') && t.as_bytes().get(10) == Some(&b'T'))
+        .is_some_and(|t| {
+            chrono::DateTime::parse_from_rfc3339(&antares_store::filter::canonical_datetime(t))
+                .is_ok()
+        })
 }
 
 /// Whether row `r` is observed at or after `cutover`. A stamp chrono cannot
@@ -954,7 +1000,8 @@ const NEWEST_ROWS: &str = "(WITH RECURSIVE a(attr) AS (\
             SELECT i.iri FROM b JOIN iri_ids i ON i.tenant_id = m.tenant_id AND i.id = b.no) \
           SELECT ai.* FROM n a \
           CROSS JOIN LATERAL (SELECT CASE WHEN a.attr = ANY(m.dataset_attrs) THEN '-infinity'::timestamptz \
-              ELSE COALESCE((SELECT t.observed_at FROM (\
+              ELSE (SELECT CASE WHEN k.nth - interval '28 hours' > m.offset_until THEN k.nth \
+                ELSE k.nth - interval '28 hours' END FROM (SELECT COALESCE((SELECT t.observed_at FROM (\
                 (SELECT t.observed_at FROM attr_instances t \
                   WHERE t.tenant_id = m.tenant_id AND t.entity_id = m.id AND t.attr_id = a.attr{window} \
                   ORDER BY t.observed_at DESC LIMIT greatest(${n}::bigint, 1)) \
@@ -963,7 +1010,7 @@ const NEWEST_ROWS: &str = "(WITH RECURSIVE a(attr) AS (\
                   WHERE true{window} \
                   ORDER BY t.observed_at DESC LIMIT greatest(${n}::bigint, 1))) t \
                 ORDER BY t.observed_at DESC OFFSET greatest(${n}::bigint - 1, 0) LIMIT 1), \
-                '-infinity'::timestamptz) - interval '28 hours' END AS th) c \
+                '-infinity'::timestamptz) AS nth) k) END AS th) c \
           CROSS JOIN LATERAL (SELECT * FROM attr_instances ai \
             WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id AND ai.attr_id = a.attr \
             AND ai.observed_at >= c.th \
@@ -979,6 +1026,11 @@ const NEWEST_ROWS: &str = "(WITH RECURSIVE a(attr) AS (\
 /// has N rows strictly above it under either order. KPI histories of 22k
 /// instances per Entity passed the gateway's 30 s ranking all of them
 /// (T-4246); this reads about N plus 28 hours of rows per Attribute.
+/// Where the Entity's `offset_until` (migration 0028) lies more than 28 h
+/// before the N-th newest, every row within those 28 h is a UTC stamp,
+/// whose text key orders like `observed_at`: the N newest and their ties are
+/// then exactly what the rank keeps, and the read stops there (T-5616: the
+/// helsinki-bikes stations write ~1200 rows a day each).
 ///
 /// `None` (rank the whole window, as before) where the superset argument
 /// does not hold or no index serves it:
@@ -1654,7 +1706,11 @@ impl PgTemporalStore {
                 Some(r) if r.timerel == "before" => "ASC",
                 _ => "DESC",
             };
-            wheres.push(has_history(&preds, dir));
+            let shown = f.page_attrs.map(|attrs| {
+                binds.push(B::Arr(super::storable(attrs)));
+                binds.len()
+            });
+            wheres.push(has_history(&preds, dir, shown));
             paged = true;
         }
         // 5.7.4.4 S2 superset prefilter: entities with no windowed instance
@@ -2341,7 +2397,7 @@ mod tests {
     /// union that reads an Entity's rows in the btree's own order.
     #[test]
     fn the_page_qualification_probes_one_row_per_parent() {
-        let sql = has_history(" AND ai.x", "DESC");
+        let sql = has_history(" AND ai.x", "DESC", None);
         assert!(
             sql.contains("ORDER BY ai.attr_id DESC, ai.observed_at DESC LIMIT 1"),
             "{sql}"
@@ -2352,6 +2408,75 @@ mod tests {
         );
         assert_eq!(sql.matches(" AND ai.x").count(), 2, "{sql}");
         assert!(!sql.contains("EXISTS"), "{sql}");
+        assert!(!sql.contains("ANY("), "{sql}");
+    }
+
+    /// T-5616: under a policy the page qualifies an Entity only through the
+    /// Attributes its rules show, in both parents, on the one bind.
+    #[test]
+    fn the_page_qualification_keeps_to_the_shown_attributes() {
+        let sql = has_history(" AND ai.x", "DESC", Some(9));
+        assert!(sql.contains("ai.attr_id = ANY($9)"), "{sql}");
+        assert!(
+            sql.contains("ai.attr_no IN (SELECT i.id FROM iri_ids i WHERE i.tenant_id = m.tenant_id AND i.iri = ANY($9))"),
+            "{sql}"
+        );
+    }
+
+    /// T-5616: the read takes the N newest alone only where the Entity's
+    /// last non-UTC stamp lies more than 28 h before the N-th newest.
+    #[test]
+    fn the_newest_rows_widen_only_near_an_offset_stamp() {
+        let f = TemporalFilter {
+            last_n: Some(10),
+            ..Default::default()
+        };
+        let sql = newest_rows(&f, 3, 4).expect("reads the newest rows");
+        assert!(
+            sql.contains(
+                "CASE WHEN k.nth - interval '28 hours' > m.offset_until THEN k.nth \
+                 ELSE k.nth - interval '28 hours' END"
+            ),
+            "{sql}"
+        );
+        assert!(sql.contains("ai.observed_at >= c.th"), "{sql}");
+    }
+
+    /// T-5616: a UTC RFC 3339 stamp keys like its instant; an offset, a space
+    /// separator, a non-stamp or no observedAt does not.
+    #[test]
+    fn only_a_utc_t_stamp_orders_like_its_instant() {
+        for (data, utc) in [
+            (
+                serde_json::json!({"observedAt": "2026-10-26T12:00:00Z"}),
+                true,
+            ),
+            (
+                serde_json::json!({"observedAt": "2026-10-26T12:00:00,5Z"}),
+                true,
+            ),
+            (
+                serde_json::json!({"observedAt": "2026-10-26T12:00:00.123456789Z"}),
+                true,
+            ),
+            (
+                serde_json::json!({"observedAt": "2026-10-26T12:00:00+00:00"}),
+                false,
+            ),
+            (
+                serde_json::json!({"observedAt": "2026-10-26T14:00:00+02:00"}),
+                false,
+            ),
+            (
+                serde_json::json!({"observedAt": "2026-10-26 12:00:00Z"}),
+                false,
+            ),
+            (serde_json::json!({"observedAt": "yesterdayZ"}), false),
+            (serde_json::json!({"observedAt": 5}), false),
+            (serde_json::json!({"value": 1}), false),
+        ] {
+            assert_eq!(utc_observed(&data), utc, "{data}");
+        }
     }
 
     #[test]

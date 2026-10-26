@@ -276,10 +276,11 @@ impl Server {
             let asked = [(confirm::ANSWER.to_owned(), InputRequest::Elicitation(ask))];
             return InputRequiredResult::new(Some(asked.into_iter().collect()), Some(state)).into();
         };
-        let confirmed = if !confirm::redeem(&state, &bound) {
-            Err("the requestState does not answer this call; call the tool again without it")
-        } else if !confirm::accepted(request.input_responses.as_ref()) {
+        // a decline spends nothing: only an accepted answer redeems the state
+        let confirmed = if !confirm::accepted(request.input_responses.as_ref()) {
             Err("the person did not confirm; nothing was written")
+        } else if !confirm::redeem(&state, &bound, &self.caller.subject()) {
+            Err("the requestState does not answer this call; call the tool again without it")
         } else {
             Ok(())
         };
@@ -1283,12 +1284,16 @@ impl ServerHandler for Server {
                 None,
             ));
         }
-        Ok(ReadResourceResult::new(vec![
-            ResourceContents::text(text, uri).with_mime_type("application/json")
+        // broker data reaches the model labelled as data, as a tool result does
+        let mut read = ReadResourceResult::new(vec![
+            ResourceContents::text(fenced(&text), uri).with_mime_type("text/markdown")
         ])
         .with_ttl_ms(0)
-        .with_cache_scope(CacheScope::Private)
-        .into())
+        .with_cache_scope(CacheScope::Private);
+        let mut meta = rmcp::model::MetaObject::default();
+        meta.0.insert(UNTRUSTED_META.to_owned(), Value::Bool(true));
+        read.meta = Some(meta);
+        Ok(read.into())
     }
 }
 
