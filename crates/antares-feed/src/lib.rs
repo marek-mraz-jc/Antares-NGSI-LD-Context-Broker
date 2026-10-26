@@ -321,7 +321,7 @@ fn joined(name: &str, own: Option<&str>, asked: Option<&str>) -> Result<Option<S
 
 /// The Query Entities a page reads: the view's types the output lists (narrowed by a
 /// request's `type`), the joined `q` and `scopeQ`, one geo query and the language.
-fn pushdown(
+async fn pushdown(
     view: &ViewOps,
     plan: &Plan,
     asked: &Asked,
@@ -334,20 +334,11 @@ fn pushdown(
         }
         wanted.retain(|w| named.contains(&w.as_str()));
     }
-    let mut query = if view.shows_every_name() {
-        "local=true".to_owned()
-    } else {
-        let (shown, _) = view.shown_names();
-        let matching: Vec<String> = shown
-            .iter()
-            .filter(|t| wanted.iter().any(|w| w == local(t)))
-            .map(|t| encode(t))
-            .collect();
-        if matching.is_empty() {
-            return Err(not_found());
-        }
-        format!("type={}", matching.join(","))
-    };
+    let wanted_names: Vec<&str> = wanted.iter().map(String::as_str).collect();
+    let mut query = view
+        .type_selector(&wanted_names)
+        .await
+        .ok_or_else(not_found)?;
     let filter = &plan.filter;
     let mut add = |key: &str, value: Option<String>| {
         if let Some(v) = value {
@@ -397,7 +388,7 @@ async fn entries(
     plan: &Plan,
     asked: &Asked,
 ) -> Result<(Vec<Entry>, usize), Problem> {
-    let (pushdown, wanted) = pushdown(view, plan, asked)?;
+    let (pushdown, wanted) = pushdown(view, plan, asked).await?;
     let lang = asked
         .seen
         .get("lang")

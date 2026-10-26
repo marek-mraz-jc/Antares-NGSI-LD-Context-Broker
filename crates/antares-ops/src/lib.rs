@@ -691,6 +691,37 @@ impl ViewOps {
             .map_err(|d| Refusal::Denied(d.0))
     }
 
+    /// The `type=` a surface's Query Entities pushes for the local type
+    /// names `wanted` (the last IRI segment): the view's shown types of
+    /// those names, or for a view of every type the Tenant's stored types of
+    /// those names (F-ANT5-010, F-ANT5-011), so the read never walks the
+    /// whole Tenant into the residual-scan bound. `None` when a view that
+    /// names its types shows none of `wanted`; `local=true`, the whole
+    /// local store, only when the store keeps no type list.
+    pub async fn type_selector(&self, wanted: &[&str]) -> Option<String> {
+        let local = |n: &str| n.rsplit(['/', '#']).next().unwrap_or(n).to_owned();
+        let named = |names: &[String]| -> Vec<String> {
+            names
+                .iter()
+                .filter(|t| wanted.contains(&local(t).as_str()))
+                .map(|t| percent::encode(t))
+                .collect()
+        };
+        let matching = if self.shows_every_name() {
+            match self.inner.state.stored_type_names(&self.tenant).await {
+                Ok(Some(stored)) => match named(&stored) {
+                    // no Entity of those types yet: a selector that matches none
+                    m if m.is_empty() => wanted.iter().map(|t| percent::encode(t)).collect(),
+                    m => m,
+                },
+                _ => return Some("local=true".to_owned()),
+            }
+        } else {
+            named(&self.shown_names().0)
+        };
+        (!matching.is_empty()).then(|| format!("type={}", matching.join(",")))
+    }
+
     /// Whether the view shows every type and Attribute (ADR-0023 rule 12):
     /// [`Self::shown_names`] and [`Self::shown_by_type`] are then empty and a
     /// surface offers a name by its syntax alone.

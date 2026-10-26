@@ -912,6 +912,23 @@ impl AppState {
             .map_err(|e| e.to_string())
     }
 
+    /// The Entity types Tenant `t`'s live Entities carry, expanded and
+    /// sorted, read from the store's type list; `None` when the store keeps
+    /// none. For a surface over a view of every type (F-ANT5-010).
+    ///
+    /// # Errors
+    /// The store's.
+    #[cfg(feature = "views")]
+    pub async fn stored_type_names(
+        &self,
+        t: &antares_model::TenantId,
+    ) -> Result<Option<Vec<String>>, String> {
+        self.store
+            .entity_type_names(t)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// One page of Tenant `t`'s Entities of one of `types`, each holding only
     /// `attrs` (expanded IRIs), from match `offset` on; a store that cannot
     /// page answers every match and the page is cut here. For maintenance
