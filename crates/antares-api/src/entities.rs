@@ -4133,11 +4133,24 @@ mod clause_5_6_1_and_5_6_21 {
         let one = json!({"id": id, "type": "Vehicle"});
         let temporal = json!({"id": id, "type": "Vehicle",
             "speed": [{"type": "Property", "value": 1, "observedAt": "2026-10-26T00:00:00Z"}]});
-        for (path, body) in [
-            ("/ngsi-ld/v1/entities", one.clone()),
-            ("/ngsi-ld/v1/entityOperations/create", json!([one.clone()])),
-            ("/ngsi-ld/v1/entityOperations/upsert", json!([one.clone()])),
-            ("/ngsi-ld/v1/temporal/entities", temporal),
+        // a batch answers 207 with the member's 400 in `errors` (5.6.7)
+        for (path, body, want) in [
+            ("/ngsi-ld/v1/entities", one.clone(), StatusCode::BAD_REQUEST),
+            (
+                "/ngsi-ld/v1/entityOperations/create",
+                json!([one.clone()]),
+                StatusCode::MULTI_STATUS,
+            ),
+            (
+                "/ngsi-ld/v1/entityOperations/upsert",
+                json!([one.clone()]),
+                StatusCode::MULTI_STATUS,
+            ),
+            (
+                "/ngsi-ld/v1/temporal/entities",
+                temporal,
+                StatusCode::BAD_REQUEST,
+            ),
         ] {
             let payload = body.to_string();
             let resp = app
@@ -4154,7 +4167,7 @@ mod clause_5_6_1_and_5_6_21 {
             let status = resp.status();
             let bytes = resp.into_body().collect().await.expect("body").to_bytes();
             let text = String::from_utf8_lossy(&bytes);
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {text}");
+            assert_eq!(status, want, "{path}: {text}");
             assert!(text.contains("holds a comma"), "{path}: {text}");
         }
         let resp = app
