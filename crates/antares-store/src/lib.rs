@@ -949,20 +949,18 @@ pub async fn drain_events<D: TemporalDriver + ?Sized>(
             let ev = &evs[j];
             shell = &ev.shell;
             if ev.op == TemporalOp::ScopeChanged {
-                let inst = ev.instance.clone();
-                d.mutate(tenant, id, |doc| {
-                    let target = doc.as_object_mut().ok_or(())?;
-                    match target.get_mut("scope").and_then(Value::as_array_mut) {
-                        Some(arr) if arr.first().is_some_and(Value::is_object) => {
-                            arr.push(inst);
-                        }
-                        _ => {
-                            target.insert("scope".into(), Value::Array(vec![inst]));
-                        }
-                    }
-                    Ok::<(), ()>(())
-                })
-                .await?;
+                // the additions before it first: they may create the doc the
+                // scope instance goes on, and history keeps production order
+                if !additions.is_empty() {
+                    let pending = Value::Object(std::mem::take(&mut additions));
+                    d.temporal_append(tenant, id, shell, &pending).await?;
+                }
+                if push_scope(d, tenant, id, &ev.instance).await?.is_none() {
+                    // no temporal doc yet: create the shell, then record
+                    let empty = Value::Object(serde_json::Map::new());
+                    d.temporal_append(tenant, id, shell, &empty).await?;
+                    push_scope(d, tenant, id, &ev.instance).await?;
+                }
             } else {
                 if let Some(arr) = additions
                     .entry(ev.attr.clone())
@@ -981,6 +979,29 @@ pub async fn drain_events<D: TemporalDriver + ?Sized>(
         i = j;
     }
     Ok(())
+}
+
+/// Appends a scope instance to the held temporal doc; `None` when there is
+/// no doc.
+async fn push_scope<D: TemporalDriver + ?Sized>(
+    d: &D,
+    tenant: &TenantId,
+    id: &str,
+    inst: &Value,
+) -> Result<Option<Result<(), ()>>, NgsiError> {
+    d.mutate(tenant, id, |doc| {
+        let target = doc.as_object_mut().ok_or(())?;
+        match target.get_mut("scope").and_then(Value::as_array_mut) {
+            Some(arr) if arr.first().is_some_and(Value::is_object) => {
+                arr.push(inst.clone());
+            }
+            _ => {
+                target.insert("scope".into(), Value::Array(vec![inst.clone()]));
+            }
+        }
+        Ok::<(), ()>(())
+    })
+    .await
 }
 
 /// A drained request folded into one append per run of consecutive events of
@@ -1675,13 +1696,18 @@ mod tests {
             &self,
             _t: &TenantId,
             id: &str,
-            _shell: &Value,
+            shell: &Value,
             additions: &Value,
         ) -> Result<(), NgsiError> {
             self.appends
                 .lock()
                 .expect("lock")
                 .push((id.to_owned(), additions.clone()));
+            // a real driver creates the doc from the shell on first touch
+            self.doc
+                .lock()
+                .expect("lock")
+                .get_or_insert_with(|| shell.clone());
             Ok(())
         }
         async fn query_temporal(
@@ -1821,6 +1847,36 @@ mod tests {
             Some(1),
             "the plain scope became an instance array: {doc}"
         );
+    }
+
+    /// F-ANT1-015: a scope change first in a run, with no temporal doc yet,
+    /// still lands: the shell is created rather than the instance dropped,
+    /// and additions queued before it are appended first.
+    #[tokio::test]
+    async fn event_list_keeps_a_scope_change_on_an_entity_without_history() {
+        let t = TenantId::new("t").expect("tenant");
+        let d = Recorder::default();
+        d.event_list(&[
+            ev(TemporalOp::ScopeChanged, "urn:a", "scope", 7),
+            ev(TemporalOp::AttrCreated, "urn:a", "speed", 1),
+        ])
+        .await
+        .expect("drain ok");
+        let doc = d.get(&t, "urn:a").await.expect("get").expect("doc");
+        assert_eq!(doc["scope"][0]["value"], 7, "{doc}");
+
+        let d = Recorder::default();
+        d.event_list(&[
+            ev(TemporalOp::AttrCreated, "urn:a", "speed", 1),
+            ev(TemporalOp::ScopeChanged, "urn:a", "scope", 7),
+        ])
+        .await
+        .expect("drain ok");
+        let appends = d.appends.lock().expect("lock").clone();
+        assert_eq!(appends.len(), 1, "{appends:?}");
+        assert_eq!(appends[0].1["speed"][0]["value"], 1);
+        let doc = d.get(&t, "urn:a").await.expect("get").expect("doc");
+        assert_eq!(doc["scope"][0]["value"], 7, "{doc}");
     }
 
     #[tokio::test]

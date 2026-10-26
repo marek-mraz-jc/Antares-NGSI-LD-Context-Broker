@@ -3364,3 +3364,72 @@ mod coalesced_delivery {
         );
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod csource_fanout_share {
+    use super::*;
+
+    /// F-ANT3-006: a tenant whose fan-outs hang holds at most its share of
+    /// the fan-out slots, so another tenant's registration write still gets
+    /// one at once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hung_tenant_leaves_slots_for_another() {
+        let a = TenantId::new("fanshare-a").expect("tenant");
+        let b = TenantId::new("fanshare-b").expect("tenant");
+        let mut held = Vec::new();
+        for _ in 0..CSOURCE_FANOUT_PER_TENANT {
+            held.push(fanout_permits(&a).await);
+        }
+        let wait = std::time::Duration::from_millis(300);
+        assert!(
+            tokio::time::timeout(wait, fanout_permits(&a)).await.is_err(),
+            "tenant a is at its share"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), fanout_permits(&b))
+                .await
+                .is_ok(),
+            "tenant b must not wait behind tenant a"
+        );
+        drop(held);
+    }
+
+    /// F-ANT3-019: the CSource notification paths read every registration a
+    /// page at a time, past the whole-list ceiling that made them read
+    /// nothing on Postgres.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_registration_read_passes_the_list_ceiling() {
+        let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
+            eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
+            return;
+        };
+        let pool = antares_sql::store::pg::connect(&url, 5)
+            .await
+            .expect("connect");
+        let tenant = TenantId::new("csrceiling").expect("tenant");
+        antares_sql::store::pg::ensure_tenant(&pool, &tenant)
+            .await
+            .expect("tenant row");
+        let st = AppState::with_store(
+            "antares-csr-ceiling".into(),
+            Arc::new(antares_sql::store::any::AnyStore::Pg(
+                antares_sql::store::any::PgBackend::new(pool),
+            )),
+            "postgres",
+        );
+        let n = usize::try_from(antares_sql::store::pg::entity::MAX_UNDECIDED_ROWS)
+            .expect("n")
+            .saturating_add(1);
+        for i in 0..n {
+            let id = format!("urn:ngsi-ld:ContextSourceRegistration:c{i:06}");
+            let doc = serde_json::json!({"id": id, "type": "ContextSourceRegistration",
+                "endpoint": "http://localhost:1/", "keep": i % 2 == 0});
+            let _ = st.store.create(&tenant, Kind::Registration, &id, doc).await;
+        }
+        let kept = docs_where(&st, &tenant, Kind::Registration, |d| d["keep"] == true)
+            .await
+            .expect("a paged read is never refused for volume");
+        assert_eq!(kept.len(), n.div_ceil(2));
+    }
+}

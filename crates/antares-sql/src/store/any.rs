@@ -737,8 +737,28 @@ impl AnyStore {
             AnyStore::Mem(s) => Ok(s.list_slice(tenant, kind, offset, limit)),
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => match kind {
-                // Not doc kinds; sliced from the whole list, like `list_page`.
-                Kind::Entity | Kind::Temporal => {
+                // Not doc kinds: each reads its own window in SQL, so the
+                // whole-list ceiling never refuses a page (F-ANT1-011).
+                Kind::Entity => {
+                    let (mut rows, total) = p
+                        .entities
+                        .list_slice(
+                            tenant,
+                            i64::try_from(offset).unwrap_or(i64::MAX),
+                            i64::try_from(limit).unwrap_or(i64::MAX),
+                        )
+                        .await
+                        .map_err(db)?;
+                    // 4.22 at the read boundary, as `list_page` does
+                    let now = now_utc();
+                    rows.retain_mut(|d| !crate::store::filter::strip_expired(d, &now));
+                    Ok((rows, usize::try_from(total).unwrap_or(usize::MAX)))
+                }
+                // ponytail: temporal is sliced from the whole list, as in
+                // `list_page`: its documents are rebuilt from instance rows
+                // and the paged temporal query skips shells without history;
+                // the upgrade is a keyset reader over temporal_entities.
+                Kind::Temporal => {
                     let mut rows = AnyStore::list(self, tenant, kind).await?;
                     rows.sort_by(|a, b| row_id(a).cmp(row_id(b)));
                     let total = rows.len();

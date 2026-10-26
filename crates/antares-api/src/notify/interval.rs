@@ -305,7 +305,10 @@ pub async fn interval_tick(st: &AppState) {
         // csource timeInterval subs: periodic CSourceNotification with all
         // matching registrations, independent of changes (5.11.7)
         for sub in read_or_warn(
-            st.store.list(&tenant, Kind::CSourceSubscription).await,
+            docs_where(st, &tenant, Kind::CSourceSubscription, |s| {
+                s.get("timeInterval").is_some()
+            })
+            .await,
             "the periodic Context Source Registration Subscriptions",
         ) {
             let Some(interval) = sub.get("timeInterval").and_then(Value::as_f64) else {
@@ -332,11 +335,13 @@ pub async fn interval_tick(st: &AppState) {
             let ctx = sub_context(st, &tenant, &sub).await;
             let spec = crate::registry::spec_for_subscription(&sub);
             let data: Vec<Value> = read_or_warn(
-                st.store.list(&tenant, Kind::Registration).await,
+                docs_where(st, &tenant, Kind::Registration, |r| {
+                    crate::registry::csr_matches_subscription(&sub, r, &ctx)
+                })
+                .await,
                 "the registrations a periodic Context Source Notification carries",
             )
             .into_iter()
-            .filter(|r| crate::registry::csr_matches_subscription(&sub, r, &ctx))
             .map(|r| {
                 let mut p = crate::registry::present_registration(
                     &filter_csr(&spec, &r, &ctx),
