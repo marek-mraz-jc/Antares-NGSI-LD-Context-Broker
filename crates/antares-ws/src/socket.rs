@@ -524,7 +524,7 @@ impl Session {
     /// The queue has something (or overflowed, or another socket took the
     /// connection).
     async fn drain(&mut self) -> Option<End> {
-        match self.conn.next(self.generation, self.hub.limits.queue) {
+        match self.conn.next(self.generation, &self.hub.limits) {
             None => Some(End::TakenOver),
             Some(Next::Overflow(from, to)) => {
                 let _gap = self.send(envelope::gap(from, to)).await;

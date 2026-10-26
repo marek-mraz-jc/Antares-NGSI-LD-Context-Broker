@@ -64,6 +64,10 @@ struct State {
     generation: u64,
     /// The queue overflowed while a socket was attached: it closes.
     overflowed: bool,
+    /// The bytes of the queued texts and of the ring's: together they stay
+    /// under `ANTARES_WS_QUEUE_BYTES` (F-ANT3-001).
+    queue_bytes: usize,
+    ring_bytes: usize,
 }
 
 struct Queued {
@@ -98,9 +102,166 @@ impl State {
         let from = self.lost.map_or(from, |(f, _)| f.min(from));
         self.lost = Some((from, seq));
         self.queue.clear();
+        self.queue_bytes = 0;
         if self.attached.is_some() {
             self.overflowed = true;
         }
+    }
+
+    /// Drops the ring's oldest texts while it holds more than `count`, or
+    /// while the queue, the ring and `add` more bytes pass `budget`.
+    fn trim(&mut self, count: usize, budget: usize, add: usize) {
+        while let Some(len) = self.ring.front().map(|(_, t)| t.len()).filter(|_| {
+            self.ring.len() > count
+                || self
+                    .queue_bytes
+                    .saturating_add(self.ring_bytes)
+                    .saturating_add(add)
+                    > budget
+        }) {
+            drop(self.ring.pop_front());
+            self.ring_bytes = self.ring_bytes.saturating_sub(len);
+        }
+    }
+
+    /// Room for `add` more queued bytes: the ring's oldest texts leave
+    /// first; false when the queue alone would pass `queue_bytes`.
+    fn room(&mut self, add: usize, limits: &Limits) -> bool {
+        self.trim(limits.queue, limits.queue_bytes, add);
+        self.queue_bytes.saturating_add(add) <= limits.queue_bytes
+    }
+
+    /// Offer one notification (rule 6): coalesced into a queued one of the
+    /// same Subscription and single Entity when neither shows changes,
+    /// queued when there is room, and otherwise lost with everything still
+    /// queued. Room is a count (`queue`) and bytes (`queue_bytes`, shared
+    /// with the ring).
+    fn offer(&mut self, n: Forwarded, limits: &Limits) -> Answer {
+        let Some(&show) = self.subs.get(&n.subscription) else {
+            return Answer::Unknown;
+        };
+        let coalescible = !show && n.entity.is_some() && !n.changes;
+        let into = coalescible
+            .then(|| {
+                // never past a queued x-gap: a change after a loss leaves
+                // after it, so the consumer reads the gap first
+                self.queue
+                    .iter()
+                    .rposition(|q| {
+                        q.gap_from.is_some()
+                            || (q.coalescible && q.sub == n.subscription && q.entity == n.entity)
+                    })
+                    .filter(|&i| self.queue.get(i).is_some_and(|q| q.gap_from.is_none()))
+            })
+            .flatten();
+        let queued = into.and_then(|i| self.queue.get(i));
+        let seq = queued.map_or(self.next_seq.max(1), |q| q.seq);
+        let merged = queued.map_or(0, |q| q.merged.saturating_add(1));
+        let old = queued.map_or(0, |q| q.text.len());
+        // rendered once, with the seq it takes; the cap is judged as if the
+        // seq had the most digits a u64 has, so a text at the cap stays
+        // under it whatever seq it gets
+        let text = envelope::notification(&n.rendered, seq, &n.subscription, merged);
+        if text
+            .len()
+            .saturating_add(U64_MAX_DIGITS.saturating_sub(digits(seq)))
+            > MAX_NOTIFICATION_BYTES
+        {
+            return Answer::TooLarge;
+        }
+        if into.is_some() && !self.room(text.len().saturating_sub(old), limits) {
+            self.overflow(self.next_seq.saturating_sub(1).max(seq));
+            return Answer::Overflow;
+        }
+        if let Some(q) = into.and_then(|i| self.queue.get_mut(i)) {
+            self.queue_bytes = self
+                .queue_bytes
+                .saturating_sub(old)
+                .saturating_add(text.len());
+            q.text = text;
+            q.merged = merged;
+            return Answer::Queued;
+        }
+        self.next_seq = seq.saturating_add(1);
+        if self.queue.len() >= limits.queue || !self.room(text.len(), limits) {
+            self.overflow(seq);
+            return Answer::Overflow;
+        }
+        self.queue_bytes = self.queue_bytes.saturating_add(text.len());
+        self.queue.push_back(Queued {
+            seq,
+            sub: n.subscription,
+            entity: n.entity,
+            coalescible,
+            merged,
+            gap_from: None,
+            text,
+        });
+        Answer::Queued
+    }
+
+    /// A notification of `sub` lost before it was offered, as an `x-gap`
+    /// in its place; losses in a row share one. An `x-gap` is counted in
+    /// the queue's bytes but never refused on them: at most `queue` of them,
+    /// each under 100 bytes.
+    fn lose(&mut self, sub: &str, limits: &Limits) -> Answer {
+        if !self.subs.contains_key(sub) {
+            return Answer::Unknown;
+        }
+        let seq = self.next_seq.max(1);
+        self.next_seq = seq.saturating_add(1);
+        if let Some(q) = self.queue.back_mut() {
+            if let Some(from) = q.gap_from {
+                let text = envelope::gap(from, seq);
+                self.queue_bytes = self
+                    .queue_bytes
+                    .saturating_sub(q.text.len())
+                    .saturating_add(text.len());
+                q.seq = seq;
+                q.text = text;
+                return Answer::Queued;
+            }
+        }
+        let text = envelope::gap(seq, seq);
+        if self.queue.len() >= limits.queue {
+            self.overflow(seq);
+            return Answer::Overflow;
+        }
+        self.queue_bytes = self.queue_bytes.saturating_add(text.len());
+        self.queue.push_back(Queued {
+            seq,
+            sub: sub.to_owned(),
+            entity: None,
+            coalescible: false,
+            merged: 0,
+            gap_from: Some(seq),
+            text,
+        });
+        Answer::Queued
+    }
+
+    /// What the socket of `generation` writes next; written notifications
+    /// enter the ring, which keeps the last `queue` and, with the queue,
+    /// at most `queue_bytes`.
+    fn next(&mut self, generation: u64, limits: &Limits) -> Option<Next> {
+        if self.attached != Some(generation) {
+            return None;
+        }
+        if self.overflowed {
+            self.overflowed = false;
+            let (from, to) = self.lost.unwrap_or((0, 0));
+            return Some(Next::Overflow(from, to));
+        }
+        let mut out = Vec::with_capacity(self.queue.len());
+        while let Some(q) = self.queue.pop_front() {
+            let len = q.text.len();
+            out.push(q.text.clone());
+            self.queue_bytes = self.queue_bytes.saturating_sub(len);
+            self.ring_bytes = self.ring_bytes.saturating_add(len);
+            self.ring.push_back((q.seq, q.text));
+        }
+        self.trim(limits.queue, limits.queue_bytes, 0);
+        Some(Next::Send(out))
     }
 }
 
@@ -153,128 +314,31 @@ impl Conn {
         lock(&self.state).attached == Some(generation)
     }
 
-    /// Offer one notification (rule 6): coalesced into a queued one of the
-    /// same Subscription and single Entity when neither shows changes,
-    /// queued when there is room, and otherwise lost with everything still
-    /// queued, which closes an attached socket.
-    fn offer(&self, n: Forwarded, limit: usize) -> Answer {
-        let mut st = lock(&self.state);
-        let Some(&show) = st.subs.get(&n.subscription) else {
-            return Answer::Unknown;
-        };
-        let coalescible = !show && n.entity.is_some() && !n.changes;
-        let into = coalescible
-            .then(|| {
-                // never past a queued x-gap: a change after a loss leaves
-                // after it, so the consumer reads the gap first
-                st.queue
-                    .iter()
-                    .rposition(|q| {
-                        q.gap_from.is_some()
-                            || (q.coalescible && q.sub == n.subscription && q.entity == n.entity)
-                    })
-                    .filter(|&i| st.queue.get(i).is_some_and(|q| q.gap_from.is_none()))
-            })
-            .flatten();
-        let queued = into.and_then(|i| st.queue.get(i));
-        let seq = queued.map_or(st.next_seq.max(1), |q| q.seq);
-        let merged = queued.map_or(0, |q| q.merged.saturating_add(1));
-        // rendered once, with the seq it takes; the cap is judged as if the
-        // seq had the most digits a u64 has, so a text at the cap stays
-        // under it whatever seq it gets
-        let text = envelope::notification(&n.rendered, seq, &n.subscription, merged);
-        if text
-            .len()
-            .saturating_add(U64_MAX_DIGITS.saturating_sub(digits(seq)))
-            > MAX_NOTIFICATION_BYTES
-        {
-            return Answer::TooLarge;
-        }
-        if let Some(q) = into.and_then(|i| st.queue.get_mut(i)) {
-            q.text = text;
-            q.merged = merged;
-            return Answer::Queued;
-        }
-        st.next_seq = seq.saturating_add(1);
-        if st.queue.len() >= limit {
-            st.overflow(seq);
-            drop(st);
+    /// Offer one notification ([`State::offer`]); an overflow closes an
+    /// attached socket.
+    fn offer(&self, n: Forwarded, limits: &Limits) -> Answer {
+        let answer = lock(&self.state).offer(n, limits);
+        if matches!(answer, Answer::Queued | Answer::Overflow) {
             self.wake.notify_one();
-            return Answer::Overflow;
         }
-        st.queue.push_back(Queued {
-            seq,
-            sub: n.subscription,
-            entity: n.entity,
-            coalescible,
-            merged,
-            gap_from: None,
-            text,
-        });
-        drop(st);
-        self.wake.notify_one();
-        Answer::Queued
+        answer
     }
 
     /// A notification of `sub` the broker dropped before offering it (a
     /// full delivery lane): it takes the next seq and leaves as an `x-gap`
     /// in its place, so the consumer learns of it in order. Losses in a row
     /// share one `x-gap`.
-    fn lose(&self, sub: &str, limit: usize) -> Answer {
-        let mut st = lock(&self.state);
-        if !st.subs.contains_key(sub) {
-            return Answer::Unknown;
-        }
-        let seq = st.next_seq.max(1);
-        st.next_seq = seq.saturating_add(1);
-        if let Some(q) = st.queue.back_mut() {
-            if let Some(from) = q.gap_from {
-                q.seq = seq;
-                q.text = envelope::gap(from, seq);
-                return Answer::Queued;
-            }
-        }
-        if st.queue.len() >= limit {
-            st.overflow(seq);
-            drop(st);
+    fn lose(&self, sub: &str, limits: &Limits) -> Answer {
+        let answer = lock(&self.state).lose(sub, limits);
+        if matches!(answer, Answer::Queued | Answer::Overflow) {
             self.wake.notify_one();
-            return Answer::Overflow;
         }
-        st.queue.push_back(Queued {
-            seq,
-            sub: sub.to_owned(),
-            entity: None,
-            coalescible: false,
-            merged: 0,
-            gap_from: Some(seq),
-            text: envelope::gap(seq, seq),
-        });
-        drop(st);
-        self.wake.notify_one();
-        Answer::Queued
+        answer
     }
 
-    /// What the socket of `generation` writes next; written notifications
-    /// enter the ring, which keeps the last `limit`.
-    pub fn next(&self, generation: u64, limit: usize) -> Option<Next> {
-        let mut st = lock(&self.state);
-        if st.attached != Some(generation) {
-            return None;
-        }
-        if st.overflowed {
-            st.overflowed = false;
-            let (from, to) = st.lost.unwrap_or((0, 0));
-            return Some(Next::Overflow(from, to));
-        }
-        let mut out = Vec::with_capacity(st.queue.len());
-        while let Some(q) = st.queue.pop_front() {
-            out.push(q.text.clone());
-            st.ring.push_back((q.seq, q.text));
-            while st.ring.len() > limit {
-                st.ring.pop_front();
-            }
-        }
-        Some(Next::Send(out))
+    /// What the socket of `generation` writes next ([`State::next`]).
+    pub fn next(&self, generation: u64, limits: &Limits) -> Option<Next> {
+        lock(&self.state).next(generation, limits)
     }
 
     /// Attach a socket: the next generation, which the previous socket of
@@ -616,7 +680,7 @@ impl Hub {
         if conn.tenant != n.tenant {
             return Answer::Unknown;
         }
-        let answer = conn.offer(n, self.limits.queue);
+        let answer = conn.offer(n, &self.limits);
         if answer == Answer::Overflow {
             self.overflows
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -635,7 +699,7 @@ impl Hub {
         if conn.tenant != tenant {
             return Answer::Unknown;
         }
-        let answer = conn.lose(sub, self.limits.queue);
+        let answer = conn.lose(sub, &self.limits);
         if answer == Answer::Overflow {
             self.overflows
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -668,5 +732,113 @@ impl Hub {
             .await
             .and_then(|a| serde_json::from_slice(&a).ok())
             .unwrap_or(Answer::Unknown)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// An attached connection's state with one Subscription `s`.
+    fn attached() -> State {
+        let mut st = State {
+            next_seq: 1,
+            attached: Some(1),
+            ..State::default()
+        };
+        st.subs.insert("s".to_owned(), false);
+        st
+    }
+
+    fn big() -> Forwarded {
+        Forwarded {
+            tenant: "t".to_owned(),
+            subscription: "s".to_owned(),
+            entity: None,
+            changes: false,
+            rendered: json!({ "body": { "x": "a".repeat(900 * 1024) } }),
+        }
+    }
+
+    /// The texts a socket writes, none for an overflow.
+    fn texts(next: Option<Next>) -> Vec<String> {
+        match next {
+            Some(Next::Send(texts)) => texts,
+            _ => Vec::new(),
+        }
+    }
+
+    fn ring_bytes(st: &State) -> usize {
+        st.ring.iter().map(|(_, t)| t.len()).sum()
+    }
+
+    /// F-ANT3-001: 256 notifications of 900 KiB, each drained as it comes,
+    /// leave the ring under the byte budget, not 256 of them.
+    #[test]
+    fn the_ring_holds_bytes_under_the_budget() {
+        let limits = Limits::default();
+        let mut st = attached();
+        for _ in 0..256 {
+            assert_eq!(st.offer(big(), &limits), Answer::Queued);
+            let sent = st.next(1, &limits);
+            assert!(matches!(sent, Some(Next::Send(_))));
+        }
+        assert!(ring_bytes(&st) <= limits.queue_bytes, "{}", ring_bytes(&st));
+        assert_eq!(st.ring_bytes, ring_bytes(&st));
+        assert!(st.ring.len() < 256, "{}", st.ring.len());
+        let newest = st.ring.back().map(|(seq, _)| *seq);
+        assert_eq!(newest, Some(256));
+    }
+
+    /// F-ANT3-001: a coalesced notification that grows the queue past its
+    /// bytes overflows too; an `x-gap` is counted in them.
+    #[test]
+    fn a_coalesced_notification_past_the_bytes_overflows() {
+        let limits = Limits {
+            queue_bytes: MAX_NOTIFICATION_BYTES,
+            ..Limits::default()
+        };
+        let mut st = attached();
+        assert_eq!(st.offer(big(), &limits), Answer::Queued);
+        let mut small = big();
+        small.entity = Some("e".to_owned());
+        small.rendered = json!({ "body": { "x": 1 } });
+        assert_eq!(st.offer(small.clone(), &limits), Answer::Queued);
+        assert_eq!(
+            st.offer(small, &limits),
+            Answer::Queued,
+            "coalesced, it fits"
+        );
+        assert_eq!(st.queue.len(), 2);
+        let mut grown = big();
+        grown.entity = Some("e".to_owned());
+        assert_eq!(st.offer(grown, &limits), Answer::Overflow);
+        assert_eq!(st.queue_bytes, 0);
+        assert_eq!(st.lose("s", &limits), Answer::Queued);
+        assert!(st.queue_bytes > 0);
+        assert_eq!(st.lose("s", &limits), Answer::Queued);
+        let gap = st.queue.front().map(|q| q.text.len());
+        assert_eq!(Some(st.queue_bytes), gap);
+    }
+
+    /// F-ANT3-001: offered and not drained, the queue overflows on bytes
+    /// long before its count, through the `x-gap` path.
+    #[test]
+    fn the_queue_overflows_on_bytes() {
+        let limits = Limits::default();
+        let mut st = attached();
+        let answers: Vec<Answer> = (0..256).map(|_| st.offer(big(), &limits)).collect();
+        let first = answers.iter().position(|a| *a == Answer::Overflow);
+        assert!(first.is_some(), "no overflow reported");
+        assert!(first < Some(limits.queue), "{first:?}");
+        let held = st.queue_bytes.saturating_add(ring_bytes(&st));
+        assert!(held <= limits.queue_bytes, "{held}");
+        let gap = st.next(1, &limits);
+        assert!(matches!(gap, Some(Next::Overflow(1, _))));
+        assert_eq!(texts(gap), Vec::<String>::new());
+        let lengths: Vec<usize> = texts(st.next(1, &limits)).iter().map(String::len).collect();
+        assert!(lengths.iter().sum::<usize>() <= limits.queue_bytes);
+        assert!(ring_bytes(&st) <= limits.queue_bytes, "{}", ring_bytes(&st));
     }
 }

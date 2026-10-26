@@ -331,6 +331,15 @@ async fn properties_relationships_and_ngsild_q_shape_a_history() -> Result<(), S
     );
     let bad = get(&f.app, &format!("{ITEMS}?ngsild.q=(((")).await;
     assert_eq!(bad.status, StatusCode::BAD_REQUEST, "{}", bad.body);
+    // the Temporal Query's own 400 (an ngsild.q is refused before the read since F-ANT5-012)
+    let scope = get(&f.app, &format!("{ITEMS}?ngsild.scopeQ=(((")).await;
+    assert_eq!(scope.status, StatusCode::BAD_REQUEST, "{}", scope.body);
+    assert_eq!(
+        scope.body.get("detail"),
+        Some(&json!(
+            "the query is not valid NGSI-LD; an ngsild. parameter takes NGSI-LD syntax"
+        ))
+    );
     let feb = get(&f.app, &format!("{ITEMS}?datetime=2026-02-30T00:00:00Z")).await;
     assert_eq!(feb.status, StatusCode::BAD_REQUEST, "{}", feb.body);
     let no_at = get(&f.app, &format!("{ITEMS}/urn:ngsi-ld:Car:1")).await;

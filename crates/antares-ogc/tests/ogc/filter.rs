@@ -300,6 +300,24 @@ async fn filter_and_bbox_and_datetime_are_anded() -> Result<(), String> {
     Ok(())
 }
 
+/// F-ANT5-012: an `ngsild.q` that does not parse alone would close its group and OR past the
+/// filter's conjunct; it is refused whether or not the collection has an output filter.
+#[tokio::test]
+async fn ngsild_q_cannot_escape_its_group() -> Result<(), String> {
+    let f = fixture().await?;
+    let speed = enc("speed > 50");
+    let escaping = enc("speed<65)|(speed>0");
+    let (code, body) = status(&f, &format!("filter={speed}&ngsild.q={escaping}")).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{body}");
+    let (whole, body) = status(
+        &f,
+        &format!("filter={speed}&ngsild.q={}", enc("(speed<65)|(speed>0)")),
+    )
+    .await;
+    assert_eq!(whole, StatusCode::OK, "{body}");
+    Ok(())
+}
+
 #[tokio::test]
 async fn temporal_functions_pushed_or_residual() -> Result<(), String> {
     let f = fixture().await?;

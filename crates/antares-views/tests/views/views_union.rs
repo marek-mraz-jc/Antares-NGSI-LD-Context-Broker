@@ -364,3 +364,46 @@ async fn every_page_counts_the_whole_union() -> Result<(), String> {
     assert_eq!(head.header("NGSILD-Results-Count").as_deref(), Some("2"));
     Ok(())
 }
+
+/// Puts views `car0`..`car{n-1}`, each the Cars with their speed; their ids.
+async fn speed_views(app: &Router, n: usize) -> Result<Vec<String>, String> {
+    let mut ids = Vec::new();
+    for i in 0..n {
+        let id = format!("car{i}");
+        put_view(
+            app,
+            &json!({
+                "id": id, "tenant": "city", "selector": ["Car"],
+                "rules": [{"types": ["Car"], "attributes": ["speed"]}],
+                "operations": READS
+            }),
+        )
+        .await?;
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+/// F-ANT1-001: every view read of one union request takes from one byte
+/// budget, the broker's `max_answer_bytes`; pages that pass it together are
+/// a 413 naming the bound, while a few views still answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn view_pages_past_the_answer_budget_together_are_413() -> Result<(), String> {
+    let plain = fixture().await?;
+    speed_views(&plain.app, 1).await?;
+    let one = union(&plain.app, "views=car0&type=Car&limit=1000").await;
+    assert_eq!(one.status, StatusCode::OK, "{}", one.text);
+    let page = one.text.len();
+    let f = fixture_with(TestBroker::with_max_answer_bytes(page.saturating_mul(3)).await?).await?;
+    let ids = speed_views(&f.app, 8).await?;
+    let few = union(&f.app, "views=car0,car1&type=Car&limit=1000").await;
+    assert_eq!(few.status, StatusCode::OK, "{}", few.text);
+    let many = union(
+        &f.app,
+        &format!("views={}&type=Car&limit=1000", ids.join(",")),
+    )
+    .await;
+    assert_eq!(many.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", many.text);
+    assert!(many.text.contains("max_answer_bytes"), "{}", many.text);
+    Ok(())
+}

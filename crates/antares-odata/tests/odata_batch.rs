@@ -484,6 +484,39 @@ async fn odata_batch_member_past_the_buffer_bound_is_413() {
     );
 }
 
+/// F-ANT4-004: the member answers one batch buffers share the broker's
+/// `max_answer_bytes`; the member that passes it and every later one answer
+/// 413, and the batch framing stays valid.
+#[tokio::test(flavor = "multi_thread")]
+async fn odata_batch_members_past_the_shared_answer_bound_are_413() {
+    std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
+    let get = json!({"id": "1", "method": "get", "url": "Car?$select=speed"});
+    let (_a, plain) = city_on(TestBroker::new().await.expect("broker"))
+        .await
+        .expect("city");
+    let (status, _, one) = json_batch(&plain, &json!([get]), &[]).await;
+    assert_eq!(status, StatusCode::OK, "{one}");
+    let member = one["responses"][0]["body"].to_string().len();
+    let bound = member.saturating_add(member.div_ceil(2));
+    let b = TestBroker::with_max_answer_bytes(bound)
+        .await
+        .expect("broker");
+    let (_b, app) = city_on(b).await.expect("city");
+    let members = json!([
+        {"id": "1", "method": "get", "url": "Car?$select=speed"},
+        {"id": "2", "method": "get", "url": "Car?$select=speed"},
+        {"id": "3", "method": "get", "url": "Car?$select=speed"}
+    ]);
+    let go_on = [("Prefer", "odata.continue-on-error")];
+    let (status, _, answer) = json_batch(&app, &members, &go_on).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(statuses(&answer), [200, 413, 413], "{answer}");
+    assert_eq!(
+        answer["responses"][1]["body"]["error"]["code"], "PayloadTooLarge",
+        "{answer}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn odata_batch_itself_is_refused_whole() {
     let (_b, app, engine) = broker().await.expect("broker");
