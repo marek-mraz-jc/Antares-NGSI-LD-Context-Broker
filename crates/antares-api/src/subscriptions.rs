@@ -4,6 +4,7 @@
 //! Subscription data type (5.2.12).
 
 use crate::negotiate::*;
+use crate::notify::endpoint_uri;
 use crate::state::{now_iso, AppState};
 use antares_jsonld::{parse_datetime, Context};
 use antares_model::{NgsiError, TenantId};
@@ -984,14 +985,6 @@ const WATCH: &str = "5.7.2";
 /// connection's call, so HTTP and any other connection answer `false`.
 fn own_socket(st: &AppState, uri: Option<&str>) -> bool {
     uri.is_some_and(|u| u.starts_with(SOCKET_ENDPOINT) && st.sinks.require(u, &[]).is_ok())
-}
-
-/// `notification.endpoint.uri` of a Subscription.
-pub(crate) fn endpoint_uri(sub: &Map<String, Value>) -> Option<&str> {
-    sub.get("notification")?
-        .get("endpoint")?
-        .get("uri")?
-        .as_str()
 }
 
 /// The clause an operation on the stored Subscription `id` is decided as:

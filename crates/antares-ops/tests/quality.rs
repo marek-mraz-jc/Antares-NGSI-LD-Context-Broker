@@ -284,3 +284,39 @@ async fn a_tenant_without_a_document_and_a_deleted_document_mark_nothing() {
         .get("quarantinedAt")
         .is_none());
 }
+
+/// F-ANT4-011: a mark whose rule is gone, its whole document deleted
+/// included, is lifted by the next sweep: no Entity stays hidden for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mark_whose_rule_is_gone_is_lifted() {
+    let b = TestBroker::new().await.expect("broker");
+    let app = b.serve_mounted(Vec::new()).expect("app");
+    send(
+        &app,
+        Method::PUT,
+        "/q/quality/city",
+        None,
+        Some(RULES.into()),
+    )
+    .await;
+    create(&app, "city", positioned("urn:v:old", V, 30)).await;
+    let changed = b.sweep_quality(chrono::Utc::now()).await;
+    assert_eq!(changed.len(), 1, "{changed:?}");
+    assert!(entity(&app, "city", "urn:v:old")
+        .await
+        .get("quarantinedAt")
+        .is_some());
+
+    send(&app, Method::DELETE, "/q/quality/city", None, None).await;
+    let changed = b.sweep_quality(chrono::Utc::now()).await;
+    assert_eq!(
+        changed
+            .iter()
+            .map(|c| (c.tenant.as_str(), c.rule.as_str(), c.outcome, c.count))
+            .collect::<Vec<_>>(),
+        [("city", "stale-position", "lift", 1)]
+    );
+    let lifted = entity(&app, "city", "urn:v:old").await;
+    assert!(lifted.get("quarantinedAt").is_none(), "{lifted}");
+    assert!(lifted.get("quarantineRules").is_none(), "{lifted}");
+}

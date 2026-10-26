@@ -27,7 +27,7 @@ pub mod write;
 
 use antares_ops::percent::{decoded, encode};
 use antares_ops::{
-    Caller, OperationId, Ops, Page, Pushdown, Refusal, Scanned, Surface, ViewOps, RESIDUAL_SCAN,
+    Caller, OperationId, Ops, Page, Problem, Pushdown, Scanned, Surface, ViewOps, RESIDUAL_SCAN,
 };
 use axum::extract::{Query, Request};
 use axum::http::header::{
@@ -98,38 +98,6 @@ impl Surface for Feed {
                 async move { serve(&ops, &caller, req).await }
             }),
         )
-    }
-}
-
-/// A refusal: its status and a fixed message that never names what the view hides.
-enum Problem {
-    /// The surface's own refusal.
-    Own(StatusCode, String),
-    /// The NGSI-LD refusal of the query the feed ran.
-    Refused(Refusal),
-    /// The store's own answer to that query (a broken `q`: 400).
-    Answer(Box<Response>),
-}
-
-impl Problem {
-    fn new(status: StatusCode, title: impl Into<String>) -> Self {
-        Self::Own(status, title.into())
-    }
-
-    fn reply(self) -> Response {
-        match self {
-            Self::Own(status, title) => {
-                let body = json!({ "title": title, "status": status.as_u16() });
-                (
-                    status,
-                    [(CONTENT_TYPE, "application/problem+json")],
-                    body.to_string(),
-                )
-                    .into_response()
-            }
-            Self::Refused(refusal) => refusal.ngsi_ld(),
-            Self::Answer(answer) => *answer,
-        }
     }
 }
 
@@ -321,7 +289,7 @@ fn joined(name: &str, own: Option<&str>, asked: Option<&str>) -> Result<Option<S
 
 /// The Query Entities a page reads: the view's types the output lists (narrowed by a
 /// request's `type`), the joined `q` and `scopeQ`, one geo query and the language.
-fn pushdown(
+async fn pushdown(
     view: &ViewOps,
     plan: &Plan,
     asked: &Asked,
@@ -334,20 +302,11 @@ fn pushdown(
         }
         wanted.retain(|w| named.contains(&w.as_str()));
     }
-    let mut query = if view.shows_every_name() {
-        "local=true".to_owned()
-    } else {
-        let (shown, _) = view.shown_names();
-        let matching: Vec<String> = shown
-            .iter()
-            .filter(|t| wanted.iter().any(|w| w == local(t)))
-            .map(|t| encode(t))
-            .collect();
-        if matching.is_empty() {
-            return Err(not_found());
-        }
-        format!("type={}", matching.join(","))
-    };
+    let wanted_names: Vec<&str> = wanted.iter().map(String::as_str).collect();
+    let mut query = view
+        .type_selector(&wanted_names)
+        .await
+        .ok_or_else(not_found)?;
     let filter = &plan.filter;
     let mut add = |key: &str, value: Option<String>| {
         if let Some(v) = value {
@@ -363,7 +322,7 @@ fn pushdown(
     let lang = get("lang").map(str::to_owned).or_else(|| plan.lang.clone());
     add("lang", lang);
     let geo_asked = GEO.iter().any(|k| asked.seen.contains_key(*k));
-    if filter.has_geo() && geo_asked {
+    if output::fixes_area(filter) && geo_asked {
         return Err(bad(
             "this feed fixes its area: leave out georel, geometry and coordinates",
         ));
@@ -397,7 +356,7 @@ async fn entries(
     plan: &Plan,
     asked: &Asked,
 ) -> Result<(Vec<Entry>, usize), Problem> {
-    let (pushdown, wanted) = pushdown(view, plan, asked)?;
+    let (pushdown, wanted) = pushdown(view, plan, asked).await?;
     let lang = asked
         .seen
         .get("lang")

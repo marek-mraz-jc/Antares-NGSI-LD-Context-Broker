@@ -160,7 +160,7 @@ async fn skipped(
     left: usize,
 ) -> Option<odata_batch::Response> {
     if left == 0 {
-        return Some(too_large(ops).await);
+        return Some(member_too_large(ops).await);
     }
     depends_on
         .iter()
@@ -226,18 +226,18 @@ async fn run(
     // spends the bound, so every later member answers 413 too.
     let (parts, body) = answer.into_parts();
     let Ok(body) = ops.read_answer(body).await else {
-        return too_large(ops).await;
+        return member_too_large(ops).await;
     };
     let Some(rest) = left.checked_sub(body.len()) else {
         *left = 0;
-        return too_large(ops).await;
+        return member_too_large(ops).await;
     };
     *left = rest;
     framed(&parts, &body)
 }
 
 /// The 413 a member answers past the buffer bound.
-async fn too_large(ops: &Ops) -> odata_batch::Response {
+async fn member_too_large(ops: &Ops) -> odata_batch::Response {
     let (parts, body) = ODataErrorResponse::new(
         StatusCode::PAYLOAD_TOO_LARGE,
         "PayloadTooLarge",

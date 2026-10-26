@@ -1156,7 +1156,18 @@ impl Store {
                 })
                 && f.attrs
                     .is_none_or(|attrs| attrs.iter().any(|a| has_live_attr(doc, a, &now)))
-                && q.is_none_or(|(q, ctx)| antares_ql::eval::eval_q(q, doc, ctx, &|_| None))
+                && q.is_none_or(|(q, ctx)| {
+                    // 4.22: `q` judges what a read may see, so an instance
+                    // past its expiresAt never makes the Entity match
+                    // (F-ANT1-007); only a doc carrying one pays the copy
+                    if holds_expired_instance(doc, &now) {
+                        let mut live = doc.clone();
+                        filter::strip_expired(&mut live, &now);
+                        antares_ql::eval::eval_q(q, &live, ctx, &|_| None)
+                    } else {
+                        antares_ql::eval::eval_q(q, doc, ctx, &|_| None)
+                    }
+                })
         };
         // ids name at most what the client sent: look each up, in id order
         let candidates: Box<dyn Iterator<Item = (&String, &Value)>> = match (f.ids, f.after_id) {
@@ -1427,6 +1438,18 @@ fn has_live_attr(doc: &Value, iri: &str, now: &str) -> bool {
         Some(_) => true,
         None => false,
     }
+}
+
+/// Whether an Attribute instance of `doc`, a sub-Attribute's included, is
+/// past its `expiresAt`: what `filter::strip_expired` would remove.
+fn holds_expired_instance(doc: &Value, now: &str) -> bool {
+    doc.as_object().is_some_and(|o| {
+        o.iter()
+            .filter(|(k, _)| k.contains(':'))
+            .filter_map(|(_, v)| v.as_array())
+            .flatten()
+            .any(|i| filter::expired_at(i, now) || holds_expired_instance(i, now))
+    })
 }
 
 #[cfg(test)]

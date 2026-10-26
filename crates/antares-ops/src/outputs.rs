@@ -376,8 +376,20 @@ fn is_path(path: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "_-.:".contains(c))
 }
 
+/// An NGSI-LD name: a letter or `_`, then letters, digits and `_`, at most 128.
+#[must_use]
+pub fn is_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    name.len() <= 128
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Text a person reads: not empty, at most `max` characters, no control character.
-fn is_plain(value: &str, max: usize) -> bool {
+#[must_use]
+pub fn is_plain(value: &str, max: usize) -> bool {
     !value.is_empty() && value.chars().count() <= max && !value.chars().any(char::is_control)
 }
 
@@ -385,6 +397,16 @@ fn is_plain(value: &str, max: usize) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_name_is_a_letter_or_underscore_then_word_characters() {
+        for good in ["a", "_x", "speed_2", &"n".repeat(128)] {
+            assert!(is_name(good), "{good}");
+        }
+        for bad in ["", "2a", "a-b", "a.b", "é", &"n".repeat(129)] {
+            assert!(!is_name(bad), "{bad}");
+        }
+    }
 
     fn checked(output: &Value, format: &str) -> Result<Output, String> {
         listed(Some(&json!([output])), format)

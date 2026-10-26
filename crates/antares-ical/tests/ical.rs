@@ -391,3 +391,23 @@ async fn the_preset_output_serves_the_events_of_t_4487_under_the_calendar_proper
         include_str!("fixtures/sdm-event-default.txt")
     );
 }
+
+/// F-ANT5-011: a calendar over a view of every type pushes the plans'
+/// types, so a Tenant holding more Entities of another type than one read
+/// may scan still serves its Events.
+#[tokio::test]
+async fn a_view_of_every_type_serves_a_large_tenant() {
+    let (_broker, app) = fixture().await;
+    let n = antares_ops::RESIDUAL_SCAN.saturating_add(1);
+    let noise: Vec<serde_json::Value> = (0..n)
+        .map(|i| json!({"id": format!("urn:ngsi-ld:Noise:n{i:06}"), "type": "Noise"}))
+        .collect();
+    for chunk in noise.chunks(1000) {
+        let body = serde_json::Value::Array(chunk.to_vec()).to_string();
+        let a = send(&app, "POST", "/ngsi-ld/v1/entityOperations/create", &body).await;
+        assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    }
+    let a = send(&app, "GET", "/x/views/every/ical/v1/events.ics", "").await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(uids(&parse(&a.body)).len(), 3, "{}", a.body);
+}

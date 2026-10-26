@@ -318,7 +318,8 @@ mod file {
             let mut rows = 0usize;
             loop {
                 let refs = self.refs(p.profile);
-                let page = items::page(self.view, self.caller, c, p, digest, refs).await?;
+                let page =
+                    crate::features::page(self.view, self.caller, c, p, digest, refs).await?;
                 write(&page.features)?;
                 rows = rows.saturating_add(page.features.len());
                 // A token that does not move would read the same page again.

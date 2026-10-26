@@ -217,6 +217,22 @@ async fn enqueue_change(
 /// that carries no page (idPattern, federation, orderBy) has at all.
 pub const MAX_UNDECIDED_ROWS: i64 = 10_000;
 
+/// The column `q=` is compiled over: the stored document, or, for a row
+/// holding an instance past its `expiresAt` (`attrs_expire_at` past, rare
+/// until the sweep rewrites it), the document 4.22 lets a read see: expired
+/// top-level instances dropped, an Attribute left with none removed, as
+/// `filter::strip_expired` does in memory (F-ANT1-007). A live row pays
+/// only the CASE test.
+const LIVE_ENTITY: &str = "(CASE WHEN attrs_expire_at IS NULL OR attrs_expire_at >= now() \
+     THEN entity ELSE (SELECT coalesce(jsonb_object_agg(l.k, l.v), '{}'::jsonb) FROM \
+      (SELECT x.k, CASE WHEN jsonb_typeof(x.v) = 'array' AND strpos(x.k, ':') > 0 \
+        THEN (SELECT jsonb_agg(i.v) FROM jsonb_array_elements(x.v) AS i(v) \
+         WHERE jsonb_typeof(i.v -> 'expiresAt') IS DISTINCT FROM 'string' \
+          OR try_timestamptz(i.v ->> 'expiresAt') IS NULL \
+          OR try_timestamptz(i.v ->> 'expiresAt') >= now()) \
+        ELSE x.v END AS v FROM jsonb_each(entity) AS x(k, v)) AS l \
+      WHERE l.v IS NOT NULL) END)";
+
 /// Distinct types a type selection may split into arms; a longer list keeps
 /// the plain containment, which reads the Tenant.
 const MAX_TYPE_ARMS: usize = 16;
@@ -1211,7 +1227,7 @@ impl PgEntityStore {
         if let Some(node) = f.q {
             match crate::compile::q::compile_q(
                 node,
-                "entity",
+                LIVE_ENTITY,
                 binds.len().saturating_add(1),
                 f.expand,
             ) {
@@ -1483,6 +1499,44 @@ impl PgEntityStore {
         .await?;
         tx.commit().await?;
         Ok(rows.into_iter().map(|r| r.get::<Value, _>(0)).collect())
+    }
+
+    /// One id-ordered `LIMIT`/`OFFSET` window of the Tenant's live Entities
+    /// and their count, in one snapshot: the window bounds the read, so no
+    /// row ceiling applies (`CurrentStateDriver::list_slice`, F-ANT1-011).
+    pub async fn list_slice(
+        &self,
+        tenant: &TenantId,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<Value>, i64), sqlx::Error> {
+        let mut tx = super::begin(&self.pool).await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        crate::store::pg::set_tenant(&mut tx, tenant).await?;
+        let rows = sqlx::query(
+            "SELECT entity FROM entities WHERE tenant_id = $1
+                   AND (expires_at IS NULL OR expires_at > now())
+             ORDER BY id LIMIT $2 OFFSET $3",
+        )
+        .bind(tenant.as_str())
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&mut *tx)
+        .await?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM entities WHERE tenant_id = $1
+                   AND (expires_at IS NULL OR expires_at > now())",
+        )
+        .bind(tenant.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok((
+            rows.into_iter().map(|r| r.get::<Value, _>(0)).collect(),
+            total,
+        ))
     }
 
     /// Read-modify-write: row lock via `SELECT … FOR NO KEY UPDATE`, closure

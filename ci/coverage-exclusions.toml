@@ -693,3 +693,35 @@ function = "Server::area_type" # v0 mangling puts the impl between the crate and
 lines = 1
 branches = 1
 reason = "the same store fault, where area_type returns it (T-5279): a read the gate refuses answers 401, 403 or 404 and is tested as an absent type"
+
+[[exclusion]]
+crate = "antares-ops"
+file = "src/lib.rs"
+function = "ViewOps::type_selector"
+lines = 1
+branches = 0
+reason = "the `local=true` fallback for a store that keeps no type list or fails to read it (F-ANT5-010); the built-in store under test_kit keeps one"
+
+[[exclusion]]
+crate = "antares-ops"
+file = "src/views/quality.rs"
+function = "antares_ops::views::quality::lift_orphans"
+lines = 3
+branches = 0
+reason = "2 lines: the scan or the in-place write failing on the store, which the built-in store under test_kit does not; 1 line: tracing::info! repeats its fields in the `log` fallback, which runs only with no subscriber set (F-ANT4-011)"
+
+[[exclusion]]
+crate = "antares-ops"
+file = "src/views/quality.rs"
+function = "antares_ops::views::quality::lift_in"
+lines = 1
+branches = 1
+reason = "a Tenant with more than PAGE (1000) marked Entities read over a second page, which no test seeds (F-ANT4-011)"
+
+[[exclusion]]
+crate = "antares-feed"
+file = "src/lib.rs"
+function = "antares_feed::entries"
+lines = 1
+branches = 0
+reason = "an Entity of a type the output does not list: since F-ANT5-010 every read pushes the output's types, so only the `local=true` fallback of a store without a type list returns one; the built-in store under test_kit keeps that list"

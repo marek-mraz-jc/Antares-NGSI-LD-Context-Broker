@@ -230,52 +230,87 @@ pub async fn interval_tick(st: &AppState) {
             // The filter borrows a term expander that is not Sync, so it lives
             // and dies inside this block: held across the delivery await it
             // would make the whole interval task non-Send.
-            let rows = {
-                let expand = |t: &str| ctx.expand_key(t);
-                let id_refs: Vec<&str> = ids.iter().flatten().map(String::as_str).collect();
-                // q is read as written (5.2.12); parses shared per distinct
-                // expression text, as in conditions_match — the sweep
-                // re-runs per due subscription
-                let q_ast = sub_str(&sub, "q").and_then(antares_ql::regex::q_node);
-                let geo = sub.get("geoQ").and_then(Value::as_object).and_then(|g| {
-                    let key = serde_json::to_string(g).unwrap_or_default();
-                    antares_ql::regex::geo_query(&key, || {
-                        antares_ql::geo::GeoQuery::from_params(&geo_params(g))
-                            .ok()
-                            .flatten()
-                    })
-                });
-                let geo_spec = geo.as_ref().and_then(|g| g.to_sql_spec(&ctx));
-                let filter = antares_store::filter::EntityFilter {
-                    ids: ids.as_ref().map(|_| id_refs.as_slice()),
-                    types: (!type_groups.is_empty()).then_some(type_groups.as_slice()),
-                    q: q_ast.as_deref(),
-                    scope_q: sub_str(&sub, "scopeQ"),
-                    geo: geo_spec.as_slice(),
-                    expand: &expand,
-                    ..Default::default()
+            // F-ANT3-020: the match set is read a page at a time and each
+            // page's matches leave as their own Notification, so a type-only
+            // selector over a large tenant never holds its whole set; a store
+            // that cannot decide the filter answers it whole, once.
+            let page_size = st.max_limit.max(1);
+            let mut offset = 0usize;
+            let mut sent = false;
+            loop {
+                let (rows, last) = {
+                    let expand = |t: &str| ctx.expand_key(t);
+                    let id_refs: Vec<&str> = ids.iter().flatten().map(String::as_str).collect();
+                    // q is read as written (5.2.12); parses shared per distinct
+                    // expression text, as in conditions_match — the sweep
+                    // re-runs per due subscription
+                    let q_ast = sub_str(&sub, "q").and_then(antares_ql::regex::q_node);
+                    let geo = sub.get("geoQ").and_then(Value::as_object).and_then(|g| {
+                        let key = serde_json::to_string(g).unwrap_or_default();
+                        antares_ql::regex::geo_query(&key, || {
+                            antares_ql::geo::GeoQuery::from_params(&geo_params(g))
+                                .ok()
+                                .flatten()
+                        })
+                    });
+                    let geo_spec = geo.as_ref().and_then(|g| g.to_sql_spec(&ctx));
+                    let filter = antares_store::filter::EntityFilter {
+                        ids: ids.as_ref().map(|_| id_refs.as_slice()),
+                        types: (!type_groups.is_empty()).then_some(type_groups.as_slice()),
+                        q: q_ast.as_deref(),
+                        scope_q: sub_str(&sub, "scopeQ"),
+                        geo: geo_spec.as_slice(),
+                        expand: &expand,
+                        page: Some(antares_store::filter::Page {
+                            offset: i64::try_from(offset).unwrap_or(i64::MAX),
+                            limit: i64::try_from(page_size).unwrap_or(i64::MAX),
+                            count: false,
+                        }),
+                        ..Default::default()
+                    };
+                    match st.store.query_entities(&tenant, &filter).await {
+                        Ok(o) => {
+                            let last = !o.paged || o.rows.len() < page_size;
+                            (o.rows, last)
+                        }
+                        Err(e) => {
+                            tracing::warn!("notification path: reading the Entities a periodic Subscription notifies about failed: {e}");
+                            (Vec::new(), true)
+                        }
+                    }
                 };
-                read_or_warn(
-                    st.store
-                        .query_entities(&tenant, &filter)
-                        .await
-                        .map(|o| o.rows),
-                    "the Entities a periodic Subscription notifies about",
-                )
-            };
-            let mut matching: Vec<Value> = Vec::new();
-            for d in rows {
-                if !selector_match(&sub, &d, &ctx)
-                    || !linked_eval(st, &tenant, None, |l| conditions_match(&sub, &d, &ctx, l))
-                        .await
-                {
-                    continue;
+                offset = offset.saturating_add(rows.len());
+                let mut matching: Vec<Value> = Vec::new();
+                for d in rows {
+                    if !selector_match(&sub, &d, &ctx)
+                        || !linked_eval(st, &tenant, None, |l| conditions_match(&sub, &d, &ctx, l))
+                            .await
+                    {
+                        continue;
+                    }
+                    matching.extend(
+                        build_data(st, &tenant, &sub, &ctx, None, Some(&d), &[], false, &now).await,
+                    );
                 }
-                matching.extend(
-                    build_data(st, &tenant, &sub, &ctx, None, Some(&d), &[], false, &now).await,
-                );
+                if !matching.is_empty() {
+                    sent = true;
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let (st, tenant, ctx, sub) =
+                            (st.clone(), tenant.clone(), Arc::clone(&ctx), sub.clone());
+                        sending.spawn(async move {
+                            let _permits = delivery_permits(&tenant).await;
+                            deliver(&st, &tenant, &sub, matching, &ctx).await;
+                        });
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    deliver(st, &tenant, &sub, matching, &ctx).await;
+                }
+                if last {
+                    break;
+                }
             }
-            if matching.is_empty() {
+            if !sent {
                 // 5.8.6: "If there are no matching Entities, no Notification
                 // is sent" — lastNotification stays untouched, so this
                 // subscription is still due and every following tick
@@ -286,18 +321,7 @@ pub async fn interval_tick(st: &AppState) {
                     release_interval(st, &tenant, Kind::Subscription, id, prev).await;
                 }
                 next_sub = next_sub.min(due_at);
-                continue;
             }
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let (st, tenant, ctx) = (st.clone(), tenant.clone(), Arc::clone(&ctx));
-                sending.spawn(async move {
-                    let _permits = delivery_permits(&tenant).await;
-                    deliver(&st, &tenant, &sub, matching, &ctx).await;
-                });
-            }
-            #[cfg(target_arch = "wasm32")]
-            deliver(st, &tenant, &sub, matching, &ctx).await;
         }
         if !sweep_csubs {
             continue;
@@ -305,7 +329,10 @@ pub async fn interval_tick(st: &AppState) {
         // csource timeInterval subs: periodic CSourceNotification with all
         // matching registrations, independent of changes (5.11.7)
         for sub in read_or_warn(
-            st.store.list(&tenant, Kind::CSourceSubscription).await,
+            docs_where(st, &tenant, Kind::CSourceSubscription, |s| {
+                s.get("timeInterval").is_some()
+            })
+            .await,
             "the periodic Context Source Registration Subscriptions",
         ) {
             let Some(interval) = sub.get("timeInterval").and_then(Value::as_f64) else {
@@ -332,11 +359,13 @@ pub async fn interval_tick(st: &AppState) {
             let ctx = sub_context(st, &tenant, &sub).await;
             let spec = crate::registry::spec_for_subscription(&sub);
             let data: Vec<Value> = read_or_warn(
-                st.store.list(&tenant, Kind::Registration).await,
+                docs_where(st, &tenant, Kind::Registration, |r| {
+                    crate::registry::csr_matches_subscription(&sub, r, &ctx)
+                })
+                .await,
                 "the registrations a periodic Context Source Notification carries",
             )
             .into_iter()
-            .filter(|r| crate::registry::csr_matches_subscription(&sub, r, &ctx))
             .map(|r| {
                 let mut p = crate::registry::present_registration(
                     &filter_csr(&spec, &r, &ctx),

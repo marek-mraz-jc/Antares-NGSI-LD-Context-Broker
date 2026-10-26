@@ -23,6 +23,7 @@
 mod api;
 mod crs;
 mod export;
+mod features;
 mod filter;
 mod history;
 mod items;
@@ -620,7 +621,7 @@ async fn tile(
         alternate: false,
     };
     let digest = items::digest(id, &c.id, &[]);
-    let page = match items::page(view, caller, c, &p, digest, refs).await {
+    let page = match features::page(view, caller, c, &p, digest, refs).await {
         Ok(page) => page,
         Err(refused) => return refused.reply(),
     };
@@ -816,11 +817,12 @@ impl Here<'_> {
             Err(refused) => return refused.reply(),
         };
         let digest = items::digest(self.id, &c.id, pairs);
-        let page =
-            match items::page(self.view, self.caller, c, &p, digest, self.refs(p.profile)).await {
-                Ok(page) => page,
-                Err(refused) => return refused.reply(),
-            };
+        let page = match features::page(self.view, self.caller, c, &p, digest, self.refs(p.profile))
+            .await
+        {
+            Ok(page) => page,
+            Err(refused) => return refused.reply(),
+        };
         let at = format!("{}/collections/{}/items", self.base, c.id);
         let this = query.map_or_else(|| at.clone(), |q| format!("{at}?{q}"));
         let mut links = vec![
@@ -869,7 +871,7 @@ impl Here<'_> {
             Err(refused) => return refused.reply(),
         };
         let refs = self.refs(p.profile);
-        match items::one(self.view, self.caller, c, id, &p, refs).await {
+        match features::one(self.view, self.caller, c, id, &p, refs).await {
             Ok(mut feature) => {
                 let at = format!("{}/collections/{}", self.base, c.id);
                 let own = format!("{at}/items/{}", items::encode(id));

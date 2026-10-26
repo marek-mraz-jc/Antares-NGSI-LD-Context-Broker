@@ -296,8 +296,15 @@ Stated so they are not rediscovered. Each is measured, not guessed.
   second one, `context` ↔ `loader`, of two). Three numbers in it are
   measured, not chosen (T-3602): the gate had never run on this fork, and
   `antares-api` already held a component of 7 when the baseline said 1; it
-  holds 21 now (`admin_auth` to `views`, the handlers reaching each other
-  through `state` and back), recorded so that it can only shrink.
+  holds 22 now (`admin_auth` to `views`, the handlers reaching each other
+  through `state` and back), recorded so that it can only shrink. The 22nd
+  is `router` (T-5810): T-4773 moved the router out of `lib.rs`, which the
+  count never sees, and `AppState::call` serves an in-process call through
+  that router, so the cycle it closes was there before the move.
+  `antares-ogc` reads a collection through `features` (current state in
+  `items`, `{type}-history` in `history`, which builds on `items`), and the
+  `channels` write intent and `notify::endpoint_uri` live with the code
+  that honours them, so neither joins the component.
   `odata-csdl` holds 3 (`error`, `model`, `validate`) through two doc
   links alone, `model` and `error` naming `validate` for the reader; its
   code edges are acyclic.
@@ -490,6 +497,25 @@ Stated so they are not rediscovered. Each is measured, not guessed.
   `visible` and `window` take and return different things in each crate,
   and `mirrored` flips OData's `CompareOp` and CQL2's `Cmp`, two enums of
   two grammars.
+- Re-measured 2026-10-26 (T-5810) with dev's feed, GBFS, GTFS-RT, JSON-stat,
+  GeoJSON, OGC history and T-5787 discovery work merged: xray run
+  40367890016 stood at 107 clones over 1348 lines, 42 signature groups, 99
+  names and one struct twice. Merged: the feed surfaces' refusal is
+  `antares_ops::Problem` (iCal and Atom/JSON Feed had one enum each, GBFS,
+  GTFS-RT, JSON-stat and GeoJSON one `problem` body each); the NGSI-LD name
+  and plain-text checks are `antares_ops::outputs::is_name` and `is_plain`;
+  the feed output's `Filter` is `antares_ops::outputs::Filter` (the feed
+  keeps its own `fixes_area`, where a `geoproperty` alone fixes no area);
+  the MQTT client options of both protocol versions come from one
+  `options!`; and a discovery walk is opened by `Walk::of`. That leaves 100
+  clones over 1218 lines and no struct twice. Signature groups stand at 41
+  and names at 98: each new surface crate brings its own `serve`, `page`,
+  `asked`, `plan`, `preset`, `output`, `preview` and `render`, and the
+  shared shapes (`(&str) -> String`, `(&Value) -> Option<String>`) join
+  escapes and codecs of different grammars. Feed's `instance`, `value_of`
+  and `at` read fewer attribute kinds than iCal's (no `vocab`, lists or
+  `json`): merging them changes what a feed shows, so they stay two until
+  that change is its own task.
 
 ## 9. To change X, touch Y
 

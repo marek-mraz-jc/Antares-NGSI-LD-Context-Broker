@@ -24,6 +24,42 @@ use crate::negotiate::CleanParams;
 /// both spellings.
 const SCOPE_IRI: &str = "https://uri.etsi.org/ngsi-ld/scope";
 
+/// Why an in-process write from an inbound bridge Channel (ADR-0031) runs:
+/// the bind probe decides the write and writes nothing; a relay sample
+/// notifies and stores nothing. `channels` sets it, the attribute write
+/// below honours it.
+#[cfg(all(feature = "channels", not(target_arch = "wasm32")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Intent {
+    Bind,
+    Relay,
+}
+
+#[cfg(all(feature = "channels", not(target_arch = "wasm32")))]
+tokio::task_local! {
+    pub(crate) static INTENT: Intent;
+}
+
+/// The intent of the in-process write running in this task. Set only by
+/// `channels` around [`AppState::call`]; a request off the socket has none.
+#[cfg(all(feature = "channels", not(target_arch = "wasm32")))]
+fn intent() -> Option<Intent> {
+    INTENT.try_with(|i| *i).ok()
+}
+
+/// A relayed sample's change, handed to the Subscription matcher without a
+/// store write: no Entity row and no history row (ADR-0031 section 3).
+#[cfg(all(feature = "channels", not(target_arch = "wasm32")))]
+fn relay(st: &AppState, tenant: &antares_model::TenantId, before: Value, after: Value) {
+    if let Some(flush) = &st.change_flush {
+        flush(vec![(
+            tenant.as_str().to_owned(),
+            Some(before),
+            Some(after),
+        )]);
+    }
+}
+
 /// Outcome of a multi-attribute write: 204 when everything applied, else 207
 /// with an UpdateResult (5.2.18).
 fn update_result(
@@ -183,6 +219,7 @@ async fn write_attrs(
     // The Entity's change, judged and applied on the document it lands on:
     // inside the store's read-modify-write, or on a copy for a relay.
     let apply = |doc: &mut Value| {
+        crate::history::restage(id);
         Condition::pre(cond.as_ref(), id, doc)?;
         #[cfg(feature = "views")]
         if let Some(g) = &guard {
@@ -231,7 +268,7 @@ async fn write_attrs(
     // An inbound bridge Channel's bind probe and relay samples (ADR-0031):
     // decided above exactly as a write, then answered here without one.
     #[cfg(all(feature = "channels", not(target_arch = "wasm32")))]
-    if let Some(intent) = crate::channels::intent() {
+    if let Some(intent) = intent() {
         if !regs.is_empty() {
             return Err(NgsiError::BadRequestData(
                 "a Channel binds no attribute a Context Source registration serves".into(),
@@ -243,7 +280,7 @@ async fn write_attrs(
             .get(&tenant, Kind::Entity, id)
             .await?
             .ok_or_else(|| NgsiError::ResourceNotFound(format!("entity {id} not found")))?;
-        if intent == crate::channels::Intent::Bind {
+        if intent == Intent::Bind {
             return Ok(no_content(&tenant));
         }
         let mut after = before.clone();
@@ -255,7 +292,7 @@ async fn write_attrs(
                 if let Some(g) = &guard {
                     g.settled()?;
                 }
-                crate::channels::relay(st, &tenant, before, after);
+                relay(st, &tenant, before, after);
             }
         }
         return Ok(update_result(&tenant, updated, not_updated));
@@ -264,6 +301,7 @@ async fn write_attrs(
         None
     } else {
         let res = st.store.mutate(&tenant, Kind::Entity, id, apply).await?;
+        crate::history::settle(id, matches!(res, Some(Ok(()))));
         #[cfg(feature = "views")]
         if let Some(g) = &guard {
             g.settled()?;

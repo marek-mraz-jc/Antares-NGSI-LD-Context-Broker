@@ -36,7 +36,7 @@ pub mod zone;
 
 use antares_ops::percent::{decoded, encode};
 use antares_ops::{
-    Caller, OperationId, Ops, Page, Pushdown, Refusal, Scanned, Surface, ViewOps, RESIDUAL_SCAN,
+    Caller, OperationId, Ops, Page, Problem, Pushdown, Scanned, Surface, ViewOps, RESIDUAL_SCAN,
 };
 use axum::extract::{Query, Request};
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
@@ -120,38 +120,6 @@ impl Surface for Ical {
                     async move { preview(&ops, &caller, req).await }
                 }),
             )
-    }
-}
-
-/// A refusal: its status and a fixed message that never names what the view hides.
-enum Problem {
-    /// The surface's own refusal.
-    Own(StatusCode, String),
-    /// The NGSI-LD refusal of the query the feed ran.
-    Refused(Refusal),
-    /// The store's own answer to that query (a broken `q`: 400).
-    Answer(Box<Response>),
-}
-
-impl Problem {
-    fn new(status: StatusCode, title: impl Into<String>) -> Self {
-        Self::Own(status, title.into())
-    }
-
-    fn reply(self) -> Response {
-        match self {
-            Self::Own(status, title) => {
-                let body = json!({ "title": title, "status": status.as_u16() });
-                (
-                    status,
-                    [(CONTENT_TYPE, "application/problem+json")],
-                    body.to_string(),
-                )
-                    .into_response()
-            }
-            Self::Refused(refusal) => refusal.ngsi_ld(),
-            Self::Answer(answer) => *answer,
-        }
     }
 }
 
@@ -306,28 +274,16 @@ fn output(view: &ViewOps, name: &str) -> Result<CompiledOutput, Problem> {
 }
 
 /// What every Query Entities names: the view's types whose local name is a plan's, or for a
-/// view of every type the local store, narrowed by type after the read. A caller's `type`
-/// may only name those types.
-fn selector(view: &ViewOps, wanted: &[&str], types: &[String]) -> Result<String, Problem> {
+/// view of every type the stored types of those names ([`ViewOps::type_selector`]). A
+/// caller's `type` may only name those types.
+async fn selector(view: &ViewOps, wanted: &[&str], types: &[String]) -> Result<String, Problem> {
     if types.iter().any(|t| !wanted.contains(&local(t))) {
         return Err(Problem::new(
             StatusCode::BAD_REQUEST,
             format!("this calendar maps the types {} alone", wanted.join(", ")),
         ));
     }
-    if view.shows_every_name() {
-        return Ok("local=true".into());
-    }
-    let (shown, _) = view.shown_names();
-    let matching: Vec<String> = shown
-        .iter()
-        .filter(|t| wanted.contains(&local(t)))
-        .map(|t| encode(t))
-        .collect();
-    if matching.is_empty() {
-        return Err(not_found());
-    }
-    Ok(format!("type={}", matching.join(",")))
+    view.type_selector(wanted).await.ok_or_else(not_found)
 }
 
 /// The caller's query parameters under the output's filter: `q` and `scopeQ` AND-ed, a fixed
@@ -354,7 +310,7 @@ fn view_of(ops: &Ops, id: &str) -> Result<ViewOps, Problem> {
 }
 
 /// The pushdown of a feed or a preview over `plans`.
-fn pushdown(
+async fn pushdown(
     view: &ViewOps,
     plans: &[&Plan],
     filter: &mapping::Filter,
@@ -364,7 +320,7 @@ fn pushdown(
     Ok(Pushdown {
         query: format!(
             "{}{}",
-            selector(view, &wanted, &asked.types)?,
+            selector(view, &wanted, &asked.types).await?,
             narrowed(filter, asked)?
         ),
         attrs: asked.attrs.clone(),
@@ -445,7 +401,7 @@ async fn feed(
     let view = view_of(ops, id)?;
     let output = output(&view, name)?;
     let plans: Vec<&Plan> = output.plans.iter().collect();
-    let pushdown = pushdown(&view, &plans, &output.output.filter, &asked)?;
+    let pushdown = pushdown(&view, &plans, &output.output.filter, &asked).await?;
     let window = Window::read(asked.from, asked.to, output.zone);
     let now = Utc::now();
     let mut out = String::new();
@@ -568,7 +524,7 @@ async fn previewed(
     let asked = asked(uri)?;
     let view = view_of(ops, id)?;
     let plan = &candidate;
-    let pushdown = pushdown(&view, &[plan], &mapping::Filter::default(), &asked)?;
+    let pushdown = pushdown(&view, &[plan], &mapping::Filter::default(), &asked).await?;
     let window = Window::read(asked.from, asked.to, plan.zone());
     let first = Page {
         start: 0,
