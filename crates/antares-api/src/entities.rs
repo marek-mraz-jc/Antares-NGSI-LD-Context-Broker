@@ -89,7 +89,7 @@ async fn create_entity_inner(
         "entity document must be a JSON object".into(),
     ))?;
     let mut expanded = expand_entity(obj, &parsed.ctx, ExpandOpts::default())?;
-    let id = antares_jsonld::expanded_id(&expanded)?.to_owned();
+    let id = antares_jsonld::new_entity_id(&expanded)?.to_owned();
 
     // distributed create (4.3.6, 6.4.3.1)
     let types: Option<Vec<String>> = expanded.get("type").and_then(Value::as_array).map(|a| {
@@ -4085,6 +4085,7 @@ mod clause_5_6_1_and_5_6_21 {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use http_body_util::BodyExt;
     use serde_json::json;
     use tower::ServiceExt;
 
@@ -4119,6 +4120,52 @@ mod clause_5_6_1_and_5_6_21 {
             "a raw # truncates the URL at the fragment and addresses another \
              resource: {loc}"
         );
+    }
+
+    /// F-ANT2-013: 5.7.2 names Entities by a comma-separated `id` list, and
+    /// the EntityMap, temporal and federation pages rebuild that list, so an
+    /// id holding a comma is refused on every create door and nothing is
+    /// stored.
+    #[tokio::test]
+    async fn an_entity_id_holding_a_comma_is_refused_at_create() {
+        let app = crate::router(AppState::new("antares-test".into()));
+        let id = "urn:ngsi-ld:Vehicle:a,b";
+        let one = json!({"id": id, "type": "Vehicle"});
+        let temporal = json!({"id": id, "type": "Vehicle",
+            "speed": [{"type": "Property", "value": 1, "observedAt": "2026-10-26T00:00:00Z"}]});
+        for (path, body) in [
+            ("/ngsi-ld/v1/entities", one.clone()),
+            ("/ngsi-ld/v1/entityOperations/create", json!([one.clone()])),
+            ("/ngsi-ld/v1/entityOperations/upsert", json!([one.clone()])),
+            ("/ngsi-ld/v1/temporal/entities", temporal),
+        ] {
+            let payload = body.to_string();
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header("Content-Type", "application/json")
+                        .header("Content-Length", payload.len().to_string())
+                        .body(Body::from(payload))
+                        .expect("req"),
+                )
+                .await
+                .expect("resp");
+            let status = resp.status();
+            let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+            let text = String::from_utf8_lossy(&bytes);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {text}");
+            assert!(text.contains("holds a comma"), "{path}: {text}");
+        }
+        let resp = app
+            .oneshot(
+                Request::get("/ngsi-ld/v1/entities/urn:ngsi-ld:Vehicle:a,b")
+                    .body(Body::empty())
+                    .expect("req"),
+            )
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     async fn seed(st: &AppState, tenant: &TenantId, n: usize) {

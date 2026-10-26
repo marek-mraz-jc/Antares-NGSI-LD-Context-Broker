@@ -58,7 +58,7 @@ pub async fn upsert_temporal(
             "temporal entity must be a JSON object".into(),
         ))?;
         let expanded = expand_entity(obj, &parsed.ctx, TEMPORAL_OPTS)?;
-        let id = antares_jsonld::expanded_id(&expanded)?.to_owned();
+        let id = antares_jsonld::new_entity_id(&expanded)?.to_owned();
         // the engine is asked with what 5.6.1 gives it (T-4855): types, Attributes, body
         let types: Vec<String> = expanded
             .get("type")

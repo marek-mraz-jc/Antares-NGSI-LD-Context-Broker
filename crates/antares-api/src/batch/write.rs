@@ -683,7 +683,7 @@ fn prep_create(item: &Value, ctx: &antares_jsonld::Context, ts: &str) -> Result<
         .as_object()
         .ok_or_else(|| NgsiError::BadRequestData("entity must be an object".into()))?;
     let mut expanded = expand_entity(obj, ctx, ExpandOpts::default())?;
-    let id = antares_jsonld::expanded_id(&expanded)?.to_owned();
+    let id = antares_jsonld::new_entity_id(&expanded)?.to_owned();
     stamp_new(&mut expanded, ts);
     Ok((id, expanded))
 }
@@ -710,7 +710,13 @@ fn prep_write(
             ..Default::default()
         },
     )?;
-    let id = antares_jsonld::expanded_id(&expanded)?.to_owned();
+    // an upsert creates what is missing: the create rule on its id
+    let id = if mode == BatchMode::Upsert {
+        antares_jsonld::new_entity_id(&expanded)?
+    } else {
+        antares_jsonld::expanded_id(&expanded)?
+    }
+    .to_owned();
     Ok((id, expanded))
 }
 
