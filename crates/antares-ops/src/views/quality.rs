@@ -27,6 +27,7 @@ use antares_model::TenantId;
 use axum::Router;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::sync::Weak;
 use std::time::Duration;
 
@@ -289,6 +290,117 @@ pub(super) async fn sweep(r: &Reloader, now: chrono::DateTime<chrono::Utc>) -> V
                 );
                 out.push(changed);
             }
+        }
+    }
+    out.extend(lift_orphans(&r.state, &rules, now).await);
+    out
+}
+
+/// Lifts, in every Tenant, each name in `quarantineRules` that no current
+/// rule of that Tenant carries (F-ANT4-011): a rule renamed or deleted, its
+/// whole document included, leaves no Entity quarantined (hidden) for good.
+/// Read like [`judge_rule`]: at most [`ROUNDS`] pages of the Entities that
+/// hold a mark, then each one rewritten under its row lock.
+async fn lift_orphans(
+    state: &AppState,
+    rules: &Rules,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<Changed> {
+    let mut tenants: Vec<String> = state.tenant_names().await.unwrap_or_default();
+    tenants.extend(rules.iter().map(|(t, _)| t.as_str().to_owned()));
+    tenants.sort();
+    tenants.dedup();
+    let ts = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let attrs = [QUARANTINE_RULES.to_owned()];
+    let mut out = Vec::new();
+    for tenant in tenants {
+        let Ok(t) = TenantId::new(&tenant) else {
+            continue;
+        };
+        let current: Vec<&str> = rules
+            .iter()
+            .filter(|(rt, _)| *rt == t)
+            .flat_map(|(_, list)| list.iter().map(|r| r.name.as_str()))
+            .collect();
+        let orphaned = |doc: &Value| -> Vec<String> {
+            marked_by(doc)
+                .into_iter()
+                .filter(|n| !current.contains(&n.as_str()))
+                .collect()
+        };
+        let mut pending: Vec<String> = Vec::new();
+        for round in 0..ROUNDS {
+            let rows = match state
+                .scan_entities(&t, &[], &attrs, round.saturating_mul(PAGE), PAGE)
+                .await
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::warn!(tenant, error = %e, "quality sweep failed");
+                    break;
+                }
+            };
+            let last = rows.len() < PAGE;
+            pending.extend(rows.iter().filter(|d| !orphaned(d).is_empty()).filter_map(|d| {
+                d.get("id").and_then(Value::as_str).map(str::to_owned)
+            }));
+            if last {
+                break;
+            }
+        }
+        let mut lifted: BTreeMap<String, u64> = BTreeMap::new();
+        for batch in pending.chunks(PAGE) {
+            // the names each Entity lost, by id: a rerun closure overwrites
+            let mut gone_by: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            let written = state
+                .mutate_entities(&t, batch, |id, doc| {
+                    let gone = orphaned(doc);
+                    if gone.is_empty() {
+                        return false;
+                    }
+                    let keep: Vec<String> = marked_by(doc)
+                        .into_iter()
+                        .filter(|n| !gone.contains(n))
+                        .collect();
+                    let Some(object) = doc.as_object_mut() else {
+                        return false;
+                    };
+                    if keep.is_empty() {
+                        object.remove(QUARANTINED_AT);
+                        object.remove(QUARANTINE_RULES);
+                    } else {
+                        object.insert(QUARANTINE_RULES.to_owned(), property(&json!(keep), &ts));
+                    }
+                    gone_by.insert(id.to_owned(), gone);
+                    true
+                })
+                .await;
+            let written = match written {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!(tenant, error = %e, "quality sweep failed");
+                    break;
+                }
+            };
+            for (id, _) in batch.iter().zip(written).filter(|(_, w)| *w) {
+                for name in gone_by.remove(id.as_str()).unwrap_or_default() {
+                    let n = lifted.entry(name).or_default();
+                    *n = n.saturating_add(1);
+                }
+            }
+        }
+        for (rule, count) in lifted {
+            metrics::counter!("antares_quality_sweep_total",
+                "tenant" => tenant.clone(), "type" => "", "rule" => rule.clone(), "outcome" => "lift")
+            .increment(count);
+            tracing::info!(tenant, rule, count, "quality sweep lifted a mark no rule carries");
+            out.push(Changed {
+                tenant: tenant.clone(),
+                type_iri: String::new(),
+                rule,
+                outcome: "lift",
+                count,
+            });
         }
     }
     out
