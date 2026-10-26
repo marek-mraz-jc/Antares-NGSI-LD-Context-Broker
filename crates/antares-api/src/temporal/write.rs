@@ -58,7 +58,7 @@ pub async fn upsert_temporal(
             "temporal entity must be a JSON object".into(),
         ))?;
         let expanded = expand_entity(obj, &parsed.ctx, TEMPORAL_OPTS)?;
-        let id = antares_jsonld::new_entity_id(&expanded)?.to_owned();
+        let id = antares_jsonld::expanded_id(&expanded)?.to_owned();
         // the engine is asked with what 5.6.1 gives it (T-4855): types, Attributes, body
         let types: Vec<String> = expanded
             .get("type")
@@ -82,6 +82,12 @@ pub async fn upsert_temporal(
             body: Some(&expanded),
         )
         .await?;
+        // the create rule on a comma id (F-ANT2-013) holds for a new Entity,
+        // judged after the gate so a refused caller learns nothing stored;
+        // a stored legacy one is still upserted
+        if id.contains(',') && st.temporal.get(&tenant, &id).await?.is_none() {
+            antares_jsonld::new_entity_id(&expanded)?;
+        }
         // 5.6.11.4: exclusive/redirect registrations matching the input are
         // forwarded when "Create or Update Temporal" is supported; proxy
         // modes without it are an error of type Conflict; inclusive ones
