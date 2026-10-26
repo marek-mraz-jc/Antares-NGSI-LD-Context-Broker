@@ -194,6 +194,14 @@ pub async fn interval_tick(st: &AppState) {
             // this subscription right now) keeps sweeping on the interval
             // instead of parking on an anchor only the winner advanced.
             next_sub = next_sub.min(now_ms.saturating_add(interval_offset_ms(interval)));
+            // a stored q that no longer parses (one percent-encoded before
+            // 5.2.12's read-as-written) matches nothing, as conditions_match
+            // decides: no Entity to read and no Notification to send, so
+            // nothing to claim either (F-ANT3-009: the claim stamped
+            // lastNotification for a firing that never ran)
+            if sub_str(&sub, "q").is_some_and(|q| antares_ql::regex::q_node(q).is_none()) {
+                continue;
+            }
             let claim = if st.nats {
                 match claim_interval(st, &tenant, Kind::Subscription, &sub, interval).await {
                     Some(prev) => Some(prev),
@@ -202,12 +210,6 @@ pub async fn interval_tick(st: &AppState) {
             } else {
                 None
             };
-            // a stored q that no longer parses (one percent-encoded before
-            // 5.2.12's read-as-written) matches nothing, as conditions_match
-            // decides: no Entity to read and no Notification to send
-            if sub_str(&sub, "q").is_some_and(|q| antares_ql::regex::q_node(q).is_none()) {
-                continue;
-            }
             let ctx = sub_context(st, &tenant, &sub).await;
             let now = now_iso();
             // 5.8.6: the periodic Notification "shall include all the
@@ -349,7 +351,9 @@ pub async fn interval_tick(st: &AppState) {
             {
                 let (st, tenant, ctx) = (st.clone(), tenant.clone(), Arc::clone(&ctx));
                 sending.spawn(async move {
-                    let _permit = DELIVERY_SLOTS.acquire().await;
+                    // the Tenant's share and a slot, as for Subscriptions
+                    // (F-ANT3-007: a bare slot let one Tenant hold them all)
+                    let _permits = delivery_permits(&tenant).await;
                     deliver_csource(&st, &tenant, &sub, data, &ctx, "newlyMatching").await;
                 });
             }

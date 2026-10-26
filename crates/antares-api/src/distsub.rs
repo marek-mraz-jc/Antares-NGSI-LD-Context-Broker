@@ -710,7 +710,10 @@ fn reduced_copy(
                 .map(|n| ctx.expand_key(n))
         })
         .collect();
-    if !reg_attrs.is_empty() {
+    // a periodic Subscription watches nothing (5.2.12 forbids the pair):
+    // its copy gets no watchedAttributes either, or the source refuses it
+    let periodic = o.contains_key("timeInterval");
+    if !reg_attrs.is_empty() && !periodic {
         let watch: Vec<Value> = match o.get("watchedAttributes").and_then(Value::as_array) {
             Some(w) => w
                 .iter()
@@ -1065,6 +1068,29 @@ mod tests {
                 "lastFailure": "2026-01-02T00:00:00Z",
             },
         })
+    }
+
+    /// F-ANT3-014: a periodic Subscription that watches everything gets no
+    /// watchedAttributes in its copy: 5.2.12 forbids the pair with
+    /// timeInterval, so the source refused every such copy.
+    #[test]
+    fn a_periodic_copy_watches_nothing() {
+        let st = AppState::new("antares-ds-periodic".into());
+        let mut sub = sub_doc();
+        if let Some(o) = sub.as_object_mut() {
+            o.remove("watchedAttributes");
+            o.insert("timeInterval".into(), json!(10));
+        }
+        let copy = reduced_copy(
+            &st,
+            &sub,
+            &reg_doc(),
+            "urn:ngsi-ld:Subscription:remote1",
+            &st.loader.core(),
+        )
+        .expect("a copy the registration covers");
+        assert_eq!(copy.get("watchedAttributes"), None, "{copy}");
+        assert_eq!(copy.get("timeInterval"), Some(&json!(10)));
     }
 
     /// 5.8.1.4: "a copy of the original Subscription shall be reduced to

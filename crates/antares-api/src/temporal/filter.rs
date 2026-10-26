@@ -265,14 +265,18 @@ pub(super) fn scope_window_retain(
         Some(t) => match t.timerel.as_str() {
             "before" => (None, Some(dt_key(&t.time_at))),
             "after" => (Some(dt_key(&t.time_at)), None),
-            "between" => (Some(dt_key(&t.time_at)), t.end_time_at.as_deref().map(dt_key)),
+            "between" => (
+                Some(dt_key(&t.time_at)),
+                t.end_time_at.as_deref().map(dt_key),
+            ),
             _ => (None, None),
         },
         None => (None, None),
     };
     let intersects = iv.iter().any(|(s, e)| {
         wend.as_deref().is_none_or(|w| s.as_str() < w)
-            && e.as_deref().is_none_or(|e| wstart.as_deref().is_none_or(|w| e > w))
+            && e.as_deref()
+                .is_none_or(|e| wstart.as_deref().is_none_or(|w| e > w))
     });
     if !intersects {
         return false;
@@ -284,11 +288,14 @@ pub(super) fn scope_window_retain(
             }
             if let Some(arr) = v.as_array_mut() {
                 arr.retain(|inst| {
-                    inst.get(timeprop).and_then(Value::as_str).map(dt_key).is_some_and(|t| {
-                        let t = t.as_str();
-                        iv.iter()
-                            .any(|(s, e)| t >= s.as_str() && e.as_deref().is_none_or(|e| t < e))
-                    })
+                    inst.get(timeprop)
+                        .and_then(Value::as_str)
+                        .map(dt_key)
+                        .is_some_and(|t| {
+                            let t = t.as_str();
+                            iv.iter()
+                                .any(|(s, e)| t >= s.as_str() && e.as_deref().is_none_or(|e| t < e))
+                        })
                 });
             }
         }
