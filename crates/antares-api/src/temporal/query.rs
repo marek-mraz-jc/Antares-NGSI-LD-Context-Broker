@@ -82,8 +82,9 @@ pub(super) async fn query_temporal_outer(
                 .filter_map(|d| d.get("id").and_then(Value::as_str).map(str::to_owned)),
         );
     }
+    let mut stale: Vec<String> = Vec::new();
     if let Some(emap) = map.get_mut("entityMap").and_then(Value::as_object_mut) {
-        let stale: Vec<String> = candidates
+        stale = candidates
             .iter()
             .filter(|eid| {
                 emap.get(eid.as_str())
@@ -93,11 +94,11 @@ pub(super) async fn query_temporal_outer(
             })
             .cloned()
             .collect();
-        for k in stale {
-            emap.remove(&k);
+        for k in &stale {
+            emap.remove(k);
         }
     }
-    crate::entity_map::map_put(st, &tenant, map.clone()).await?;
+    crate::entity_map::map_prune(st, &tenant, &map_id, &stale).await?;
     // fix the query to the candidates that survived the recheck (5.5.14)
     let ids: Vec<&str> = candidates
         .iter()

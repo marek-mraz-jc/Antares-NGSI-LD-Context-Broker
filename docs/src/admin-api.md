@@ -113,7 +113,7 @@ progress). A memory-store broker answers:
 | `status` | `UP`, or `DRAINING` with status 503 once shutdown began. |
 | `store` | The current-state backend: `memory`, `file`, `postgres`, `timescale`. |
 | `temporal` | The history backend: one of the four, or `none` when history is off (`ANTARES_TEMPORAL`). |
-| `storeInfo`, `temporalInfo` | What each driver actually runs on: `{engine}` for the built-in stores (`memory` or `redb`), and on Postgres `{engine, poolSize, poolAcquireTimeoutSeconds, server, postgis?, timescaledb?}` — the pool's own shape always, the server probe read once at startup and omitted if it failed. Absent when a driver has nothing to add to its name (`none` history). Two deployments answering `postgres` are told apart here. |
+| `storeInfo`, `temporalInfo` | What each driver actually runs on: `{engine}` for the built-in stores (`memory` or `redb`), and on Postgres `{engine, poolSize, poolWriteReserve, poolAcquireTimeoutSeconds, server, postgis?, timescaledb?}` — the pool's own shape always, the server probe read once at startup and omitted if it failed. Absent when a driver has nothing to add to its name (`none` history). Two deployments answering `postgres` are told apart here. |
 | `version`, `commit` | Workspace version and the git hash the binary was built from. |
 | `notificationSchemes` | The `notification.endpoint.uri` schemes this build can deliver to — the registered bindings (6.3.8, clause 7, and any a deployment added). A subscription naming a scheme absent here is refused at creation with `BadRequestData`. |
 | `deadLetters` | Dead letters this process wrote since start ([notification delivery](operations.md#notification-delivery)). |
@@ -279,7 +279,10 @@ validate it, store it under the reserved tenant `antares-views` and reload
 the pod's view table before they answer; every other pod reloads within
 `ANTARES_VIEWS_RELOAD_MS` (default 5000). `/q/health` lists each view
 (`loaded` with its tenant, operation count and loader notes, or `invalid`
-with the reason) under `views`, and each surface that serves through views
+with the reason) under `views` to a caller with the admin bearer (or to
+everyone when no admin token is configured); an open caller gets
+`{"count": n}` there, under `schemas` and under `policy.documents`, since
+the reports name Tenants (F-ANT2-005). It lists each surface that serves through views
 as `open` or `closed` under `surfaces`: no view loaded, every route of such
 a surface answers `404`. `viewsRevision` is sixteen hex digits, a digest of
 the stored view documents the table was loaded from: every pod over one
@@ -382,7 +385,7 @@ Only in a broker built with the `views` feature and started with a policy
 engine that reads rule documents (ADR-0020 amendment); with `allow-all`, or
 an engine that reads none, every route here answers `404`. A rule document
 belongs to one client tenant and is opaque to the broker: the engine owns
-its schema. The broker bounds it (64 KiB, 32 levels of nesting, 8192 JSON
+its schema. The broker bounds it (1 MiB, 32 levels of nesting, 131072 JSON
 values), hands it to the engine, and stores it under the reserved tenant
 `antares-policy` with a revision it counts. The table reloads with the view
 table: the pod that took a write before it answers, every other pod within
@@ -410,7 +413,7 @@ for a name that is not a client tenant.
 The body is the document. `201` created, `204` replaced; `400` for no JSON,
 `null`, a depth or value count over its bound, or the engine's reason for
 refusing it (nothing is stored, the previous revision keeps deciding);
-`413` over 64 KiB.
+`413` over 1 MiB.
 
 ### DELETE /q/policy/{tenant}
 

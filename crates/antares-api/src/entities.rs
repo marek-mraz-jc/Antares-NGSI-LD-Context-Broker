@@ -650,6 +650,7 @@ async fn query_entities_outer(
     );
     let chunk_size = limit.max(20);
     let mut page_ids: Vec<String> = Vec::new();
+    let mut stale: Vec<String> = Vec::new();
     let (mut skipped, mut total, mut more, mut visited) = (0usize, 0usize, false, 0usize);
     for chunk in ids.chunks(chunk_size) {
         let mut p = params.clone();
@@ -678,6 +679,7 @@ async fn query_entities_outer(
                     .is_some_and(|a| matches!(a.as_slice(), [only] if only == "@none"));
                 if local_only && !matched.contains(id.as_str()) {
                     emap.remove(id);
+                    stale.push(id.clone());
                 }
             }
         }
@@ -706,7 +708,7 @@ async fn query_entities_outer(
     if count {
         more = total > offset.saturating_add(limit);
     }
-    crate::entity_map::map_put(st, &tenant, map.clone()).await?;
+    crate::entity_map::map_prune(st, &tenant, &map_id, &stale).await?;
     // fix the final fetch to exactly the page's survivors (5.5.14: an empty
     // set is fixed to nothing); one extra page-sized fetch keeps the whole
     // repr pipeline shared instead of forked

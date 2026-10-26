@@ -148,6 +148,48 @@ pub async fn connect_with(
     max_connections: u32,
     statement_timeout: std::time::Duration,
 ) -> Result<PgPool, sqlx::Error> {
+    let pool = options(max_connections, statement_timeout)
+        .connect(url)
+        .await?;
+    // DDL is exempt from the per-session statement timeout: building an index
+    // on a large attr_instances legitimately runs longer than a query ever
+    // should. The lock timeout stays — a migration blocked on a lock must
+    // fail rather than hold the boot path.
+    //
+    // `SET` is session-scoped and the pool has no release hook, so the
+    // connection is DETACHED first: it never goes back into the pool, and no
+    // request is ever served by a connection with the runaway-query wall
+    // switched off. The pool opens a fresh one (running `after_connect`) on
+    // demand.
+    if migrate_enabled(std::env::var("ANTARES_MIGRATE").ok().as_deref()) {
+        use sqlx::{Connection, Executor};
+        let mut migrate_conn = pool.acquire().await?.detach();
+        migrate_conn
+            .execute(sqlx::raw_sql("SET statement_timeout = 0"))
+            .await?;
+        migrate(&mut migrate_conn).await?;
+        migrate_conn.close().await?;
+    }
+    Ok(pool)
+}
+
+/// The write reserve (`ANTARES_PG_WRITE_RESERVE`, T-5150): a second pool of
+/// `max_connections` with the same session settings and bounds as
+/// [`connect_with`], which only the batch writes draw from, so reads queued
+/// on the main pool cannot hold a pipeline's batch upsert behind them. It
+/// runs no migrations: [`connect_with`] already did, on the main pool.
+pub async fn connect_reserve(
+    url: &str,
+    max_connections: u32,
+    statement_timeout: std::time::Duration,
+) -> Result<PgPool, sqlx::Error> {
+    options(max_connections, statement_timeout)
+        .connect(url)
+        .await
+}
+
+/// The bounds and session settings every broker pool shares.
+fn options(max_connections: u32, statement_timeout: std::time::Duration) -> PgPoolOptions {
     use std::time::Duration;
     // No parallel workers: a request reads a page, and a page whose filter
     // the planner thinks selective (a `q` under RLS is never an index
@@ -159,7 +201,7 @@ pub async fn connect_with(
          SET max_parallel_workers_per_gather = 0",
         statement_timeout.as_millis()
     );
-    let pool = PgPoolOptions::new()
+    PgPoolOptions::new()
         .max_connections(max_connections)
         .acquire_timeout(Duration::from_secs(5))
         .idle_timeout(Duration::from_secs(600))
@@ -193,28 +235,6 @@ pub async fn connect_with(
                 Ok(())
             })
         })
-        .connect(url)
-        .await?;
-    // DDL is exempt from the per-session statement timeout: building an index
-    // on a large attr_instances legitimately runs longer than a query ever
-    // should. The lock timeout stays — a migration blocked on a lock must
-    // fail rather than hold the boot path.
-    //
-    // `SET` is session-scoped and the pool has no release hook, so the
-    // connection is DETACHED first: it never goes back into the pool, and no
-    // request is ever served by a connection with the runaway-query wall
-    // switched off. The pool opens a fresh one (running `after_connect`) on
-    // demand.
-    if migrate_enabled(std::env::var("ANTARES_MIGRATE").ok().as_deref()) {
-        use sqlx::{Connection, Executor};
-        let mut migrate_conn = pool.acquire().await?.detach();
-        migrate_conn
-            .execute(sqlx::raw_sql("SET statement_timeout = 0"))
-            .await?;
-        migrate(&mut migrate_conn).await?;
-        migrate_conn.close().await?;
-    }
-    Ok(pool)
 }
 
 /// Make RLS effective for this transaction — SET LOCAL only (transaction

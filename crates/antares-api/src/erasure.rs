@@ -38,7 +38,8 @@ fn stamped(member: &Value) -> Option<chrono::DateTime<chrono::FixedOffset>> {
 /// member with no stamp goes.
 ///
 /// # Errors
-/// The stores', as text.
+/// A `before` that is no RFC 3339 instant, before anything goes; the
+/// stores', as text.
 pub async fn erase(
     st: &AppState,
     t: &TenantId,
@@ -46,7 +47,14 @@ pub async fn erase(
     attrs: Option<&[String]>,
     before: Option<&str>,
 ) -> Result<Value, String> {
-    let cut = before.and_then(|b| chrono::DateTime::parse_from_rfc3339(b).ok());
+    // a cut that does not parse erases nothing: read as no cut it would
+    // erase what was written after the erasure
+    let cut = before
+        .map(|b| {
+            chrono::DateTime::parse_from_rfc3339(b)
+                .map_err(|e| format!("erasure time {b:?} is no RFC 3339 instant: {e}"))
+        })
+        .transpose()?;
     let goes = |member: &Value| match (cut, stamped(member)) {
         (Some(cut), Some(at)) => at <= cut,
         _ => true,
@@ -85,28 +93,52 @@ pub async fn erase(
             .map_err(|e| e.to_string())?;
         rows = rows.saturating_add(gone);
     }
-    // ponytail: a dead letter naming one of the Entities goes whole, read by
-    // its text; a letter keyed by Entity when dead letters ever grow large
+    // a dead letter goes whole when it notified one of the Entities; one
+    // that merely names an Entity (a Relationship object) stays. A letter
+    // with no readable notification goes when its text names one.
+    let mut doomed = Vec::new();
+    crate::csource::walk_docs(st, t, Kind::DeadLetter, |letter| {
+        let hit = match notified(&letter) {
+            Some(ids) => ids.iter().any(|id| entities.contains(id)),
+            None => {
+                let text = letter.to_string();
+                entities
+                    .iter()
+                    .any(|id| text.contains(&format!("\"{id}\"")))
+            }
+        };
+        if hit {
+            if let Some(id) = letter.get("id").and_then(Value::as_str) {
+                doomed.push(id.to_owned());
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     let mut letters = 0u64;
-    let names: Vec<String> = entities.iter().map(|id| format!("\"{id}\"")).collect();
-    for letter in st
-        .store
-        .list(t, Kind::DeadLetter)
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        let text = letter.to_string();
-        if !names.iter().any(|n| text.contains(n.as_str())) {
-            continue;
-        }
-        if let Some(id) = letter.get("id").and_then(Value::as_str) {
-            let gone = st
-                .store
-                .delete(t, Kind::DeadLetter, id)
-                .await
-                .map_err(|e| e.to_string())?;
-            letters = letters.saturating_add(u64::from(gone));
-        }
+    for id in doomed {
+        let gone = st
+            .store
+            .delete(t, Kind::DeadLetter, &id)
+            .await
+            .map_err(|e| e.to_string())?;
+        letters = letters.saturating_add(u64::from(gone));
     }
     Ok(json!({"entities": current, "history": rows, "deadLetters": letters}))
+}
+
+/// The ids of the Entities a dead letter notified: `data` of its
+/// Notification (5.3.1), or the Features of a GeoJSON one (6.3.15); `None`
+/// when it carries no readable notification.
+fn notified(letter: &Value) -> Option<Vec<String>> {
+    let out = antares_notifier::Outbound::from_dead_letter(letter).ok()?;
+    let ids = ["data", "features"]
+        .iter()
+        .filter_map(|k| out.body.get(*k).and_then(Value::as_array))
+        .flatten()
+        .filter_map(|e| e.get("id").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect();
+    Some(ids)
 }

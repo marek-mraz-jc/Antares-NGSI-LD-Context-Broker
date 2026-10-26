@@ -142,6 +142,7 @@ dependencies = [
  "ngsild-jsonld",
  "ngsild-model",
  "ngsild-ql",
+ "regex-syntax",
  "serde_json",
 ]
 

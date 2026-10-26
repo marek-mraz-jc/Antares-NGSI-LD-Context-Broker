@@ -163,6 +163,55 @@ async fn a_registration_cannot_ask_for_the_subject_header() {
     }
 }
 
+/// F-ANT3-003: the caller's own credentials stay home too. A registration
+/// asking for `Authorization`, `Proxy-Authorization` or `Cookie` by the
+/// copy-from-the-request value gets none of them; a value it states itself
+/// (its own credential, 4.3.6.5) still goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registration_cannot_ask_for_the_callers_credentials() {
+    let st = state();
+    let (port, seen) = peer("[]");
+    register(
+        &st,
+        port,
+        json!([{"key": "Authorization", "value": "urn:ngsi-ld:request"},
+               {"key": "Proxy-Authorization", "value": "urn:ngsi-ld:request"},
+               {"key": "Cookie", "value": "urn:ngsi-ld:request"},
+               {"key": "X-Source-Key", "value": "registrant-own"}]),
+    )
+    .await;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/ngsi-ld/v1/entities?type=Vehicle")
+        .header(subject_header(), "alice")
+        .header("Authorization", "Bearer callers-token")
+        .header("Proxy-Authorization", "Basic callers-proxy")
+        .header("Cookie", "session=callers-session")
+        .body(Body::empty())
+        .expect("req");
+    let resp = antares_api::router(st.clone())
+        .oneshot(req)
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let asked = seen.lock().expect("lock").clone();
+    assert!(!asked.is_empty(), "the peer was never reached");
+    for req in &asked {
+        for secret in ["callers-token", "callers-proxy", "callers-session"] {
+            assert!(
+                !req.contains(secret),
+                "{secret} reached a Context Source: {req}"
+            );
+        }
+        assert!(
+            req.contains("registrant-own"),
+            "the stated value is gone: {req}"
+        );
+    }
+}
+
 /// The guard is narrow: a registration that asks for an ordinary header
 /// still gets it, so 4.3.6.5 is not broken in the name of the seam.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

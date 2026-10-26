@@ -117,7 +117,9 @@ async fn batch_query_inner(
     } else {
         Value::Array(payload)
     };
-    let mut resp = respond_prefer(StatusCode::OK, out, &parsed.ctx, accept, &tenant, headers);
+    // 6.3.6: the json answer's Link names the @context it was compacted in
+    let served = crate::contexts::linkable(st, &tenant, headers, &parsed.ctx, accept).await?;
+    let mut resp = respond_prefer(StatusCode::OK, out, &served, accept, &tenant, headers);
     attach_paging(&mut resp, count_hdr, &[]);
     filter.mark(&st.host_alias, resp.headers_mut());
     Ok(resp)

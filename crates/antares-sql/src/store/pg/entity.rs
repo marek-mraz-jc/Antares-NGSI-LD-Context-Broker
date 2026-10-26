@@ -34,6 +34,10 @@ pub struct PgEntityStore {
     /// `ANTARES_PG_BATCH_ASYNC_COMMIT` for a feed that rewrites itself every
     /// second, where the next batch restores what a crash lost.
     async_batch: std::sync::atomic::AtomicBool,
+    /// The pool the batch writes begin on: `pool` itself, or the write
+    /// reserve (`ANTARES_PG_WRITE_RESERVE`, T-5150) when the broker set one,
+    /// whose connections no read takes.
+    batch_pool: PgPool,
 }
 
 // EntityFilter/Page/QueryOutcome live in `store::filter` (pure data,
@@ -647,10 +651,17 @@ pub fn ngsi_error(e: &sqlx::Error) -> Option<&NgsiError> {
 impl PgEntityStore {
     pub fn new(pool: PgPool) -> Self {
         Self {
+            batch_pool: pool.clone(),
             pool,
             outbox: std::sync::atomic::AtomicBool::new(false),
             async_batch: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Run the batch writes on `reserve` instead of the shared pool.
+    pub fn with_batch_pool(mut self, reserve: PgPool) -> Self {
+        self.batch_pool = reserve;
+        self
     }
 
     /// Asynchronous commit for the batch writes (see the field).
@@ -662,7 +673,7 @@ impl PgEntityStore {
     /// A batch write's transaction, with `synchronous_commit = off` set
     /// LOCAL to it when [`Self::set_async_batch_commit`] is on.
     async fn begin_batch(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
-        let mut tx = super::begin(&self.pool).await?;
+        let mut tx = super::begin(&self.batch_pool).await?;
         if self.async_batch.load(std::sync::atomic::Ordering::Relaxed) {
             sqlx::query("SET LOCAL synchronous_commit = off")
                 .execute(&mut *tx)
@@ -1074,11 +1085,25 @@ impl PgEntityStore {
                 Err(w) => wheres.push(w),
             }
         }
-        // `attrs`: the entity carries at least one of them — jsonb `?|`,
-        // exactly the evaluator's `any(|a| doc.get(a).is_some())`.
+        // `attrs`: the entity holds at least one of them NOW — the
+        // evaluator's `has_live_attr` after 4.22 stripped expired instances.
+        // `?|` alone also matched an Attribute whose every instance expired.
+        // Only a row with an expired instance (`attrs_expire_at` past, rare)
+        // pays for the per-instance check, so the predicate stays decided
+        // and the page stays pushed down.
         if let Some(attrs) = f.attrs {
             binds.push(Bind::TextArr(super::storable(attrs)));
-            wheres.push(format!("entity ?| ${}", binds.len()));
+            let n = binds.len();
+            wheres.push(format!(
+                "entity ?| ${n} AND (attrs_expire_at IS NULL OR attrs_expire_at >= now() \
+                 OR EXISTS (SELECT 1 FROM unnest(${n}::text[]) AS w(a) \
+                  WHERE entity ? w.a AND (jsonb_typeof(entity -> w.a) <> 'array' \
+                   OR strpos(w.a, ':') = 0 OR jsonb_array_length(entity -> w.a) = 0 \
+                   OR EXISTS (SELECT 1 FROM jsonb_array_elements(entity -> w.a) AS i(v) \
+                    WHERE jsonb_typeof(i.v -> 'expiresAt') IS DISTINCT FROM 'string' \
+                     OR try_timestamptz(i.v ->> 'expiresAt') IS NULL \
+                     OR try_timestamptz(i.v ->> 'expiresAt') >= now()))))"
+            ));
             probes.extend(attrs_probe(tenant, attrs));
         }
         if let Some(node) = f.q {

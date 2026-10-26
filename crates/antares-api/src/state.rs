@@ -306,7 +306,7 @@ tokio::task_local! {
     /// How many [`AppState::call`] frames this task is already inside, held
     /// against [`crate::bounds::MAX_IN_PROCESS_CALL_DEPTH`]. Absent outside a
     /// façade call, which reads as zero.
-    static INPROCESS_DEPTH: usize;
+    pub(crate) static INPROCESS_DEPTH: usize;
 }
 
 /// The broker's state as every handler and layer receives it. Cloned at
@@ -606,36 +606,41 @@ impl AppState {
                     }
                     let id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, url.as_bytes());
                     // A refetch (staleness, delete+reload) must keep the row's
-                    // identity and hit counters — only the body is new.
+                    // identity and hit counters — only the body is new — and
+                    // it swaps the body under the row lock, so a bump racing
+                    // it keeps its count. Only a row that is not there is
+                    // written whole.
                     // The row this writes is `Cached` and belongs to no Tenant
                     // (ADR-0021), but the call still acts for the Tenant whose
                     // resolution triggered the fetch: that is what lets the guard
                     // above see this Tenant's own Hosted rows.
-                    let prior = store
-                        .context_get(tenant, &id.to_string())
-                        .await
-                        .ok()
-                        .flatten();
-                    let field = |k: &str| {
-                        prior
-                            .as_ref()
-                            .and_then(|p| p[k].as_str())
-                            .map(str::to_owned)
-                    };
-                    let created = field("createdAt").unwrap_or_else(now_iso);
+                    let id = id.to_string();
+                    let body = serde_json::json!({"@context": ctx_value});
+                    let refetched = store
+                        .context_mutate(
+                            tenant,
+                            &id,
+                            Box::new(|row| {
+                                row.as_object_mut()
+                                    .ok_or(())?
+                                    .insert("body".into(), body.clone());
+                                Ok(())
+                            }),
+                        )
+                        .await;
+                    if matches!(refetched, Ok(Some(Ok(())))) {
+                        return;
+                    }
                     let doc = serde_json::json!({
                         "url": url,
-                        "localId": id.to_string(),
+                        "localId": id,
                         "kind": "Cached",
-                        "createdAt": created,
-                        "numberOfHits": prior
-                            .as_ref()
-                            .and_then(|p| p["numberOfHits"].as_u64())
-                            .unwrap_or(0),
-                        "lastUsage": field("lastUsage"),
-                        "body": {"@context": ctx_value},
+                        "createdAt": now_iso(),
+                        "numberOfHits": 0,
+                        "lastUsage": null,
+                        "body": body,
                     });
-                    if let Err(e) = store.context_put(tenant, &id.to_string(), doc).await {
+                    if let Err(e) = store.context_put(tenant, &id, doc).await {
                         // a client-named @context URL may carry userinfo
                         tracing::warn!(
                             "@context write-through failed for {}: {e}",
@@ -659,24 +664,19 @@ impl AppState {
                     if Loader::is_pinned_core(url) {
                         return true;
                     }
-                    // One read, not two: a bump runs on every counted use of a
-                    // non-pinned @context, and the hosted probe already carries
-                    // the row it found.
-                    let held = hosted_row(&*store, tenant, url).await;
-                    let (id, row) = match held {
-                        Some((id, row)) => (id, Ok(Some(row))),
-                        None => {
-                            let id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, url.as_bytes())
-                                .to_string();
-                            let row = store.context_get(tenant, &id).await;
-                            (id, row)
-                        }
+                    let id = match hosted_row_id(&*store, tenant, url).await {
+                        Some(id) => id,
+                        None => uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, url.as_bytes())
+                            .to_string(),
                     };
-                    match row {
-                        // the row is what the store handed back; a row that
-                        // cannot carry the counters is left uncounted
-                        Ok(Some(mut doc)) if doc.is_object() => {
-                            if let Some(o) = doc.as_object_mut() {
+                    // under the row lock: a bump racing a delete leaves the row
+                    // deleted, and two racing bumps both count
+                    let bumped = store
+                        .context_mutate(
+                            tenant,
+                            &id,
+                            Box::new(|row| {
+                                let o = row.as_object_mut().ok_or(())?;
                                 let hits = o
                                     .get("numberOfHits")
                                     .and_then(serde_json::Value::as_u64)
@@ -684,21 +684,24 @@ impl AppState {
                                     .saturating_add(1);
                                 o.insert("numberOfHits".into(), serde_json::json!(hits));
                                 o.insert("lastUsage".into(), serde_json::json!(now_iso()));
-                            }
-                            if let Err(e) = store.context_put(tenant, &id, doc).await {
-                                tracing::warn!(
-                                    "@context hit bump failed for {}: {e}",
-                                    antares_notifier::redact_userinfo(url)
-                                );
-                            }
-                            true
-                        }
+                                Ok(())
+                            }),
+                        )
+                        .await;
+                    match bumped {
+                        Ok(Some(Ok(()))) => true,
                         // a row that cannot carry the counters is left
                         // uncounted, and still exists: it must not be evicted
-                        Ok(Some(_)) => true,
+                        Ok(Some(Err(()))) => true,
                         Ok(None) => false,
                         // a store hiccup must never evict a healthy cache entry
-                        Err(_) => true,
+                        Err(e) => {
+                            tracing::warn!(
+                                "@context hit bump failed for {}: {e}",
+                                antares_notifier::redact_userinfo(url)
+                            );
+                            true
+                        }
                     }
                 })
             }));

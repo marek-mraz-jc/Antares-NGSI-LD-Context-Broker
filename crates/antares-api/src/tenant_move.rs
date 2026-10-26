@@ -24,12 +24,13 @@ const FORMAT: u64 = 1;
 /// The Tenant a path names, or the `400` of a name no request could carry.
 fn tenant_of(raw: &str) -> Result<TenantId, Box<Response>> {
     let bad = || {
-        ApiError::from(NgsiError::BadRequestData(format!(
-            "invalid tenant: {raw:?}"
-        )))
-        .into_response()
+        Box::new(
+            ApiError::from(NgsiError::BadRequestData(format!(
+                "invalid tenant: {raw:?}"
+            )))
+            .into_response(),
+        )
     };
-    let bad = || Box::new(bad());
     if TenantId::is_reserved_str(raw) {
         return Err(bad());
     }

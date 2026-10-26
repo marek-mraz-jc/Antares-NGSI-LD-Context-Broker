@@ -164,28 +164,7 @@ pub(crate) async fn map_put(
     let Some(id) = doc.get("id").and_then(Value::as_str).map(str::to_owned) else {
         return Ok(());
     };
-    // 6.4.3.2-1: "the actual expiresAt time of the EntityMap shall be set by
-    // the Context Broker or Context Source, possibly overriding the requested
-    // duration" — the 5.14.2.4 update path carries a client-chosen instant, so
-    // the ceiling binds here, at the one point every writer goes through. An
-    // absent or unreadable expiry is left alone: 5.5.14 keeps it unusable.
-    let now = chrono::Utc::now();
-    let ceiling = now
-        .checked_add_signed(chrono::Duration::seconds(MAX_LIFETIME_SECS))
-        .unwrap_or(now);
-    if doc
-        .get("expiresAt")
-        .and_then(Value::as_str)
-        .and_then(dt)
-        .is_some_and(|e| e > ceiling)
-    {
-        if let Some(o) = doc.as_object_mut() {
-            o.insert(
-                "expiresAt".into(),
-                json!(ceiling.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
-            );
-        }
-    }
+    clamp_expiry(&mut doc);
     // The ceiling decides whether a NEW map fits; rewriting a map that is
     // already stored replaces a row that is already counted, so the paging
     // path neither lists the tenant's maps nor evicts one per page. A count
@@ -223,12 +202,87 @@ pub(crate) async fn map_put(
     Ok(())
 }
 
+/// 6.4.3.2-1: "the actual expiresAt time of the EntityMap shall be set by
+/// the Context Broker or Context Source, possibly overriding the requested
+/// duration": every writer of a map's expiresAt goes through this. An
+/// absent or unreadable expiry is left alone: 5.5.14 keeps it unusable.
+fn clamp_expiry(doc: &mut Value) {
+    let now = chrono::Utc::now();
+    let ceiling = now
+        .checked_add_signed(chrono::Duration::seconds(MAX_LIFETIME_SECS))
+        .unwrap_or(now);
+    if doc
+        .get("expiresAt")
+        .and_then(Value::as_str)
+        .and_then(dt)
+        .is_some_and(|e| e > ceiling)
+    {
+        if let Some(o) = doc.as_object_mut() {
+            o.insert(
+                "expiresAt".into(),
+                json!(ceiling.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+            );
+        }
+    }
+}
+
+/// 5.14.2.4: set the expiresAt of a map as it is stored now, clamped;
+/// `false` when the map is gone (a deleted map is not resurrected).
+pub(crate) async fn map_set_expiry(
+    st: &AppState,
+    tenant: &TenantId,
+    id: &str,
+    expires: &str,
+) -> Result<bool, NgsiError> {
+    let mut want = json!({"expiresAt": expires});
+    clamp_expiry(&mut want);
+    Ok(st
+        .store
+        .mutate(tenant, Kind::EntityMap, id, |d| {
+            if let Some(o) = d.as_object_mut() {
+                if let Some(e) = want.get("expiresAt") {
+                    o.insert("expiresAt".into(), e.clone());
+                }
+            }
+            Ok::<_, std::convert::Infallible>(())
+        })
+        .await?
+        .is_some())
+}
+
+/// 5.5.9.3 "Entities not or no longer fitting the query shall be removed
+/// from the Entity map during pagination": remove the `stale` ids a page
+/// visited, and nothing else, from the map as it is stored NOW. A request
+/// that read the map before an update or a delete writes back only its own
+/// removals, so a new expiresAt survives and a deleted map stays deleted.
+pub(crate) async fn map_prune(
+    st: &AppState,
+    tenant: &TenantId,
+    id: &str,
+    stale: &[String],
+) -> Result<(), NgsiError> {
+    if stale.is_empty() {
+        return Ok(());
+    }
+    st.store
+        .mutate(tenant, Kind::EntityMap, id, |d| {
+            if let Some(emap) = d.get_mut("entityMap").and_then(Value::as_object_mut) {
+                for k in stale {
+                    emap.remove(k);
+                }
+            }
+            Ok::<_, std::convert::Infallible>(())
+        })
+        .await?;
+    Ok(())
+}
+
 /// 5.14.3.4: "If the NGSI-LD endpoint does not know about a matching EntityMap
 /// for the EntityMap ID, then an error of type ResourceNotFound shall be
 /// raised." What the endpoint knows about is what [`map_get`] serves, so the
 /// delete reads through it: an expired map is beyond access (5.5.14) for the
-/// retrieve and for the delete alike, and `map_get` prunes the row on the way
-/// past, which leaves nothing for a later sweep to collect.
+/// retrieve and for the delete alike; the expired row is left for
+/// `sweep_expired_maps` to collect.
 pub(crate) async fn map_delete(
     st: &AppState,
     tenant: &TenantId,
@@ -722,6 +776,54 @@ mod tests {
         );
         assert!(map_delete(&st, &a, id).await.expect("delete"));
         assert!(map_read(&st, &a, id).await.is_none());
+    }
+
+    /// 5.5.9.3 + 5.14.2.4 (F-ANT2-020): a page's prune lands after an
+    /// update and a delete that ran while the page was read. The update's
+    /// expiresAt survives, only the visited stale id goes, and a map deleted
+    /// mid-walk stays deleted.
+    #[tokio::test]
+    async fn clause_5_5_9_3_prune_keeps_a_concurrent_update_and_delete() {
+        let st = AppState::new("antares-em-prune".into());
+        let t = TenantId::default();
+        let id = "urn:ngsi-ld:entitymap:p1";
+        let mut doc = live_map(id);
+        doc["entityMap"] = json!({"urn:a": ["@none"], "urn:b": ["@none"]});
+        map_put(&st, &t, doc).await.expect("stored");
+        let read_by_page = map_read(&st, &t, id).await.expect("map");
+        let later = (chrono::Utc::now() + chrono::Duration::seconds(3000))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        assert!(map_set_expiry(&st, &t, id, &later).await.expect("update"));
+        assert_ne!(read_by_page["expiresAt"], json!(later));
+        map_prune(&st, &t, id, &["urn:a".to_owned()])
+            .await
+            .expect("prune");
+        let now = map_read(&st, &t, id).await.expect("map");
+        assert_eq!(now["expiresAt"], json!(later), "the prune undid the update");
+        assert_eq!(now["entityMap"], json!({"urn:b": ["@none"]}));
+
+        assert!(map_delete(&st, &t, id).await.expect("delete"));
+        map_prune(&st, &t, id, &["urn:b".to_owned()])
+            .await
+            .expect("prune");
+        assert!(
+            st.store
+                .get(&t, Kind::EntityMap, id)
+                .await
+                .expect("store")
+                .is_none(),
+            "the prune resurrected a deleted map"
+        );
+        assert!(
+            !map_set_expiry(&st, &t, id, &later).await.expect("update"),
+            "an update resurrected a deleted map"
+        );
+        assert!(st
+            .store
+            .get(&t, Kind::EntityMap, id)
+            .await
+            .expect("store")
+            .is_none());
     }
 
     fn live_map(id: &str) -> Value {

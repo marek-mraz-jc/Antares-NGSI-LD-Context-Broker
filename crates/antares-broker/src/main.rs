@@ -139,6 +139,8 @@ const KNOWN_KEYS: &[&str] = &[
     "ANTARES_NOTIFY_MAX_AGE_SECS",
     // Postgres pool size (max connections); default 20.
     "ANTARES_PG_POOL",
+    // connections of that pool only batch writes take (T-5150); default 0.
+    "ANTARES_PG_WRITE_RESERVE",
     "ANTARES_PG_STATEMENT_TIMEOUT_MS",
     // batch writes commit with synchronous_commit = off (T-5050); default off.
     "ANTARES_PG_BATCH_ASYNC_COMMIT",
@@ -501,6 +503,24 @@ fn parse_pg_pool(raw: Option<&str>) -> Result<u32, String> {
     }
 }
 
+/// ANTARES_PG_WRITE_RESERVE → how many of the `pool` connections only the
+/// batch writes take (T-5150): absent or 0 is off (one shared pool). A
+/// reserve must leave the reads at least one connection; anything else is
+/// fatal, like ANTARES_PG_POOL.
+fn parse_pg_write_reserve(raw: Option<&str>, pool: u32) -> Result<u32, String> {
+    let Some(v) = raw else { return Ok(0) };
+    match v.parse::<u32>() {
+        Ok(n) if n < pool => Ok(n),
+        Ok(n) => Err(format!(
+            "ANTARES_PG_WRITE_RESERVE ({n}) must be below ANTARES_PG_POOL ({pool}): \
+             the reads need at least one connection"
+        )),
+        Err(_) => Err(format!(
+            "ANTARES_PG_WRITE_RESERVE must be a non-negative integer (got {v:?})"
+        )),
+    }
+}
+
 /// What ANTARES_TEMPORAL resolved to, before anything is built.
 #[derive(Debug, PartialEq, Eq)]
 enum TemporalChoice {
@@ -850,6 +870,10 @@ async fn build_builtin(
                 .map(antares_api::secret::Secret::new)
                 .map_err(|_| format!("ANTARES_STORE={mode} requires ANTARES_DATABASE_URL"))?;
             let pool_size = parse_pg_pool(std::env::var("ANTARES_PG_POOL").ok().as_deref())?;
+            let write_reserve = parse_pg_write_reserve(
+                std::env::var("ANTARES_PG_WRITE_RESERVE").ok().as_deref(),
+                pool_size,
+            )?;
             let statement_timeout = parse_pg_statement_timeout(
                 std::env::var("ANTARES_PG_STATEMENT_TIMEOUT_MS")
                     .ok()
@@ -865,7 +889,7 @@ async fn build_builtin(
             for _ in 0..30 {
                 match antares_sql::store::pg::connect_with(
                     url.expose(),
-                    pool_size,
+                    pool_size.saturating_sub(write_reserve),
                     statement_timeout,
                 )
                 .await
@@ -936,8 +960,31 @@ async fn build_builtin(
                         // Read once, here: /q/health is polled, so what it
                         // says about the server is captured at startup and
                         // never queried on the request.
-                        let version = antares_sql::store::pg::version_info(&pool).await;
-                        let store = AnyStore::Pg(PgBackend::new(pool).with_version(version));
+                        let mut version = antares_sql::store::pg::version_info(&pool).await;
+                        // the operator sized ANTARES_PG_POOL as a whole: the
+                        // reads' pool holds poolSize - poolWriteReserve
+                        if let Some(m) = version.as_object_mut() {
+                            m.insert("poolSize".into(), pool_size.into());
+                            m.insert("poolWriteReserve".into(), write_reserve.into());
+                        }
+                        let mut backend_pg = PgBackend::new(pool).with_version(version);
+                        if write_reserve > 0 {
+                            let reserve = antares_sql::store::pg::connect_reserve(
+                                url.expose(),
+                                write_reserve,
+                                statement_timeout,
+                            )
+                            .await
+                            .map_err(|e| {
+                                format!("ANTARES_PG_WRITE_RESERVE: reserve pool not opened: {e}")
+                            })?;
+                            tracing::info!(
+                                "ANTARES_PG_WRITE_RESERVE: {write_reserve} of {pool_size} \
+                                 connections are kept for batch writes"
+                            );
+                            backend_pg = backend_pg.with_write_reserve(reserve);
+                        }
+                        let store = AnyStore::Pg(backend_pg);
                         if async_batch {
                             tracing::info!(
                                 "ANTARES_PG_BATCH_ASYNC_COMMIT: batch writes commit with \
@@ -2220,7 +2267,10 @@ mod policy_shelf_tests {
 
 #[cfg(test)]
 mod pg_pool_tests {
-    use super::{parse_pg_batch_async_commit, parse_pg_pool, parse_pg_statement_timeout};
+    use super::{
+        parse_pg_batch_async_commit, parse_pg_pool, parse_pg_statement_timeout,
+        parse_pg_write_reserve, unknown_config_key,
+    };
 
     /// ANTARES_PG_BATCH_ASYNC_COMMIT: off unless asked; a typo is fatal.
     #[test]
@@ -2261,5 +2311,19 @@ mod pg_pool_tests {
             "a zero-sized pool must be fatal"
         );
         assert!(parse_pg_pool(Some("-3")).is_err());
+    }
+
+    /// ANTARES_PG_WRITE_RESERVE (T-5150): absent is off, a reserve leaves
+    /// the reads at least one connection, and a bad value is fatal.
+    #[test]
+    fn pg_write_reserve_parse_bounds() {
+        assert_eq!(parse_pg_write_reserve(None, 16), Ok(0));
+        assert_eq!(parse_pg_write_reserve(Some("0"), 16), Ok(0));
+        assert_eq!(parse_pg_write_reserve(Some("4"), 16), Ok(4));
+        assert_eq!(parse_pg_write_reserve(Some("15"), 16), Ok(15));
+        assert!(parse_pg_write_reserve(Some("16"), 16).is_err());
+        assert!(parse_pg_write_reserve(Some("-1"), 16).is_err());
+        assert!(parse_pg_write_reserve(Some("four"), 16).is_err());
+        assert!(!unknown_config_key("ANTARES_PG_WRITE_RESERVE"));
     }
 }

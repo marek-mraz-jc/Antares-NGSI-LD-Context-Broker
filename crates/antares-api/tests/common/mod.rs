@@ -496,6 +496,14 @@ impl CurrentStateDriver for Double {
     ) -> Result<Option<Value>, NgsiError> {
         self.inner.context_get(tenant, id).await
     }
+    async fn context_mutate<'a>(
+        &self,
+        tenant: Option<&TenantId>,
+        id: &str,
+        f: antares_store::MutateFn<'a>,
+    ) -> Result<Option<Result<(), ()>>, NgsiError> {
+        self.inner.context_mutate(tenant, id, f).await
+    }
     async fn context_delete(&self, tenant: Option<&TenantId>, id: &str) -> Result<bool, NgsiError> {
         self.inner.context_delete(tenant, id).await
     }

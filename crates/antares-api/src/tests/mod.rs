@@ -140,7 +140,7 @@ async fn health_is_up() {
 #[tokio::test(flavor = "multi_thread")]
 async fn health_lists_the_registered_notification_schemes() {
     let st = AppState::new("h".into());
-    let (code, body) = health(axum::extract::State(st)).await;
+    let (code, body) = health(axum::extract::State(st), axum::http::HeaderMap::new()).await;
     assert_eq!(code, StatusCode::OK);
     let schemes = body.0["notificationSchemes"]
         .as_array()
@@ -237,7 +237,7 @@ async fn health_names_the_policy_engine_and_its_timeout() {
         }
     }
     let st = AppState::new("h".into()).with_policy(std::sync::Arc::new(Named));
-    let (_, body) = health(axum::extract::State(st)).await;
+    let (_, body) = health(axum::extract::State(st), axum::http::HeaderMap::new()).await;
     assert_eq!(body.0["policy"]["engine"], "named-engine");
 }
 

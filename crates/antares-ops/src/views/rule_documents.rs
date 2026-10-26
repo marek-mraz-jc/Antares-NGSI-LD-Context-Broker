@@ -23,8 +23,12 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Weak};
 
-/// The largest rule document `/q/policy/{tenant}` accepts, in bytes.
-pub const MAX_DOCUMENT_BYTES: usize = 64 * 1024;
+/// The largest rule document `/q/policy/{tenant}` accepts, in bytes. Every
+/// Pipeline that writes a space adds a derived grant of about 230 bytes to
+/// its tenant's document (platform PL-20): 64 KiB refused a space of 302
+/// pipelines and left every newer one without a grant (T-5717). 1 MiB holds
+/// about 4,000 and stays under axum's 2 MiB default body limit.
+pub const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
 
 /// The deepest nesting of arrays and objects in a rule document; the
 /// document itself is level 1.
@@ -32,7 +36,8 @@ pub const MAX_DOCUMENT_DEPTH: usize = 32;
 
 /// The most JSON values in a rule document, every array, object and scalar
 /// counted once: the bound on what one reload hands the engine.
-pub const MAX_DOCUMENT_VALUES: usize = 8192;
+/// The same density as the byte bound: 8,192 per 64 KiB.
+pub const MAX_DOCUMENT_VALUES: usize = 131_072;
 
 /// Each Tenant's stored document as read, and whether the engine took it.
 pub(super) type Cache = HashMap<String, (Value, bool)>;

@@ -93,6 +93,7 @@ mod prefer_body_cap;
 mod projection_absolute_iri_4_21;
 mod query_binding_parity_5_7_2;
 mod query_json_keys_4_9;
+mod query_link_context_6_3_6;
 mod reg_index;
 mod reg_mirror_local_bus;
 mod reg_narrowing_5_12;

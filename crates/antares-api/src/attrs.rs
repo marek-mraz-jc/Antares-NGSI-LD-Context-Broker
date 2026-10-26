@@ -681,9 +681,7 @@ fn combine_attr_parts(
     if updated.is_empty()
         && !matches!(local, LocalOutcome::Ok)
         && !any_fed_ok
-        && fed_parts
-            .iter()
-            .any(|p| p.detail.contains("does not accept"))
+        && fed_parts.iter().any(|p| p.conflict)
     {
         let mut resp = (
             axum::http::StatusCode::CONFLICT,

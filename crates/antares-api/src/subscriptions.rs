@@ -978,7 +978,8 @@ fn own_socket(st: &AppState, uri: Option<&str>) -> bool {
     uri.is_some_and(|u| u.starts_with(SOCKET_ENDPOINT) && st.sinks.require(u, &[]).is_ok())
 }
 
-fn endpoint_uri(sub: &Map<String, Value>) -> Option<&str> {
+/// `notification.endpoint.uri` of a Subscription.
+pub(crate) fn endpoint_uri(sub: &Map<String, Value>) -> Option<&str> {
     sub.get("notification")?
         .get("endpoint")?
         .get("uri")?
@@ -1237,6 +1238,7 @@ pub async fn list(
         &format!("/ngsi-ld/v1/{}", resource_path(kind)),
         accept,
         total,
+        kind == Kind::CSourceSubscription,
     )?;
     let sys = sys_attrs_asked(params);
     let payload: Vec<Value> = page
@@ -1266,7 +1268,6 @@ pub async fn update(
         .map_err(|_| NgsiError::BadRequestData(format!("invalid subscription id {id:?}")))?;
     check_params(params, &["local"])?;
     let clause = clause_on(st, &tenant, kind, id, "5.8.2", "5.11.3").await?;
-    gate!(st, &tenant, headers, clause, ids: &[id]).await?;
     let parsed = parse_body(st, headers, body, BodyKind::MergePatch).await?;
     let obj = parsed.object(NgsiError::BadRequestData(
         "fragment must be a JSON object".into(),
@@ -1280,9 +1281,42 @@ pub async fn update(
     // a fragment that moves the endpoint off the socket is no watch
     let mut watch = clause == WATCH;
     if watch && endpoint_uri(&norm).is_some_and(|u| !own_socket(st, Some(u))) {
-        gate!(st, &tenant, headers, "5.8.2", ids: &[id]).await?;
         watch = false;
     }
+    // F-ANT3-002: the engine decides the Subscription as it will be, as
+    // create does, so a fragment cannot move a permitted Subscription onto
+    // types, attributes or a q the engine refuses; one that moved the
+    // endpoint off the socket is a plain 5.8.2.
+    // ponytail: decided on the stored document read here; an update racing
+    // between this read and the write below is decided on its own merge.
+    let decided = if clause == WATCH && !watch {
+        "5.8.2"
+    } else {
+        clause
+    };
+    let mut stored = match &st.policy {
+        Some(_) => st.store.get(&tenant, kind, id).await?,
+        None => None,
+    };
+    let merged = match stored.as_mut() {
+        Some(doc) => {
+            let merged = antares_store::stored_object(doc)?;
+            crate::apply_doc_fragment(merged, &norm, &now_iso());
+            Some(merged)
+        }
+        None => None,
+    };
+    let shown = merged.as_deref().map(sub_members).unwrap_or_default();
+    gate!(
+        st, &tenant, headers, decided,
+        ids: &[id],
+        types: &shown.types,
+        attrs: &shown.attrs,
+        q: shown.q.as_ref(),
+        scope_q: merged.as_deref().and_then(|m| m.get("scopeQ")).and_then(Value::as_str),
+        geo: shown.geo.as_ref(),
+    )
+    .await?;
     check_endpoint(st, &norm)?;
     check_jsonld_context(st, &tenant, &norm).await?;
     #[cfg(feature = "views")]

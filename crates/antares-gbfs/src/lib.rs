@@ -129,7 +129,7 @@ async fn serve(
         .ok_or_else(not_found)?;
     let stations = stations(&view, caller).await?;
     let (body, skipped) = map::file(file, &system, id, &stations, url);
-    metrics::counter!(SKIPPED, "surface" => "gbfs", "reason" => file.to_owned())
+    metrics::counter!(SKIPPED, "surface" => "gbfs", "reason" => "unmapped")
         .increment(u64::try_from(skipped).unwrap_or(u64::MAX));
     Ok((
         StatusCode::OK,

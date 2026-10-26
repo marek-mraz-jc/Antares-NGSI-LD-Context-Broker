@@ -34,7 +34,7 @@ pub fn paginate(
     matches: Vec<Value>,
     path: &str,
 ) -> ApiResult<(Vec<Value>, Option<usize>, Vec<String>)> {
-    paginate_impl(st, params, matches, path, Accept::Json, None)
+    paginate_impl(st, params, matches, path, Accept::Json, None, false)
 }
 
 /// The store already applied ORDER BY id + LIMIT/OFFSET and counted the
@@ -46,11 +46,12 @@ pub fn paginate_pre(
     path: &str,
     total: usize,
 ) -> ApiResult<(Vec<Value>, Option<usize>, Vec<String>)> {
-    paginate_impl(st, params, page, path, Accept::Json, Some(total))
+    paginate_impl(st, params, page, path, Accept::Json, Some(total), false)
 }
 
 /// `paginate_pre` for a caller that negotiated a media type: the store
 /// already applied ORDER BY id + LIMIT/OFFSET and counted the match set.
+/// `csource`: a csource resource's Link order (see [`paginate_impl`]).
 pub fn paginate_pre_accept(
     st: &AppState,
     params: &HashMap<String, String>,
@@ -58,8 +59,9 @@ pub fn paginate_pre_accept(
     path: &str,
     accept: Accept,
     total: usize,
+    csource: bool,
 ) -> ApiResult<(Vec<Value>, Option<usize>, Vec<String>)> {
-    paginate_impl(st, params, page, path, accept, Some(total))
+    paginate_impl(st, params, page, path, accept, Some(total), csource)
 }
 
 /// The query parameter carrying the keyset cursor of an Entity query's
@@ -258,7 +260,8 @@ pub fn page_params(
 }
 
 /// 6.3.10: next/prev Links carry the response media type; the suite asserts
-/// `;type="application/ld+json"` on ld+json list responses (031_02).
+/// `;type="application/ld+json"` on ld+json list responses (031_02). The
+/// Links keep a csource resource's order (the registration list's).
 pub fn paginate_accept(
     st: &AppState,
     params: &HashMap<String, String>,
@@ -266,7 +269,7 @@ pub fn paginate_accept(
     path: &str,
     accept: Accept,
 ) -> ApiResult<(Vec<Value>, Option<usize>, Vec<String>)> {
-    paginate_impl(st, params, matches, path, accept, None)
+    paginate_impl(st, params, matches, path, accept, None, true)
 }
 
 /// The media type a page Link names: "exactly equal to the media type
@@ -286,6 +289,7 @@ fn paginate_impl(
     path: &str,
     accept: Accept,
     pre: Option<usize>,
+    csource_style: bool,
 ) -> ApiResult<(Vec<Value>, Option<usize>, Vec<String>)> {
     let (offset, limit, count) = page_params(st, params)?;
     let total = pre.unwrap_or(matches.len());
@@ -297,7 +301,6 @@ fn paginate_impl(
     // csource resources: the suite string-compares links against
     // `?other…&limit=N&offset=M` order (037_11, 041_03); entity lists keep
     // sorted params (031_02). The type suffix follows Accept for both.
-    let csource_style = path.contains("csource");
     let mut mk = |off: usize, rel: &str| {
         let mut qp: Vec<String>;
         if csource_style {
