@@ -225,6 +225,31 @@ async fn ws_a_request_that_is_no_websocket_handshake_is_refused() -> Result<(), 
     Ok(())
 }
 
+/// F-ANT3-005: a client naming a reserved or malformed Tenant is refused
+/// before the hub admits a connection for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn ws_a_reserved_or_invalid_tenant_is_refused() -> Result<(), String> {
+    let b = broker(Limits::default()).await?;
+    let handshake = [
+        ("Connection", "Upgrade"),
+        ("Upgrade", "websocket"),
+        ("Sec-WebSocket-Version", "13"),
+        ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+    ];
+    for tenant in ["snap-x", "a b"] {
+        let mut headers = handshake.to_vec();
+        headers.push(("NGSILD-Tenant", tenant));
+        let (code, body) = b.http.call("GET", ROOT, &headers, None).await?;
+        assert_eq!(code, 400, "{tenant}: {body}");
+        assert!(
+            text(&body, "/detail").contains("6.3.14"),
+            "{tenant}: {body}"
+        );
+    }
+    assert_eq!(b.hub.connections(), 0);
+    Ok(())
+}
+
 /// RFC 6455 section 4.2.2 needs the connection itself: a request served
 /// in process carries no `OnUpgrade`, so a well-formed handshake there is
 /// refused with 426 and admits nothing (T-3704, T-3707).

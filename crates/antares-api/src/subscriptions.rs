@@ -738,6 +738,15 @@ const MASKED: &str = "***";
 /// header, the Authorization header the example). No read answers them: the keys stay, the
 /// values are [`MASKED`] (T-5565, CC-06).
 fn mask_receiver_info(notification: &mut Map<String, Value>) {
+    // 7.2 userinfo in the endpoint URI is a credential too (F-ANT3-004).
+    if let Some(uri) = notification
+        .get_mut("endpoint")
+        .and_then(|e| e.get_mut("uri"))
+    {
+        if let Some(masked) = uri.as_str().and_then(masked_uri) {
+            *uri = Value::String(masked);
+        }
+    }
     let pairs = notification
         .get_mut("endpoint")
         .and_then(|e| e.get_mut("receiverInfo"))
@@ -749,10 +758,38 @@ fn mask_receiver_info(notification: &mut Map<String, Value>) {
     }
 }
 
+/// The endpoint URI with its userinfo replaced by [`MASKED`]; `None` when it
+/// carries none.
+fn masked_uri(uri: &str) -> Option<String> {
+    let bare = antares_notifier::redact_userinfo(uri);
+    if bare == uri {
+        return None;
+    }
+    let (scheme, host) = bare.split_once("//")?;
+    Some(format!("{scheme}//{MASKED}@{host}"))
+}
+
 /// A client that reads a Subscription and writes its `notification` back sends the
 /// [`MASKED`] values it was answered. Such a value keeps the credential stored under the same
 /// key instead of overwriting it; a key the stored endpoint lacks keeps the literal value.
 fn keep_masked_receiver_info(fragment: &mut Map<String, Value>, stored: &Map<String, Value>) {
+    // The masked URI it was answered keeps the stored one, credentials and all.
+    let stored_uri = stored
+        .get("notification")
+        .and_then(|n| n.get("endpoint"))
+        .and_then(|e| e.get("uri"))
+        .and_then(Value::as_str);
+    if let (Some(stored_uri), Some(uri)) = (
+        stored_uri,
+        fragment
+            .get_mut("notification")
+            .and_then(|n| n.get_mut("endpoint"))
+            .and_then(|e| e.get_mut("uri")),
+    ) {
+        if masked_uri(stored_uri).as_deref() == uri.as_str() {
+            *uri = Value::String(stored_uri.to_owned());
+        }
+    }
     let held = stored
         .get("notification")
         .and_then(|n| n.get("endpoint"))
@@ -1505,6 +1542,37 @@ mod tests {
         let expected =
             json!([{"key": "X-New", "value": MASKED}, {"key": "A", "value": "Bearer s"}]);
         assert_eq!(fragment, receiver_info(expected));
+    }
+
+    /// F-ANT3-004: a read masks the endpoint URI's userinfo, and the masked
+    /// URI written back keeps the stored credentials.
+    #[test]
+    fn the_endpoint_uri_credentials_are_masked_and_kept() {
+        let mut n = json!({"endpoint": {"uri": "mqtt://u:secret@h:1883/t"}})
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        mask_receiver_info(&mut n);
+        assert_eq!(n["endpoint"]["uri"], "mqtt://***@h:1883/t");
+        let stored = json!({"notification": {"endpoint": {"uri": "mqtt://u:secret@h:1883/t"}}})
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let mut back = json!({"notification": n})
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        keep_masked_receiver_info(&mut back, &stored);
+        assert_eq!(
+            back["notification"]["endpoint"]["uri"],
+            "mqtt://u:secret@h:1883/t"
+        );
+        let mut plain = json!({"endpoint": {"uri": "http://h/n"}})
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        mask_receiver_info(&mut plain);
+        assert_eq!(plain["endpoint"]["uri"], "http://h/n");
     }
 
     /// Table 5.2.33-1 `type`: "To indicate a request for all Entities (with
