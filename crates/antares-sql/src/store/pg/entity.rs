@@ -910,7 +910,7 @@ impl PgEntityStore {
         self.catalogued(tenant, Some(any_of)).await
     }
 
-    /// [`antares_store::Store::entity_id_segments`] over the C-collated id
+    /// [`antares_store::CurrentStateDriver::entity_id_segments`] over the C-collated id
     /// index (0027): one seek per segment, the next one past the segment's
     /// own bound, so the cost follows the segments, not the ids (T-5661).
     /// Expired Entities count too: a segment only narrows, never decides.
