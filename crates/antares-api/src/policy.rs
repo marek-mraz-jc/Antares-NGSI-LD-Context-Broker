@@ -2032,7 +2032,7 @@ const MAX_ID_SEGMENTS: usize = 64;
 /// The exact id prefixes a rule's one id pattern forces, from the segments
 /// the Tenant's ids show ([`antares_store::filter::id_pattern_segments`]):
 /// the store reads them as ranges of an index in their own order, where the
-/// literal of [`id_narrowing`] filtered a walk of the whole type, which for
+/// literal of `types_attrs::id_narrowing` filtered a walk of the whole type, which for
 /// a few late matches still took 10 s on dev (T-5661). `None` when the
 /// pattern does not split or the store keeps no segments.
 pub(crate) async fn id_prefixes(
