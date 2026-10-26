@@ -190,6 +190,157 @@ async fn last_n_keeps_what_ranking_the_whole_window_keeps() {
     assert!(s.delete(&t, id).await.expect("delete"));
 }
 
+/// T-5616: the write keeps `offset_until` (migration 0028), the newest
+/// instance whose observedAt the rank may order unlike `observed_at`, and
+/// lastN stays exact both where the read takes the N newest alone (every row
+/// within 28 h of the N-th newest a UTC stamp) and where an offset stamp
+/// inside those 28 h keeps the wider read.
+#[tokio::test(flavor = "multi_thread")]
+async fn last_n_reads_the_newest_rows_alone_after_the_last_offset_stamp() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let s = PgTemporalStore::new(pool.clone());
+    let t = TenantId::new("pglastn").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let id = "urn:ngsi-ld:Vehicle:lastn-utc";
+    let _ = s.delete(&t, id).await;
+    let offset_until = || async {
+        sqlx::query_scalar::<_, String>(
+            "SELECT to_char(offset_until AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') FROM temporal_entities WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(t.as_str())
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("offset_until")
+    };
+
+    // 200 hourly UTC stamps, one with a fraction, and an old offset stamp
+    // more than 28 h before any N-th newest asked below
+    let mut speed: Vec<Value> = (0..200).map(|h| inst(h, &chrono_free(h), None)).collect();
+    speed.push(inst(500, "2026-01-09T06:30:00.5Z", None));
+    speed.push(inst(501, "2026-01-01T12:00:00+14:00", None));
+    let doc = json!({
+        "id": id, "type": "Vehicle",
+        "createdAt": "2026-01-01T00:00:00Z", "modifiedAt": "2026-01-01T00:00:00Z",
+        SPEED: speed,
+    });
+    assert!(s.create(&t, id, &doc).await.expect("create"));
+    assert_eq!(offset_until().await, "2025-12-31 22:00:00");
+
+    let expand = |t: &str| t.to_owned();
+    let check = |doc: Value, cases: Vec<(Option<&'static str>, i64)>| {
+        let s = &s;
+        let t = &t;
+        let expand = &expand;
+        async move {
+            for (after, n) in cases {
+                let f = TemporalFilter {
+                    ids: Some(&[id]),
+                    range: after.map(|a| InstanceRange {
+                        timerel: "after",
+                        time_at: a,
+                        end_time_at: None,
+                        timeproperty: "observedAt",
+                    }),
+                    last_n: Some(n),
+                    expand,
+                    ..TemporalFilter::default()
+                };
+                let out = s.query(t, &f).await.expect("query");
+                assert_eq!(
+                    ids(&out.rows[0][SPEED]),
+                    oracle(&doc[SPEED].as_array().expect("speed")[..], after, n),
+                    "{after:?} lastN={n}"
+                );
+            }
+        }
+    };
+    let cases = vec![
+        (None, 1),
+        (None, 3),
+        (Some("2026-01-09T00:00:00Z"), 10),
+        (None, 199),
+    ];
+    check(doc.clone(), cases.clone()).await;
+
+    // an offset stamp keys newest yet is the oldest instant of the last day:
+    // the read keeps 28 h and the rank still ranks it first
+    let mut doc = doc;
+    doc[SPEED]
+        .as_array_mut()
+        .expect("speed")
+        .push(inst(502, "2026-01-09T20:00:00+14:00", None));
+    assert!(s.delete(&t, id).await.expect("delete"));
+    assert!(s.create(&t, id, &doc).await.expect("create"));
+    assert_eq!(offset_until().await, "2026-01-09 06:00:00");
+    check(doc, cases).await;
+
+    assert!(s.delete(&t, id).await.expect("delete"));
+}
+
+/// T-5616: under a policy the page qualifies an Entity only through the
+/// Attributes its rules show: one whose window holds only a hidden
+/// Attribute is neither on the page nor in the count.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_page_qualifies_through_the_shown_attributes_only() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let s = PgTemporalStore::new(pool.clone());
+    let t = TenantId::new("pglastn").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let (shown, hidden) = (
+        "urn:ngsi-ld:Station:page-shown",
+        "urn:ngsi-ld:Station:page-hidden",
+    );
+    for (id, speed_at) in [
+        (shown, "2026-01-09T00:00:00Z"),
+        (hidden, "2026-01-01T00:00:00Z"),
+    ] {
+        let _ = s.delete(&t, id).await;
+        let doc = json!({
+            "id": id, "type": "Station",
+            "createdAt": "2026-01-01T00:00:00Z", "modifiedAt": "2026-01-01T00:00:00Z",
+            SPEED: [inst(1, speed_at, None)],
+            LEVEL: [inst(2, "2026-01-09T00:00:00Z", None)],
+        });
+        assert!(s.create(&t, id, &doc).await.expect("create"));
+    }
+    let expand = |t: &str| t.to_owned();
+    let types = ["Station".to_owned()];
+    let only_speed = [SPEED.to_owned()];
+    for (page_attrs, want) in [
+        (None, vec![hidden, shown]),
+        (Some(&only_speed[..]), vec![shown]),
+    ] {
+        let f = TemporalFilter {
+            types: Some(&types),
+            range: Some(InstanceRange {
+                timerel: "after",
+                time_at: "2026-01-05T00:00:00Z",
+                end_time_at: None,
+                timeproperty: "observedAt",
+            }),
+            page: Some(antares_store::filter::Page {
+                offset: 0,
+                limit: 10,
+                count: true,
+            }),
+            page_attrs,
+            expand: &expand,
+            ..TemporalFilter::default()
+        };
+        let out = s.query(&t, &f).await.expect("query");
+        let got: Vec<&str> = out.rows.iter().filter_map(|r| r["id"].as_str()).collect();
+        assert_eq!(got, want, "{page_attrs:?}");
+        assert!(out.paged, "{page_attrs:?}");
+        assert_eq!(out.total, i64::try_from(want.len()).ok(), "{page_attrs:?}");
+    }
+    for id in [shown, hidden] {
+        assert!(s.delete(&t, id).await.expect("delete"));
+    }
+}
+
 /// `2026-01-01T00:00:00Z` plus `h` hours, without a date library.
 fn chrono_free(h: usize) -> String {
     format!("2026-01-{:02}T{:02}:00:00Z", 1 + h / 24, h % 24)

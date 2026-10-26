@@ -150,6 +150,10 @@ pub struct TemporalFilter<'a> {
     /// (≥1 instance, in-window when a range is given), so the paged set is
     /// exactly the set the evaluator would keep.
     pub page: Option<Page>,
+    /// With `page`: an Entity qualifies for the page only through an
+    /// instance of one of these Attributes (expanded IRIs), the ones a
+    /// policy's rules show (T-5616); `None` qualifies through any.
+    pub page_attrs: Option<&'a [String]>,
     /// 5.7.4.4 S2 prefilter: the `q=` AST. The Pg arm compiles the leaves it
     /// can reproduce into windowed EXISTS predicates and treats everything
     /// else as TRUE — always a SUPERSET of the eval_q verdict, so the API
@@ -210,6 +214,7 @@ impl Default for TemporalFilter<'_> {
             oldest_first: false,
             timeproperty: "observedAt",
             page: None,
+            page_attrs: None,
             q: None,
             expand: &|t: &str| t.to_owned(),
             geo: &[],

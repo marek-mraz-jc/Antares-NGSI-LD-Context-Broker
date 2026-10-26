@@ -4,7 +4,9 @@
 //! and a request that is not the operation it names is refused.
 
 use antares_ops::test_kit::TestBroker;
-use antares_ops::{Caller, OperationId, Ops, OpsRequest, Refusal, Surface, CONTEXT_DETAIL};
+use antares_ops::{
+    Caller, OperationId, Ops, OpsRequest, Refusal, Surface, CONTEXT_DETAIL, TIMEOUT_DETAIL,
+};
 use axum::body::Body;
 use axum::extract::Query;
 use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode};
@@ -259,8 +261,8 @@ async fn the_health_report_names_the_surface() {
     );
 }
 
-#[test]
-fn every_refusal_renders_with_its_status_and_no_echo() {
+#[tokio::test]
+async fn every_refusal_renders_with_its_status_and_no_echo() {
     for (r, status) in [
         (Refusal::NotFound, 404),
         (Refusal::Closed, 404),
@@ -281,6 +283,7 @@ fn every_refusal_renders_with_its_status_and_no_echo() {
             500,
         ),
         (Refusal::ContextNotAvailable, 504),
+        (Refusal::StatementTimeout, 500),
         (
             Refusal::Overloaded {
                 retry_after: Some(HeaderValue::from_static("6")),
@@ -292,6 +295,18 @@ fn every_refusal_renders_with_its_status_and_no_echo() {
         assert_eq!(rendered.status(), status, "{r:?}");
         assert_eq!(r.status(), status, "{r:?}");
     }
+    // T-5616: the gateway reads this detail to answer 504 query-timeout
+    let timeout = Refusal::StatementTimeout.ngsi_ld();
+    let body = timeout
+        .into_body()
+        .collect()
+        .await
+        .map(|b| String::from_utf8_lossy(&b.to_bytes()).into_owned())
+        .unwrap_or_default();
+    assert!(
+        body.contains(&format!("\"detail\":\"{TIMEOUT_DETAIL}\"")),
+        "{body}"
+    );
     let not_allowed = Refusal::NotAllowed {
         allow: vec![Method::GET, Method::HEAD],
     }
