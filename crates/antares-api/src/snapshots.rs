@@ -1267,7 +1267,11 @@ async fn clone_fill(st: &AppState, tenant: &TenantId, src_id: &str, new_id: &str
         if snap_get(st, tenant, new_id).await.is_none() {
             return;
         }
-        tokio::time::sleep(CLONE_POLL).await;
+        // the browser's own timer on wasm32 (tokio time has no reactor there)
+        #[cfg(not(target_arch = "wasm32"))]
+        tokio::time::sleep(std::time::Duration::from_millis(CLONE_POLL_MS.into())).await;
+        #[cfg(target_arch = "wasm32")]
+        gloo_timers::future::TimeoutFuture::new(CLONE_POLL_MS).await;
     };
     let (Some(from), Some(to)) = (
         synth_tenant(&src),
@@ -1297,7 +1301,7 @@ async fn clone_fill(st: &AppState, tenant: &TenantId, src_id: &str, new_id: &str
 }
 
 /// How often a clone looks whether its source finished preparing.
-const CLONE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+const CLONE_POLL_MS: u32 = 50;
 
 /// Copy every Entity (one `list_page` at a time) and every Temporal
 /// Evolution of `from` into `to`, at most `cap` documents of each. An
