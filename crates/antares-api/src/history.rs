@@ -32,6 +32,7 @@ pub fn drain_errors() -> u64 {
 #[cfg(not(target_arch = "wasm32"))]
 tokio::task_local! {
     static BUFFER: std::cell::RefCell<Vec<TemporalEvent>>;
+    static STAGED: std::cell::RefCell<Vec<TemporalEvent>>;
     static CHANGES: std::cell::RefCell<Vec<crate::mirror::Change>>;
     static PROVENANCE: Value;
     static TENANT: Option<TenantId>;
@@ -97,10 +98,59 @@ pub(crate) fn backfilled(doc: &Value, attr: &str, current: &Value, incoming: &Va
             attr: attr.to_owned(),
             instance,
         };
-        BUFFER.try_with(|b| b.borrow_mut().push(event)).is_ok()
+        stage(event)
     }
     #[cfg(target_arch = "wasm32")]
     false
+}
+
+/// Holds a backfill's event until its write is known to commit: the
+/// closure that found it may still be refused or rerun (F-ANT2-016), and
+/// [`settle`] buffers it only then. `false` outside a request.
+#[cfg(not(target_arch = "wasm32"))]
+fn stage(event: TemporalEvent) -> bool {
+    STAGED.try_with(|b| b.borrow_mut().push(event)).is_ok()
+}
+
+/// A read-modify-write of Entity `id` (re)starts: the backfills an earlier
+/// run of its closure staged are void (F-ANT2-016). Called first thing in
+/// every closure that can reach [`backfilled`].
+pub(crate) fn restage(id: &str) {
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = STAGED.try_with(|b| b.borrow_mut().retain(|e| e.entity_id != id));
+    #[cfg(target_arch = "wasm32")]
+    let _ = id;
+}
+
+/// The read-modify-write of Entity `id` returned: its staged backfills go
+/// to the request's history when the write committed, and are dropped when
+/// it was refused or found nothing.
+pub(crate) fn settle(id: &str, committed: bool) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mine = STAGED
+            .try_with(|b| {
+                let mut b = b.borrow_mut();
+                let (mine, rest) = std::mem::take(&mut *b)
+                    .into_iter()
+                    .partition::<Vec<_>, _>(|e| e.entity_id == id);
+                *b = rest;
+                mine
+            })
+            .unwrap_or_default();
+        if committed && !mine.is_empty() {
+            let _ = BUFFER.try_with(|b| b.borrow_mut().extend(mine));
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = (id, committed);
+}
+
+/// [`settle`] for each id of a batch read-modify-write, by its slot.
+pub(crate) fn settle_all<T, E>(ids: &[String], res: &[Option<Result<T, E>>]) {
+    for (id, r) in ids.iter().zip(res) {
+        settle(id, matches!(r, Some(Ok(_))));
+    }
 }
 
 /// The provenance of the request in flight with its `operation` and
@@ -634,7 +684,7 @@ pub(crate) async fn layer(
     let tenant = crate::negotiate::tenant_from(req.headers()).ok();
     let (resp, evs, changes) = BUFFER
         .scope(std::cell::RefCell::new(Vec::new()), async {
-            CHANGES
+            STAGED.scope(std::cell::RefCell::new(Vec::new()), CHANGES
                 .scope(std::cell::RefCell::new(Vec::new()), async {
                     PROVENANCE
                         .scope(
@@ -645,7 +695,7 @@ pub(crate) async fn layer(
                             }),
                         )
                         .await
-                })
+                }))
                 .await
         })
         .await;
@@ -779,5 +829,53 @@ pub(crate) async fn mirror_delete_attr(
         .await;
     if let Err(e) = r {
         tracing::warn!("temporal attr mirror failed: {e}");
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    fn ev(id: &str) -> TemporalEvent {
+        TemporalEvent {
+            op: antares_store::TemporalOp::AttrModified,
+            tenant: TenantId::new("t").expect("tenant"),
+            entity_id: id.to_owned(),
+            shell: serde_json::json!({"id": id}),
+            attr: "https://example.org/level".to_owned(),
+            instance: serde_json::json!({"type": "Property", "value": 1}),
+        }
+    }
+
+    /// F-ANT2-016: a backfill found inside a read-modify-write reaches the
+    /// request's history only when that write commits; a refused write
+    /// leaves none, and a rerun closure records its backfill once.
+    #[tokio::test]
+    async fn a_backfill_is_recorded_only_for_a_committed_write() {
+        let buffered = BUFFER
+            .scope(std::cell::RefCell::new(Vec::new()), async {
+                STAGED
+                    .scope(std::cell::RefCell::new(Vec::new()), async {
+                        // refused: nothing reaches history
+                        restage("urn:a");
+                        assert!(stage(ev("urn:a")));
+                        settle("urn:a", false);
+                        assert_eq!(BUFFER.with(|b| b.borrow().len()), 0);
+                        // rerun twice, then committed: one event
+                        restage("urn:b");
+                        assert!(stage(ev("urn:b")));
+                        restage("urn:b");
+                        assert!(stage(ev("urn:b")));
+                        // another Entity's staged event stays staged
+                        assert!(stage(ev("urn:c")));
+                        settle_all::<(), ()>(&["urn:b".to_owned()], &[Some(Ok(()))]);
+                        assert_eq!(STAGED.with(|b| b.borrow().len()), 1);
+                        BUFFER.with(|b| b.take())
+                    })
+                    .await
+            })
+            .await;
+        let ids: Vec<&str> = buffered.iter().map(|e| e.entity_id.as_str()).collect();
+        assert_eq!(ids, ["urn:b"]);
     }
 }

@@ -183,6 +183,7 @@ async fn write_attrs(
     // The Entity's change, judged and applied on the document it lands on:
     // inside the store's read-modify-write, or on a copy for a relay.
     let apply = |doc: &mut Value| {
+        crate::history::restage(id);
         Condition::pre(cond.as_ref(), id, doc)?;
         #[cfg(feature = "views")]
         if let Some(g) = &guard {
@@ -264,6 +265,7 @@ async fn write_attrs(
         None
     } else {
         let res = st.store.mutate(&tenant, Kind::Entity, id, apply).await?;
+        crate::history::settle(id, matches!(res, Some(Ok(()))));
         #[cfg(feature = "views")]
         if let Some(g) = &guard {
             g.settled()?;

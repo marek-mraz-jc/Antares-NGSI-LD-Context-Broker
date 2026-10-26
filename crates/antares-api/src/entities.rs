@@ -2492,6 +2492,7 @@ async fn merge_entity_inner(
             let res = st
                 .store
                 .mutate(&tenant, Kind::Entity, id, |doc| {
+                    crate::history::restage(id);
                     if !crate::negotiate::matches_type_param(doc, params, &parsed.ctx) {
                         return Err(NgsiError::ResourceNotFound(format!(
                             "entity {id} does not match the type selector"
@@ -2511,6 +2512,7 @@ async fn merge_entity_inner(
                     Ok::<(), NgsiError>(())
                 })
                 .await?;
+            crate::history::settle(id, matches!(res, Some(Ok(()))));
             parts.push(match res {
                 Some(Ok(())) => crate::federation::Part::local(204, "merged locally"),
                 _ => crate::federation::Part::local(404, format!("entity {id} not found locally")),
@@ -2558,6 +2560,7 @@ async fn merge_entity_inner(
     let res = st
         .store
         .mutate(&tenant, Kind::Entity, id, |doc| {
+            crate::history::restage(id);
             crate::policy::Condition::pre(cond.as_ref(), id, doc)?;
             #[cfg(feature = "views")]
             if let Some(g) = &guard {
@@ -2587,6 +2590,7 @@ async fn merge_entity_inner(
             Ok::<(), NgsiError>(())
         })
         .await?;
+    crate::history::settle(id, matches!(res, Some(Ok(()))));
     #[cfg(feature = "views")]
     if let Some(g) = &guard {
         g.settled()?;

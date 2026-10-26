@@ -400,6 +400,7 @@ impl BatchRun<'_> {
             .st
             .store
             .batch_mutate(&self.tenant, &ids, |id, doc| {
+                crate::history::restage(id);
                 conds.pre(id, doc)?;
                 let src = member(&docs, id)?;
                 let before = doc.clone();
@@ -415,6 +416,7 @@ impl BatchRun<'_> {
                 Ok::<(), NgsiError>(())
             })
             .await?;
+        crate::history::settle_all(&ids, &res);
         let mut replaces = Vec::new();
         for ((id, expanded), r) in round.iter().zip(res) {
             match r {
@@ -505,6 +507,7 @@ impl BatchRun<'_> {
             .st
             .store
             .batch_mutate(&self.tenant, &ids, |id, doc| {
+                crate::history::restage(id);
                 conds.pre(id, doc)?;
                 #[cfg(feature = "views")]
                 let guard = guards.get(id);
@@ -529,6 +532,7 @@ impl BatchRun<'_> {
                 Ok::<(), NgsiError>(())
             })
             .await?;
+        crate::history::settle_all(&ids, &res);
         for ((id, _), r) in round.iter().zip(res) {
             #[cfg(feature = "views")]
             if let Some(crate::policy::Denied(why)) = guards.get(id).and_then(|g| g.verdict().err())
@@ -892,6 +896,7 @@ async fn upsert_in_view(
     let res = st
         .store
         .batch_mutate(tenant, &ids, |id, doc| {
+            crate::history::restage(id);
             conds.pre(id, doc)?;
             let guard = guards.get(id);
             if let Some(g) = guard {
@@ -923,6 +928,7 @@ async fn upsert_in_view(
             Ok::<(), NgsiError>(())
         })
         .await?;
+    crate::history::settle_all(&ids, &res);
     let mut creates = Vec::new();
     for ((id, doc), r) in round.into_iter().zip(res) {
         if let Some(crate::policy::Denied(why)) = guards.get(&id).and_then(|g| g.verdict().err()) {
