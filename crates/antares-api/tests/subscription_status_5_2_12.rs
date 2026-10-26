@@ -90,3 +90,29 @@ async fn an_update_cannot_remove_the_last_selector() {
     assert_eq!(got["entities"][0]["type"], "Vehicle", "{got}");
     assert!(got.get("watchedAttributes").is_none(), "{got}");
 }
+
+/// F-ANT3-016: Table 5.2.12-1's exclusive pairs hold for the updated
+/// Subscription, not only within the fragment: a PATCH adding
+/// `timeInterval` to a Subscription with `watchedAttributes` (or
+/// `throttling`) is refused and nothing is written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_patch_may_not_pair_time_interval_with_a_stored_member() {
+    antares_jsonld::allow_private_egress(true);
+    let mut st = AppState::new("test-sub-pairs".into());
+    antares_api::wire(&mut st).await;
+    let sub = r#"{"id":"urn:S2","type":"Subscription","entities":[{"type":"Vehicle"}],
+        "watchedAttributes":["speed"],"throttling":5,
+        "notification":{"endpoint":{"uri":"http://127.0.0.1:9/n"}}}"#;
+    let (s, b) = send(&st, "POST", "/ngsi-ld/v1/subscriptions", Some(sub)).await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let (s, b) = send(
+        &st,
+        "PATCH",
+        "/ngsi-ld/v1/subscriptions/urn:S2",
+        Some(r#"{"timeInterval":10}"#),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{b}");
+    let (_, got) = send(&st, "GET", "/ngsi-ld/v1/subscriptions/urn:S2", None).await;
+    assert_eq!(got.get("timeInterval"), None, "{got}");
+}

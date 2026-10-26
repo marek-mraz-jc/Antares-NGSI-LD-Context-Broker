@@ -353,25 +353,35 @@ pub fn spec_for_subscription(sub: &Value) -> CsrSpec {
     if let Some(es) = sub.get("entities").and_then(Value::as_array) {
         let mut types = Vec::new();
         let mut ids = Vec::new();
+        let mut patterns = Vec::new();
+        // a selector naming no id restricts no id: then neither list does
+        let mut unrestricted = false;
         for e in es {
             if let Some(t) = e.get("type").and_then(Value::as_str) {
                 types.push(t.to_owned());
             }
-            if let Some(i) = e.get("id").and_then(Value::as_str) {
-                ids.push(i.to_owned());
+            let before = ids.len();
+            match e.get("id") {
+                Some(Value::String(i)) => ids.push(i.clone()),
+                Some(Value::Array(a)) => {
+                    ids.extend(a.iter().filter_map(Value::as_str).map(str::to_owned));
+                }
+                _ => {}
             }
-            if spec.id_pattern.is_none() {
-                spec.id_pattern = e
-                    .get("idPattern")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
+            let pattern = e.get("idPattern").and_then(Value::as_str);
+            if let Some(p) = pattern {
+                patterns.push(format!("(?:{p})"));
             }
+            unrestricted |= ids.len() == before && pattern.is_none();
         }
         if !types.is_empty() {
             spec.types = Some(types);
         }
-        if !ids.is_empty() {
-            spec.ids = Some(ids);
+        // every selector's ids and idPatterns (F-ANT3-015), as one id list
+        // and one alternation
+        if !unrestricted {
+            spec.ids = Some(ids).filter(|i| !i.is_empty());
+            spec.id_pattern = Some(patterns.join("|")).filter(|p| !p.is_empty());
         }
     }
     let mut attrs: Vec<String> = sub
@@ -439,6 +449,24 @@ mod tests {
     use super::*;
     use antares_jsonld::Loader;
     use serde_json::json;
+
+    /// F-ANT3-015: a CSR subscription's id arrays and every selector's
+    /// idPattern restrict which registrations it watches; a selector with
+    /// neither restricts none.
+    #[test]
+    fn a_subscription_spec_reads_every_selectors_ids_and_patterns() {
+        let spec = spec_for_subscription(&json!({"entities": [
+            {"type": "T", "id": ["urn:a", "urn:b"]},
+            {"type": "T", "idPattern": "^urn:c"},
+            {"type": "T", "idPattern": "^urn:d"}
+        ]}));
+        assert_eq!(spec.ids, Some(vec!["urn:a".to_owned(), "urn:b".to_owned()]));
+        assert_eq!(spec.id_pattern.as_deref(), Some("(?:^urn:c)|(?:^urn:d)"));
+        let open = spec_for_subscription(&json!({"entities": [
+            {"type": "T", "id": "urn:a"}, {"type": "U"}
+        ]}));
+        assert_eq!((open.ids, open.id_pattern), (None, None));
+    }
 
     /// TS 104 175 Table 5.2.6.5.2-1: a CSR subscription's geoQ "is matched
     /// against the specified Context Source Registration GeoJSON attributes,

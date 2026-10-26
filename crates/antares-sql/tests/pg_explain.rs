@@ -1330,3 +1330,53 @@ async fn the_temporal_page_qualification_reads_each_station_newest_first() {
     );
     assert_eq!(qualified, STATIONS, "every station has rows in the window");
 }
+
+/// F-ANT1-016: the query geometry's validity probe runs on the query's own
+/// transaction and its failure fails the query. It used to take a second
+/// pool connection and read a pool timeout as "invalid", so a busy pool cost
+/// the spatial pushdown (a scan of the candidates) and every geoquery waited
+/// out the 5 s acquire wall twice. With the only connection held, the read
+/// now fails once, on its own acquire, as the pool timeout a 503 answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_busy_pool_fails_a_geoquery_once() {
+    use antares_jsonld::core_context;
+    use antares_model::TenantId;
+    use antares_sql::compile::geo::{GeoSpec, Rel};
+    use antares_sql::store::pg::entity::{EntityFilter, PgEntityStore};
+    let url = require_db!();
+    let pool = pg::connect(&url, 1).await.expect("connect");
+    let store = PgEntityStore::new(pool.clone());
+    let t = TenantId::new("pgbusygeo").expect("tenant");
+    let held = pool.acquire().await.expect("the only connection");
+    let ctx = core_context();
+    let expand = |term: &str| ctx.expand_key(term);
+    let area = serde_json::json!([[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.0, 0.0]]]);
+    let geo = [GeoSpec {
+        rel: Rel::Within,
+        geometry: "Polygon",
+        coordinates: &area,
+        geoproperty_iri: "",
+    }];
+    let started = std::time::Instant::now();
+    let out = store
+        .query(
+            &t,
+            &EntityFilter {
+                geo: &geo,
+                expand: &expand,
+                ..Default::default()
+            },
+        )
+        .await;
+    let waited = started.elapsed();
+    drop(held);
+    assert!(
+        matches!(out, Err(sqlx::Error::PoolTimedOut)),
+        "{:?}",
+        out.map(|o| o.rows.len())
+    );
+    assert!(
+        waited < std::time::Duration::from_secs(8),
+        "one acquire wall, not two: {waited:?}"
+    );
+}

@@ -595,6 +595,14 @@ fn check_subscription_members(out: &Map<String, Value>, is_patch: bool) -> Resul
             return Err(bad("notification is required (5.2.12)".into()));
         }
     }
+    check_exclusive_pairs(out)
+}
+
+/// The Table 5.2.12-1 member pairs a Subscription may not carry together,
+/// checked on a fragment and again on the Subscription it updates
+/// (F-ANT3-016).
+fn check_exclusive_pairs(out: &Map<String, Value>) -> Result<(), NgsiError> {
+    let bad = NgsiError::BadRequestData;
     if out.contains_key("timeInterval") && out.contains_key("watchedAttributes") {
         return Err(bad(
             "timeInterval and watchedAttributes are mutually exclusive (5.2.12)".into(),
@@ -1353,7 +1361,7 @@ pub async fn update(
                     "one of entities or watchedAttributes is required (5.2.12)".into(),
                 ));
             }
-            Ok::<(), NgsiError>(())
+            check_exclusive_pairs(target)
         })
         .await?;
     match res {
