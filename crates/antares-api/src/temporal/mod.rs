@@ -119,14 +119,28 @@ impl InstancePage {
 
     /// The per-Attribute cap a store may apply before the window: every
     /// instance up to the end of this page in its order, and one more, so
-    /// the window still sees whether a next page exists.
-    fn store_cap(&self) -> Option<i64> {
-        self.n.map(|n| {
+    /// the window still sees whether a next page exists. Without N the page
+    /// is `default` instances, the broker's default page, when the caller
+    /// pages instances at all (`None` for an aggregation, which reads the
+    /// whole window): a chart's plain window read paged by offsetN used to
+    /// rebuild every instance of the window per page (T-5777).
+    fn store_cap(&self, default: Option<usize>) -> Option<i64> {
+        self.n.or(default).map(|n| {
             n.saturating_add(self.offset)
                 .saturating_add(1)
                 .min(i64::MAX as usize) as i64
         })
     }
+}
+
+/// The page a read without firstN/lastN serves per Attribute, for the
+/// store's cap: none for an aggregation (it reads the whole window) or a
+/// tenant recording `onChange`, whose window starts at the level carried in.
+fn default_page(st: &AppState, tenant: &TenantId, trepr: &TRepr) -> Option<usize> {
+    (!trepr.aggregated && !crate::history::records_on_change(st, tenant)).then(|| {
+        st.temporal_default_instances
+            .min(st.temporal_instance_limit)
+    })
 }
 
 /// Parsed temporal representation params (options/format/lastN/pick/omit/

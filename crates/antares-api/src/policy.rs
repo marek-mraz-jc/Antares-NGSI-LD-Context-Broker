@@ -422,6 +422,15 @@ impl Window {
                 .to
                 .is_none_or(|b| t < antares_model::dt_key(&b.render(now, false)))
     }
+
+    /// Whether every instance observed at or after `start` is past this
+    /// window's start, the bound resolved against `now`.
+    #[must_use]
+    pub fn opens_by(&self, start: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.from.is_none_or(|b| {
+            antares_model::dt_key(start) >= antares_model::dt_key(&b.render(now, true))
+        })
+    }
 }
 
 /// The text of a [`Filter::warning`]: printable ASCII on one line, at most

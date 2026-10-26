@@ -12,26 +12,47 @@ pub(super) fn replays_state(rules: Option<&crate::policy::Filter>) -> bool {
 }
 
 /// Whether the store's per-Attribute cap keeps every instance `rules` would
-/// show of the page: with no rules always; under rules only for lastN, when
-/// no rule reads state and every window stays open towards now, so the
-/// rules keep the newest instances of what they show. A window that closes
-/// before now, or firstN, would have the store keep instances the rules
-/// then drop (T-4246). Rule windows judge observedAt, so a window under a
-/// cap ordered by another `timeproperty` (a backfill: new createdAt, old
-/// observedAt) keeps the cap in the API too.
+/// show of the page: with no rules always; under rules only when no rule
+/// reads state and every rule window stays open on the page's side: towards
+/// now for lastN, and from no later than the query's `start` (its `after`
+/// or `between` instant) oldest first, so the rules keep a leading run of
+/// what the store kept. A window that closes before now under lastN, or
+/// opens after the start oldest first, would have the store keep instances
+/// the rules then drop (T-4246, T-5777). Rule windows judge observedAt, so
+/// a window under a cap ordered by another `timeproperty` (a backfill: new
+/// createdAt, old observedAt) keeps the cap in the API too.
 pub(super) fn cap_keeps_shown(
     rules: Option<&crate::policy::Filter>,
     page: &InstancePage,
     timeprop: &str,
+    start: Option<&str>,
 ) -> bool {
+    // an `Ago` bound resolved an hour late: the rules resolve theirs after
+    // the store answered, by then a little later than now
+    let late = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::hours(1))
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC);
     rules.is_none_or(|r| {
-        page.desc
-            && !replays_state(Some(r))
+        !replays_state(Some(r))
             && r.rules.iter().all(|rule| {
                 rule.temporal.is_empty()
-                    || (timeprop == "observedAt" && rule.temporal.iter().all(|w| w.to.is_none()))
+                    || (timeprop == "observedAt"
+                        && rule.temporal.iter().all(|w| {
+                            if page.desc {
+                                w.to.is_none()
+                            } else {
+                                start.is_some_and(|s| w.opens_by(s, late))
+                            }
+                        }))
             })
     })
+}
+
+/// The instant a window read oldest first starts at: `timeAt` of `after`
+/// and `between`; `before` and no window start at the beginning of time.
+pub(super) fn range_start(tq: Option<&TemporalQ>) -> Option<&str> {
+    tq.filter(|t| matches!(t.timerel.as_str(), "after" | "between"))
+        .map(|t| t.time_at.as_str())
 }
 
 /// 5.7.4.4 S2/S3: the values filter and the geoquery are judged on the
