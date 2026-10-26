@@ -1522,9 +1522,38 @@ pub mod test_kit {
     }
 }
 
+/// An Attribute's default instance (TS 104 175 5.2.6.4.1): the one without a `datasetId`;
+/// `None` when every instance is named, so a named instance never stands in for the member.
+#[must_use]
+pub fn default_instance<'a>(
+    entity: &'a serde_json::Value,
+    name: &str,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    let named = |i: &serde_json::Value| i.get("datasetId").is_some();
+    match entity.get(name)? {
+        serde_json::Value::Array(instances) => instances.iter().find(|i| !named(i))?.as_object(),
+        one => one.as_object().filter(|_| !named(one)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-ANT5-009: a named instance listed first is not the member's value.
+    #[test]
+    fn the_default_instance_is_the_one_without_a_dataset_id() {
+        let e = serde_json::json!({"a": [{"datasetId": "urn:x", "value": 1}, {"value": 5}],
+            "b": {"datasetId": "urn:x", "value": 1}, "c": {"value": 2}});
+        let v = |n| {
+            default_instance(&e, n)
+                .and_then(|m| m.get("value"))
+                .cloned()
+        };
+        assert_eq!(v("a"), Some(serde_json::json!(5)));
+        assert_eq!(v("b"), None);
+        assert_eq!(v("c"), Some(serde_json::json!(2)));
+    }
 
     /// T-3752: a view's short names expand as the core @context reads them.
     #[test]

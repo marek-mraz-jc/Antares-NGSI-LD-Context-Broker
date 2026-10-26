@@ -4,6 +4,7 @@
 //! `tests/gtfsrt/gtfs-realtime.proto` the tests check these against), and the SDM `Vehicle`
 //! mapped to it (docs/src/gtfsrt.md section 2). What an Entity does not carry stays absent.
 
+use antares_ops::default_instance as attribute;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Map, Value};
 
@@ -107,14 +108,6 @@ pub struct VehicleDescriptor {
     /// The licence plate.
     #[prost(string, optional, tag = "3")]
     pub license_plate: Option<String>,
-}
-
-/// An Attribute's default instance: the member itself, or the first of several.
-fn attribute<'a>(entity: &'a Value, name: &str) -> Option<&'a Map<String, Value>> {
-    match entity.get(name)? {
-        Value::Array(instances) => instances.first()?.as_object(),
-        other => other.as_object(),
-    }
 }
 
 fn text(entity: &Value, name: &str) -> Option<String> {

@@ -3,6 +3,7 @@
 //! files (docs/src/gbfs.md section 2). What an Entity does not carry stays out of the file; a
 //! station missing a field GBFS requires is left out of that file and counted.
 
+use antares_ops::default_instance as attribute;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -126,14 +127,6 @@ fn email(address: &str) -> bool {
         && !domain.ends_with('.')
         && !address.chars().any(|c| c.is_whitespace() || c.is_control())
         && !domain.contains('@')
-}
-
-/// An Attribute's default instance: the member itself, or the first of several.
-fn attribute<'a>(entity: &'a Value, name: &str) -> Option<&'a Map<String, Value>> {
-    match entity.get(name)? {
-        Value::Array(instances) => instances.first()?.as_object(),
-        other => other.as_object(),
-    }
 }
 
 fn value<'a>(entity: &'a Value, name: &str) -> Option<&'a Value> {

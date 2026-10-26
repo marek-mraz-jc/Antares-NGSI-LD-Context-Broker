@@ -4,6 +4,7 @@
 //! period, indicator, then the table's other keys and the unit), each cell one Entity, a cell no
 //! Entity holds `null` and never 0.
 
+use antares_ops::default_instance as attribute;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,14 +23,6 @@ const DIMENSIONS: [&str; 5] = [
     "dimensionKey",
     "unitText",
 ];
-
-/// An Attribute's default instance: the member itself, or the first of several.
-fn attribute<'a>(entity: &'a Value, name: &str) -> Option<&'a Map<String, Value>> {
-    match entity.get(name)? {
-        Value::Array(instances) => instances.first()?.as_object(),
-        other => other.as_object(),
-    }
-}
 
 /// An Attribute's text: a Property's string, or a `LanguageProperty`'s text in its first
 /// language (a request's `lang` turns it into a Property before it gets here).
