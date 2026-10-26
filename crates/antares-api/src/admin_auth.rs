@@ -142,18 +142,41 @@ pub async fn subject_or_admin(State(st): State<AppState>, req: Request, next: Ne
 
 /// Whether [`subject_or_admin`] lets a request with `headers` through.
 fn admitted(st: &AppState, headers: &axum::http::HeaderMap) -> bool {
-    let carries_subject = crate::policy::SUBJECT_HEADERS
-        .iter()
-        .any(|name| headers.contains_key(name.as_str()));
     let presented = headers
         .get(header::AUTHORIZATION)
         .map(axum::http::HeaderValue::as_bytes);
     !st.subject_required
-        || carries_subject
+        || vouched_subject(&crate::policy::SUBJECT_HEADERS, st, headers)
         || st
             .admin_auth
             .as_deref()
             .is_some_and(|a| a.admits(presented))
+}
+
+/// A subject header from a caller the broker believes (F-ANT2-001): an
+/// in-process call, which only this process makes, or, on a broker that
+/// names its gateway (`ANTARES_PROVENANCE_FROM`), a request carrying that
+/// gateway's mesh identity. A pod that only reaches the API port cannot
+/// pass by adding the header. An empty value counts: the gateway sends an
+/// anonymous caller as `x-jc-roles` with none.
+fn vouched_subject(names: &[String], st: &AppState, headers: &axum::http::HeaderMap) -> bool {
+    names.iter().any(|name| headers.contains_key(name.as_str()))
+        && (crate::state::in_process_depth() > 0 || from_named_gateway(st, headers))
+}
+
+/// No gateway named, or the request carries its mesh identity.
+#[cfg(feature = "jc")]
+fn from_named_gateway(st: &AppState, headers: &axum::http::HeaderMap) -> bool {
+    st.provenance_from
+        .as_deref()
+        .is_none_or(|gateway| crate::provenance::from_gateway(headers, Some(gateway)))
+}
+
+/// Vanilla Antares reads no gateway identity (ANTARES_PROVENANCE_FROM is a
+/// platform key), so no gateway is named.
+#[cfg(not(feature = "jc"))]
+fn from_named_gateway(_st: &AppState, _headers: &axum::http::HeaderMap) -> bool {
+    true
 }
 
 /// `401` with a bearer challenge and `detail`.
@@ -283,5 +306,45 @@ mod tests {
         let shown = format!("{:?}", auth());
         assert!(!shown.contains(SECRET), "{shown}");
         assert!(shown.contains("metrics_open"), "{shown}");
+    }
+
+    #[cfg(feature = "jc")]
+    const GATEWAY: &str = "context-gateway.jc.serviceaccount.identity.linkerd.cluster.local";
+
+    #[cfg(feature = "jc")]
+    fn headers(pairs: &[(&'static str, &'static str)]) -> axum::http::HeaderMap {
+        let mut out = axum::http::HeaderMap::new();
+        for (k, v) in pairs {
+            out.insert(*k, axum::http::HeaderValue::from_static(v));
+        }
+        out
+    }
+
+    /// F-ANT2-001: a bare subject header passes the T-5032 wall only from
+    /// the gateway's mesh identity or an in-process call, once the broker
+    /// names its gateway.
+    #[cfg(feature = "jc")]
+    #[tokio::test]
+    async fn a_subject_is_believed_only_from_the_gateway_or_this_process() {
+        let names = vec!["x-jc-subject".to_owned()];
+        let mut st = AppState::new("subject-wall".into());
+        st.subject_required = true;
+        let bare = headers(&[("x-jc-subject", "anyone")]);
+        let other = headers(&[("x-jc-subject", "anyone"), ("l5d-client-id", "pod.other")]);
+        let gateway = headers(&[("x-jc-subject", "anyone"), ("l5d-client-id", GATEWAY)]);
+        let no_subject = headers(&[("l5d-client-id", GATEWAY)]);
+        // no gateway named: the header alone, as before
+        assert!(vouched_subject(&names, &st, &bare));
+        st.provenance_from = Some(GATEWAY.to_owned());
+        assert!(!vouched_subject(&names, &st, &bare));
+        assert!(!vouched_subject(&names, &st, &other));
+        assert!(vouched_subject(&names, &st, &gateway));
+        assert!(!vouched_subject(&names, &st, &no_subject));
+        let in_process = crate::state::INPROCESS_DEPTH
+            .scope(1, async { vouched_subject(&names, &st, &bare) })
+            .await;
+        assert!(in_process);
+        // the wall itself: neither subject nor bearer
+        assert!(!admitted(&st, &bare));
     }
 }

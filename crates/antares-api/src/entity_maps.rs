@@ -3,7 +3,7 @@
 //! recording which Entities — and which Context Sources — are relevant to an
 //! ongoing consumption request (4.5.25, data type 5.2.39).
 
-use crate::entity_map::{created_response, dt, map_delete, map_get, map_put, open_map};
+use crate::entity_map::{created_response, dt, map_delete, map_get, map_set_expiry, open_map};
 use crate::negotiate::*;
 use crate::state::AppState;
 use antares_model::{NgsiError, TenantId};
@@ -11,7 +11,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::HashMap;
 
 // ---------- storage (5.14.1.1: "internal storage, or memory") ----------
@@ -76,18 +76,17 @@ pub async fn update_entity_map(
         let obj = frag.as_object().ok_or_else(|| {
             NgsiError::BadRequestData("EntityMap fragment must be a JSON object".into())
         })?;
-        let mut doc = map_get(&st, &tenant, &id)
-            .await?
-            .ok_or_else(|| NgsiError::ResourceNotFound(format!("EntityMap {id} not found")))?;
+        let gone = || NgsiError::ResourceNotFound(format!("EntityMap {id} not found"));
+        map_get(&st, &tenant, &id).await?.ok_or_else(gone)?;
         if let Some(e) = obj.get("expiresAt") {
             let s = e.as_str().filter(|s| dt(s).is_some()).ok_or_else(|| {
                 NgsiError::BadRequestData("expiresAt must be a DateTime (4.6.3)".into())
             })?;
-            if let Some(o) = doc.as_object_mut() {
-                o.insert("expiresAt".into(), json!(s));
+            // only the member this update names, onto the map as stored now
+            if !map_set_expiry(&st, &tenant, &id, s).await? {
+                return Err(gone().into());
             }
         }
-        map_put(&st, &tenant, doc).await?;
         Ok::<_, ApiError>(no_content(&tenant))
     };
     go.await.unwrap_or_else(|e| e.into_response())

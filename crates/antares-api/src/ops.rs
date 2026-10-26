@@ -131,6 +131,7 @@ pub const GIT_HASH: &str = env!("ANTARES_GIT_HASH");
 /// listener stops accepting.
 pub(super) async fn health(
     axum::extract::State(state): axum::extract::State<AppState>,
+    headers: axum::http::HeaderMap,
 ) -> (StatusCode, axum::Json<serde_json::Value>) {
     // Drain: the load balancer decides on the STATUS CODE, so draining has
     // to be a 503 — a 200 body saying "DRAINING" would keep traffic arriving.
@@ -221,16 +222,32 @@ pub(super) async fn health(
     // Notifications the delivery policy gave up on (this process, since start).
     body.insert("deadLetters".into(), notify::dead_letters_written().into());
     // Each stored view, loaded or invalid with the reason (ADR-0023 rule 10).
+    // only the view reports below read the credential
+    #[cfg(not(feature = "views"))]
+    drop(headers);
+    // The reports name Tenants and views, which `/q/tenants` keeps behind
+    // the admin credential: an open caller gets their sizes (F-ANT2-005).
     #[cfg(feature = "views")]
     {
-        body.insert("views".into(), state.views.report());
+        let presented = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .map(axum::http::HeaderValue::as_bytes);
+        let admitted = state
+            .admin_auth
+            .as_deref()
+            .is_none_or(|a| a.admits(presented));
+        let shown = |report: serde_json::Value| match report {
+            serde_json::Value::Object(m) if !admitted => serde_json::json!({"count": m.len()}),
+            other => other,
+        };
+        body.insert("views".into(), shown(state.views.report()));
         // Which documents the table was loaded from (threat V26): two pods
         // reporting two values serve two predicates.
         body.insert("viewsRevision".into(), state.views.revision().into());
         // The engine's rule documents by tenant and revision, loaded or
         // refused (ADR-0020 amendment); never the documents themselves.
-        policy.insert("documents".into(), state.views.policy_report());
-        body.insert("schemas".into(), state.views.schema_report());
+        policy.insert("documents".into(), shown(state.views.policy_report()));
+        body.insert("schemas".into(), shown(state.views.schema_report()));
     }
     // Changes the bounded matcher queue dropped (this process, since start).
     body.insert("changesDropped".into(), notify::changes_dropped().into());

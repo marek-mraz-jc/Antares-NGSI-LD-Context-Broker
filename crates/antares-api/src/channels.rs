@@ -743,15 +743,44 @@ async fn restore(st: &AppState, shared: &Shared) {
         let subject = crate::policy::stored_subject(&tenant, &doc).headers;
         let k = key(&tenant, &ch.id);
         let (st, shared) = (st.clone(), shared.clone());
-        // a bridge that is down at start is tried again, every 30 s
         tokio::spawn(async move {
-            while let Err(e) =
-                start(&st, &shared, k.clone(), ch.clone(), subject.clone(), false).await
-            {
-                tracing::warn!("channels: channel {k} did not start, retrying in 30 s: {e}");
-                tokio::time::sleep(Duration::from_secs(30)).await;
-            }
+            keep_starting(&st, &shared, k, doc, ch, subject, RESTORE_RETRY).await;
         });
+    }
+}
+
+/// How long a restore waits before it tries a refused bridge again.
+const RESTORE_RETRY: Duration = Duration::from_secs(30);
+
+/// Start a restored Channel, again every `every` while its bridge refuses,
+/// for as long as the stored View is still `doc`: a Channel deleted or
+/// re-bound meanwhile is not this restore's to start (its delete stopped it,
+/// its new bind started its own).
+async fn keep_starting(
+    st: &AppState,
+    shared: &Shared,
+    k: String,
+    doc: Value,
+    ch: Channel,
+    subject: Vec<(String, String)>,
+    every: Duration,
+) {
+    let Ok(t) = store_tenant() else { return };
+    loop {
+        match start(st, shared, k.clone(), ch.clone(), subject.clone(), false).await {
+            Ok(()) => return,
+            Err(e) => tracing::warn!(
+                "channels: channel {k} did not start, retrying in {} s: {e}",
+                every.as_secs()
+            ),
+        }
+        tokio::time::sleep(every).await;
+        match st.store.get(&t, Kind::View, &k).await {
+            Ok(Some(now)) if now == doc => {}
+            Ok(_) => return,
+            // a store that cannot answer now may answer at the next try
+            Err(e) => tracing::warn!("channels: reading channel {k} failed: {e}"),
+        }
     }
 }
 
@@ -983,6 +1012,79 @@ mod tests {
         assert!(b.admits(t0));
         assert!(!b.admits(t0));
         assert!(b.admits(t0 + Duration::from_secs(1)));
+    }
+
+    /// A bridge that refuses its first `n` opens.
+    struct Flaky(std::sync::atomic::AtomicUsize);
+
+    impl Bridge for Flaky {
+        fn open<'a>(&'a self, _: &'a str, _: tokio::sync::mpsc::Sender<Sample>) -> Opening<'a> {
+            Box::pin(async move {
+                let left = self.0.load(Ordering::SeqCst);
+                if left == 0 {
+                    return Ok(None);
+                }
+                self.0.store(left.saturating_sub(1), Ordering::SeqCst);
+                Err("bridge down".to_owned())
+            })
+        }
+    }
+
+    /// F-ANT3-012: a restore retrying a refused bridge stops once the
+    /// Channel is deleted, so the bridge coming back starts nothing.
+    #[tokio::test]
+    async fn a_restore_retry_stops_once_the_channel_is_gone() {
+        let st = AppState::new("antares-channels-retry".into());
+        let flaky: Arc<dyn Bridge> = Arc::new(Flaky(std::sync::atomic::AtomicUsize::new(3)));
+        let shared = Shared {
+            bridges: Arc::new(HashMap::from([("lo".to_owned(), flaky)])),
+            running: Arc::default(),
+        };
+        let ch = Channel {
+            id: "bus-1-speed".into(),
+            tenant: None,
+            entity: "urn:ngsi-ld:Bus:1".into(),
+            attribute: "speed".into(),
+            broker: "lo".into(),
+            topic: "bus/1/speed".into(),
+            direction: "in".into(),
+            retention: Retention::Mirror,
+            max_rate: 10,
+            max_bytes: 1024,
+            link: None,
+        };
+        let k = key(&TenantId::default(), &ch.id);
+        let doc = serde_json::to_value(&ch).expect("channel doc");
+        let t = store_tenant().expect("store tenant");
+        st.store
+            .create(&t, Kind::View, &k, doc.clone())
+            .await
+            .expect("seed");
+        let retry = {
+            let (st, shared, k, doc) = (st.clone(), shared.clone(), k.clone(), doc.clone());
+            tokio::spawn(async move {
+                keep_starting(
+                    &st,
+                    &shared,
+                    k,
+                    doc,
+                    ch,
+                    Vec::new(),
+                    Duration::from_millis(20),
+                )
+                .await;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(st.store.delete(&t, Kind::View, &k).await.expect("delete"));
+        tokio::time::timeout(Duration::from_secs(5), retry)
+            .await
+            .expect("the retry never stopped")
+            .expect("retry task");
+        assert!(
+            !lock(&shared.running).contains_key(&k),
+            "a deleted Channel was started by its restore"
+        );
     }
 
     #[test]

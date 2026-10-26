@@ -986,6 +986,40 @@ impl PgDocStore {
         Ok(row.map(|r| r.get::<Value, _>(0)))
     }
 
+    /// Read-modify-write of one row under `FOR UPDATE`: `None` when it is
+    /// absent or another Tenant's, `Some(Err)` when `f` refused (rolled back).
+    pub async fn context_mutate(
+        &self,
+        tenant: Option<&TenantId>,
+        id: &str,
+        f: impl FnOnce(&mut Value) -> Result<(), ()> + Send,
+    ) -> Result<Option<Result<(), ()>>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        set_context_tenant(&mut tx, tenant).await?;
+        let row = sqlx::query(
+            "SELECT body FROM jsonld_contexts
+              WHERE id = $1 AND (tenant_id IS NULL OR tenant_id = $2) FOR UPDATE",
+        )
+        .bind(id)
+        .bind(tenant.map(TenantId::as_str))
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let mut doc: Value = row.get(0);
+        if f(&mut doc).is_err() {
+            return Ok(Some(Err(())));
+        }
+        sqlx::query("UPDATE jsonld_contexts SET body = $2 WHERE id = $1")
+            .bind(id)
+            .bind(&doc)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some(Ok(())))
+    }
+
     pub async fn context_delete(
         &self,
         tenant: Option<&TenantId>,

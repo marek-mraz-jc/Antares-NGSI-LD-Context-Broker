@@ -56,6 +56,8 @@ const READS: [&str; 15] = [
 /// The service account the harness writes the seed and the moves as: a
 /// permission of its own in every document, never the scenario's caller.
 const SEEDER: &str = "matrix-seed";
+/// The mesh identity the broker believes a subject from.
+const GATEWAY: &str = "context-gateway.jc.serviceaccount.identity.linkerd.cluster.local";
 
 /// The members of an Entity that are not Attributes.
 const FRAME: [&str; 7] = [
@@ -206,6 +208,12 @@ async fn broker() -> (Router, antares_ops::views::Reload) {
         .with_policy(std::sync::Arc::new(
             joinedcontext_policy::JoinedcontextPolicy::new(),
         ));
+    // As a deployment behind the gateway runs (F-ANT2-001): a subject is
+    // believed only from the gateway's mesh identity, which every request
+    // of this matrix carries, so each surface's in-process calls (views,
+    // MCP, the internal Context Source) run under that wall too.
+    state.subject_required = true;
+    state.provenance_from = Some(GATEWAY.to_owned());
     antares_api::wire(&mut state).await;
     let surfaces: Vec<Box<dyn antares_api::ApiSurface>> = vec![
         Box::new(antares_api::Admin),
@@ -247,7 +255,8 @@ async fn send(
     let mut req = Request::builder()
         .method(method)
         .uri(uri)
-        .header("Host", "localhost");
+        .header("Host", "localhost")
+        .header("l5d-client-id", GATEWAY);
     for (k, v) in headers {
         req = req.header(k.as_str(), v.as_str());
     }
@@ -1032,7 +1041,8 @@ async fn step(app: &Router, s: &Scenario, step: &Value, failures: &mut Vec<Strin
 /// A WebSocket Subscription through the view, made as the caller before
 /// the seed is written: its status, and the socket when it was made.
 async fn subscribe(port: u16, s: &Scenario) -> (u64, Option<Socket>) {
-    let (path, who) = (format!("/x/views/{}/ws", s.view()), with_tenant(s));
+    let (path, mut who) = (format!("/x/views/{}/ws", s.view()), with_tenant(s));
+    who.push(("l5d-client-id".to_owned(), GATEWAY.to_owned()));
     let types: Vec<Value> = s.types().iter().map(|t| json!({"type": t})).collect();
     let name = s.name.clone();
     tokio::task::spawn_blocking(move || {

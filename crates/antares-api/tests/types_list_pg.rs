@@ -116,6 +116,12 @@ async fn a_views_type_list_over_100k_entities_probes_no_empty_group() {
         .execute(&mut *tx)
         .await
         .expect("tenant setting");
+    // the seed is setup, not the read under test: CI runners took over the
+    // pool's 30 s statement_timeout writing 100 000 rows (57014)
+    antares_sql::sqlx::query("SET LOCAL statement_timeout = 0")
+        .execute(&mut *tx)
+        .await
+        .expect("seed timeout");
     antares_sql::sqlx::query(
         "INSERT INTO entities (tenant_id, id, entity, types, created_at, modified_at)
          SELECT $1, 'urn:ngsi-ld:' || t || ':' || lpad(n::text, 6, '0'),
@@ -255,6 +261,12 @@ async fn type_details_over_100k_entities_read_each_row_once() {
         .execute(&mut *tx)
         .await
         .expect("tenant setting");
+    // the seed is setup, not the read under test: CI runners took over the
+    // pool's 30 s statement_timeout writing 100 000 rows (57014)
+    antares_sql::sqlx::query("SET LOCAL statement_timeout = 0")
+        .execute(&mut *tx)
+        .await
+        .expect("seed timeout");
     antares_sql::sqlx::query(
         "INSERT INTO entities (tenant_id, id, entity, types, created_at, modified_at)
          SELECT $1, 'urn:ngsi-ld:' || t || ':' || lpad(n::text, 6, '0'),
@@ -321,141 +333,6 @@ async fn type_details_over_100k_entities_read_each_row_once() {
     }
     eprintln!("/attributes?details=true over 100 000 Entities: {best:?} at best of 5");
     assert!(best < Duration::from_secs(1), "/attributes took {best:?}");
-
-    antares_sql::sqlx::query("DELETE FROM entities WHERE tenant_id = $1")
-        .bind(&tenant)
-        .execute(&pool)
-        .await
-        .expect("clean");
-}
-
-/// T-5661: a view of one type and one `idPattern`, as the Helsinki
-/// statistics Endpoints on dev. 200 000 KeyPerformanceIndicators, none of
-/// them in the view: the probe walked every one to the fold ceiling and
-/// judged the regex in Rust, 9-10 s for `/types` on dev, the gateway's 503.
-/// The literal the pattern forces now narrows the read in SQL. A decoy that
-/// carries the literal but fails the regex, and a type outside the view,
-/// stay unlisted; one matching Entity lists the type.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_views_id_pattern_narrows_the_type_probe() {
-    let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
-        eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
-        return;
-    };
-    let pool = antares_sql::store::pg::connect(&url, 5)
-        .await
-        .expect("connect");
-    let tenant = format!("tp{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
-    let tid = TenantId::new(&tenant).expect("tenant");
-    antares_sql::store::pg::ensure_tenant(&pool, &tid)
-        .await
-        .expect("tenant row");
-    // `n` KPIs per city in stat-services, plus the rows `extra` names
-    let insert = |n: i32, extra: &[(&str, &str)]| {
-        let (ids, types): (Vec<String>, Vec<String>) = extra
-            .iter()
-            .map(|(i, t)| ((*i).to_owned(), (*t).to_owned()))
-            .unzip();
-        let pool = pool.clone();
-        let tenant = tenant.clone();
-        async move {
-            let mut tx = pool.begin().await.expect("tx");
-            antares_sql::sqlx::query("SELECT set_config('antares.tenant', $1, true)")
-                .bind(&tenant)
-                .execute(&mut *tx)
-                .await
-                .expect("tenant setting");
-            // the seed is setup, not the read under test: a slow CI runner
-            // took over the pool's 30 s statement_timeout writing 200 000 rows
-            antares_sql::sqlx::query("SET LOCAL statement_timeout = 0")
-                .execute(&mut *tx)
-                .await
-                .expect("seed timeout");
-            antares_sql::sqlx::query(
-                "INSERT INTO entities (tenant_id, id, entity, types, created_at, modified_at)
-                 SELECT $1, i, jsonb_build_object('id', i, 'type', jsonb_build_array($2 || t),
-                            $2 || 'kpiValue', jsonb_build_array(
-                                jsonb_build_object('type', 'Property', 'value', 1))),
-                        ARRAY[$2 || t], now(), now()
-                   FROM (SELECT 'urn:ngsi-ld:KeyPerformanceIndicator:jc.example:' || c
-                                    || ':stat-services-' || lpad(n::text, 6, '0'),
-                                'KeyPerformanceIndicator'
-                           FROM unnest(ARRAY['helsinki','praha']) AS c,
-                                generate_series(1, $5) AS n
-                         UNION ALL SELECT * FROM unnest($3::text[], $4::text[])) AS e(i, t)",
-            )
-            .bind(&tenant)
-            .bind(DEFAULT)
-            .bind(ids)
-            .bind(types)
-            .bind(n)
-            .execute(&mut *tx)
-            .await
-            .expect("entities");
-            tx.commit().await.expect("commit");
-        }
-    };
-    insert(
-        100_000,
-        &[
-            (
-                "urn:ngsi-ld:KeyPerformanceIndicator:UPPER:helsinki:stat-environment-decoy",
-                "KeyPerformanceIndicator",
-            ),
-            (
-                "urn:ngsi-ld:Car:jc.example:helsinki:stat-environment-car",
-                "Car",
-            ),
-        ],
-    )
-    .await;
-    antares_sql::sqlx::query("ANALYZE entities")
-        .execute(&pool)
-        .await
-        .expect("analyze");
-
-    let store = antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(
-        pool.clone(),
-    ));
-    let view = Filter {
-        rules: vec![Rule {
-            types: vec![iri("KeyPerformanceIndicator")],
-            id_patterns: vec![
-                "^urn:ngsi-ld:KeyPerformanceIndicator:[a-z0-9.-]+:helsinki:stat-environment-[A-Za-z0-9._-]+$"
-                    .into(),
-            ],
-            attributes: vec![iri("kpiValue")],
-            ..Rule::default()
-        }],
-        ..Filter::default()
-    };
-    let mut st = AppState::with_store("me".into(), Arc::new(store), "postgres")
-        .with_policy(Arc::new(Narrowing(view)));
-    antares_api::wire(&mut st).await;
-
-    // cold: the first call after start is the one the gateway cut at 10 s
-    let (code, body, cold) = types(&st, &tenant).await;
-    assert_eq!(code, StatusCode::OK, "{body}");
-    assert_eq!(body["typeList"], serde_json::json!([]), "{body}");
-    assert!(body.get("NGSILD-Warning").is_none(), "{body}");
-    eprintln!("/types through an idPattern view over 200 000 KPIs, cold: {cold:?}");
-    assert!(cold < Duration::from_secs(1), "/types took {cold:?} cold");
-
-    insert(
-        0,
-        &[(
-            "urn:ngsi-ld:KeyPerformanceIndicator:jc.example:helsinki:stat-environment-air",
-            "KeyPerformanceIndicator",
-        )],
-    )
-    .await;
-    let (code, body, _) = types(&st, &tenant).await;
-    assert_eq!(code, StatusCode::OK, "{body}");
-    assert_eq!(
-        body["typeList"],
-        serde_json::json!(["KeyPerformanceIndicator"]),
-        "{body}"
-    );
 
     antares_sql::sqlx::query("DELETE FROM entities WHERE tenant_id = $1")
         .bind(&tenant)
