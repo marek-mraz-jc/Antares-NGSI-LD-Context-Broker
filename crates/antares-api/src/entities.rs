@@ -1911,7 +1911,7 @@ pub async fn delete_entity(
         // the client meant, and the delete then removes an Entity the
         // client's selector excluded.
         let ctx = request_context(&st.loader, &headers).await?;
-        let pre = crate::policy::pre_image(&st, &tenant, &id, None).await;
+        let pre = crate::policy::pre_image(&st, &tenant, &id, None).await?;
         let granted = gate!(
             st, &tenant, &headers, "5.6.6",
             ids: &[&id],
@@ -2397,7 +2397,7 @@ async fn merge_entity_inner(
             ..Default::default()
         },
     )?;
-    let pre = crate::policy::pre_image(st, &tenant, id, Some(&fragment)).await;
+    let pre = crate::policy::pre_image(st, &tenant, id, Some(&fragment)).await?;
     let granted = gate!(
         st, &tenant, headers, "5.6.17",
         ids: &[id],
@@ -2987,7 +2987,7 @@ pub async fn replace_entity(
                 }),
             None => None,
         };
-        let pre = crate::policy::pre_image(&st, &tenant, &id, shown.as_ref()).await;
+        let pre = crate::policy::pre_image(&st, &tenant, &id, shown.as_ref()).await?;
         let granted = gate!(
             st, &tenant, &headers, "5.6.18",
             ids: &[&id],

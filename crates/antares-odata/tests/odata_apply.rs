@@ -682,3 +682,20 @@ async fn a_chain_of_concat_is_refused_before_it_outgrows_one_scan() -> Result<()
     );
     Ok(())
 }
+
+/// F-ANT4-003: `$metadata` names what the engine lets the caller read, as
+/// the LinkML surface does; the same view without the engine names `owner`.
+#[tokio::test]
+async fn the_metadata_hides_what_the_engine_hides() -> Result<(), String> {
+    for (hiding, named) in [(true, false), (false, true)] {
+        let (_b, app) = broker(hiding).await?;
+        for doc in ["$metadata"] {
+            let (status, body) = send(&app, Method::GET, &format!("{ROOT}/{doc}"), None).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let text = body.to_string();
+            assert!(text.contains("brand"), "{text}");
+            assert_eq!(text.contains("owner"), named, "hiding {hiding}: {text}");
+        }
+    }
+    Ok(())
+}
