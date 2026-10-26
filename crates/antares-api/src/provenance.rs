@@ -110,7 +110,7 @@ pub fn may_read_versions(headers: &HeaderMap, gateway: Option<&str>) -> bool {
 
 /// Does the request carry the gateway's mesh identity `gateway`?
 #[cfg(feature = "jc")]
-fn from_gateway(headers: &HeaderMap, gateway: Option<&str>) -> bool {
+pub(crate) fn from_gateway(headers: &HeaderMap, gateway: Option<&str>) -> bool {
     gateway.is_some_and(|g| {
         headers
             .get("l5d-client-id")
