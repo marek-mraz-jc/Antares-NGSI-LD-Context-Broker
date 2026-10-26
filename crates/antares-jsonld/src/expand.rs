@@ -417,6 +417,21 @@ pub fn expanded_id(v: &Value) -> Result<&str, NgsiError> {
         .ok_or_else(|| NgsiError::InternalError("expanded entity carries no id".into()))
 }
 
+/// The `id` of an expanded Entity about to be created. 5.7.2 names Entities
+/// by a comma-separated `id` list, so an id holding a comma could never be
+/// queried by id and splits in two on every page rebuilt from such a list
+/// (EntityMap, temporal pages, federation forwards): refused at create.
+pub fn new_entity_id(v: &Value) -> Result<&str, NgsiError> {
+    let id = expanded_id(v)?;
+    if id.contains(',') {
+        return Err(NgsiError::BadRequestData(format!(
+            "entity id {id:?} holds a comma: an id query (5.7.2) names Entities as a comma-separated list, so such an id cannot be created; use another character, e.g. {:?}",
+            id.replace(',', "-")
+        )));
+    }
+    Ok(id)
+}
+
 /// 4.5.1/5.5.4: an Attribute or sub-Attribute name shall expand to an
 /// absolute IRI. A user @context is merged before the Core one (4.4), so a
 /// term defined as `{"@id": "id"}` stays RELATIVE and would otherwise land
@@ -4437,6 +4452,19 @@ mod edges {
             Err(NgsiError::InternalError(_))
         ));
         assert_eq!(expanded_id(&json!({"id": "urn:x"})).ok(), Some("urn:x"));
+    }
+
+    #[test]
+    fn a_new_entity_id_holding_a_comma_is_refused() {
+        assert_eq!(
+            new_entity_id(&json!({"id": "urn:x:a"})).ok(),
+            Some("urn:x:a")
+        );
+        let err = format!("{:?}", new_entity_id(&json!({"id": "urn:x:a,b"})));
+        assert!(err.starts_with("Err(BadRequestData("), "{err}");
+        assert!(err.contains("urn:x:a-b"), "{err}");
+        let none = format!("{:?}", new_entity_id(&json!({})));
+        assert!(none.starts_with("Err(InternalError("), "{none}");
     }
 
     #[test]

@@ -129,6 +129,7 @@ async fn batch_write(
     let proxies: Vec<&crate::federation::FedReg> =
         fed_regs.iter().filter(|r| r.is_proxy()).collect();
     let (creates, prepped) = run.prep(items, &proxies);
+    let prepped = run.new_comma_ids(prepped).await?;
     for round in rounds(prepped) {
         run.round(round).await?;
     }
@@ -329,6 +330,32 @@ impl BatchRun<'_> {
             }
         }
         (creates, prepped)
+    }
+
+    /// An upsert creates what is missing, so the create rule on a comma id
+    /// (F-ANT2-013) holds for a member whose Entity is not stored; one
+    /// already stored under such an id is still updated, so a source that
+    /// keeps upserting a legacy comma id does not turn red.
+    async fn new_comma_ids(&mut self, prepped: Vec<Member>) -> Result<Vec<Member>, NgsiError> {
+        let comma: Vec<&str> = prepped
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .filter(|id| id.contains(','))
+            .collect();
+        if self.opts.mode != BatchMode::Upsert || comma.is_empty() {
+            return Ok(prepped);
+        }
+        let stored = self.st.store.get_entities(&self.tenant, &comma).await?;
+        let mut kept = Vec::with_capacity(prepped.len());
+        for (id, doc) in prepped {
+            match antares_jsonld::new_entity_id(&doc) {
+                Err(e) if !stored.contains_key(&id) => {
+                    self.out.errors.push(err_entry(Some(&id), &e));
+                }
+                _ => kept.push((id, doc)),
+            }
+        }
+        Ok(kept)
     }
 
     /// One round of an upsert, update or merge, every id in it unique, its
@@ -687,7 +714,7 @@ fn prep_create(item: &Value, ctx: &antares_jsonld::Context, ts: &str) -> Result<
         .as_object()
         .ok_or_else(|| NgsiError::BadRequestData("entity must be an object".into()))?;
     let mut expanded = expand_entity(obj, ctx, ExpandOpts::default())?;
-    let id = antares_jsonld::expanded_id(&expanded)?.to_owned();
+    let id = antares_jsonld::new_entity_id(&expanded)?.to_owned();
     stamp_new(&mut expanded, ts);
     Ok((id, expanded))
 }

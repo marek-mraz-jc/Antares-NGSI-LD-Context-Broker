@@ -82,6 +82,12 @@ pub async fn upsert_temporal(
             body: Some(&expanded),
         )
         .await?;
+        // the create rule on a comma id (F-ANT2-013) holds for a new Entity,
+        // judged after the gate so a refused caller learns nothing stored;
+        // a stored legacy one is still upserted
+        if id.contains(',') && st.temporal.get(&tenant, &id).await?.is_none() {
+            antares_jsonld::new_entity_id(&expanded)?;
+        }
         // 5.6.11.4: exclusive/redirect registrations matching the input are
         // forwarded when "Create or Update Temporal" is supported; proxy
         // modes without it are an error of type Conflict; inclusive ones

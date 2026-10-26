@@ -89,7 +89,7 @@ async fn create_entity_inner(
         "entity document must be a JSON object".into(),
     ))?;
     let mut expanded = expand_entity(obj, &parsed.ctx, ExpandOpts::default())?;
-    let id = antares_jsonld::expanded_id(&expanded)?.to_owned();
+    let id = antares_jsonld::new_entity_id(&expanded)?.to_owned();
 
     // distributed create (4.3.6, 6.4.3.1)
     let types: Option<Vec<String>> = expanded.get("type").and_then(Value::as_array).map(|a| {
@@ -4089,6 +4089,7 @@ mod clause_5_6_1_and_5_6_21 {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use http_body_util::BodyExt;
     use serde_json::json;
     use tower::ServiceExt;
 
@@ -4123,6 +4124,116 @@ mod clause_5_6_1_and_5_6_21 {
             "a raw # truncates the URL at the fragment and addresses another \
              resource: {loc}"
         );
+    }
+
+    /// F-ANT2-013: 5.7.2 names Entities by a comma-separated `id` list, and
+    /// the EntityMap, temporal and federation pages rebuild that list, so an
+    /// id holding a comma is refused on every create door and nothing is
+    /// stored.
+    #[tokio::test]
+    async fn an_entity_id_holding_a_comma_is_refused_at_create() {
+        let app = crate::router(AppState::new("antares-test".into()));
+        let id = "urn:ngsi-ld:Vehicle:a,b";
+        let one = json!({"id": id, "type": "Vehicle"});
+        let temporal = json!({"id": id, "type": "Vehicle",
+            "speed": [{"type": "Property", "value": 1, "observedAt": "2026-10-26T00:00:00Z"}]});
+        // a batch answers 207 with the member's 400 in `errors` (5.6.7)
+        for (path, body, want) in [
+            ("/ngsi-ld/v1/entities", one.clone(), StatusCode::BAD_REQUEST),
+            (
+                "/ngsi-ld/v1/entityOperations/create",
+                json!([one.clone()]),
+                StatusCode::MULTI_STATUS,
+            ),
+            (
+                "/ngsi-ld/v1/entityOperations/upsert",
+                json!([one.clone()]),
+                StatusCode::MULTI_STATUS,
+            ),
+            (
+                "/ngsi-ld/v1/temporal/entities",
+                temporal,
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let payload = body.to_string();
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header("Content-Type", "application/json")
+                        .header("Content-Length", payload.len().to_string())
+                        .body(Body::from(payload))
+                        .expect("req"),
+                )
+                .await
+                .expect("resp");
+            let status = resp.status();
+            let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+            let text = String::from_utf8_lossy(&bytes);
+            assert_eq!(status, want, "{path}: {text}");
+            assert!(text.contains("holds a comma"), "{path}: {text}");
+        }
+        let resp = app
+            .oneshot(
+                Request::get("/ngsi-ld/v1/entities/urn:ngsi-ld:Vehicle:a,b")
+                    .body(Body::empty())
+                    .expect("req"),
+            )
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// F-ANT2-013: an upsert refuses a comma only for an id it would create;
+    /// an Entity stored under one before the rule is still upserted, so a
+    /// source that keeps writing it does not turn red.
+    #[tokio::test]
+    async fn an_upsert_still_reaches_a_stored_comma_id() {
+        let st = AppState::new("antares-test".into());
+        let tenant = TenantId::default();
+        let id = "urn:ngsi-ld:Vehicle:a,b";
+        let vehicle = "https://uri.etsi.org/ngsi-ld/default-context/Vehicle";
+        let doc = json!({"id": id, "type": [vehicle]});
+        st.store
+            .upsert(&tenant, Kind::Entity, id, doc.clone())
+            .await
+            .expect("seed entity");
+        assert!(st
+            .temporal
+            .create(&tenant, id, doc)
+            .await
+            .expect("seed temporal"));
+        let app = crate::router(st);
+        let one = json!({"id": id, "type": "Vehicle",
+            "speed": {"type": "Property", "value": 2}});
+        let temporal = json!({"id": id, "type": "Vehicle",
+            "speed": [{"type": "Property", "value": 2, "observedAt": "2026-10-26T00:00:00Z"}]});
+        for (path, body) in [
+            ("/ngsi-ld/v1/entityOperations/upsert", json!([one])),
+            ("/ngsi-ld/v1/temporal/entities", temporal),
+        ] {
+            let payload = body.to_string();
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post(path)
+                        .header("Content-Type", "application/json")
+                        .header("Content-Length", payload.len().to_string())
+                        .body(Body::from(payload))
+                        .expect("req"),
+                )
+                .await
+                .expect("resp");
+            let status = resp.status();
+            let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+            assert_eq!(
+                status,
+                StatusCode::NO_CONTENT,
+                "{path}: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
     }
 
     async fn seed(st: &AppState, tenant: &TenantId, n: usize) {
