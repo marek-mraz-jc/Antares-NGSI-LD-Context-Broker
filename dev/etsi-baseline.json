@@ -115,7 +115,7 @@
   "IOP_TP/NGSI-LD/Interoperability/EntityMap/IOP_EXT_MAP_01.robot::IOP_EXT_MAP_01_08 The Response Header Carries A Location-Style Map Reference",
   "IOP_TP/NGSI-LD/Interoperability/Errors/IOP_EXT_ERR_01.robot::IOP_EXT_ERR_01_01 A Peer's 500 Body Never Pollutes The Union",
   "IOP_TP/NGSI-LD/Interoperability/Errors/IOP_EXT_ERR_01.robot::IOP_EXT_ERR_01_02 A Stalling Peer Times Out Into Warning 199",
-  "IOP_TP/NGSI-LD/Interoperability/Errors/IOP_EXT_ERR_01.robot::IOP_EXT_ERR_01_03 A Redirect-Only Retrieve With A Dead Source Is 404 Plus Warning",
+  "IOP_TP/NGSI-LD/Interoperability/Errors/IOP_EXT_ERR_01.robot::IOP_EXT_ERR_01_03 A Redirect-Only Retrieve With A Dead Source Is 502 Plus Warning",
   "IOP_TP/NGSI-LD/Interoperability/Errors/IOP_EXT_ERR_01.robot::IOP_EXT_ERR_01_04 A Garbage 200 From A Peer Is Warning 111, Never Merged",
   "IOP_TP/NGSI-LD/Interoperability/Errors/IOP_EXT_ERR_01.robot::IOP_EXT_ERR_01_05 management.timeout Bounds The Forward",
   "IOP_TP/NGSI-LD/Interoperability/Errors/IOP_EXT_ERR_01.robot::IOP_EXT_ERR_01_06 management.cooldown Suppresses Contact After A Failure",

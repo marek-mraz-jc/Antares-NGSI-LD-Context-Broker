@@ -33,7 +33,9 @@ ${retrieve_ops_file_path}       csourceRegistrations/context-source-registration
     [Documentation]    5.6.1.4: the whole entity is covered by a redirect
     ...    registration whose source does not support Create Entity → the
     ...    complete create fails with 409 Conflict; the source is never
-    ...    contacted and the entity does not exist locally.
+    ...    contacted and the entity does not exist locally. The check
+    ...    reads with local=true (5.5.13): a plain Retrieve would forward
+    ...    to the redirect source, and 6.3.17 answers its failure 502.
     [Tags]    dist-ops    5_6_1    4_20    since_v1.9.1
     Setup Registration With Ops    redirect
     ${response}=    Create Entity    ${entity_payload_filename}    ${entity_id}
@@ -41,7 +43,7 @@ ${retrieve_ops_file_path}       csourceRegistrations/context-source-registration
     Should Contain    ${response.text}    errors/Conflict
     ${stub_count}=    Get Stub Count    POST    /source/ngsi-ld/v1/entities
     Should Be Equal As Integers    ${stub_count}    0
-    ${response}=    Retrieve Entity    ${entity_id}
+    ${response}=    Retrieve Entity    ${entity_id}    local=true
     Check Response Status Code    404    ${response.status_code}
 
 5614_01_02 Inclusive Registration Without Create Support Is Not Forwarded
