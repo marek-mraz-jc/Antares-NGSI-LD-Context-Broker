@@ -1846,8 +1846,9 @@ pub async fn filter_entities_paged(
         if (enough.is_none() && counting.is_none()) || !store_paged || got < read.1 {
             break;
         }
-        // a walk over candidates is bounded as the flat read it replaces was
-        if (counting.is_some() || undecidable) && rows >= *crate::bounds::MAX_FOLD_DOCS {
+        // a walk over candidates is bounded as the flat read it replaces was,
+        // a window that never fills (rules admitting nothing) too (F-ANT2-010)
+        if rows >= *crate::bounds::MAX_FOLD_DOCS {
             return Err(NgsiError::TooManyResults(format!(
                 "this query read more than {} entities; narrow it",
                 *crate::bounds::MAX_FOLD_DOCS
@@ -2217,8 +2218,23 @@ async fn purge_inner(
         ],
     )?;
     let ctx = request_context(&st.loader, headers).await?;
-    gate!(st, &tenant, headers, "5.6.21", scope_q: params.get("scopeQ").map(String::as_str))
-        .await?;
+    // The engine sees the whole request (F-ANT2-023); 5.6.21 stays one
+    // tenant-wide grant (ADR-0020), so nothing narrows the purge itself.
+    let named = ReadMembers::with_ctx(st, params, &ctx);
+    let ids: Vec<&str> = params
+        .get("id")
+        .map(|s| s.split(',').map(str::trim).collect())
+        .unwrap_or_default();
+    gate!(
+        st, &tenant, headers, "5.6.21",
+        ids: &ids,
+        q: named.q.as_ref(),
+        scope_q: params.get("scopeQ").map(String::as_str),
+        types: &named.types,
+        attrs: &named.attrs,
+        geo: named.geo.as_ref(),
+    )
+    .await?;
     // 5.6.21.4: exactly five qualifying conditions —
     //   a) selector of Entity Types
     //   b) list of Attribute names, including at least one non-system Attribute

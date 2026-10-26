@@ -476,7 +476,8 @@ async fn a_skipped_append_leaves_no_dictionary_row() {
     let shell = json!({"id": id, "type": "Tank",
         "createdAt": "2026-01-03T00:00:00Z", "modifiedAt": "2026-01-03T00:00:00Z"});
     let additions = json!({probe: [{"type": "Property", "value": 1,
-        "observedAt": "2026-01-03T00:00:00Z"}]});
+        "observedAt": "2026-01-03T00:00:00Z",
+        "instanceId": "urn:ngsi-ld:Instance:00000000-0000-4000-b000-000000000002"}]});
     let mut tx = pool.begin().await.expect("tx");
     pg::set_tenant(&mut tx, &t).await.expect("tenant");
     sqlx::query("DELETE FROM iri_ids WHERE tenant_id = $1")
@@ -648,4 +649,71 @@ async fn a_short_burst_keeps_every_report_and_no_repeat() {
     let rows = "SELECT count(*) FROM attr_rows WHERE tenant_id = $1 AND short";
     assert_eq!(count(&pool, &t, rows).await, 10, "10 reports, no repeat");
     assert!(s.delete(&t, id).await.expect("delete"));
+}
+
+/// F-ANT1-013: a store that started before the migration setting the
+/// cut-over (a pod during a rolling deploy) routes by it once it is set,
+/// instead of keeping the unset value it read first. Runs in its own
+/// database, since it moves the one `history_cutover` row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cut_over_set_after_the_first_write_routes_the_next_one() {
+    let Ok(shared) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
+        eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
+        return;
+    };
+    let admin = pg::connect(&shared, 2).await.expect("connect+migrate");
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let name = format!("antares_cutover_{run}");
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
+        .execute(&admin)
+        .await
+        .expect("own database");
+    let (base, _) = shared.rsplit_once('/').expect("a database URL");
+    let pool = pg::connect(&format!("{base}/{name}"), 3)
+        .await
+        .expect("connect+migrate the own database");
+    let mut s = PgTemporalStore::new(pool.clone());
+    s.temporal_only = true;
+    let t = TenantId::new("pgcutlate").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let id = "urn:ngsi-ld:Tank:cutlate";
+    let first = json!({"id": id, "type": "Tank",
+        "createdAt": "2026-01-01T00:00:00Z", "modifiedAt": "2026-01-01T00:00:00Z",
+        SPEED: [{"type": "Property", "value": 1, "observedAt": "2026-01-01T00:00:00Z",
+                 "instanceId": "urn:ngsi-ld:Instance:00000000-0000-4000-b000-000000000001"}]});
+    assert!(s.create(&t, id, &first).await.expect("create"));
+    sqlx::query("UPDATE history_cutover SET at = $1::timestamptz")
+        .bind(MOVED_FROM)
+        .execute(&pool)
+        .await
+        .expect("set the cut-over");
+    let later = json!({SPEED: [{"type": "Property", "value": 2,
+        "observedAt": "2026-01-03T00:00:00Z",
+        "instanceId": "urn:ngsi-ld:Instance:00000000-0000-4000-b000-000000000002"}]});
+    s.append(&t, id, &first, &later).await.expect("append");
+    let rows = count(
+        &pool,
+        &t,
+        "SELECT count(*) FROM attr_rows WHERE tenant_id = $1",
+    )
+    .await;
+    let text = count(
+        &pool,
+        &t,
+        "SELECT count(*) FROM attr_instances WHERE tenant_id = $1",
+    )
+    .await;
+    pool.close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {name}")))
+        .execute(&admin)
+        .await
+        .expect("drop own database");
+    assert_eq!(
+        (rows, text),
+        (1, 1),
+        "the observation after the cut-over is keyed, the first one is not"
+    );
 }

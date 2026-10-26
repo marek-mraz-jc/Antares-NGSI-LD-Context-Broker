@@ -1004,17 +1004,67 @@ async fn remote_notify_inner(st: &AppState, body: &[u8]) -> ApiResult<Response> 
         }
     }
     // 5.8.6: forward to the original subscriber under the OWN subscriptionId
+    let split = sub.get("splitEntities").and_then(Value::as_bool) == Some(true);
     let (st2, sub2, t2) = (st.clone(), sub.clone(), tenant.clone());
     crate::spawn(async move {
         let ctx = crate::notify::sub_context(&st2, &t2, &sub2).await;
+        // split_merge shaped its Entities already
+        let data = if split {
+            data
+        } else {
+            project_forwarded(&sub2, data, &ctx)
+        };
         crate::notify::deliver(&st2, &t2, &sub2, data, &ctx).await;
     });
     Ok(StatusCode::OK.into_response())
 }
 
+/// The local Subscription's projection (attributes, pick, omit, format)
+/// over Entities a Context Source notified (F-ANT3-013): the source answers
+/// its own copy's projection, which need not be the subscriber's. Each is
+/// read back into the storage form, shaped and compacted as the local
+/// notify path does; one that does not read is dropped.
+fn project_forwarded(sub: &Value, data: Vec<Value>, ctx: &antares_jsonld::Context) -> Vec<Value> {
+    let shape = crate::notify::notif_shape(sub, ctx);
+    data.iter()
+        .filter_map(Value::as_object)
+        .filter_map(|obj| {
+            antares_jsonld::expand_entity(
+                obj,
+                ctx,
+                antares_jsonld::ExpandOpts {
+                    allow_null: true,
+                    sys: true,
+                    ..Default::default()
+                },
+            )
+            .ok()
+        })
+        .map(|doc| {
+            let shaped = crate::repr::apply(&doc, &shape.repr);
+            crate::repr::compact_for(&shape.repr, &shaped, ctx)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-ANT3-013: a forwarded notification carries what the local
+    /// Subscription projects, not what the source sent.
+    #[test]
+    fn a_forwarded_notification_takes_the_local_projection() {
+        let ctx = antares_jsonld::core_context();
+        let sub = json!({"notification": {"attributes": [format!("{DC}speed")]}});
+        let data = vec![json!({"id": "urn:ngsi-ld:Vehicle:1", "type": "Vehicle",
+            "speed": {"type": "Property", "value": 1},
+            "brand": {"type": "Property", "value": "x"}})];
+        let out = project_forwarded(&sub, data, &ctx);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["speed"]["value"], 1, "{}", out[0]);
+        assert!(out[0].get("brand").is_none(), "{}", out[0]);
+    }
 
     /// The default @context prefix every Term expands to (5.5.7).
     const DC: &str = "https://uri.etsi.org/ngsi-ld/default-context/";

@@ -190,7 +190,7 @@ impl Double {
         }
     }
 
-    /// The INSERT of one document fails while the rest of the store keeps
+    /// The INSERT (create or upsert) of one document fails while the rest of the store keeps
     /// working — a backend that refuses one write, or loses the connection
     /// between two of them. A caller that discards the result writes nothing
     /// and reports the document as stored.
@@ -380,6 +380,7 @@ impl CurrentStateDriver for Double {
         doc: Value,
     ) -> Result<bool, NgsiError> {
         self.pool_wall()?;
+        self.refused_create(kind, id)?;
         self.inner.upsert(tenant, kind, id, doc).await
     }
     async fn get(

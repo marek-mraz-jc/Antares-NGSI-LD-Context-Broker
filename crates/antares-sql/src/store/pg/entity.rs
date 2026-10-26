@@ -1139,6 +1139,9 @@ impl PgEntityStore {
                 binds.extend(c.binds.into_iter().map(Bind::Text));
             }
         }
+        let mut tx = self
+            .begin_probed(tenant, &probes, &mut wheres, &mut binds)
+            .await?;
         for spec in f.geo {
             decided = false;
             // A client may send a self-intersecting polygon. GEOS raises on
@@ -1146,8 +1149,11 @@ impl PgEntityStore {
             // 500 in `postgres` mode while `memory` mode answers happily from
             // the evaluator. Probing validity once here keeps the two modes
             // identical: invalid ⇒ no pushdown, evaluator decides. Stored
-            // geometries can't be invalid — the write path NULLs those.
-            if self.geometry_is_valid(spec).await {
+            // geometries can't be invalid — the write path NULLs those. The
+            // probe runs on the query's own transaction, and a failed probe
+            // fails the query (F-ANT1-016): a pool timeout answers 503
+            // instead of costing the pushdown.
+            if geometry_is_valid(&mut tx, spec).await? {
                 if let Some(c) = crate::compile::geo::compile_geo(
                     spec,
                     "location",
@@ -1162,10 +1168,6 @@ impl PgEntityStore {
                 }
             }
         }
-
-        let mut tx = self
-            .begin_probed(tenant, &probes, &mut wheres, &mut binds)
-            .await?;
 
         // every bind up to here belongs to the WHERE clause — the count-only
         // fallback statement below reuses exactly this prefix
@@ -1310,22 +1312,6 @@ impl PgEntityStore {
             }
         }
         Ok(tx)
-    }
-
-    /// One cheap probe: is the client's query geometry OGC-valid? Unparseable
-    /// GeoJSON counts as invalid — same outcome, no pushdown — and reaches
-    /// that answer through `try_geomfromgeojson` (0001_init.sql), so the
-    /// probe itself can never raise.
-    async fn geometry_is_valid(&self, spec: &crate::compile::geo::GeoSpec<'_>) -> bool {
-        let geojson = serde_json::to_string(&serde_json::json!({
-            "type": spec.geometry, "coordinates": spec.coordinates
-        }))
-        .unwrap_or_default();
-        sqlx::query_scalar::<_, bool>("SELECT COALESCE(ST_IsValid(try_geomfromgeojson($1)), false)")
-            .bind(&geojson)
-            .fetch_one(&self.pool)
-            .await
-            .unwrap_or(false)
     }
 
     /// Id-ordered snapshot for one tenant (the v0 `list` shape — still the
@@ -1984,6 +1970,24 @@ pub(super) async fn prune_expired_current(
         }
     }
     Ok(n)
+}
+
+/// One cheap probe on `tx`: is the client's query geometry OGC-valid?
+/// Unparseable GeoJSON counts as invalid — same outcome, no pushdown — and
+/// reaches that answer through `try_geomfromgeojson` (0001_init.sql), so only
+/// the connection can make the probe fail.
+async fn geometry_is_valid(
+    tx: &mut sqlx::PgConnection,
+    spec: &crate::compile::geo::GeoSpec<'_>,
+) -> Result<bool, sqlx::Error> {
+    let geojson = serde_json::to_string(&serde_json::json!({
+        "type": spec.geometry, "coordinates": spec.coordinates
+    }))
+    .unwrap_or_default();
+    sqlx::query_scalar::<_, bool>("SELECT COALESCE(ST_IsValid(try_geomfromgeojson($1)), false)")
+        .bind(&geojson)
+        .fetch_one(&mut *tx)
+        .await
 }
 
 #[cfg(test)]

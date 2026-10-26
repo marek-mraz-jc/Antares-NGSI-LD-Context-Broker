@@ -28,8 +28,10 @@ pub struct PgTemporalStore {
 /// "Integer history keys").
 #[derive(Default)]
 struct Keys {
-    /// `history_cutover`, read on the first write: only a migration, which
-    /// runs before the store serves, sets it.
+    /// `history_cutover`, cached once set: only a migration sets it, but a
+    /// pod that started before a rolling deploy's migration sees it unset, so
+    /// an unset value is read again on every write until it is set
+    /// (F-ANT1-013). A test store pins it with `PgTemporalStore::with_cutover`.
     cutover: tokio::sync::OnceCell<Option<chrono::DateTime<chrono::Utc>>>,
     /// (Tenant, IRI) pairs a committed `iri_ids` row holds. A write sends the
     /// dictionary insert only for an IRI missing here, so a warm process
@@ -99,17 +101,20 @@ impl Keys {
         &self,
         tx: &mut sqlx::PgConnection,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, sqlx::Error> {
-        self.cutover
-            .get_or_try_init(|| async {
-                sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
-                    "SELECT at FROM history_cutover",
-                )
-                .fetch_optional(&mut *tx)
-                .await
-                .map(Option::flatten)
-            })
-            .await
-            .copied()
+        if let Some(at) = self.cutover.get() {
+            return Ok(*at);
+        }
+        let at = sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+            "SELECT at FROM history_cutover",
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map(Option::flatten)?;
+        if at.is_some() {
+            // a racing writer may have set it first: both read the same row
+            let _ = self.cutover.set(at);
+        }
+        Ok(at)
     }
 
     /// Writes the `iri_ids` rows of `iris` the dictionary lacks, inside the
