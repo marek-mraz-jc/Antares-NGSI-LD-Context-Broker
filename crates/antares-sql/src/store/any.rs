@@ -133,6 +133,13 @@ impl PgBackend {
         }
     }
 
+    /// Seal the notification credentials under `ANTARES_SECRET_KEY`
+    /// (T-5838, [`super::pg::seal`]).
+    pub fn with_secret_key(mut self, key: super::pg::seal::SecretKey) -> Self {
+        self.docs = self.docs.with_secret_key(key);
+        self
+    }
+
     /// Give the batch writes their own pool (`ANTARES_PG_WRITE_RESERVE`,
     /// T-5150): reads keep the main pool, so a flood of them cannot queue
     /// ahead of a pipeline's batch upsert.
@@ -287,6 +294,17 @@ impl AnyStore {
             AnyStore::Mem(_) => {}
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => p.entities.set_outbox(on),
+        }
+    }
+
+    /// Seal the notification credentials a release before
+    /// `ANTARES_SECRET_KEY` stored in plaintext (T-5838); the count of rows
+    /// sealed. The memory arm seals nothing.
+    pub async fn seal_plaintext_credentials(&self) -> Result<u64, NgsiError> {
+        match self {
+            AnyStore::Mem(_) => Ok(0),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p.docs.seal_plaintext().await.map_err(db),
         }
     }
 

@@ -6,6 +6,7 @@ pub mod doc;
 pub mod entity;
 pub mod maintenance;
 pub mod outbox;
+pub mod seal;
 pub mod temporal;
 
 use antares_model::TenantId;

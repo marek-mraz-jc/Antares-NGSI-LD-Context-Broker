@@ -27,6 +27,10 @@ uuid = { workspace = true, optional = true }
 metrics = { workspace = true, optional = true }
 futures-util = { workspace = true }
 tracing = { workspace = true }
+# T-5838: AES-256-GCM over the notification credentials at rest, from the
+# ring rustls already builds; base64 for the key and the sealed text
+ring = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 
 # tokio carries sockets natively; on wasm32 only the sync primitives —
 # the on_blocking helper compiles to a plain inline call there.
@@ -60,7 +64,7 @@ harness = false
 # it off and gets the memory store through the same seam. A feature gate
 # only — every gated item keeps its behaviour verbatim.
 default = ["postgres"]
-postgres = ["dep:sqlx", "dep:metrics", "dep:uuid"]
+postgres = ["dep:sqlx", "dep:metrics", "dep:uuid", "dep:ring", "dep:base64"]
 # Row readers that exist for the integration tests in tests/ and for
 # nothing else: the broker's own operations never call them, so a release
 # build never compiles them.
