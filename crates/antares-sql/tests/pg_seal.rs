@@ -2,6 +2,8 @@
 //! T-5838: notification credentials sealed at rest in the doc store. Needs
 //! ANTARES_TEST_DATABASE_URL (see tests/pg.rs recipe); skips loudly without.
 
+#![cfg(feature = "postgres")]
+
 use antares_model::TenantId;
 use antares_sql::store::pg;
 use antares_sql::store::pg::doc::{DocKind, PgDocStore};
