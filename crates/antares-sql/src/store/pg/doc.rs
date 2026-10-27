@@ -340,6 +340,15 @@ async fn insert_doc(
         .map(|r| r.get::<bool, _>(0)))
 }
 
+/// The row a sealed credential is bound to ([`super::seal::Row`]).
+fn seal_row<'a>(kind: DocKind, tenant: &'a TenantId, id: &'a str) -> super::seal::Row<'a> {
+    super::seal::Row {
+        kind,
+        tenant: tenant.as_str(),
+        id,
+    }
+}
+
 pub struct PgDocStore {
     pool: PgPool,
     /// `ANTARES_SECRET_KEY`: seals the notification credentials (T-5838).
@@ -375,18 +384,40 @@ impl PgDocStore {
         self
     }
 
-    fn opened(&self, kind: DocKind, mut doc: Value) -> Result<Value, sqlx::Error> {
-        super::seal::open(self.key.as_deref(), kind, &mut doc)?;
+    fn opened(
+        &self,
+        kind: DocKind,
+        tenant: &TenantId,
+        id: &str,
+        mut doc: Value,
+    ) -> Result<Value, sqlx::Error> {
+        super::seal::open(self.key.as_deref(), seal_row(kind, tenant, id), &mut doc)?;
         Ok(doc)
     }
 
+    fn sealed<'a>(
+        &self,
+        kind: DocKind,
+        tenant: &TenantId,
+        id: &str,
+        doc: &'a Value,
+    ) -> Result<std::borrow::Cow<'a, Value>, sqlx::Error> {
+        Ok(super::seal::sealed(
+            self.key.as_deref(),
+            seal_row(kind, tenant, id),
+            doc,
+        )?)
+    }
+
+    /// Rows of `SELECT {doc}, id`, each credential opened for its own row.
     fn opened_all(
         &self,
         kind: DocKind,
+        tenant: &TenantId,
         rows: Vec<sqlx::postgres::PgRow>,
     ) -> Result<Vec<Value>, sqlx::Error> {
         rows.into_iter()
-            .map(|r| self.opened(kind, r.get::<Value, _>(0)))
+            .map(|r| self.opened(kind, tenant, &r.get::<String, _>(1), r.get::<Value, _>(0)))
             .collect()
     }
 
@@ -415,7 +446,7 @@ impl PgDocStore {
         let mut tx = super::begin(&self.pool).await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
         crate::store::pg::claim_tenant(&mut tx, tenant).await?;
-        let stored = super::seal::sealed(self.key.as_deref(), kind, doc)?;
+        let stored = self.sealed(kind, tenant, id, doc)?;
         let created = insert_doc(&mut tx, tenant, kind, id, &stored, conflict)
             .await?
             .is_some();
@@ -457,7 +488,7 @@ impl PgDocStore {
         crate::store::pg::claim_tenant(&mut tx, tenant).await?;
         // INSERT … ON CONFLICT DO UPDATE … RETURNING always answers with
         // the row; no row means the statement stopped being an upsert.
-        let stored = super::seal::sealed(self.key.as_deref(), kind, doc)?;
+        let stored = self.sealed(kind, tenant, id, doc)?;
         let existed = insert_doc(&mut tx, tenant, kind, id, &stored, &conflict)
             .await?
             .ok_or(sqlx::Error::RowNotFound)?;
@@ -487,7 +518,7 @@ impl PgDocStore {
             .fetch_optional(&mut *tx)
             .await?;
         tx.commit().await?;
-        row.map(|r| self.opened(kind, r.get::<Value, _>(0)))
+        row.map(|r| self.opened(kind, tenant, id, r.get::<Value, _>(0)))
             .transpose()
     }
 
@@ -581,8 +612,9 @@ impl PgDocStore {
         tx.commit().await?;
         rows.into_iter()
             .map(|r| {
-                let doc = self.opened(kind, r.get(1))?;
-                Ok((r.get::<String, _>(0), (doc, r.get(2))))
+                let id = r.get::<String, _>(0);
+                let doc = self.opened(kind, tenant, &id, r.get(1))?;
+                Ok((id, (doc, r.get(2))))
             })
             .collect()
     }
@@ -620,7 +652,7 @@ impl PgDocStore {
             let Some(row) = row else {
                 return Ok(None);
             };
-            let mut doc = self.opened(kind, row.get(0))?;
+            let mut doc = self.opened(kind, tenant, id, row.get(0))?;
             // The match rows are a pure function of the document, so the
             // rows this write would produce can be compared with the ones
             // already stored before deciding to touch them.
@@ -632,7 +664,7 @@ impl PgDocStore {
                         .cloned()
                         .unwrap_or(Value::Object(Default::default()));
                     let (expires, active, sent, last_n, last_s, last_f) = bookkeeping(&doc);
-                    let stored = super::seal::sealed(self.key.as_deref(), kind, &doc)?;
+                    let stored = self.sealed(kind, tenant, id, &doc)?;
                     let mut q = sqlx::query(sqlx::AssertSqlSafe(update.clone()))
                         .bind(tenant.as_str())
                         .bind(id)
@@ -715,7 +747,7 @@ impl PgDocStore {
         limit: i64,
     ) -> Result<Vec<Value>, sqlx::Error> {
         let sql = format!(
-            "SELECT {} FROM {} WHERE tenant_id = $1 AND id > $2 ORDER BY id LIMIT $3",
+            "SELECT {}, id FROM {} WHERE tenant_id = $1 AND id > $2 ORDER BY id LIMIT $3",
             kind.doc_column(),
             kind.table()
         );
@@ -728,7 +760,7 @@ impl PgDocStore {
             .fetch_all(&mut *tx)
             .await?;
         tx.commit().await?;
-        self.opened_all(kind, rows)
+        self.opened_all(kind, tenant, rows)
     }
 
     /// One id-ordered window of docs and the size of the whole set:
@@ -748,7 +780,7 @@ impl PgDocStore {
         limit: i64,
     ) -> Result<(Vec<Value>, i64), sqlx::Error> {
         let page_sql = format!(
-            "SELECT {} FROM {} WHERE tenant_id = $1 ORDER BY id LIMIT $2 OFFSET $3",
+            "SELECT {}, id FROM {} WHERE tenant_id = $1 ORDER BY id LIMIT $2 OFFSET $3",
             kind.doc_column(),
             kind.table()
         );
@@ -766,7 +798,7 @@ impl PgDocStore {
             .fetch_all(&mut *tx)
             .await?;
         tx.commit().await?;
-        Ok((self.opened_all(kind, rows)?, total))
+        Ok((self.opened_all(kind, tenant, rows)?, total))
     }
 
     /// Every doc's id and the first 64 bits of the md5 of its text, under
@@ -796,8 +828,9 @@ impl PgDocStore {
 
     /// Every doc of one kind for one tenant, id-ordered.
     pub async fn list(&self, tenant: &TenantId, kind: DocKind) -> Result<Vec<Value>, sqlx::Error> {
-        let rows = self.every_row(tenant, kind, kind.doc_column()).await?;
-        self.opened_all(kind, rows)
+        let select = format!("{}, id", kind.doc_column());
+        let rows = self.every_row(tenant, kind, &select).await?;
+        self.opened_all(kind, tenant, rows)
     }
 
     /// Seal every notification credential still stored in plaintext (rows

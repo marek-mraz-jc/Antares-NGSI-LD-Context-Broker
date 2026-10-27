@@ -209,3 +209,62 @@ async fn rows_written_before_the_key_are_read_and_sealed_at_boot() {
         "{still} after a second pass sealing {again}"
     );
 }
+
+/// The bounce of T-5838: a dump holder who can create subscriptions pastes
+/// another row's `enc:v1:` value. Sent as a value, it is sealed as text and
+/// delivered as that text; copied into the row by SQL, it does not open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_value_copied_from_another_row_is_never_decrypted() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let s = PgDocStore::new(pool.clone())
+        .with_secret_key(SecretKey::from_base64(TEST_KEY).expect("key"));
+    let t = tenant(&pool, "pgsealcopy").await;
+    let victim = "urn:ngsi-ld:Subscription:victim";
+    s.create(&t, DocKind::Subscription, victim, &sub(victim))
+        .await
+        .expect("victim");
+    let stored: Value =
+        serde_json::from_str(&raw(&pool, &t, "subscriptions", "subscription", victim).await)
+            .expect("json");
+    let pasted = value(&stored).as_str().expect("sealed text").to_owned();
+    assert!(pasted.starts_with("enc:v1:"), "{pasted}");
+
+    let thief = "urn:ngsi-ld:Subscription:thief";
+    let mut doc = sub(thief);
+    doc["notification"]["endpoint"]["receiverInfo"][0]["value"] = json!(pasted);
+    s.create(&t, DocKind::Subscription, thief, &doc)
+        .await
+        .expect("thief");
+    let got = s
+        .get(&t, DocKind::Subscription, thief)
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(
+        value(&got),
+        &json!(pasted),
+        "the literal text, not the token"
+    );
+
+    // the row copied by SQL, as a database writer would
+    let mut tx = pool.begin().await.expect("tx");
+    sqlx::query("SELECT set_config('antares.tenant', $1, true)")
+        .bind(t.as_str())
+        .execute(&mut *tx)
+        .await
+        .expect("tenant setting");
+    sqlx::query(
+        "UPDATE subscriptions SET subscription = jsonb_set(subscription,
+           '{notification,endpoint,receiverInfo,0,value}', to_jsonb($3::text))
+         WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(t.as_str())
+    .bind(thief)
+    .bind(&pasted)
+    .execute(&mut *tx)
+    .await
+    .expect("copy");
+    tx.commit().await.expect("commit");
+    assert!(s.get(&t, DocKind::Subscription, thief).await.is_err());
+}

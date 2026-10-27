@@ -80,26 +80,30 @@ impl SecretKey {
         })
     }
 
-    fn seal(&self, plain: &str) -> Result<String, Unreadable> {
+    fn seal(&self, plain: &str, aad: &[u8]) -> Result<String, Unreadable> {
         let mut nonce = [0u8; NONCE_LEN];
         self.rng.fill(&mut nonce).map_err(|_| Unreadable)?;
         let mut buf = plain.as_bytes().to_vec();
         self.key
-            .seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut buf)
+            .seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(nonce),
+                Aad::from(aad),
+                &mut buf,
+            )
             .map_err(|_| Unreadable)?;
         let mut out = nonce.to_vec();
         out.append(&mut buf);
         Ok(format!("{PREFIX}{}", B64.encode(out)))
     }
 
-    fn open(&self, sealed: &str) -> Result<String, Unreadable> {
+    fn open(&self, sealed: &str, aad: &[u8]) -> Result<String, Unreadable> {
         let raw = B64.decode(sealed).map_err(|_| Unreadable)?;
         let (nonce, body) = raw.split_at_checked(NONCE_LEN).ok_or(Unreadable)?;
         let nonce = Nonce::try_assume_unique_for_key(nonce).map_err(|_| Unreadable)?;
         let mut body = body.to_vec();
         let plain = self
             .key
-            .open_in_place(nonce, Aad::empty(), &mut body)
+            .open_in_place(nonce, Aad::from(aad), &mut body)
             .map_err(|_| Unreadable)?;
         String::from_utf8(plain.to_vec()).map_err(|_| Unreadable)
     }
@@ -159,35 +163,64 @@ pub(crate) fn holds_credentials(kind: DocKind) -> bool {
     )
 }
 
-/// `doc` as it is stored: every plaintext credential sealed under `key`. No
+/// The row a sealed value belongs to. It is the AEAD's associated data, so
+/// a value opens only in the row it was sealed for: an `enc:v1:` text copied
+/// out of a dump into another subscription (another tenant, kind or id)
+/// fails to open instead of being delivered to its new receiver.
+#[derive(Clone, Copy)]
+pub(crate) struct Row<'a> {
+    pub kind: DocKind,
+    pub tenant: &'a str,
+    pub id: &'a str,
+}
+
+impl Row<'_> {
+    fn aad(&self) -> Vec<u8> {
+        let kind = match self.kind {
+            DocKind::Subscription => "subscription",
+            DocKind::CSourceSubscription => "csource-subscription",
+            DocKind::DeadLetter => "dead-letter",
+            _ => "other",
+        };
+        // NUL never occurs in a tenant name or an id, so the parts cannot
+        // run into each other
+        format!("antares-seal-v1\0{kind}\0{}\0{}", self.tenant, self.id).into_bytes()
+    }
+}
+
+/// `doc` as it is stored: every credential sealed under `key` for `row`. A
+/// value the client sent already starting with `enc:v1:` is sealed like any
+/// other text, so it reads back as that literal text, never decrypted. No
 /// key, or nothing to seal, writes the doc as it came.
 pub(crate) fn sealed<'a>(
     key: Option<&SecretKey>,
-    kind: DocKind,
+    row: Row<'_>,
     doc: &'a Value,
 ) -> Result<std::borrow::Cow<'a, Value>, Unreadable> {
-    let Some(key) = key.filter(|_| holds_credentials(kind)) else {
+    let Some(key) = key.filter(|_| holds_credentials(row.kind)) else {
         return Ok(std::borrow::Cow::Borrowed(doc));
     };
+    let aad = row.aad();
     let mut out = doc.clone();
-    for v in credentials(kind, &mut out) {
-        if let Some(s) = v.as_str().filter(|s| !s.starts_with(PREFIX)) {
-            *v = Value::String(key.seal(s)?);
+    for v in credentials(row.kind, &mut out) {
+        if let Some(s) = v.as_str() {
+            *v = Value::String(key.seal(s, &aad)?);
         }
     }
     Ok(std::borrow::Cow::Owned(out))
 }
 
-/// Open every sealed credential of a stored `doc` in place; plaintext
-/// values pass through.
+/// Open every sealed credential of the stored `doc` of `row` in place;
+/// plaintext values (rows from before the key) pass through.
 pub(crate) fn open(
     key: Option<&SecretKey>,
-    kind: DocKind,
+    row: Row<'_>,
     doc: &mut Value,
 ) -> Result<(), Unreadable> {
-    for v in credentials(kind, doc) {
+    let aad = row.aad();
+    for v in credentials(row.kind, doc) {
         if let Some(body) = v.as_str().and_then(|s| s.strip_prefix(PREFIX)) {
-            *v = Value::String(key.ok_or(Unreadable)?.open(body)?);
+            *v = Value::String(key.ok_or(Unreadable)?.open(body, &aad)?);
         }
     }
     Ok(())
@@ -217,6 +250,53 @@ mod tests {
         SecretKey::from_base64(&B64.encode([byte; 32])).expect("key")
     }
 
+    fn row(kind: DocKind) -> Row<'static> {
+        Row {
+            kind,
+            tenant: "t",
+            id: "urn:ngsi-ld:Subscription:s",
+        }
+    }
+
+    /// The bounce of T-5838: a value copied into another row (tenant, kind
+    /// or id) does not open there, and a client-sent `enc:v1:` text is kept
+    /// as text, never decrypted.
+    #[test]
+    fn a_sealed_value_opens_only_in_its_own_row() {
+        let k = key(8);
+        let stored = sealed(Some(&k), row(DocKind::Subscription), &sub("Bearer t"))
+            .expect("seal")
+            .into_owned();
+        let elsewhere = [
+            Row {
+                id: "urn:ngsi-ld:Subscription:other",
+                ..row(DocKind::Subscription)
+            },
+            Row {
+                tenant: "u",
+                ..row(DocKind::Subscription)
+            },
+            row(DocKind::CSourceSubscription),
+        ];
+        for other in elsewhere {
+            assert!(open(Some(&k), other, &mut stored.clone()).is_err());
+        }
+        let pasted = value_of(&stored);
+        let again = sealed(Some(&k), row(DocKind::Subscription), &sub(&pasted))
+            .expect("seal")
+            .into_owned();
+        let mut back = again.clone();
+        open(Some(&k), row(DocKind::Subscription), &mut back).expect("open");
+        assert_eq!(value_of(&back), pasted);
+    }
+
+    fn value_of(doc: &Value) -> String {
+        doc["notification"]["endpoint"]["receiverInfo"][0]["value"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
     fn sub(value: &str) -> Value {
         json!({"id": "urn:ngsi-ld:Subscription:s", "notification": {"endpoint": {
             "uri": "http://h/n",
@@ -228,12 +308,12 @@ mod tests {
     fn a_sealed_subscription_shows_no_credential_and_opens_to_it() {
         let k = key(7);
         let doc = sub("Bearer t");
-        let stored = sealed(Some(&k), DocKind::Subscription, &doc).expect("seal");
+        let stored = sealed(Some(&k), row(DocKind::Subscription), &doc).expect("seal");
         let text = stored.to_string();
         assert!(!text.contains("Bearer t"), "{text}");
         assert!(text.contains(PREFIX), "{text}");
         let mut back = stored.into_owned();
-        open(Some(&k), DocKind::Subscription, &mut back).expect("open");
+        open(Some(&k), row(DocKind::Subscription), &mut back).expect("open");
         assert_eq!(back, doc);
     }
 
@@ -242,40 +322,42 @@ mod tests {
         let k = key(1);
         let doc = json!({"receiverInfo": [["Authorization", "Bearer t"]],
                          "headers": [["X-A", "b"]], "uri": "http://h/n"});
-        let stored = sealed(Some(&k), DocKind::DeadLetter, &doc).expect("seal");
+        let stored = sealed(Some(&k), row(DocKind::DeadLetter), &doc).expect("seal");
         assert_eq!(stored["receiverInfo"][0][0], "Authorization");
         assert!(!stored.to_string().contains("Bearer t"));
         assert!(!stored.to_string().contains("\"b\""));
         let mut back = stored.into_owned();
-        open(Some(&k), DocKind::DeadLetter, &mut back).expect("open");
+        open(Some(&k), row(DocKind::DeadLetter), &mut back).expect("open");
         assert_eq!(back, doc);
     }
 
     #[test]
     fn plaintext_passes_and_ciphertext_never_leaves_without_its_key() {
         let mut plain = sub("Bearer t");
-        assert!(open(None, DocKind::Subscription, &mut plain).is_ok());
+        assert!(open(None, row(DocKind::Subscription), &mut plain).is_ok());
         assert_eq!(plain, sub("Bearer t"));
 
-        let stored = sealed(Some(&key(2)), DocKind::Subscription, &sub("Bearer t"))
+        let stored = sealed(Some(&key(2)), row(DocKind::Subscription), &sub("Bearer t"))
             .expect("seal")
             .into_owned();
-        assert!(open(None, DocKind::Subscription, &mut stored.clone()).is_err());
-        assert!(open(Some(&key(3)), DocKind::Subscription, &mut stored.clone()).is_err());
-        // sealing twice keeps the one ciphertext
-        let again = sealed(Some(&key(2)), DocKind::Subscription, &stored).expect("seal");
-        assert_eq!(*again, stored);
+        assert!(open(None, row(DocKind::Subscription), &mut stored.clone()).is_err());
+        assert!(open(
+            Some(&key(3)),
+            row(DocKind::Subscription),
+            &mut stored.clone()
+        )
+        .is_err());
     }
 
     #[test]
     fn no_key_or_another_kind_stores_the_doc_as_it_came() {
         let doc = sub("Bearer t");
         assert_eq!(
-            *sealed(None, DocKind::Subscription, &doc).expect("none"),
+            *sealed(None, row(DocKind::Subscription), &doc).expect("none"),
             doc
         );
         assert_eq!(
-            *sealed(Some(&key(4)), DocKind::View, &doc).expect("view"),
+            *sealed(Some(&key(4)), row(DocKind::View), &doc).expect("view"),
             doc
         );
     }
@@ -289,9 +371,14 @@ mod tests {
         assert_eq!(format!("{:?}", key(5)), "SecretKey(..)");
         // 64 hex digits are the 32 bytes they spell, the same key as base64
         let hex = SecretKey::from_base64(&"07".repeat(32)).expect("hex");
-        let stored = sealed(Some(&hex), DocKind::Subscription, &sub("Bearer t"))
+        let stored = sealed(Some(&hex), row(DocKind::Subscription), &sub("Bearer t"))
             .expect("seal")
             .into_owned();
-        assert!(open(Some(&key(7)), DocKind::Subscription, &mut stored.clone()).is_ok());
+        assert!(open(
+            Some(&key(7)),
+            row(DocKind::Subscription),
+            &mut stored.clone()
+        )
+        .is_ok());
     }
 }
