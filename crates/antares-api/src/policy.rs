@@ -3495,4 +3495,75 @@ mod tests {
             .collect();
         assert_eq!(values, [&json!({"value": "ana"})], "{image}");
     }
+
+    /// T-5826: the store decides a view's reads only when every typed rule
+    /// narrows by the same translatable `idPattern` set and nothing else;
+    /// each guard of `shared_id_patterns` has its case.
+    #[test]
+    fn only_one_shared_translatable_pattern_set_is_left_to_the_store() {
+        const TREES: &str =
+            "^urn:ngsi-ld:Tree:[a-z0-9.-]+:praha-mesto:green-[a-z-]+-[0-9a-f-]{36}$";
+        let tree = |patterns: &[&str]| Rule {
+            id_patterns: patterns.iter().map(|p| (*p).to_owned()).collect(),
+            ..rule("Tree", &["name"])
+        };
+        let untyped = Rule {
+            types: Vec::new(),
+            q: Some(Box::new(antares_ql::parse_q("height>5").expect("q"))),
+            ..Rule::default()
+        };
+        let seeded = [tree(&[TREES]), untyped.clone()];
+        assert_eq!(
+            shared_id_patterns(&seeded),
+            Some([TREES.to_owned()].as_slice())
+        );
+        let refused: [(&str, Vec<Rule>); 10] = [
+            (
+                "q",
+                vec![Rule {
+                    q: Some(Box::new(antares_ql::parse_q("height>5").expect("q"))),
+                    ..tree(&[TREES])
+                }],
+            ),
+            (
+                "scopeQ",
+                vec![Rule {
+                    scope_q: Some("/praha".into()),
+                    ..tree(&[TREES])
+                }],
+            ),
+            (
+                "geo_q",
+                vec![Rule {
+                    geo_q: Some(zone_a()),
+                    ..tree(&[TREES])
+                }],
+            ),
+            (
+                "geo_also",
+                vec![Rule {
+                    geo_also: vec![*zone_a()],
+                    ..tree(&[TREES])
+                }],
+            ),
+            (
+                "ids",
+                vec![Rule {
+                    ids: vec!["urn:ngsi-ld:Tree:1".into()],
+                    ..tree(&[TREES])
+                }],
+            ),
+            (
+                "other patterns",
+                vec![tree(&[TREES]), tree(&["^urn:ngsi-ld:Tree:other-[0-9]+$"])],
+            ),
+            ("no pattern after one", vec![tree(&[TREES]), tree(&[])]),
+            ("no pattern before one", vec![tree(&[]), tree(&[TREES])]),
+            ("no pattern", vec![tree(&[]), untyped]),
+            ("untranslatable", vec![tree(&["urn:x:.*"])]),
+        ];
+        for (case, rules) in &refused {
+            assert_eq!(shared_id_patterns(rules), None, "{case}");
+        }
+    }
 }
