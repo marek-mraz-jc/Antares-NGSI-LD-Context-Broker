@@ -111,8 +111,18 @@ deciding; a Tenant with no document denies every platform caller.
    lists it (`views`), every policy otherwise; of those, the ones whose
    assignee is the caller, whose clause is listed and whose validity holds
    now.
-2. A prohibition that applies and names no type, or a type the operation
-   names, or applies to an operation naming no type: `Deny`.
+2. A prohibition that applies and names no type, or has an entry naming no
+   Attribute and a type the operation names, or applies to an operation
+   naming no type (a read excepted, below): `Deny`. An entry naming
+   `propertyNames` or `relationshipNames` takes back only those Attributes
+   of its types (T-5842, as the platform gateway since T-5586): a read
+   (rule 4) serves its types without them (`omit_by_type`), so a `q` or an
+   `attrs` naming one selects nothing (T-1862) and a rule every Attribute
+   of which is taken back shows nothing; a write (rule 5) touching one is
+   refused whole: an Attribute it names or its body carries, for a replace
+   (5.6.18) or an upsert (5.6.8) also one the stored Entity holds, and for
+   a delete of the Entity every one it holds. On every other clause such
+   an entry refuses its type whole.
 3. No permission applies: `Deny` (default deny).
 4. A read (`policy::FILTERABLE`): `Filter` with one `Rule` per selector of
    every permission: its type, id or id pattern, the information's
@@ -149,8 +159,9 @@ deciding; a Tenant with no document denies every platform caller.
    without type refuses every clause it lists. Otherwise a read is offered
    when a permission applies (a read of a type no prohibition names is
    narrowed, never refused, rules 2 and 4); a write when a permission
-   without information applies, or one naming a type no prohibition covers
-   (a conditional prohibition counts as covering its whole type); a
+   without information applies, or one naming a type no prohibition refuses
+   whole (a conditional prohibition counts as refusing its whole type, an
+   entry naming Attributes refuses none); a
    whole-Tenant clause is decided as a request. A call is still decided by
    rules 1 to 7 (T-3784).
 
@@ -192,11 +203,11 @@ absent, never listed as denied; a refusal of `access/check` names nothing
 (GW6).
 
 An Attribute is granted when a permission covering the type lists it, or
-lists none (the whole Entity). A prohibition refuses its whole type,
-whichever Attributes it lists, exactly as the engine refuses a real read or
-write of that type (T-5527 measured it: a prohibition naming `speed`
-refuses a read of `colour` too), so the answer per Attribute never shows a
-cell the real request refuses. A write of the access-control vocabulary
+lists none (the whole Entity). A prohibition entry naming no Attribute
+refuses its whole type; one naming Attributes refuses only those, exactly as
+the engine decides a real read or write of that type (T-5842: a prohibition
+naming `speed` refuses a read of `speed` and serves `colour`), so the answer
+per Attribute never shows a cell the real request refuses. A write of the access-control vocabulary
 (GW29) is never granted.
 
 `access/explain` is the platform's access simulator (EP-103, platform

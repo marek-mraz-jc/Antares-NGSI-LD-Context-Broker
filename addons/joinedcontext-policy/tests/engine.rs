@@ -1339,6 +1339,16 @@ async fn the_probe_refuses_a_write_only_when_every_granted_type_is_prohibited() 
         offered(&[on("s", "Sensor"), no("x", "Sensor")], &["5.7.2", "5.6.3"]).await?,
         [true, false]
     );
+    // a prohibition naming an Attribute leaves the type's other Attributes writable (T-5842)
+    let status = with(
+        no("x", "Sensor"),
+        "information",
+        json!([{"entities": [{"type": "Sensor"}], "propertyNames": ["status"]}]),
+    );
+    assert_eq!(
+        offered(&[on("s", "Sensor"), status], &["5.7.2", "5.6.3"]).await?,
+        [true, true]
+    );
     Ok(())
 }
 
@@ -1376,5 +1386,132 @@ async fn a_notification_names_the_types_it_carries() -> Res {
         engine.pre_notify(&subject, &json!({}), &mut empty),
         NotifyDecision::Drop
     );
+    Ok(())
+}
+
+/// A prohibition of `ops` for the group `city`, its entries `information`.
+fn prohibition(ops: &[&str], information: Value) -> Value {
+    with(
+        grant("no", "group", "city", ops, information),
+        "effect",
+        json!("prohibit"),
+    )
+}
+
+/// T-5842, as the gateway PDP since T-5586: a prohibition of updateAttrs naming `colour` refuses a
+/// PATCH touching `colour` and lets one of `speed` through; one naming no Attribute still refuses
+/// the whole type.
+#[tokio::test]
+async fn a_write_prohibition_naming_an_attribute_refuses_only_writes_touching_it() -> Res {
+    let (st, _) = broker(doc(&[
+        writer(cars(&[])),
+        prohibition(&["5.6.2"], cars(&["colour"])),
+    ]))
+    .await?;
+    fleet(&st).await?;
+    let patch = |body: Value| {
+        let st = st.clone();
+        async move {
+            send(
+                &st,
+                "PATCH",
+                "/ngsi-ld/v1/entities/urn:ngsi-ld:Car:1/attrs",
+                &ANA,
+                Some(&body),
+            )
+            .await
+            .map(|(code, _)| code)
+        }
+    };
+    assert_eq!(
+        patch(json!({"colour": prop(json!("blue"))})).await?,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        patch(json!({"speed": prop(json!(1)), "colour": prop(json!("blue"))})).await?,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        patch(json!({"speed": prop(json!(1))})).await?,
+        StatusCode::NO_CONTENT
+    );
+    // the prohibition lists updateAttrs only: a delete of the Entity is not prohibited
+    let (code, _) = send(
+        &st,
+        "DELETE",
+        "/ngsi-ld/v1/entities/urn:ngsi-ld:Car:2",
+        &ANA,
+        None,
+    )
+    .await?;
+    assert_eq!(code, StatusCode::NO_CONTENT);
+    // an entry naming no Attribute refuses the whole type, beside one that names some
+    let (st, _) = broker(doc(&[
+        writer(cars(&[])),
+        prohibition(
+            &["5.6.2"],
+            json!([{"entities": [{"type": "Car"}], "propertyNames": ["colour"]},
+                   {"entities": [{"type": "Car"}]}]),
+        ),
+    ]))
+    .await?;
+    fleet(&st).await?;
+    let (code, _) = send(
+        &st,
+        "PATCH",
+        "/ngsi-ld/v1/entities/urn:ngsi-ld:Car:1/attrs",
+        &ANA,
+        Some(&json!({"speed": prop(json!(1))})),
+    )
+    .await?;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    Ok(())
+}
+
+/// T-5842: a read prohibition naming `colour` drops it from every answer, and a `q` or an
+/// `attrs` naming it selects nothing (the oracle of T-1862), while `speed` reads as before.
+#[tokio::test]
+async fn a_read_prohibition_naming_an_attribute_drops_it_and_its_filters() -> Res {
+    let reader = grant("r", "group", "city", &["5.7.1", "5.7.2"], cars(&[]));
+    let (st, _) = broker(doc(&[
+        reader,
+        prohibition(&["5.7.1", "5.7.2"], cars(&["colour"])),
+    ]))
+    .await?;
+    fleet(&st).await?;
+    let (code, list) = send(&st, "GET", "/ngsi-ld/v1/entities?type=Car", &ANA, None).await?;
+    assert_eq!((code, ids(&list)), (StatusCode::OK, car_ids(&[1, 2, 3])));
+    assert!(!list.to_string().contains("colour"), "{list}");
+    assert!(list.to_string().contains("speed"), "{list}");
+    let (code, one) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities/urn:ngsi-ld:Car:1",
+        &ANA,
+        None,
+    )
+    .await?;
+    assert_eq!(code, StatusCode::OK);
+    assert!(
+        one.get("colour").is_none() && one.get("speed").is_some(),
+        "{one}"
+    );
+    for (uri, want) in [
+        ("/ngsi-ld/v1/entities?type=Car&q=colour==%22red%22", vec![]),
+        ("/ngsi-ld/v1/entities?type=Car&attrs=colour", vec![]),
+        ("/ngsi-ld/v1/entities?type=Car&q=speed%3E50", car_ids(&[2])),
+    ] {
+        let (code, list) = send(&st, "GET", uri, &ANA, None).await?;
+        assert_eq!((code, ids(&list)), (StatusCode::OK, want), "{uri}: {list}");
+    }
+    // the admin holds no prohibition and reads `colour`
+    let (_, list) = send(&st, "GET", "/ngsi-ld/v1/entities?type=Car", &ADMIN, None).await?;
+    assert!(list.to_string().contains("colour"), "{list}");
+    // an entry naming no Attribute still refuses the whole type
+    let reader = grant("r", "group", "city", &["5.7.1", "5.7.2"], cars(&[]));
+    let (st, _) = broker(doc(&[reader, prohibition(&["5.7.2"], cars(&[]))])).await?;
+    fleet(&st).await?;
+    let (code, _) = send(&st, "GET", "/ngsi-ld/v1/entities?type=Car", &ANA, None).await?;
+    assert_eq!(code, StatusCode::FORBIDDEN);
     Ok(())
 }

@@ -4,7 +4,7 @@
 //! "what may I do here" and never "what is here": a type only somebody else
 //! may touch is absent, not listed as denied.
 
-use crate::decide::{covers_types, held, POLICY_VOCABULARY};
+use crate::decide::{held, refuses_types, withholds, POLICY_VOCABULARY};
 use crate::document::{context, Policy, Selector, Table};
 use crate::names::{self, OPERATIONS};
 use crate::subject::{Caller, Platform};
@@ -159,9 +159,9 @@ pub enum Verdict<'t> {
     /// the Attribute, when one is asked about).
     Granted(&'t Policy),
     /// A prohibition listing the action's clause and covering the type,
-    /// which ends it whatever any permission says (GW8). A prohibition
-    /// refuses its whole type, whichever Attributes it lists, as `decide`
-    /// does.
+    /// which ends it whatever any permission says (GW8). An entry naming no
+    /// Attribute refuses its whole type; one naming Attributes refuses only
+    /// those, as `decide` does (T-5842).
     Prohibited(&'t Policy),
     /// A permission covers the type but none lists the Attribute asked
     /// about: the request goes through without it.
@@ -198,12 +198,12 @@ pub fn verdict<'t>(
     let attribute = attribute.map(|a| ctx.expand_key(a));
     let write = clause.starts_with("5.6.");
     let lists = |p: &&&Policy| p.clauses.contains(clause);
-    if let Some(p) = grants
-        .prohibitions
-        .iter()
-        .filter(lists)
-        .find(|p| covers_types(p, &types))
-    {
+    if let Some(p) = grants.prohibitions.iter().filter(lists).find(|p| {
+        refuses_types(p, &types, false)
+            || attribute
+                .as_deref()
+                .is_some_and(|a| withholds(p, &types, a))
+    }) {
         return Verdict::Prohibited(p);
     }
     if write && attribute.as_deref().is_some_and(is_access_control) {
@@ -735,7 +735,7 @@ mod tests {
     }
 
     #[test]
-    fn a_prohibition_refuses_its_whole_type_whichever_attributes_it_lists() -> Result<(), String> {
+    fn a_prohibition_naming_attributes_refuses_only_those() -> Result<(), String> {
         let t = compiled(&json!([
             {"id": "read-car", "assignee": {"kind": "role", "id": "public"},
              "operations": ["5.7.1", "5.7.2"], "information": [{"entities": [{"type": "Car"}]}]},
@@ -745,35 +745,42 @@ mod tests {
         ]))?;
         let public = caller(&[("x-jc-roles", "")]);
         let grants = Grants::of(Some(&t), &public, Utc::now());
-        // the prohibition names `speed`, and refuses `colour` too: the real read does (below)
-        for attribute in ["speed", "colour"] {
-            assert_eq!(may(&grants, "retrieveEntity", attribute), false);
-            assert_eq!(
-                at(
-                    &explain(
-                        &grants,
-                        "retrieveEntity",
-                        Some("Car"),
-                        Some(attribute),
-                        &every
-                    ),
-                    "/context/reason"
+        // T-5842: the prohibition names `speed` and takes back only `speed`, as the real read
+        assert_eq!(may(&grants, "retrieveEntity", "speed"), false);
+        assert_eq!(may(&grants, "retrieveEntity", "colour"), true);
+        assert_eq!(
+            at(
+                &explain(
+                    &grants,
+                    "retrieveEntity",
+                    Some("Car"),
+                    Some("speed"),
+                    &every
                 ),
-                "prohibited"
-            );
-        }
-        // Step 1 of T-5527: the engine's own read refuses the whole type, it does not narrow it
-        let types = vec![context().expand_key("Car")];
-        let attrs = vec![context().expand_key("colour")];
+                "/context/reason"
+            ),
+            "prohibited"
+        );
+        assert_eq!(
+            at(
+                &check(&grants, "retrieveEntity", Some("Car"), None, &every),
+                "/decision"
+            ),
+            true
+        );
+        let ctx = context();
+        let types = vec![ctx.expand_key("Car")];
         let op = Operation {
             types: &types,
-            attrs: &attrs,
             ..Operation::new("5.7.2")
         };
-        assert!(matches!(
-            crate::decide::decide(Some(&t), &public, &op, Utc::now()),
-            Decision::Deny(_)
-        ));
+        let Decision::Filter(f) = crate::decide::decide(Some(&t), &public, &op, Utc::now()) else {
+            return Err("a read narrowed by an Attribute".into());
+        };
+        assert_eq!(
+            f.omit_by_type.get(&types[0]),
+            Some(&vec![ctx.expand_key("speed")])
+        );
         Ok(())
     }
 
@@ -903,9 +910,14 @@ mod tests {
         match crate::decide::decide(Some(t), who, &op, Utc::now()) {
             Decision::Allow => true,
             Decision::Deny(_) | Decision::AllowIf(_) => false,
-            Decision::Filter(f) => f.rules.iter().any(|r| {
-                r.types.contains(&ty) && (r.every_attribute || r.attributes.contains(&attr))
-            }),
+            Decision::Filter(f) => {
+                let omitted = f.omit_by_type.get(&ty).is_some_and(|o| o.contains(&attr));
+                let shown = f.rules.is_empty()
+                    || f.rules.iter().any(|r| {
+                        r.types.contains(&ty) && (r.every_attribute || r.attributes.contains(&attr))
+                    });
+                shown && !omitted
+            }
         }
     }
 

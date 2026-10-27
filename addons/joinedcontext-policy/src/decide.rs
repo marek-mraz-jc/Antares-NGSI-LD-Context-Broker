@@ -66,15 +66,24 @@ pub fn decide(
         .filter(|p| p.clauses.contains(op.clause))
         .collect();
     let types = entity_types(op);
+    let read = FILTERABLE.contains(&op.clause);
+    // T-5842: a read or a write is narrowed by the prohibition entries naming Attributes;
+    // any other operation is refused by them whole, as before.
+    let by_attribute = read || op.clause.starts_with("5.6.");
     let prohibited = |types: &[String]| {
-        applying
-            .iter()
-            .any(|p| p.prohibit && covers_types(p, types))
+        applying.iter().any(|p| {
+            p.prohibit
+                && if by_attribute {
+                    refuses_types(p, types, read)
+                } else {
+                    covers_types(p, types)
+                }
+        })
     };
     // A read that names types is decided per type, as a read of each alone would be (T-4455):
     // a type a prohibition covers is left out and the others are read. Any other operation,
     // and a read naming no type, is refused whole.
-    let per_type = FILTERABLE.contains(&op.clause) && !types.is_empty();
+    let per_type = read && !types.is_empty();
     let (types, refused): (Vec<String>, Vec<String>) = if per_type {
         types
             .into_iter()
@@ -86,12 +95,21 @@ pub fn decide(
     if (per_type && types.is_empty()) || (!per_type && prohibited(&types)) {
         return Decision::Deny(PROHIBITED.into());
     }
+    let withheld = if by_attribute {
+        withheld(applying.iter().copied(), &types)
+    } else {
+        BTreeMap::new()
+    };
+    // a write touching an Attribute a prohibition takes back is refused whole (T-5842)
+    if !read && touches(op, &withheld) {
+        return Decision::Deny(PROHIBITED.into());
+    }
     let grants: Vec<&Policy> = applying.into_iter().filter(|p| !p.prohibit).collect();
     if grants.is_empty() {
         return Decision::Deny(NOT_GRANTED.into());
     }
-    if FILTERABLE.contains(&op.clause) {
-        read(&grants, op, (&types, &refused), platform)
+    if read {
+        read_filter(&grants, op, (&types, &refused), withheld, platform)
     } else if WHOLE_TENANT.contains(&op.clause) {
         if grants.iter().any(|p| unconditional_whole(p)) {
             Decision::Allow
@@ -136,7 +154,7 @@ pub fn probe(
     let refused = |t: &String| {
         applying
             .iter()
-            .any(|p| p.prohibit && covers_types(p, std::slice::from_ref(t)))
+            .any(|p| p.prohibit && refuses_types(p, std::slice::from_ref(t), false))
     };
     let every_type_refused = applying
         .iter()
@@ -201,6 +219,83 @@ pub fn covers_types(p: &Policy, types: &[String]) -> bool {
             .any(|s| s.types.iter().any(|t| types.contains(t)))
 }
 
+/// A prohibition refuses the whole of `types` (platform GW4) when it names no type, or an
+/// entry naming no Attribute names one of them; an entry naming `propertyNames` or
+/// `relationshipNames` takes back only those (T-5842, as the gateway PDP since T-5586). An
+/// operation naming no type is refused by any prohibition, unless `untyped_narrows`: a read
+/// naming no type loses the Attributes instead.
+#[must_use]
+pub fn refuses_types(p: &Policy, types: &[String], untyped_narrows: bool) -> bool {
+    p.selectors.is_empty()
+        || (types.is_empty() && !untyped_narrows)
+        || p.selectors
+            .iter()
+            .filter(|s| s.every_attribute)
+            .any(|s| types.is_empty() || s.types.iter().any(|t| types.contains(t)))
+}
+
+/// Whether an entry of prohibition `p` naming Attributes takes back `attribute` (an IRI)
+/// of one of `types`, or of any type when `types` is empty (T-5842).
+#[must_use]
+pub fn withholds(p: &Policy, types: &[String], attribute: &str) -> bool {
+    p.prohibit
+        && p.selectors.iter().any(|s| {
+            !s.every_attribute
+                && (types.is_empty() || s.types.iter().any(|t| types.contains(t)))
+                && s.attributes.iter().any(|a| a == attribute)
+        })
+}
+
+/// The Attributes the prohibitions among `applying` take back, per type: only the types of
+/// `types` when it names any (T-5842).
+fn withheld<'p>(
+    applying: impl Iterator<Item = &'p Policy>,
+    types: &[String],
+) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for s in applying
+        .filter(|p| p.prohibit)
+        .flat_map(|p| &p.selectors)
+        .filter(|s| !s.every_attribute)
+    {
+        for t in s
+            .types
+            .iter()
+            .filter(|t| types.is_empty() || types.contains(t))
+        {
+            let names = out.entry(t.clone()).or_default();
+            names.extend(s.attributes.iter().cloned());
+            names.sort();
+            names.dedup();
+        }
+    }
+    out
+}
+
+/// Whether a write touches an Attribute of `withheld`: one it names or its body carries; a
+/// replace (5.6.18, and an upsert, 5.6.8, whose mode the operation does not tell) also
+/// removes what the stored Entity holds, and a write naming no Attribute and carrying no body
+/// (a delete of the Entity) touches everything it holds, or everything when none is stored.
+fn touches(op: &Operation<'_>, withheld: &BTreeMap<String, Vec<String>>) -> bool {
+    if withheld.is_empty() {
+        return false;
+    }
+    let hit = |name: &str| withheld.values().flatten().any(|w| w == name);
+    let whole = op.attrs.is_empty() && op.body.is_none();
+    if whole && op.stored.is_none() {
+        return true;
+    }
+    op.attrs.iter().any(|a| hit(a))
+        || op
+            .body
+            .and_then(Value::as_object)
+            .is_some_and(|o| o.keys().any(|k| hit(k)))
+        || ((whole || ["5.6.18", "5.6.8"].contains(&op.clause))
+            && op
+                .stored
+                .is_some_and(|s| s.attribute_names.iter().any(|a| hit(a))))
+}
+
 fn unconditional_whole(p: &Policy) -> bool {
     p.selectors.is_empty() && !p.is_conditional()
 }
@@ -222,16 +317,27 @@ fn names(table: &Table, caller: &Platform, now: DateTime<Utc>) -> Decision {
 }
 
 /// A read: one rule per selector of every grant (ADR-0023 rule 11), none of which shows a type
-/// of `refused`, the requested types a prohibition covers (T-4455).
-fn read(
+/// of `refused`, the requested types a prohibition covers (T-4455), and each type without the
+/// Attributes `withheld` takes back (T-5842): the broker reads them as absent, so a `q` or an
+/// `attrs` naming one selects nothing (T-1862).
+fn read_filter(
     grants: &[&Policy],
     op: &Operation<'_>,
     (types, refused): (&[String], &[String]),
+    withheld: BTreeMap<String, Vec<String>>,
     caller: &Platform,
 ) -> Decision {
     // With a type left out, a whole grant is a rule per type read, never the whole Tenant.
     if refused.is_empty() && grants.iter().any(|p| unconditional_whole(p)) {
-        return Decision::Allow;
+        if withheld.is_empty() {
+            return Decision::Allow;
+        }
+        return Decision::Filter(Filter {
+            warning: left_out(&[], op, types, &withheld),
+            omit_by_type: withheld,
+            restricted: caller.restricted,
+            ..Filter::default()
+        });
     }
     let mut rules: Vec<Rule> = Vec::new();
     for p in grants {
@@ -248,7 +354,18 @@ fn read(
             rules.extend(p.selectors.iter().cloned());
         }
     }
-    if !refused.is_empty() {
+    // a rule every Attribute of which is taken back shows nothing, as the gateway's Deny
+    let all_withheld = |rule: &Rule| {
+        !rule.every_attribute
+            && rule.attributes.iter().all(|a| {
+                rule.types
+                    .iter()
+                    .all(|t| withheld.get(t).is_some_and(|w| w.contains(a)))
+            })
+    };
+    let before = rules.len();
+    rules.retain(|rule| !all_withheld(rule));
+    if !refused.is_empty() || rules.len() < before {
         for rule in &mut rules {
             rule.types.retain(|t| !refused.contains(t));
         }
@@ -259,7 +376,8 @@ fn read(
         }
     }
     Decision::Filter(Filter {
-        warning: left_out(&rules, op, types),
+        warning: left_out(&rules, op, types, &withheld),
+        omit_by_type: withheld,
         rules,
         restricted: caller.restricted,
         ..Filter::default()
@@ -271,8 +389,14 @@ fn read(
 /// a `q`, none of the Attributes `attrs` names, answers nothing, and the caller would read that
 /// as no data. Only types the grants show (and the request names, when it names any) are
 /// named, so the text tells nothing the caller may not read. An `orderBy` leaves no Entity out
-/// and is not counted.
-fn left_out(rules: &[Rule], op: &Operation<'_>, types: &[String]) -> Option<Warning> {
+/// and is not counted. An Attribute of `withheld` is one its type does not serve; with no
+/// rule (a whole grant) every type it names shows every other Attribute.
+fn left_out(
+    rules: &[Rule],
+    op: &Operation<'_>,
+    types: &[String],
+    withheld: &BTreeMap<String, Vec<String>>,
+) -> Option<Warning> {
     let ctx = context();
     // The handler hands `q` over as written; its names expand as the grants' own did.
     let referenced: Vec<String> =
@@ -304,12 +428,21 @@ fn left_out(rules: &[Rule], op: &Operation<'_>, types: &[String]) -> Option<Warn
             }
         }
     }
+    if rules.is_empty() {
+        for t in withheld.keys() {
+            shown.insert(t, None);
+        }
+    }
     let names: Vec<String> = shown
         .into_iter()
         .filter_map(|(t, attributes)| {
-            let attributes = attributes?;
-            let unserved = referenced.iter().any(|a| !attributes.contains(a.as_str()))
-                || (!asked.is_empty() && !asked.iter().any(|a| attributes.contains(a)));
+            let hidden = withheld.get(t);
+            let serves = |a: &str| {
+                attributes.as_ref().is_none_or(|s| s.contains(a))
+                    && hidden.is_none_or(|h| !h.iter().any(|w| w == a))
+            };
+            let unserved = referenced.iter().any(|a| !serves(a))
+                || (!asked.is_empty() && !asked.iter().any(|a| serves(a)));
             unserved.then(|| ctx.compact_iri(t))
         })
         .collect();
@@ -479,6 +612,7 @@ fn smuggled(op: &Operation<'_>) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::document::compile;
+    use antares_api::policy::StoredImage;
     use serde_json::json;
 
     const AREA: &str =
@@ -926,6 +1060,89 @@ mod tests {
             return Err("a read by selector is a filter".into());
         };
         assert_eq!(f.warning, None);
+        Ok(())
+    }
+
+    /// T-5842: a whole grant and a prohibition taking back `colour` of Car.
+    fn colour_withheld(ops: &[&str]) -> Result<Table, String> {
+        let role = json!({"kind": "role", "id": "r"});
+        compile(&json!({"policies": [
+            {"id": "all", "assignee": role, "operations": ops},
+            {"id": "no", "effect": "prohibit", "assignee": role, "operations": ops,
+             "information": [{"entities": [{"type": "Car"}], "propertyNames": ["colour"]}]}
+        ]}))
+    }
+
+    /// T-5842: a read under a whole grant loses the withheld Attribute, and a `q` on it names
+    /// the type in the warning; a `q` on another Attribute warns of nothing.
+    #[test]
+    fn a_whole_read_omits_a_withheld_attribute_and_warns_of_a_q_on_it() -> Result<(), String> {
+        let t = colour_withheld(&["5.7.2"])?;
+        for (q, warned) in [("colour==\"red\"", true), ("speed>1", false)] {
+            let q = antares_ql::parse_q(q).map_err(|e| e.to_string())?;
+            let op = Operation {
+                types: &car(),
+                q: Some(&q),
+                ..Operation::new("5.7.2")
+            };
+            let Decision::Filter(f) = decide(Some(&t), &caller(), &op, Utc::now()) else {
+                return Err("a read narrowed by an Attribute is a filter".into());
+            };
+            assert_eq!(f.omit_by_type.get(&iri("Car")), Some(&vec![iri("colour")]));
+            assert!(f.rules.is_empty());
+            assert_eq!(f.warning.is_some(), warned);
+        }
+        // a read naming no type loses it too, and is not refused
+        let Decision::Filter(f) = decide(Some(&t), &caller(), &Operation::new("5.7.2"), Utc::now())
+        else {
+            return Err("an untyped read narrowed by an Attribute is a filter".into());
+        };
+        assert_eq!(f.omit_by_type.len(), 1);
+        Ok(())
+    }
+
+    /// T-5842: which writes touch a withheld Attribute: one it names or its body carries, a
+    /// replace of a stored Entity holding it, and a delete of the Entity.
+    #[test]
+    fn a_write_touching_a_withheld_attribute_is_refused() -> Result<(), String> {
+        let ops = ["5.6.2", "5.6.6", "5.6.18"];
+        let t = colour_withheld(&ops)?;
+        let types = car();
+        let holding = StoredImage {
+            types: types.clone(),
+            scope: Vec::new(),
+            attribute_names: vec![iri("colour"), iri("speed")],
+        };
+        let without = StoredImage {
+            attribute_names: vec![iri("speed")],
+            ..holding.clone()
+        };
+        let speed = vec![iri("speed")];
+        let colour = vec![iri("colour")];
+        let body = json!({ (iri("speed")): [] });
+        let coloured = json!({ (iri("colour")): [] });
+        let cases: [(&str, &[String], Option<&Value>, Option<&StoredImage>, bool); 9] = [
+            ("5.6.2", &speed, Some(&body), Some(&holding), true),
+            ("5.6.2", &colour, Some(&coloured), Some(&holding), false),
+            ("5.6.2", &[], Some(&coloured), Some(&holding), false),
+            ("5.6.18", &speed, Some(&body), Some(&without), true),
+            ("5.6.18", &speed, Some(&body), Some(&holding), false),
+            ("5.6.6", &[], None, Some(&without), true),
+            ("5.6.6", &[], None, Some(&holding), false),
+            ("5.6.6", &[], None, None, false),
+            ("5.6.2", &speed, None, None, true),
+        ];
+        for (clause, attrs, body, stored, allowed) in cases {
+            let op = Operation {
+                types: &types,
+                attrs,
+                body,
+                stored,
+                ..Operation::new(clause)
+            };
+            let d = decide(Some(&t), &caller(), &op, Utc::now());
+            assert_eq!(d == Decision::Allow, allowed, "{clause} {attrs:?} {d:?}");
+        }
         Ok(())
     }
 
