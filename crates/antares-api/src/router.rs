@@ -203,7 +203,7 @@ pub fn router(state: AppState) -> Router {
 /// and gzip level 1, each its own layer because tower-http gives one layer one
 /// quality. The br layer sits inside: it packs whenever the client accepts br,
 /// and the gzip layer outside leaves an encoded answer alone, so gzip serves
-/// only a client without br. [`compress_when`] leaves a body of known size
+/// only a client without br. [`CompressWhen`] leaves a body of known size
 /// under 1 KiB plain, and text/event-stream, images and gRPC.
 pub fn compression() -> Stack<CompressionLayer<CompressWhen>, CompressionLayer<CompressWhen>> {
     let br = CompressionLayer::new()
