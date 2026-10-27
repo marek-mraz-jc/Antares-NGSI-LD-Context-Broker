@@ -456,3 +456,65 @@ impl PolicyEngine for DenyClause {
         NotifyDecision::Deliver
     }
 }
+
+/// T-5835: a type of 600 properties names more than the broker's 8 KiB URI cap in its
+/// attribute list; the history page still reads it and answers its states.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_history_of_a_type_wider_than_the_uri_cap_answers() -> Result<(), String> {
+    let f = fixture_with(fresh().await?).await?;
+    let names: Vec<String> = (0..600)
+        .map(|n| format!("measuredQuantity{n:03}"))
+        .collect();
+    let slots: serde_json::Map<String, Value> = names
+        .iter()
+        .map(|n| (n.clone(), json!({"range": "float"})))
+        .collect();
+    let schema = json!({
+        "id": "https://example.org/wide", "name": "wide",
+        "prefixes": {"dc": {"prefix_prefix": "dc", "prefix_reference": "https://uri.etsi.org/ngsi-ld/default-context/"}},
+        "default_prefix": "dc",
+        "classes": {"Wide": {"slots": names}},
+        "slots": slots
+    });
+    let view = json!({
+        "id": "wide", "tenant": "wide", "selector": ["Wide"],
+        "rules": names.chunks(200).map(|c| json!({"types": ["Wide"], "attributes": c})).collect::<Vec<_>>(),
+        "operations": ["temporal_query"]
+    });
+    let entity = json!({"id": "urn:ngsi-ld:Wide:1", "type": "Wide",
+        "measuredQuantity599": [at(&json!(1), T0), at(&json!(2), T1)]});
+    for (method, path, body, tenant) in [
+        ("PUT", "/q/schemas/wide", schema.to_string(), None),
+        ("PUT", "/q/views/wide", view.to_string(), None),
+        (
+            "POST",
+            "/ngsi-ld/v1/temporal/entities",
+            entity.to_string(),
+            Some("wide"),
+        ),
+    ] {
+        let headers: Vec<(&str, &str)> = tenant.map(|t| ("NGSILD-Tenant", t)).into_iter().collect();
+        let a = send(&f.app, method, path, &body, &headers).await;
+        if !a.status.is_success() {
+            return Err(format!("{path}: {} {}", a.status, a.body));
+        }
+    }
+    let a = get(
+        &f.app,
+        "/x/views/wide/ogc/features/collections/Wide-history/items?limit=10",
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(
+        ids(&a.body),
+        vec![
+            format!("urn:ngsi-ld:Wide:1@{T0}"),
+            format!("urn:ngsi-ld:Wide:1@{T1}")
+        ]
+    );
+    assert_eq!(
+        a.body.pointer("/features/1/properties/measuredQuantity599"),
+        Some(&json!(2))
+    );
+    Ok(())
+}
