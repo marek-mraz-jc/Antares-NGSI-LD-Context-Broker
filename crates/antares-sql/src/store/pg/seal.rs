@@ -97,15 +97,18 @@ impl SecretKey {
     }
 
     fn open(&self, sealed: &str, aad: &[u8]) -> Result<String, Unreadable> {
-        let raw = B64.decode(sealed).map_err(|_| Unreadable)?;
-        let (nonce, body) = raw.split_at_checked(NONCE_LEN).ok_or(Unreadable)?;
+        let mut raw = B64.decode(sealed).map_err(|_| Unreadable)?;
+        let nonce = raw.get(..NONCE_LEN).ok_or(Unreadable)?;
         let nonce = Nonce::try_assume_unique_for_key(nonce).map_err(|_| Unreadable)?;
-        let mut body = body.to_vec();
-        let plain = self
+        // Opened inside the decoded buffer: the plain text moves to its
+        // front, so the buffer becomes the String without a copy.
+        let len = self
             .key
-            .open_in_place(nonce, Aad::from(aad), &mut body)
-            .map_err(|_| Unreadable)?;
-        String::from_utf8(plain.to_vec()).map_err(|_| Unreadable)
+            .open_within(nonce, Aad::from(aad), &mut raw, NONCE_LEN..)
+            .map_err(|_| Unreadable)?
+            .len();
+        raw.truncate(len);
+        String::from_utf8(raw).map_err(|_| Unreadable)
     }
 }
 
@@ -347,6 +350,22 @@ mod tests {
             &mut stored.clone()
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_damaged_value_is_unreadable() {
+        let k = key(6);
+        let aad = row(DocKind::Subscription).aad();
+        let stored = k.seal("Bearer t", &aad).expect("seal");
+        let body = stored.strip_prefix(PREFIX).expect("prefix");
+        assert_eq!(k.open(body, &aad).expect("open"), "Bearer t");
+        assert!(k.open(&B64.encode([1u8; 5]), &aad).is_err());
+        assert!(k.open(&B64.encode([1u8; NONCE_LEN + 3]), &aad).is_err());
+        let mut raw = B64.decode(body).expect("b64");
+        if let Some(last) = raw.last_mut() {
+            *last ^= 1;
+        }
+        assert!(k.open(&B64.encode(raw), &aad).is_err());
     }
 
     #[test]
