@@ -33,7 +33,8 @@ pub const PREFIX: &str = "enc:v1:";
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
-/// The key `ANTARES_SECRET_KEY` names: 32 bytes, base64.
+/// The key `ANTARES_SECRET_KEY` names: 32 bytes, as 64 hex digits (what the
+/// deployment's secret generator writes with `encoding: hex`) or base64.
 pub struct SecretKey {
     key: LessSafeKey,
     rng: SystemRandom,
@@ -46,12 +47,24 @@ impl std::fmt::Debug for SecretKey {
 }
 
 impl SecretKey {
-    /// The key from its base64 text (standard alphabet, padded). The error
-    /// names the variable and never echoes the value.
+    /// The key from 64 hex digits or its base64 text (standard alphabet,
+    /// padded). The error names the variable and never echoes the value.
     pub fn from_base64(raw: &str) -> Result<Self, String> {
-        let bytes = B64.decode(raw.trim()).map_err(|_| {
-            "ANTARES_SECRET_KEY must be 32 bytes in base64 (openssl rand -base64 32)".to_owned()
-        })?;
+        let raw = raw.trim();
+        let hex = (raw.len() == 64 && raw.bytes().all(|b| b.is_ascii_hexdigit())).then(|| {
+            raw.as_bytes()
+                .chunks(2)
+                .filter_map(|p| u8::from_str_radix(std::str::from_utf8(p).ok()?, 16).ok())
+                .collect::<Vec<u8>>()
+        });
+        let bytes = match hex {
+            Some(b) => b,
+            None => B64.decode(raw).map_err(|_| {
+                "ANTARES_SECRET_KEY must be 32 bytes as 64 hex digits or base64 \
+                 (openssl rand -hex 32)"
+                    .to_owned()
+            })?,
+        };
         if bytes.len() != 32 {
             return Err(format!(
                 "ANTARES_SECRET_KEY must be 32 bytes in base64 (got {} bytes; \
@@ -274,5 +287,11 @@ mod tests {
         assert!(short.contains("got 16 bytes"), "{short}");
         assert!(SecretKey::from_base64(&format!(" {} \n", B64.encode([9u8; 32]))).is_ok());
         assert_eq!(format!("{:?}", key(5)), "SecretKey(..)");
+        // 64 hex digits are the 32 bytes they spell, the same key as base64
+        let hex = SecretKey::from_base64(&"07".repeat(32)).expect("hex");
+        let stored = sealed(Some(&hex), DocKind::Subscription, &sub("Bearer t"))
+            .expect("seal")
+            .into_owned();
+        assert!(open(Some(&key(7)), DocKind::Subscription, &mut stored.clone()).is_ok());
     }
 }
