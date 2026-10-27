@@ -778,7 +778,7 @@ mod tests {
             return Err("a read narrowed by an Attribute".into());
         };
         assert_eq!(
-            f.omit_by_type.get(&types[0]),
+            f.omit_by_type.get(&ctx.expand_key("Car")),
             Some(&vec![ctx.expand_key("speed")])
         );
         Ok(())

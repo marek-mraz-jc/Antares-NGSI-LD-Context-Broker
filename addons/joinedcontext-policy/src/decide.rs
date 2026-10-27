@@ -1063,6 +1063,15 @@ mod tests {
         Ok(())
     }
 
+    /// A write shape: clause, Attributes, body, stored image, and whether it is allowed.
+    type Case<'a> = (
+        &'static str,
+        &'a [String],
+        Option<&'a Value>,
+        Option<&'a StoredImage>,
+        bool,
+    );
+
     /// T-5842: a whole grant and a prohibition taking back `colour` of Car.
     fn colour_withheld(ops: &[&str]) -> Result<Table, String> {
         let role = json!({"kind": "role", "id": "r"});
@@ -1089,7 +1098,7 @@ mod tests {
                 return Err("a read narrowed by an Attribute is a filter".into());
             };
             assert_eq!(f.omit_by_type.get(&iri("Car")), Some(&vec![iri("colour")]));
-            assert!(f.rules.is_empty());
+            assert_eq!(f.rules, Vec::new());
             assert_eq!(f.warning.is_some(), warned);
         }
         // a read naming no type loses it too, and is not refused
@@ -1121,7 +1130,7 @@ mod tests {
         let colour = vec![iri("colour")];
         let body = json!({ (iri("speed")): [] });
         let coloured = json!({ (iri("colour")): [] });
-        let cases: [(&str, &[String], Option<&Value>, Option<&StoredImage>, bool); 9] = [
+        let cases: [Case; 9] = [
             ("5.6.2", &speed, Some(&body), Some(&holding), true),
             ("5.6.2", &colour, Some(&coloured), Some(&holding), false),
             ("5.6.2", &[], Some(&coloured), Some(&holding), false),

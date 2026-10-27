@@ -1,5 +1,5 @@
 {
- "about": "A prohibition naming operator of Vehicle beside a whole grant (T-5842): every Entity, Vehicles without operator, Parking and Sensor with it.",
+ "about": "A read prohibition naming operator of Vehicle beside a whole grant (T-5842): every Entity, Vehicles without operator, Parking and Sensor with it; a notification is decided as a read and loses it too.",
  "view": {
   "selector": [
    "*"
@@ -59,12 +59,7 @@
     "5.7.7",
     "5.7.8",
     "5.7.9",
-    "5.7.10",
-    "5.8.1",
-    "5.8.2",
-    "5.8.3",
-    "5.8.4",
-    "5.8.5"
+    "5.7.10"
    ],
    "information": [
     {
