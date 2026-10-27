@@ -35,6 +35,11 @@ pub struct EntityFilter<'a> {
     /// takes it walks the match set and `after_id` in byte order, the order
     /// of the C-collated id index that answers the prefixes.
     pub id_prefixes: Option<&'a [String]>,
+    /// The id matches one of these `idPattern`s, each read whole as a policy
+    /// rule reads it (`^(?:pattern)$`): an exact condition (T-5826). A store
+    /// that cannot apply one exactly ([`id_pattern_sql`]) leaves it to the
+    /// caller and reports the outcome undecided.
+    pub id_patterns: Option<&'a [String]>,
     /// Entity Type Selection (4.17) as OR-of-AND groups, expanded IRIs
     pub types: Option<&'a [Vec<String>]>,
     /// `attrs=`: the entity must carry at least one, expanded IRIs
@@ -81,6 +86,7 @@ impl Default for EntityFilter<'_> {
             ids: None,
             id_literal: None,
             id_prefixes: None,
+            id_patterns: None,
             types: None,
             attrs: None,
             q: None,
@@ -727,6 +733,103 @@ pub fn id_pattern_segments(pattern: &str) -> Option<IdSegments> {
     (!holds_sep).then_some(IdSegments { lead, sep, tail })
 }
 
+/// `pattern` read as a policy rule reads it (`^(?:pattern)$`), written as a
+/// PostgreSQL advanced regular expression with the same matches, so a store
+/// counts a dataset view's Entities in one statement where the API judged
+/// 164 000 of them per row and the gateway cut the read at 10 s (T-5826).
+/// `None` outside a subset both engines read alike: ASCII literals, classes
+/// of printable ASCII, groups, alternation, greedy repetition up to 255
+/// (PostgreSQL's `RE_DUP_MAX`), `^` and `$`. Membership of a regular language
+/// does not depend on the engine's match preference, so within it the two
+/// select the same ids.
+/// ponytail: no `\d`, `.` or non-ASCII folding (Unicode classes differ); add one
+/// here with a parity case when a seeded pattern needs it.
+pub fn id_pattern_sql(pattern: &str) -> Option<String> {
+    let hir = regex_syntax::Parser::new()
+        .parse(&format!("^(?:{pattern})$"))
+        .ok()?;
+    let mut out = String::new();
+    are(&hir, &mut out)?;
+    // a long pattern may pass `regex`'s bound and still be too complex for
+    // PostgreSQL, which would fail the statement instead of the pushdown
+    (out.len() <= 1024).then_some(out)
+}
+
+/// One printable ASCII character as an ARE atom: `\` keeps punctuation
+/// literal, inside a bracket expression too.
+fn are_char(c: u8, out: &mut String) -> Option<()> {
+    if !c.is_ascii_graphic() {
+        return None;
+    }
+    if !c.is_ascii_alphanumeric() {
+        out.push('\\');
+    }
+    out.push(char::from(c));
+    Some(())
+}
+
+fn are(h: &regex_syntax::hir::Hir, out: &mut String) -> Option<()> {
+    use regex_syntax::hir::{Class, HirKind, Look};
+    match h.kind() {
+        HirKind::Literal(l) => l.0.iter().try_for_each(|&b| are_char(b, out))?,
+        HirKind::Class(Class::Unicode(c)) => {
+            out.push('[');
+            for r in c.ranges() {
+                let (s, e) = (u8::try_from(r.start()).ok()?, u8::try_from(r.end()).ok()?);
+                let kin = |a: u8, b: u8| {
+                    (a.is_ascii_digit() && b.is_ascii_digit())
+                        || (a.is_ascii_lowercase() && b.is_ascii_lowercase())
+                        || (a.is_ascii_uppercase() && b.is_ascii_uppercase())
+                };
+                if s < e && kin(s, e) {
+                    out.push(char::from(s));
+                    out.push('-');
+                    out.push(char::from(e));
+                } else {
+                    (s..=e).try_for_each(|b| are_char(b, out))?;
+                }
+            }
+            out.push(']');
+        }
+        HirKind::Look(Look::Start) => out.push('^'),
+        HirKind::Look(Look::End) => out.push('$'),
+        HirKind::Repetition(r) if r.greedy && !matches!(r.sub.kind(), HirKind::Look(_)) => {
+            let n = |v: u32| (v <= 255).then_some(v);
+            out.push_str("(?:");
+            are(&r.sub, out)?;
+            out.push(')');
+            let q = match (n(r.min)?, r.max.map(n)) {
+                (0, None) => "*".to_owned(),
+                (1, None) => "+".to_owned(),
+                (0, Some(Some(1))) => "?".to_owned(),
+                (m, None) => format!("{{{m},}}"),
+                (m, Some(Some(x))) if m == x => format!("{{{m}}}"),
+                (m, Some(Some(x))) => format!("{{{m},{x}}}"),
+                (_, Some(None)) => return None,
+            };
+            out.push_str(&q);
+        }
+        HirKind::Capture(c) => {
+            out.push_str("(?:");
+            are(&c.sub, out)?;
+            out.push(')');
+        }
+        HirKind::Concat(hs) => hs.iter().try_for_each(|h| are(h, out))?,
+        HirKind::Alternation(hs) => {
+            out.push_str("(?:");
+            for (i, h) in hs.iter().enumerate() {
+                if i > 0 {
+                    out.push('|');
+                }
+                are(h, out)?;
+            }
+            out.push(')');
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
 /// The least string that sorts, byte by byte, after every string starting
 /// with `prefix`; `None` when nothing does (an empty prefix, or one of
 /// `char::MAX` only). With it `[prefix, end)` is exactly the strings that
@@ -746,6 +849,39 @@ pub fn prefix_end(prefix: &str) -> Option<String> {
 #[cfg(test)]
 mod id_literal_tests {
     use super::*;
+
+    /// T-5826: the seeded dataset patterns translate, each to an ARE that
+    /// keeps punctuation literal; what both engines may read apart does not.
+    #[test]
+    fn id_pattern_sql_writes_the_seeded_patterns_and_refuses_the_rest() {
+        let sql = id_pattern_sql;
+        assert_eq!(
+            sql("^urn:ngsi-ld:Tree:[a-z0-9.-]+:praha-mesto:green-[a-z-]+-[0-9a-f-]{36}$")
+                .as_deref(),
+            Some(
+                "^^urn\\:ngsi\\-ld\\:Tree\\:(?:[\\-\\.0-9a-z])+\\:praha\\-mesto\\:green\\-\
+                 (?:[\\-a-z])+\\-(?:[\\-0-9a-f]){36}$$"
+            )
+        );
+        assert_eq!(
+            sql("^urn:x:(1|2|both)-[0-9]{1,4}(-[a-z]+)?$").as_deref(),
+            Some("^^urn\\:x\\:(?:(?:1|2|both))\\-(?:[0-9]){1,4}(?:(?:\\-(?:[a-z])+))?$$")
+        );
+        for refused in [
+            "urn:x:.*",
+            "urn:x:\\d+",
+            "(?i)urn:k",
+            "urn:x:[^a]",
+            "urn:x:a+?",
+            "urn:x:a{256}",
+            "urn:x:\\bz",
+            "urn:é",
+            "urn:x |",
+            "(unclosed",
+        ] {
+            assert_eq!(sql(refused), None, "{refused}");
+        }
+    }
 
     /// T-5661: a rule's pattern narrows on its most selective literal; each
     /// result is a substring (a prefix when anchored) of every id it selects.

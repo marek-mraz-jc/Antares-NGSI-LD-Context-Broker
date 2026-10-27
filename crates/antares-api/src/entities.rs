@@ -1517,11 +1517,15 @@ pub async fn filter_entities_paged(
     // store takes those types as one more selection, and pages and counts
     // as at the root (T-3667: a page of one read every Entity the policy
     // admits).
+    // So too rules that narrow their types only by one set of `idPattern`s
+    // the store applies exactly (T-5826): it takes them as a selection too.
+    let rule_patterns = rules.and_then(|f| crate::policy::shared_id_patterns(&f.rules));
     let by_type = rules
         .filter(|f| {
-            f.rules
-                .iter()
-                .all(crate::policy::Rule::admits_by_type_alone)
+            rule_patterns.is_some()
+                || f.rules
+                    .iter()
+                    .all(crate::policy::Rule::admits_by_type_alone)
         })
         .and_then(|f| Some((f, judged_types(type_sel.as_deref(), f)?)));
     // So too when the client's `q` reads only Attributes that every rule of
@@ -1678,14 +1682,21 @@ pub async fn filter_entities_paged(
             .unwrap_or(if counting.is_some() { 1024 } else { 0 }),
     );
     let mut matched = 0usize;
+    // the walk's keyset (T-4683): each store page starts after the last id
+    // the one before read, where a growing OFFSET re-read every row it
+    // skipped (T-5826: 80 pages over 164 000 Trees)
+    let mut walk_after: Option<String> = None;
     // Rules the loop below decides row by row, each narrowing by one
     // `idPattern`, hand the store the id prefixes those patterns force: a
     // dataset view of 70 KPIs walked the Tenant's 128 678 and timed out at
     // the gateway, even for `limit=1` (T-5787). The rules still decide.
-    let rule_prefixes = match rules.filter(|_| judged.is_none() && ids.is_none()) {
-        Some(f) => crate::policy::rules_id_prefixes(st, tenant, &f.rules).await?,
-        None => None,
-    };
+    // Rules the store decides by their patterns keep the ranges too: the
+    // regex filters only the rows the prefixes' index range found.
+    let rule_prefixes =
+        match rules.filter(|_| (judged.is_none() || rule_patterns.is_some()) && ids.is_none()) {
+            Some(f) => crate::policy::rules_id_prefixes(st, tenant, &f.rules).await?,
+            None => None,
+        };
     'scan: loop {
         let f = antares_store::filter::EntityFilter {
             ids: ids.as_deref(),
@@ -1699,6 +1710,7 @@ pub async fn filter_entities_paged(
                 None
             },
             id_prefixes: rule_prefixes.as_deref(),
+            id_patterns: rule_patterns,
             types: judged.as_deref().or(type_sel.as_deref()),
             attrs: if split_agg {
                 None
@@ -1724,7 +1736,7 @@ pub async fn filter_entities_paged(
             },
             keep_attrs: keep_attrs.as_deref(),
             drop_attrs: drop_attrs.as_deref(),
-            after_id: after.as_deref(),
+            after_id: walk_after.as_deref().or(after.as_deref()),
         };
         // a walk in pages decides each row itself, so the store may page
         // what it cannot decide
@@ -1740,6 +1752,11 @@ pub async fn filter_entities_paged(
         total = outcome.total.map(|t| t as usize);
         let got = outcome.rows.len();
         rows = rows.saturating_add(got);
+        walk_after = outcome
+            .rows
+            .last()
+            .and_then(|d| d.get("id")?.as_str())
+            .map(str::to_owned);
         let all = crate::federation::merge_candidates(outcome.rows, fed);
         for doc in all {
             let id = doc.get("id").and_then(Value::as_str).unwrap_or("");
@@ -1864,10 +1881,7 @@ pub async fn filter_entities_paged(
             ))
             .into());
         }
-        read = (
-            read.0.saturating_add(got),
-            read.1.saturating_mul(2).min(COUNT_CHUNK),
-        );
+        read = (0, read.1.saturating_mul(2).min(COUNT_CHUNK));
     }
     if let Some((offset, limit)) = window {
         // the smallest total consistent with "a next page exists"

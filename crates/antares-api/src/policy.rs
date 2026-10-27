@@ -2082,6 +2082,30 @@ pub(crate) async fn rules_id_prefixes(
     Ok(Some(all).filter(|a| !a.is_empty()))
 }
 
+/// The `idPattern`s every rule of `rules` that holds for anything narrows
+/// by, when that is all they narrow by beside their types and they all name
+/// the same ones, each of which the store applies exactly
+/// ([`antares_store::filter::id_pattern_sql`]): then the rules hold for
+/// exactly the Entities of their types whose id matches one, and the store
+/// decides, pages and counts them. A dataset Endpoint's Policy narrows its
+/// type by one such pattern; judged per row, a count over 164 000 Trees
+/// took past the gateway's 10 s (T-5826).
+pub(crate) fn shared_id_patterns(rules: &[Rule]) -> Option<&[String]> {
+    let mut typed = rules.iter().filter(|r| !r.types.is_empty());
+    let first = typed.next()?;
+    let narrows =
+        |r: &Rule| !r.is_conditional() && r.ids.is_empty() && r.id_patterns == first.id_patterns;
+    let exact = |p: &String| {
+        antares_store::filter::id_pattern_sql(p).is_some()
+            && antares_ql::regex::compile(&format!("^(?:{p})$")).is_ok()
+    };
+    (narrows(first)
+        && typed.all(narrows)
+        && !first.id_patterns.is_empty()
+        && first.id_patterns.iter().all(exact))
+    .then_some(first.id_patterns.as_slice())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

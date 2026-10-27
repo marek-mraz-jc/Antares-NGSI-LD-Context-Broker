@@ -131,6 +131,11 @@ name = "query_id_pattern_pg"
 path = "tests/query_id_pattern_pg.rs"
 
 [[test]]
+# own process: sets the global tracing subscriber that counts Entity rows read
+name = "query_id_pattern_count_pg"
+path = "tests/query_id_pattern_count_pg.rs"
+
+[[test]]
 # own process: sets ANTARES_MAX_BODY_BYTES
 name = "csource_notification_bound"
 path = "tests/csource_notification_bound.rs"

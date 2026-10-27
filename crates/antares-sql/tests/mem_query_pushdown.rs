@@ -292,3 +292,29 @@ async fn a_q_never_matches_an_expired_instance() {
         );
     }
 }
+
+/// T-5826: a rule's `idPatterns` are exact here too, each read whole; one
+/// that does not compile matches nothing, as the rule's own check reads it.
+#[tokio::test]
+async fn id_patterns_are_decided_and_counted() {
+    let (s, t) = seeded().await;
+    let ps = ["urn:ngsi-ld:T:[13]".to_owned(), "(unclosed".to_owned()];
+    let out = s
+        .query_entities(
+            &t,
+            &EntityFilter {
+                id_patterns: Some(&ps),
+                page: Some(Page {
+                    offset: 0,
+                    limit: 1,
+                    count: true,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("query");
+    assert!(out.decided);
+    assert_eq!(ids(&out.rows), ["urn:ngsi-ld:T:1"]);
+    assert_eq!(out.total, Some(2));
+}
