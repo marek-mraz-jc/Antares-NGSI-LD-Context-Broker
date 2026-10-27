@@ -910,12 +910,6 @@ antares-broker v0.3.0
 │   │           │   │   └── flume v0.11.1 (*)
 │   │           │   └── flume feature "futures-sink"
 │   │           │       └── flume v0.11.1 (*)
-│   │           ├── rustls-pemfile feature "default"
-│   │           │   ├── rustls-pemfile v2.2.0
-│   │           │   │   └── rustls-pki-types feature "default" (*)
-│   │           │   └── rustls-pemfile feature "std"
-│   │           │       ├── rustls-pemfile v2.2.0 (*)
-│   │           │       └── rustls-pki-types feature "std" (*)
 │   │           └── tokio-stream feature "default"
 │   │               ├── tokio-stream v0.1.19
 │   │               │   ├── futures-core feature "default" (*)

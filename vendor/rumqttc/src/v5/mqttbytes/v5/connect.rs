@@ -670,7 +670,6 @@ mod test {
     use super::super::test::{USER_PROP_KEY, USER_PROP_VAL};
     use super::*;
     use bytes::BytesMut;
-    use pretty_assertions::assert_eq;
 
     #[test]
     fn length_calculation() {
