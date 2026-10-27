@@ -36,7 +36,15 @@ for _ in $(seq 1 50); do
   [ "${ts:-0}" -ge 1 ] && break; sleep 0.2
 done
 [ "${ts:-0}" -ge 1 ] || { echo "node tier: notification never sent" >&2; exit 1; }
-echo "node tier OK (create 201, notification sent over real HTTP)"
+# A batch write passes the batch admission (bounds.rs), whose clock aborted
+# the wasm process on its first batch (T-4937); the health read after it
+# proves the shim survived.
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/ngsi-ld/v1/entityOperations/create" \
+  -H 'Content-Type: application/ld+json' \
+  -d "[{\"id\":\"urn:ngsi-ld:Smoke:2\",\"type\":\"Smoke\",\"v\":{\"type\":\"Property\",\"value\":1},\"@context\":\"$CTX\"}]")
+[ "$code" = 201 ] || { echo "node tier: batch create expected 201, got $code" >&2; exit 1; }
+curl -sf -o /dev/null "http://127.0.0.1:$PORT/q/health" || { echo "node tier: shim died after a batch write" >&2; exit 1; }
+echo "node tier OK (create 201, batch create 201, notification sent over real HTTP)"
 kill $SHIM $RECV 2>/dev/null || true
 
 # --- File-store tier (persistence outside the browser) --------------------
