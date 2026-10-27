@@ -148,7 +148,6 @@ impl fmt::Debug for SubscribeFilter {
 mod test {
     use super::*;
     use bytes::BytesMut;
-    use pretty_assertions::assert_eq;
 
     #[test]
     fn subscribe_parsing_works() {

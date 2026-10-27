@@ -277,7 +277,6 @@ impl Login {
 mod test {
     use super::*;
     use bytes::BytesMut;
-    use pretty_assertions::assert_eq;
 
     #[test]
     fn connect_parsing_works() {

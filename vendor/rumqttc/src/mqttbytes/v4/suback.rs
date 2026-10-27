@@ -88,7 +88,6 @@ impl TryFrom<u8> for SubscribeReasonCode {
 mod test {
     use super::*;
     use bytes::BytesMut;
-    use pretty_assertions::assert_eq;
 
     #[test]
     fn suback_parsing_works() {

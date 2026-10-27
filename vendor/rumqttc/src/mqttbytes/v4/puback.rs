@@ -57,7 +57,6 @@ impl PubAck {
 mod test {
     use super::*;
     use bytes::BytesMut;
-    use pretty_assertions::assert_eq;
 
     #[test]
     fn puback_encoding_works() {

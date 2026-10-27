@@ -126,7 +126,6 @@ impl fmt::Debug for Publish {
 mod test {
     use super::*;
     use bytes::{Bytes, BytesMut};
-    use pretty_assertions::assert_eq;
 
     #[test]
     fn qos1_publish_parsing_works() {
