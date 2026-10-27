@@ -121,3 +121,35 @@ async fn a_masked_value_written_back_keeps_the_stored_credential() {
         ])
     );
 }
+
+/// T-5827: the stored credential stays with the stored uri. A masked value
+/// written beside another uri is refused naming receiverInfo, never the value,
+/// and nothing is written.
+#[tokio::test]
+async fn a_masked_value_does_not_follow_a_new_uri() {
+    let st = subscribed().await;
+    let (status, body) = send(
+        &st,
+        "PATCH",
+        &format!("/ngsi-ld/v1/subscriptions/{ID}"),
+        Some(json!({"notification": {"endpoint": {
+            "uri": "http://localhost:18098/elsewhere",
+            "receiverInfo": [{"key": "Authorization", "value": "***"}]
+        }}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("receiverInfo"), "{body}");
+    assert!(!body.to_string().contains("the-webhook-token"), "{body}");
+    let doc = st
+        .store
+        .get(&TenantId::default(), Kind::Subscription, ID)
+        .await
+        .expect("store")
+        .expect("the subscription is stored");
+    assert_eq!(
+        doc["notification"]["endpoint"]["uri"],
+        "http://localhost:18099/notify"
+    );
+    assert_eq!(stored_receiver_info(&st).await[0]["value"], json!(TOKEN));
+}

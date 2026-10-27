@@ -781,7 +781,12 @@ fn masked_uri(uri: &str) -> Option<String> {
 /// A client that reads a Subscription and writes its `notification` back sends the
 /// [`MASKED`] values it was answered. Such a value keeps the credential stored under the same
 /// key instead of overwriting it; a key the stored endpoint lacks keeps the literal value.
-fn keep_masked_receiver_info(fragment: &mut Map<String, Value>, stored: &Map<String, Value>) {
+/// The stored credential stays with the stored URI: a masked value under a stored key beside
+/// another URI is refused (T-5827), or an update-right holder could redirect the credential.
+fn keep_masked_receiver_info(
+    fragment: &mut Map<String, Value>,
+    stored: &Map<String, Value>,
+) -> Result<(), NgsiError> {
     // The masked URI it was answered keeps the stored one, credentials and all.
     let stored_uri = stored
         .get("notification")
@@ -805,11 +810,16 @@ fn keep_masked_receiver_info(fragment: &mut Map<String, Value>, stored: &Map<Str
         .and_then(|e| e.get("receiverInfo"))
         .and_then(Value::as_array);
     let Some(held) = held else {
-        return;
+        return Ok(());
     };
-    let pairs = fragment
+    let endpoint = fragment
         .get_mut("notification")
-        .and_then(|n| n.get_mut("endpoint"))
+        .and_then(|n| n.get_mut("endpoint"));
+    let moved = endpoint
+        .as_ref()
+        .and_then(|e| e.get("uri"))
+        .is_some_and(|uri| uri.as_str() != stored_uri);
+    let pairs = endpoint
         .and_then(|e| e.get_mut("receiverInfo"))
         .and_then(Value::as_array_mut);
     for pair in pairs.into_iter().flatten() {
@@ -823,9 +833,15 @@ fn keep_masked_receiver_info(fragment: &mut Map<String, Value>, stored: &Map<Str
             .and_then(|h| h.get("value"))
             .cloned();
         if let (Some(previous), Some(v)) = (previous, pair.get_mut("value")) {
+            if moved {
+                return Err(NgsiError::BadRequestData(
+                    "receiverInfo: a masked value cannot move to another uri: send the credential again".into(),
+                ));
+            }
             *v = previous;
         }
     }
+    Ok(())
 }
 
 // ---------- handlers (parameterized by Kind) ----------
@@ -1341,7 +1357,7 @@ pub async fn update(
             }
             let target = antares_store::stored_object(doc)?;
             let mut norm = norm.clone();
-            keep_masked_receiver_info(&mut norm, target);
+            keep_masked_receiver_info(&mut norm, target)?;
             crate::apply_doc_fragment(target, &norm, &ts);
             // 5.2.12 holds for the updated Subscription too: deleting both
             // selectors is refused and nothing is written
@@ -1564,17 +1580,47 @@ mod tests {
     fn a_masked_value_keeps_only_a_credential_stored_under_its_key() {
         let written = json!([{"key": "X-New", "value": MASKED}, {"key": "A", "value": MASKED}]);
         let mut fragment = receiver_info(written.clone());
-        keep_masked_receiver_info(&mut fragment, &Map::new());
+        assert!(keep_masked_receiver_info(&mut fragment, &Map::new()).is_ok());
         assert_eq!(fragment, receiver_info(written));
 
         let stored = receiver_info(json!([{"key": "A", "value": "Bearer s"}]));
         let mut fragment = receiver_info(
             json!([{"key": "X-New", "value": MASKED}, {"key": "A", "value": MASKED}]),
         );
-        keep_masked_receiver_info(&mut fragment, &stored);
+        assert!(keep_masked_receiver_info(&mut fragment, &stored).is_ok());
         let expected =
             json!([{"key": "X-New", "value": MASKED}, {"key": "A", "value": "Bearer s"}]);
         assert_eq!(fragment, receiver_info(expected));
+    }
+
+    /// T-5827: a masked value under a stored key stays with the stored uri;
+    /// beside another uri the update is refused naming receiverInfo, and a
+    /// literal value may go anywhere.
+    #[test]
+    fn a_masked_value_does_not_follow_a_new_uri() {
+        let stored = receiver_info(json!([{"key": "A", "value": "Bearer s"}]));
+        let mut fragment = json!({"notification": {"endpoint": {
+            "uri": "https://elsewhere/n",
+            "receiverInfo": [{"key": "A", "value": MASKED}]
+        }}})
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+        let refused = keep_masked_receiver_info(&mut fragment, &stored);
+        let detail = refused.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(detail.starts_with("receiverInfo:"), "{detail}");
+        assert!(!detail.contains("Bearer s"), "{detail}");
+
+        let mut literal = json!({"notification": {"endpoint": {
+            "uri": "https://elsewhere/n",
+            "receiverInfo": [{"key": "A", "value": "Bearer new"}]
+        }}})
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+        let before = literal.clone();
+        assert!(keep_masked_receiver_info(&mut literal, &stored).is_ok());
+        assert_eq!(literal, before);
     }
 
     /// F-ANT3-004: a read masks the endpoint URI's userinfo, and the masked
@@ -1595,7 +1641,7 @@ mod tests {
             .as_object()
             .cloned()
             .unwrap_or_default();
-        keep_masked_receiver_info(&mut back, &stored);
+        assert!(keep_masked_receiver_info(&mut back, &stored).is_ok());
         assert_eq!(
             back["notification"]["endpoint"]["uri"],
             "mqtt://u:secret@h:1883/t"
