@@ -37,6 +37,9 @@ const BATCH: usize = 4;
 const MAX_READS: usize = 25;
 /// The start of every history read (`timerel=after`).
 const EPOCH: &str = "1970-01-01T00:00:00Z";
+/// The longest encoded `attrs` list the Temporal Query names, half the broker's 8 KiB URI cap
+/// (antares-api `bounds::MAX_URI_BYTES`), so the rest of the query fits beside it.
+const ATTRS_BUDGET: usize = 4 * 1024;
 /// The details of the refusals a read of the history answers.
 const REFUSED: &str = "the view refused the query";
 const NOT_NGSI_LD: &str =
@@ -268,10 +271,15 @@ async fn read(
         .map(|iri| terms.term(iri))
         .collect();
     let mut path = format!(
-        "/ngsi-ld/v1/temporal/entities?type={}&attrs={}&timerel=after&timeAt={EPOCH}&lastN={INSTANCES}&limit={BATCH}&offset={offset}",
+        "/ngsi-ld/v1/temporal/entities?type={}&timerel=after&timeAt={EPOCH}&lastN={INSTANCES}&limit={BATCH}&offset={offset}",
         items::encode(&c.type_iri),
-        items::encode(&attrs.join(",")),
     );
+    // A list past the budget is left out: the view's rules still narrow the answer to its
+    // shown Attributes, and `states` reads only the collection's own.
+    let attrs = items::encode(&attrs.join(","));
+    if attrs.len() <= ATTRS_BUDGET {
+        let _ = write!(path, "&attrs={attrs}");
+    }
     if let Some(urn) = urn {
         let _ = write!(path, "&id={}", items::encode(urn));
     }
