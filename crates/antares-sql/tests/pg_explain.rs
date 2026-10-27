@@ -642,6 +642,86 @@ async fn an_id_prefix_probe_seeks_its_byte_range() {
     }
 }
 
+/// T-5826: a rule's idPattern beside its exact prefix, over a Tenant shaped
+/// like dev's praha-mesto: 164 000 Trees whose ids lie in the heap in no id
+/// order. The entity query is planned with its values, and `~` estimates
+/// each fixed character of a dataset pattern as a 1-in-5 filter: expecting
+/// one match, the planner bitmap-read every Tree and sorted them for a page
+/// (10 s on dev). The store writes the pattern as `regexp_like`, which the
+/// planner cannot estimate, and the page reads i_entities_id_bytes in order
+/// up to its LIMIT, at the start and past a keyset.
+#[tokio::test]
+async fn an_id_pattern_page_reads_its_range_in_order() {
+    const T: &str = "pgexplain-idpattern";
+    const TREES: i64 = 164_000;
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let mut tx = pool.begin().await.expect("tx");
+    for stmt in [
+        "SET LOCAL statement_timeout = 0",
+        "SELECT pg_advisory_xact_lock(58260)",
+    ] {
+        sqlx::query(stmt).execute(&mut *tx).await.expect(stmt);
+    }
+    let have: i64 = sqlx::query_scalar("SELECT count(*) FROM entities WHERE tenant_id = $1")
+        .bind(T)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("seeded?");
+    if have != TREES {
+        for stmt in [
+            "DELETE FROM entities WHERE tenant_id = $1",
+            "INSERT INTO tenants (tenant_id) VALUES ($1) ON CONFLICT DO NOTHING",
+            // md5 ids: the heap holds them in no id order, as dev's does
+            "INSERT INTO entities (tenant_id, id, entity, types, created_at, modified_at)
+             SELECT $1, 'urn:ngsi-ld:Tree:hel.fi:praha-mesto:green-tree-rows-' || md5(g::text),
+                    jsonb_build_object('https://x/height', g % 30),
+                    ARRAY['https://x/Tree'], now(), now()
+               FROM generate_series(1, $2::bigint) g",
+            "ANALYZE entities",
+        ] {
+            let q = sqlx::query(stmt);
+            let q = match stmt.contains("$1") {
+                true => q.bind(T),
+                false => q,
+            };
+            let q = match stmt.contains("$2") {
+                true => q.bind(TREES),
+                false => q,
+            };
+            q.execute(&mut *tx).await.expect(stmt);
+        }
+    }
+    tx.commit().await.expect("seed");
+    let c = "id COLLATE \"C\"";
+    let range = format!("{c} >= 'urn:ngsi-ld:Tree:' AND {c} < 'urn:ngsi-ld:Tree;'");
+    // the ARE `antares_store::filter::id_pattern_sql` writes for the
+    // public-stromy pattern, in the form `store::pg::entity` binds it
+    let re = r"^^urn\:ngsi\-ld\:Tree\:(?:[\-\.0-9a-z])+\:praha\-mesto\:green\-(?:[\-a-z])+\-(?:[\-0-9a-f]){32}$$";
+    let w = format!(
+        "tenant_id = '{T}' AND (expires_at IS NULL OR expires_at > now()) \
+         AND ({range} AND (({range}))) AND (regexp_like({c}, '{re}'))"
+    );
+    for page in [
+        type_page(&w, &[&["https://x/Tree"]], 2),
+        type_page(
+            &format!("{w} AND {c} > 'urn:ngsi-ld:Tree:hel.fi:praha-mesto:green-tree-rows-8'"),
+            &[&["https://x/Tree"]],
+            101,
+        ),
+    ] {
+        let page = page.replace("ORDER BY id LIMIT", &format!("ORDER BY {c} LIMIT"));
+        let plan = plan_of(&pool, T, &page).await;
+        // the first-type arm; the multi-type arm reads its own small index
+        assert!(
+            !plan.contains("Seq Scan")
+                && !plan.contains("Bitmap Heap Scan on entities entities_1")
+                && plan.contains("Index Scan using i_entities_id_bytes on entities entities_1"),
+            "an idPattern page sorts its whole range instead of reading it in order:\n{plan}"
+        );
+    }
+}
+
 /// T-4852 Security: the new arms and the geohash cover isolate Tenants as
 /// the policy does. Both Tenants hold the same ids at the same places; the
 /// broker's role, set to Tenant A, gets only A's rows for a type list, a
