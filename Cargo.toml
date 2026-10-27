@@ -116,6 +116,10 @@ serde_json = "1"
 # version sqlx and ed25519-dalek already build.
 sha2 = { version = "0.10", default-features = false }
 redb = "4.1"
+# T-5838: the at-rest seal of notification credentials (antares-sql); both
+# already in the vanilla tree through rustls and sqlx
+ring = "0.17"
+base64 = "0.23"
 rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"] }
 # The crypto provider for mqtts. rumqttc is built provider-less
 # (use-rustls-no-provider) so the workspace stays on ONE rustls stack with

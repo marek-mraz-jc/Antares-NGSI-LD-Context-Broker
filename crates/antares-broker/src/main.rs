@@ -144,6 +144,8 @@ const KNOWN_KEYS: &[&str] = &[
     "ANTARES_PG_STATEMENT_TIMEOUT_MS",
     // batch writes commit with synchronous_commit = off (T-5050); default off.
     "ANTARES_PG_BATCH_ASYNC_COMMIT",
+    // T-5838: the key that seals Subscription receiverInfo at rest.
+    "ANTARES_SECRET_KEY",
     // bus=local over a shared postgres/timescale store is refused — every
     // replica would run its own matcher and fire its own copy of each
     // notification. This opt-in states the deployment runs exactly ONE
@@ -884,6 +886,14 @@ async fn build_builtin(
                     .ok()
                     .as_deref(),
             )?;
+            // T-5838: read before the pool opens, so a bad key fails the boot
+            // before any connection exists; never echoed.
+            let mut secret_key = match std::env::var("ANTARES_SECRET_KEY") {
+                Ok(raw) if !raw.trim().is_empty() => {
+                    Some(antares_sql::store::pg::seal::SecretKey::from_base64(&raw)?)
+                }
+                _ => None,
+            };
             // The DB container may still be booting — bounded retry, then die.
             let mut last = String::new();
             for _ in 0..30 {
@@ -984,7 +994,27 @@ async fn build_builtin(
                             );
                             backend_pg = backend_pg.with_write_reserve(reserve);
                         }
+                        let sealing = secret_key.is_some();
+                        if let Some(key) = secret_key.take() {
+                            backend_pg = backend_pg.with_secret_key(key);
+                        }
                         let store = AnyStore::Pg(backend_pg);
+                        if sealing {
+                            let sealed = store.seal_plaintext_credentials().await.map_err(|e| {
+                                format!(
+                                    "ANTARES_SECRET_KEY: sealing stored receiverInfo failed: {e}"
+                                )
+                            })?;
+                            tracing::info!(
+                                "ANTARES_SECRET_KEY: receiverInfo is sealed at rest \
+                                 ({sealed} row(s) written before the key sealed now)"
+                            );
+                        } else {
+                            tracing::warn!(
+                                "ANTARES_SECRET_KEY is not set: Subscription receiverInfo \
+                                 (notification credentials) is stored in plaintext"
+                            );
+                        }
                         if async_batch {
                             tracing::info!(
                                 "ANTARES_PG_BATCH_ASYNC_COMMIT: batch writes commit with \

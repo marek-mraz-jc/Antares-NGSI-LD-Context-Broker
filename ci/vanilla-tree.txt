@@ -934,6 +934,7 @@ antares-broker v0.3.0
 │   │   ├── uuid feature "v5" (*)
 │   │   ├── ngsild-model feature "default" (*)
 │   │   ├── serde_json feature "default" (*)
+│   │   ├── base64 feature "default" (*)
 │   │   ├── tokio feature "default" (*)
 │   │   ├── tokio feature "macros" (*)
 │   │   ├── tokio feature "net" (*)
@@ -942,6 +943,7 @@ antares-broker v0.3.0
 │   │   ├── tokio feature "sync" (*)
 │   │   ├── tokio feature "time" (*)
 │   │   ├── tracing feature "default" (*)
+│   │   ├── ring feature "default" (*)
 │   │   ├── antares-store feature "default"
 │   │   │   └── antares-store v0.3.0
 │   │   │       ├── ngsild-jsonld feature "default" (*)
