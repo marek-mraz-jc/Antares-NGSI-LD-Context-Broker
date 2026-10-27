@@ -188,7 +188,7 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// gzip or br for a client whose Accept-Encoding asks for it (T-5847), laid
-/// over [`router`] by the binary that serves the network and by nothing else:
+/// over [`router()`] by the binary that serves the network and by nothing else:
 /// an in-process call (`AppState::call`, a forward) parses the body it gets
 /// back and must read plain JSON, and each nested frame would grow the stack
 /// a façade chain spends. The default predicate leaves a body of known size
