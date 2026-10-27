@@ -504,6 +504,33 @@ def check_local_context():
     print("  local context ok (a compiled variables.py does not fail check; stop restores)")
 
 
+def check_ceiling_on_every_broker():
+    """Every broker the ETSI stacks start, overlay replicas included, runs the 6.3.10 ceiling of
+    9 the TTF 206 cases expect: the HA overlay's antares1b without it answered 200 on every read
+    the LB sent it (roll-weekly run 40535598208, T-5858)."""
+    import yaml
+    compose = f"{HERE}/../compose-files"
+
+    def load(name):
+        with open(f"{compose}/{name}") as fh:
+            return yaml.safe_load(fh)["services"]
+
+    base = load("docker-compose-etsi.yml")
+    for overlay in (None, "docker-compose-ha.yml", "docker-compose-roles.yml", "docker-compose-policy.yml"):
+        services = {k: dict(v) for k, v in base.items()}
+        for name, svc in (load(overlay) if overlay else {}).items():
+            merged = dict(services.get(name, {}), **svc)
+            merged["environment"] = dict(services.get(name, {}).get("environment") or {},
+                                         **(svc.get("environment") or {}))
+            services[name] = merged
+        brokers = {k: v for k, v in services.items() if str(v.get("image", "")).startswith("antares")}
+        assert brokers, overlay
+        for name, svc in brokers.items():
+            got = (svc.get("environment") or {}).get("ANTARES_TEMPORAL_INSTANCE_LIMIT")
+            assert got == "9", f"{overlay or 'etsi'}: {name} runs ANTARES_TEMPORAL_INSTANCE_LIMIT={got!r}, not 9"
+    print("  temporal ceiling ok (9 on every broker of the etsi, ha, roles and policy stacks)")
+
+
 if __name__ == "__main__":
     print("etsi sampling self-check")
     check_proc_parsing()
@@ -514,4 +541,5 @@ if __name__ == "__main__":
     check_view_residue()
     check_recorder()
     check_local_context()
+    check_ceiling_on_every_broker()
     print("OK")

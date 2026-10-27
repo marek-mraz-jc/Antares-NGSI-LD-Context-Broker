@@ -52,6 +52,8 @@ x-worker-env: &worker-env
   ANTARES_DATABASE_URL: postgresql://antares:antares@localhost:5433/antares
   ANTARES_EGRESS_ALLOW_PRIVATE: "true"
   ANTARES_SWEEP_SECS: "2"
+  # the 6.3.10 ceiling the TTF 206 cases expect, as on antares1 (T-4800, T-5858)
+  ANTARES_TEMPORAL_INSTANCE_LIMIT: "9"
   # Shorter rolls: behind haproxy an api pod always
   # pays the FULL drain deadline (idle keep-alive conns never close), so the
   # default 20 s dominates roll time. 10 s is the safe floor — it must stay
