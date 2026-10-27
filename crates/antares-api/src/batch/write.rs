@@ -412,7 +412,7 @@ impl BatchRun<'_> {
         Ok(())
     }
 
-    /// options=update: merge into existing rows first; ids that turn out
+    /// options=update: update existing rows first (Update Attributes); ids that turn out
     /// absent (or vanish mid-flight) fall through to the replace batch —
     /// never a silent success (TOCTOU fix). The members left to replace.
     async fn upsert_merge(
@@ -431,7 +431,9 @@ impl BatchRun<'_> {
                 conds.pre(id, doc)?;
                 let src = member(&docs, id)?;
                 let before = doc.clone();
-                merge_into(doc, src, ts);
+                // 10.3.3.4: update mode runs Update Attributes (10.2.3.4),
+                // which replaces each instance it names whole (T-5657)
+                crate::entities::update_into(doc, src, ts);
                 // a member that only restates the stored state
                 // (a parked vehicle, a poll that saw nothing
                 // new) is no change (4.8, 5.8.3): handing the
@@ -939,7 +941,7 @@ async fn upsert_in_view(
                 )));
             };
             if update_mode {
-                merge_into(doc, src, ts);
+                crate::entities::update_into(doc, src, ts);
             } else {
                 let mut new = src.clone();
                 stamp_new(&mut new, ts);
