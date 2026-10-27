@@ -2,6 +2,9 @@
 //! Router assembly: the NGSI-LD route table, the ops-only router and the request layers (tenant, CORS, metrics, trailing slash, 405/501/OPTIONS).
 
 use super::*;
+use tower::layer::util::Stack;
+use tower_http::compression::predicate::{And, NotForContentType, Predicate, SizeAbove};
+use tower_http::compression::{CompressionLayer, CompressionLevel};
 
 /// 4.3.5 NGSI-LD API structure: Core API mandatory; Distributed API mandatory for
 /// distributed/federated deployments; Temporal API and Registry API integrated
@@ -191,15 +194,39 @@ pub fn router(state: AppState) -> Router {
 /// over [`router()`] by the binary that serves the network and by nothing else:
 /// an in-process call (`AppState::call`, a forward) parses the body it gets
 /// back and must read plain JSON, and each nested frame would grow the stack
-/// a façade chain spends. The default predicate leaves a body of known size
-/// up to 32 bytes, text/event-stream, images and gRPC plain; a body that
-/// already has a Content-Encoding or a Content-Range is never touched, and
-/// `Vary: Accept-Encoding` is appended to whatever Vary the handler set.
-/// Request bodies stay as sent: no decompression, so the body bound holds.
-pub fn compression() -> tower_http::compression::CompressionLayer {
-    tower_http::compression::CompressionLayer::new()
-        .gzip(true)
-        .br(true)
+/// a façade chain spends. A body that already has a Content-Encoding or a
+/// Content-Range is never touched, and `Vary: Accept-Encoding` is appended
+/// once to whatever Vary the handler set. Request bodies stay as sent: no
+/// decompression, so the body bound holds.
+///
+/// Levels (T-5849, the best size per CPU on real answers): brotli quality 2
+/// and gzip level 1, each its own layer because tower-http gives one layer one
+/// quality. The br layer sits inside: it packs whenever the client accepts br,
+/// and the gzip layer outside leaves an encoded answer alone, so gzip serves
+/// only a client without br. [`compress_when`] leaves a body of known size
+/// under 1 KiB plain, and text/event-stream, images and gRPC.
+pub fn compression() -> Stack<CompressionLayer<CompressWhen>, CompressionLayer<CompressWhen>> {
+    let br = CompressionLayer::new()
+        .gzip(false)
+        .quality(CompressionLevel::Precise(2))
+        .compress_when(compress_when());
+    let gzip = CompressionLayer::new()
+        .br(false)
+        .quality(CompressionLevel::Precise(1))
+        .compress_when(compress_when());
+    Stack::new(br, gzip)
+}
+
+/// The predicate of [`compression()`]: tower-http's default with its 32-byte
+/// minimum raised to 1 KiB, since a smaller body saves under 700 bytes.
+pub type CompressWhen =
+    And<And<And<SizeAbove, NotForContentType>, NotForContentType>, NotForContentType>;
+
+fn compress_when() -> CompressWhen {
+    SizeAbove::new(1024)
+        .and(NotForContentType::GRPC)
+        .and(NotForContentType::IMAGES)
+        .and(NotForContentType::SSE)
 }
 
 /// tower-http's `NormalizePath::trim_trailing_slash`, except below a view's

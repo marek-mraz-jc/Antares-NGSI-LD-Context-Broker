@@ -122,14 +122,19 @@ async fn br_answer_decodes_to_the_plain_body() {
     assert_eq!(decoded, plain.to_vec());
 }
 
+/// A problem document is a few hundred bytes: under the 1 KiB minimum
+/// (T-5849) it goes out plain even to a client that asks for gzip.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_problem_answer_decodes_to_the_same_problem() {
+async fn a_problem_answer_stays_plain() {
     let st = AppState::new("test".into());
-    let (status, plain, decoded) =
-        both(&st, "/ngsi-ld/v1/entities/urn:ngsi-ld:Kpi:missing", "gzip").await;
+    let (status, headers, body) = send(
+        &st,
+        get("/ngsi-ld/v1/entities/urn:ngsi-ld:Kpi:missing", Some("gzip")),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(decoded, plain.to_vec());
-    let problem: serde_json::Value = serde_json::from_slice(&decoded).expect("json");
+    assert!(headers.get("content-encoding").is_none(), "{headers:?}");
+    let problem: serde_json::Value = serde_json::from_slice(&body).expect("json");
     assert_eq!(
         problem["type"],
         "https://uri.etsi.org/ngsi-ld/errors/ResourceNotFound"
@@ -182,4 +187,113 @@ async fn a_gzip_request_body_is_refused() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
     let (status, _, _) = send(&st, get("/ngsi-ld/v1/entities/urn:ngsi-ld:Kpi:z", None)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// T-5849: brotli quality 2, gzip level 1 and a 1 KiB minimum. The handler
+// below answers a fixed body, so each case sets the exact size and type.
+
+fn fixed(body: Vec<u8>, content_type: &'static str) -> axum::Router {
+    axum::Router::new()
+        .route(
+            "/",
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move { ([("content-type", content_type)], body) }
+            }),
+        )
+        .layer(antares_api::compression())
+}
+
+async fn fetch(app: axum::Router, encoding: &str) -> (HeaderMap, Vec<u8>) {
+    let resp = app
+        .oneshot(get("/", Some(encoding)))
+        .await
+        .expect("response");
+    let headers = resp.headers().clone();
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    (headers, bytes.to_vec())
+}
+
+/// A page of entities as a broker answers it: repeated attribute names,
+/// varying values, about 20 KB.
+fn page() -> Vec<u8> {
+    let rows: Vec<String> = (0..80)
+        .map(|n| {
+            format!(
+                r#"{{"id":"urn:ngsi-ld:BikeHireDockingStation:{n:03}","type":"BikeHireDockingStation","availableBikeNumber":{{"type":"Property","value":{}}},"location":{{"type":"GeoProperty","value":{{"type":"Point","coordinates":[24.{:04},60.{:04}]}}}}}}"#,
+                n * 7 % 23,
+                n * 131 % 9973,
+                n * 89 % 9967
+            )
+        })
+        .collect();
+    format!("[{}]", rows.join(",")).into_bytes()
+}
+
+fn json_of(len: usize) -> Vec<u8> {
+    let mut body = page();
+    body.truncate(len);
+    body
+}
+
+#[tokio::test]
+async fn a_900_byte_body_stays_plain() {
+    let body = json_of(900);
+    let (headers, got) = fetch(fixed(body.clone(), "application/json"), "gzip, br").await;
+    assert!(headers.get("content-encoding").is_none(), "{headers:?}");
+    assert_eq!(got, body);
+}
+
+#[tokio::test]
+async fn a_2_kib_body_is_packed() {
+    let body = json_of(2048);
+    let (headers, got) = fetch(fixed(body.clone(), "application/json"), "gzip").await;
+    assert_eq!(header(&headers, "content-encoding"), vec!["gzip"]);
+    assert_eq!(gunzip(&got), body);
+}
+
+#[tokio::test]
+async fn br_wins_when_both_are_offered() {
+    for offer in ["gzip, br", "br, gzip", "gzip;q=1, br;q=0.9"] {
+        let (headers, got) = fetch(fixed(page(), "application/json"), offer).await;
+        assert_eq!(header(&headers, "content-encoding"), vec!["br"], "{offer}");
+        let vary = header(&headers, "vary").join(",").to_ascii_lowercase();
+        assert_eq!(vary.matches("accept-encoding").count(), 1, "{vary}");
+        assert_eq!(unbrotli(&got), page());
+    }
+}
+
+#[tokio::test]
+async fn event_streams_and_images_stay_plain() {
+    for content_type in ["text/event-stream", "image/png"] {
+        let body = json_of(4096);
+        let (headers, got) = fetch(fixed(body.clone(), content_type), "gzip, br").await;
+        assert!(
+            headers.get("content-encoding").is_none(),
+            "{content_type}: {headers:?}"
+        );
+        assert_eq!(got, body);
+    }
+}
+
+#[tokio::test]
+async fn gzip_runs_at_level_1() {
+    use std::io::Write;
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(1));
+    enc.write_all(&page()).expect("gzip");
+    let want = enc.finish().expect("gzip");
+    let (headers, got) = fetch(fixed(page(), "application/json"), "gzip").await;
+    assert_eq!(header(&headers, "content-encoding"), vec!["gzip"]);
+    assert_eq!(got, want);
+}
+
+#[tokio::test]
+async fn br_runs_at_quality_2() {
+    use std::io::Write;
+    let mut enc = brotli::CompressorWriter::new(Vec::new(), 4096, 2, 22);
+    enc.write_all(&page()).expect("br");
+    let want = enc.into_inner();
+    let (headers, got) = fetch(fixed(page(), "application/json"), "br").await;
+    assert_eq!(header(&headers, "content-encoding"), vec!["br"]);
+    assert_eq!(got, want);
 }
