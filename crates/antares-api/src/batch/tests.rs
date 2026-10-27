@@ -662,3 +662,56 @@ async fn upsert_207_success_carries_updated_entities_too() {
     assert!(s.contains(&fresh), "the created Entity is in S: {doc}");
     assert_eq!(doc["errors"].as_array().expect("E array").len(), 1, "{doc}");
 }
+
+/// 10.3.3.4: an upsert in "update" mode runs Update Attributes (10.2.3.4)
+/// on an existing Entity, and there the instance the fragment names "shall
+/// be replaced by the new one supplied", its `createdAt` kept: a
+/// sub-Attribute the fragment leaves out leaves the instance (T-5657).
+#[tokio::test]
+async fn upsert_update_mode_replaces_the_named_instance() {
+    let app = app();
+    let id = "urn:ngsi-ld:Building:upsert-replaces-instance";
+    let sub = |v: i64| json!({"type": "Property", "value": v});
+    let resp = post(
+        &app,
+        "/ngsi-ld/v1/entityOperations/create",
+        json!([{"id": id, "type": "Building",
+                "p1": [{"type": "Property", "value": 1, "a": sub(1), "b": sub(2)},
+                       {"type": "Property", "value": 11, "datasetId": "urn:ds:1",
+                        "x": sub(1), "y": sub(2)}]}]),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let before = get_entity(&app, &format!("{id}?options=sysAttrs")).await;
+    let resp = post(
+        &app,
+        "/ngsi-ld/v1/entityOperations/upsert?options=update",
+        json!([{"id": id, "type": "Building",
+                "p1": [{"type": "Property", "value": 3, "a": sub(3)},
+                       {"type": "Property", "value": 13, "datasetId": "urn:ds:1",
+                        "x": sub(3)}]}]),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let doc = get_entity(&app, &format!("{id}?options=sysAttrs")).await;
+    let instances = doc["p1"].as_array().expect("two instances");
+    assert_eq!(instances.len(), 2, "{doc}");
+    let default = instances.iter().find(|i| i.get("datasetId").is_none());
+    let ds1 = instances.iter().find(|i| i["datasetId"] == "urn:ds:1");
+    let (Some(default), Some(ds1)) = (default, ds1) else {
+        panic!("both instances kept: {doc}");
+    };
+    assert_eq!(default["value"], 3);
+    assert_eq!(default["a"]["value"], 3);
+    assert_eq!(default.get("b"), None, "b left the default instance: {doc}");
+    assert_eq!(ds1["value"], 13);
+    assert_eq!(ds1["x"]["value"], 3);
+    assert_eq!(ds1.get("y"), None, "y left the urn:ds:1 instance: {doc}");
+    let created = |d: &Value| {
+        d["p1"]
+            .as_array()
+            .and_then(|a| a.iter().find(|i| i.get("datasetId").is_none()))
+            .map(|i| i["createdAt"].clone())
+    };
+    assert_eq!(created(&doc), created(&before), "createdAt kept: {doc}");
+}
