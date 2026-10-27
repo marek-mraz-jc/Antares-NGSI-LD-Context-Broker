@@ -1,9 +1,10 @@
 #[cfg(feature = "use-rustls-no-provider")]
-use rustls_pemfile::Item;
-#[cfg(feature = "use-rustls-no-provider")]
 use tokio_rustls::rustls::{
     self,
-    pki_types::{CertificateDer, InvalidDnsNameError, PrivateKeyDer, ServerName},
+    pki_types::{
+        pem::{self, PemObject},
+        CertificateDer, InvalidDnsNameError, PrivateKeyDer, ServerName,
+    },
     ClientConfig, RootCertStore,
 };
 #[cfg(feature = "use-rustls-no-provider")]
@@ -11,8 +12,6 @@ use tokio_rustls::TlsConnector as RustlsConnector;
 
 #[cfg(feature = "use-rustls-no-provider")]
 use std::convert::TryFrom;
-#[cfg(feature = "use-rustls-no-provider")]
-use std::io::{BufReader, Cursor};
 #[cfg(feature = "use-rustls-no-provider")]
 use std::sync::Arc;
 
@@ -116,23 +115,24 @@ fn root_store(ca: &[u8]) -> Result<RootCertStore, Error> {
 /// Every CERTIFICATE section of `pem`, other sections skipped; a malformed section is an error.
 #[cfg(feature = "use-rustls-no-provider")]
 fn pem_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, Error> {
-    Ok(rustls_pemfile::certs(&mut BufReader::new(Cursor::new(pem)))
-        .collect::<Result<Vec<_>, _>>()?)
+    CertificateDer::pem_slice_iter(pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(pem_error)
 }
 
 /// The first SEC1, PKCS#1 or PKCS#8 private key of `pem`; `NoValidKeyInChain` when there is none.
 #[cfg(feature = "use-rustls-no-provider")]
 fn pem_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, Error> {
-    let mut key_buffer = BufReader::new(Cursor::new(pem));
-    loop {
-        match rustls_pemfile::read_one(&mut key_buffer)? {
-            Some(Item::Sec1Key(key)) => return Ok(key.into()),
-            Some(Item::Pkcs1Key(key)) => return Ok(key.into()),
-            Some(Item::Pkcs8Key(key)) => return Ok(key.into()),
-            None => return Err(Error::NoValidKeyInChain),
-            _ => {}
-        }
-    }
+    PrivateKeyDer::from_pem_slice(pem).map_err(|err| match err {
+        pem::Error::NoItemsFound => Error::NoValidKeyInChain,
+        err => pem_error(err),
+    })
+}
+
+/// A malformed PEM section, as the `io::ErrorKind::InvalidData` rustls-pemfile returned.
+#[cfg(feature = "use-rustls-no-provider")]
+fn pem_error(err: pem::Error) -> Error {
+    Error::Io(io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
 #[cfg(feature = "use-native-tls")]
