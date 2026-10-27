@@ -317,7 +317,12 @@ async fn admit_both<'a>(
     tokio::sync::SemaphorePermit<'a>,
 )> {
     // One wait for both: the slot gets what the byte share left of it.
+    // Clock rule: std Instant panics on wasm32 (every batch write aborted the
+    // wasm broker, T-4937).
+    #[cfg(not(target_arch = "wasm32"))]
     let started = std::time::Instant::now();
+    #[cfg(target_arch = "wasm32")]
+    let started = web_time::Instant::now();
     let share = admit(bytes_budget.0, bytes_budget.1, bytes, wait).await?;
     let slot = admit(
         running.0,
