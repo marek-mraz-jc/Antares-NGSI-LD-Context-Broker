@@ -51,12 +51,14 @@ fn the_served_api_answers_gzip_when_asked() {
         assert!(Instant::now() < deadline, "broker never got healthy");
         std::thread::sleep(Duration::from_millis(200));
     }
-    let path = "/ngsi-ld/v1/entities/urn:ngsi-ld:Kpi:missing";
+    // A list streams with no known size, so it passes the 1 KiB minimum
+    // (T-5849) even empty; a problem document is under it and stays plain.
+    let path = "/ngsi-ld/v1/entities?type=Kpi";
     let packed = head(port, path, "Accept-Encoding: gzip\r\n");
-    assert!(packed.starts_with("http/1.1 404"), "{packed}");
+    assert!(packed.starts_with("http/1.1 200"), "{packed}");
     assert!(packed.contains("\r\ncontent-encoding: gzip"), "{packed}");
     assert!(packed.contains("\r\nvary: accept-encoding"), "{packed}");
     let plain = head(port, path, "");
-    assert!(plain.starts_with("http/1.1 404"), "{plain}");
+    assert!(plain.starts_with("http/1.1 200"), "{plain}");
     assert!(!plain.contains("content-encoding"), "{plain}");
 }
