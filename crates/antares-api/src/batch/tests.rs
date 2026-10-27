@@ -663,37 +663,25 @@ async fn upsert_207_success_carries_updated_entities_too() {
     assert_eq!(doc["errors"].as_array().expect("E array").len(), 1, "{doc}");
 }
 
-/// 10.3.3.4: an upsert in "update" mode runs Update Attributes (10.2.3.4)
-/// on an existing Entity, and there the instance the fragment names "shall
-/// be replaced by the new one supplied", its `createdAt` kept: a
-/// sub-Attribute the fragment leaves out leaves the instance (T-5657).
-#[tokio::test]
-async fn upsert_update_mode_replaces_the_named_instance() {
-    let app = app();
-    let id = "urn:ngsi-ld:Building:upsert-replaces-instance";
+/// The stored Entity before (create) and the upsert?options=update fragment
+/// of the T-5657 cases: two instances of `p1`, each with two sub-Attributes,
+/// and a fragment that names each instance with only one of them.
+fn two_instance_docs(id: &str) -> (Value, Value) {
     let sub = |v: i64| json!({"type": "Property", "value": v});
-    let resp = post(
-        &app,
-        "/ngsi-ld/v1/entityOperations/create",
-        json!([{"id": id, "type": "Building",
-                "p1": [{"type": "Property", "value": 1, "a": sub(1), "b": sub(2)},
-                       {"type": "Property", "value": 11, "datasetId": "urn:ds:1",
-                        "x": sub(1), "y": sub(2)}]}]),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let before = get_entity(&app, &format!("{id}?options=sysAttrs")).await;
-    let resp = post(
-        &app,
-        "/ngsi-ld/v1/entityOperations/upsert?options=update",
-        json!([{"id": id, "type": "Building",
-                "p1": [{"type": "Property", "value": 3, "a": sub(3)},
-                       {"type": "Property", "value": 13, "datasetId": "urn:ds:1",
-                        "x": sub(3)}]}]),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    let doc = get_entity(&app, &format!("{id}?options=sysAttrs")).await;
+    let created = json!([{"id": id, "type": "Building",
+            "p1": [{"type": "Property", "value": 1, "a": sub(1), "b": sub(2)},
+                   {"type": "Property", "value": 11, "datasetId": "urn:ds:1",
+                    "x": sub(1), "y": sub(2)}]}]);
+    let fragment = json!([{"id": id, "type": "Building",
+            "p1": [{"type": "Property", "value": 3, "a": sub(3)},
+                   {"type": "Property", "value": 13, "datasetId": "urn:ds:1",
+                    "x": sub(3)}]}]);
+    (created, fragment)
+}
+
+/// Each named instance holds only what the fragment supplied and keeps its
+/// `createdAt` (10.2.3.4).
+fn assert_instances_replaced(before: &Value, doc: &Value) {
     let instances = doc["p1"].as_array().expect("two instances");
     assert_eq!(instances.len(), 2, "{doc}");
     let default = instances.iter().find(|i| i.get("datasetId").is_none());
@@ -713,5 +701,60 @@ async fn upsert_update_mode_replaces_the_named_instance() {
             .and_then(|a| a.iter().find(|i| i.get("datasetId").is_none()))
             .map(|i| i["createdAt"].clone())
     };
-    assert_eq!(created(&doc), created(&before), "createdAt kept: {doc}");
+    assert_ne!(created(before), Some(Value::Null), "{before}");
+    assert_eq!(created(doc), created(before), "createdAt kept: {doc}");
+}
+
+/// 10.3.3.4: an upsert in "update" mode runs Update Attributes (10.2.3.4)
+/// on an existing Entity, and there the instance the fragment names "shall
+/// be replaced by the new one supplied", its `createdAt` kept: a
+/// sub-Attribute the fragment leaves out leaves the instance (T-5657).
+#[tokio::test]
+async fn upsert_update_mode_replaces_the_named_instance() {
+    let app = app();
+    let id = "urn:ngsi-ld:Building:upsert-replaces-instance";
+    let (created, fragment) = two_instance_docs(id);
+    let resp = post(&app, "/ngsi-ld/v1/entityOperations/create", created).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let before = get_entity(&app, &format!("{id}?options=sysAttrs")).await;
+    let uri = "/ngsi-ld/v1/entityOperations/upsert?options=update";
+    let resp = post(&app, uri, fragment).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let doc = get_entity(&app, &format!("{id}?options=sysAttrs")).await;
+    assert_instances_replaced(&before, &doc);
+}
+
+/// The same through a view (ADR-0023): the view path (`upsert_in_view`)
+/// replaces each named instance whole too (T-5657).
+#[cfg(feature = "views")]
+#[tokio::test]
+async fn upsert_update_mode_through_a_view_replaces_the_named_instance() {
+    use crate::policy::Rule;
+    use crate::views::CompiledView;
+    let st = AppState::new("antares-test".into());
+    let plain = crate::router(st.clone());
+    let id = "urn:ngsi-ld:Building:view-upsert-replaces-instance";
+    let (created, fragment) = two_instance_docs(id);
+    let resp = post(&plain, "/ngsi-ld/v1/entityOperations/create", created).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let before = get_entity(&plain, &format!("{id}?options=sysAttrs")).await;
+    let view = CompiledView::new(
+        &["Building".into()],
+        None,
+        None,
+        None,
+        vec![Rule {
+            types: vec!["Building".into()],
+            attributes: vec!["p1".into()],
+            ..Rule::default()
+        }],
+    )
+    .expect("a view");
+    let viewed = crate::router(st.with_view(std::sync::Arc::new(view)));
+    let uri = "/ngsi-ld/v1/entityOperations/upsert?options=update";
+    let resp = post(&viewed, uri, fragment).await;
+    let status = resp.status();
+    assert_eq!(status, StatusCode::NO_CONTENT, "{}", body_json(resp).await);
+    let doc = get_entity(&plain, &format!("{id}?options=sysAttrs")).await;
+    assert_instances_replaced(&before, &doc);
 }
