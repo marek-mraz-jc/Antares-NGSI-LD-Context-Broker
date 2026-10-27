@@ -349,6 +349,18 @@ pub(super) fn routes(state: AppState) -> Router {
         // T-3531: a panicking handler answers 500 instead of unwinding the
         // connection task; inside the metrics layer so the 500 is counted.
         .layer(tower_http::catch_panic::CatchPanicLayer::custom(panic_500))
+        // T-5847: gzip or br when Accept-Encoding asks for it. The default
+        // predicate leaves bodies of 32 bytes or less, text/event-stream,
+        // images and gRPC plain; a body that already has a Content-Encoding
+        // or a Content-Range is never touched. Vary: Accept-Encoding is
+        // appended to whatever Vary the handler set. Outside the panic
+        // layer so its 500 is compressed like any other problem. Request
+        // bodies stay as sent: no decompression, so the body bound holds.
+        .layer(
+            tower_http::compression::CompressionLayer::new()
+                .gzip(true)
+                .br(true),
+        )
         // outermost on purpose: axum attaches the 405 Allow header in the
         // Router itself, above any nested layer — only a layer wrapping the
         // WHOLE router sees it.

@@ -1179,6 +1179,36 @@ order:
   security](#query-plans-under-row-level-security)): `level>=x;level<y`
   reads the type's rows, 64 000 here, 106-164 ms a statement under load.
 
+## Response compression
+
+The router compresses a response with gzip or br when the request's
+`Accept-Encoding` asks for one of them (tower-http `CompressionLayer`, in
+`crates/antares-api/src/router.rs`, T-5847). An NGSI-LD page repeats its
+attribute names in every entity: a 75 427 byte page of 100
+`KeyPerformanceIndicator` entities packs to 1 578 bytes with gzip.
+
+- A response is left plain when its size is known and is 32 bytes or less,
+  when its type is `text/event-stream`, `image/*` or gRPC, or when it already
+  carries `Content-Encoding` or `Content-Range`. A streamed entity list has no
+  known size, so it is compressed whatever its length.
+- Every response the layer judges gets `Vary: Accept-Encoding`, appended to
+  any `Vary` the handler set.
+- A request without `Accept-Encoding` gets the plain body, byte for byte what
+  the decoded compressed body holds.
+- Request bodies are never decompressed: a body sent with
+  `Content-Encoding: gzip` is parsed as sent and refused with 400, so the
+  4 MiB body bound counts the bytes the broker actually reads.
+- Antares sets no cookie and reads none: every caller names itself in a
+  header its own client adds, so a third-party page cannot make a browser send
+  an authenticated request and measure the compressed length (BREACH). The
+  broker issues no tokens or CSRF values, and its error bodies never echo a
+  stored credential (4.3.6.5, `tests/csi_credential_4_3_6_5.rs`).
+
+There is no switch: a client that wants plain bytes omits the header. A proxy
+in front of the broker that rewrites response bodies either decodes first or
+drops `Accept-Encoding` on its way up; the joinedcontext gateway drops it and
+compresses toward its own client.
+
 ## What the numbers are not
 
 They are one machine, one request shape, one week. A different instance
