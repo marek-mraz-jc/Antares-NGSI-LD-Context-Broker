@@ -1181,9 +1181,12 @@ order:
 
 ## Response compression
 
-The router compresses a response with gzip or br when the request's
-`Accept-Encoding` asks for one of them (tower-http `CompressionLayer`, in
-`crates/antares-api/src/router.rs`, T-5847). An NGSI-LD page repeats its
+The broker binary compresses a response with gzip or br when the request's
+`Accept-Encoding` asks for one of them (tower-http `CompressionLayer`,
+`antares_api::compression` in `crates/antares-api/src/router.rs`, laid over
+the router in `crates/antares-broker/src/main.rs`, T-5847). An in-process call
+(`AppState::call`, a façade, a forward) runs the router without it, so it
+always reads plain JSON and a façade chain spends no stack on the layer. An NGSI-LD page repeats its
 attribute names in every entity: a 75 427 byte page of 100
 `KeyPerformanceIndicator` entities packs to 1 578 bytes with gzip.
 

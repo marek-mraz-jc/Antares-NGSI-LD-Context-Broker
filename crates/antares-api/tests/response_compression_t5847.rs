@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! T-5847: responses honour Accept-Encoding gzip and br. The decoded body is
 //! byte-identical to the plain one, a tiny body stays plain, and a request
-//! body is never decompressed.
+//! body is never decompressed. The layer is the one the binary lays over
+//! the router (`antares_api::compression`); `crates/antares-broker/tests/
+//! compression.rs` proves the binary serves it.
 
 use std::io::Read;
 
@@ -13,6 +15,7 @@ use tower::ServiceExt;
 
 async fn send(st: &AppState, req: Request<Body>) -> (StatusCode, HeaderMap, Bytes) {
     let resp = antares_api::router(st.clone())
+        .layer(antares_api::compression())
         .oneshot(req)
         .await
         .expect("response");

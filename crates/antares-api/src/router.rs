@@ -187,6 +187,21 @@ pub fn router(state: AppState) -> Router {
     ))
 }
 
+/// gzip or br for a client whose Accept-Encoding asks for it (T-5847), laid
+/// over [`router`] by the binary that serves the network and by nothing else:
+/// an in-process call (`AppState::call`, a forward) parses the body it gets
+/// back and must read plain JSON, and each nested frame would grow the stack
+/// a façade chain spends. The default predicate leaves a body of known size
+/// up to 32 bytes, text/event-stream, images and gRPC plain; a body that
+/// already has a Content-Encoding or a Content-Range is never touched, and
+/// `Vary: Accept-Encoding` is appended to whatever Vary the handler set.
+/// Request bodies stay as sent: no decompression, so the body bound holds.
+pub fn compression() -> tower_http::compression::CompressionLayer {
+    tower_http::compression::CompressionLayer::new()
+        .gzip(true)
+        .br(true)
+}
+
 /// tower-http's `NormalizePath::trim_trailing_slash`, except below a view's
 /// OData service (`/x/views/{view}/odata/`): OData 4.01 Part 2 section 4 has
 /// no empty path segment, so `Products/` is a malformed URL there and not a
@@ -349,18 +364,6 @@ pub(super) fn routes(state: AppState) -> Router {
         // T-3531: a panicking handler answers 500 instead of unwinding the
         // connection task; inside the metrics layer so the 500 is counted.
         .layer(tower_http::catch_panic::CatchPanicLayer::custom(panic_500))
-        // T-5847: gzip or br when Accept-Encoding asks for it. The default
-        // predicate leaves bodies of 32 bytes or less, text/event-stream,
-        // images and gRPC plain; a body that already has a Content-Encoding
-        // or a Content-Range is never touched. Vary: Accept-Encoding is
-        // appended to whatever Vary the handler set. Outside the panic
-        // layer so its 500 is compressed like any other problem. Request
-        // bodies stay as sent: no decompression, so the body bound holds.
-        .layer(
-            tower_http::compression::CompressionLayer::new()
-                .gzip(true)
-                .br(true),
-        )
         // outermost on purpose: axum attaches the 405 Allow header in the
         // Router itself, above any nested layer — only a layer wrapping the
         // WHOLE router sees it.
