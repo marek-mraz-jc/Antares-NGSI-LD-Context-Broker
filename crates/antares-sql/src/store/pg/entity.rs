@@ -1195,8 +1195,14 @@ impl PgEntityStore {
             }
         }
         // a rule's idPatterns, exact where each reads alike as an ARE
-        // (T-5826); a non-leakproof `~` under RLS filters the rows the
-        // tenant, type and prefix keys found, it reaches no index
+        // (T-5826); a non-leakproof regex under RLS filters the rows the
+        // tenant, type and prefix keys found, it reaches no index.
+        // `regexp_like`, not `~`: the entity query is planned with its
+        // values, and `~`'s estimator reads every fixed character of a
+        // dataset pattern as a 1-in-5 filter, so it expects about one match
+        // and sorts the whole prefix range (164k Trees, 10 s on dev) instead
+        // of reading the C-collated id index in order up to the page's LIMIT.
+        // A function has no estimator and keeps the default third.
         if let Some(ps) = f.id_patterns {
             match ps
                 .iter()
@@ -1204,8 +1210,17 @@ impl PgEntityStore {
                 .collect::<Option<Vec<_>>>()
             {
                 Some(res) => {
-                    binds.push(Bind::TextArr(res));
-                    wheres.push(format!("id COLLATE \"C\" ~ ANY(${})", binds.len()));
+                    let any: Vec<String> = res
+                        .into_iter()
+                        .map(|re| {
+                            binds.push(Bind::Text(re));
+                            format!("regexp_like(id COLLATE \"C\", ${})", binds.len())
+                        })
+                        .collect();
+                    wheres.push(match any.as_slice() {
+                        [] => "false".to_owned(),
+                        _ => format!("({})", any.join(" OR ")),
+                    });
                 }
                 None => decided = false,
             }
