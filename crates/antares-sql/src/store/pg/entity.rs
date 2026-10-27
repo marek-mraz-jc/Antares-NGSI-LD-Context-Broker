@@ -1194,6 +1194,22 @@ impl PgEntityStore {
                 });
             }
         }
+        // a rule's idPatterns, exact where each reads alike as an ARE
+        // (T-5826); a non-leakproof `~` under RLS filters the rows the
+        // tenant, type and prefix keys found, it reaches no index
+        if let Some(ps) = f.id_patterns {
+            match ps
+                .iter()
+                .map(|p| antares_store::filter::id_pattern_sql(p))
+                .collect::<Option<Vec<_>>>()
+            {
+                Some(res) => {
+                    binds.push(Bind::TextArr(res));
+                    wheres.push(format!("id COLLATE \"C\" ~ ANY(${})", binds.len()));
+                }
+                None => decided = false,
+            }
+        }
         // OR of AND-groups, mirroring the Entity Type Selection Language
         // (4.17) the caller already parsed, read as `TypeSplit` arms.
         let mut split = None;

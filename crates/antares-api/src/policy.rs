@@ -2082,6 +2082,30 @@ pub(crate) async fn rules_id_prefixes(
     Ok(Some(all).filter(|a| !a.is_empty()))
 }
 
+/// The `idPattern`s every rule of `rules` that holds for anything narrows
+/// by, when that is all they narrow by beside their types and they all name
+/// the same ones, each of which the store applies exactly
+/// ([`antares_store::filter::id_pattern_sql`]): then the rules hold for
+/// exactly the Entities of their types whose id matches one, and the store
+/// decides, pages and counts them. A dataset Endpoint's Policy narrows its
+/// type by one such pattern; judged per row, a count over 164 000 Trees
+/// took past the gateway's 10 s (T-5826).
+pub(crate) fn shared_id_patterns(rules: &[Rule]) -> Option<&[String]> {
+    let mut typed = rules.iter().filter(|r| !r.types.is_empty());
+    let first = typed.next()?;
+    let narrows =
+        |r: &Rule| !r.is_conditional() && r.ids.is_empty() && r.id_patterns == first.id_patterns;
+    let exact = |p: &String| {
+        antares_store::filter::id_pattern_sql(p).is_some()
+            && antares_ql::regex::compile(&format!("^(?:{p})$")).is_ok()
+    };
+    (narrows(first)
+        && typed.all(narrows)
+        && !first.id_patterns.is_empty()
+        && first.id_patterns.iter().all(exact))
+    .then_some(first.id_patterns.as_slice())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3470,5 +3494,76 @@ mod tests {
             .flat_map(|(_, v)| v.as_array().into_iter().flatten())
             .collect();
         assert_eq!(values, [&json!({"value": "ana"})], "{image}");
+    }
+
+    /// T-5826: the store decides a view's reads only when every typed rule
+    /// narrows by the same translatable `idPattern` set and nothing else;
+    /// each guard of `shared_id_patterns` has its case.
+    #[test]
+    fn only_one_shared_translatable_pattern_set_is_left_to_the_store() {
+        const TREES: &str =
+            "^urn:ngsi-ld:Tree:[a-z0-9.-]+:praha-mesto:green-[a-z-]+-[0-9a-f-]{36}$";
+        let tree = |patterns: &[&str]| Rule {
+            id_patterns: patterns.iter().map(|p| (*p).to_owned()).collect(),
+            ..rule("Tree", &["name"])
+        };
+        let untyped = Rule {
+            types: Vec::new(),
+            q: Some(Box::new(antares_ql::parse_q("height>5").expect("q"))),
+            ..Rule::default()
+        };
+        let seeded = [tree(&[TREES]), untyped.clone()];
+        assert_eq!(
+            shared_id_patterns(&seeded),
+            Some([TREES.to_owned()].as_slice())
+        );
+        let refused: [(&str, Vec<Rule>); 10] = [
+            (
+                "q",
+                vec![Rule {
+                    q: Some(Box::new(antares_ql::parse_q("height>5").expect("q"))),
+                    ..tree(&[TREES])
+                }],
+            ),
+            (
+                "scopeQ",
+                vec![Rule {
+                    scope_q: Some("/praha".into()),
+                    ..tree(&[TREES])
+                }],
+            ),
+            (
+                "geo_q",
+                vec![Rule {
+                    geo_q: Some(zone_a()),
+                    ..tree(&[TREES])
+                }],
+            ),
+            (
+                "geo_also",
+                vec![Rule {
+                    geo_also: vec![*zone_a()],
+                    ..tree(&[TREES])
+                }],
+            ),
+            (
+                "ids",
+                vec![Rule {
+                    ids: vec!["urn:ngsi-ld:Tree:1".into()],
+                    ..tree(&[TREES])
+                }],
+            ),
+            (
+                "other patterns",
+                vec![tree(&[TREES]), tree(&["^urn:ngsi-ld:Tree:other-[0-9]+$"])],
+            ),
+            ("no pattern after one", vec![tree(&[TREES]), tree(&[])]),
+            ("no pattern before one", vec![tree(&[]), tree(&[TREES])]),
+            ("no pattern", vec![tree(&[]), untyped]),
+            ("untranslatable", vec![tree(&["urn:x:.*"])]),
+        ];
+        for (case, rules) in &refused {
+            assert_eq!(shared_id_patterns(rules), None, "{case}");
+        }
     }
 }

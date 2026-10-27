@@ -1538,3 +1538,51 @@ async fn a_geoquery_on_a_shown_location_is_paged_in_the_store_and_a_hidden_one_i
         assert_eq!(spy.unpaged_queries(), 0, "{attrs:?}: a read was unpaged");
     }
 }
+
+/// T-5826: a rule that narrows by an `idPattern` AND a `q` stays judged per
+/// row: the pattern alone is never handed to the store as the whole rule, so
+/// a Tree the pattern selects and the `q` refuses is neither shown nor
+/// counted. The same pattern without the `q` counts both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pattern_with_a_q_is_still_judged_per_entity() {
+    let narrowed = |q: Option<&str>| Filter {
+        rules: vec![Rule {
+            id_patterns: vec!["^urn:ngsi-ld:Tree:green-[0-9]+$".into()],
+            q: q.map(|q| Box::new(antares_ql::parse_q(q).unwrap())),
+            ..rule("Tree", &["height"])
+        }],
+        ..Filter::default()
+    };
+    for (q, count, ids) in [
+        (Some("height>5"), "1", vec!["urn:ngsi-ld:Tree:green-1"]),
+        (
+            None,
+            "2",
+            vec!["urn:ngsi-ld:Tree:green-1", "urn:ngsi-ld:Tree:green-2"],
+        ),
+    ] {
+        let st = state(narrowed(q)).await;
+        for (id, height) in [("green-1", 10), ("green-2", 1), ("other-3", 10)] {
+            create(
+                &st,
+                json!({"id": format!("urn:ngsi-ld:Tree:{id}"), "type": "Tree",
+                       "height": prop(json!(height))}),
+            )
+            .await;
+        }
+        let req = Request::builder()
+            .uri("/ngsi-ld/v1/entities?type=Tree&count=true&limit=10")
+            .body(Body::empty())
+            .unwrap();
+        let resp = antares_api::router(st.clone()).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{q:?}");
+        let total = resp.headers()["NGSILD-Results-Count"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let list: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(total, count, "{q:?}");
+        assert_eq!(members(&list).into_keys().collect::<Vec<_>>(), ids, "{q:?}");
+    }
+}

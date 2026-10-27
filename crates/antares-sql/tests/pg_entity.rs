@@ -1582,6 +1582,77 @@ async fn id_segments_and_prefixes_read_exact_byte_ranges() {
     assert!(s.query(&t, &f).await.expect("query").rows.is_empty());
 }
 
+/// T-5826: `id_patterns` selects in Postgres exactly the ids the API's own
+/// regex selects for each pattern `id_pattern_sql` writes, and decides; one
+/// it does not write is left to the caller, undecided.
+#[tokio::test(flavor = "multi_thread")]
+async fn id_patterns_select_as_the_rule_regex_does() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let s = PgEntityStore::new(pool.clone());
+    let t = TenantId::new("pgidpatterns").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let ids = [
+        "urn:ngsi-ld:Tree:hel.fi:praha-mesto:green-trees-0f8a3c2e-1b4d-4e6f-9a0b-1c2d3e4f5a6b",
+        "urn:ngsi-ld:Tree:hel.fi:praha-mesto:green-tree-rows-0f8a3c2e-1b4d-4e6f-9a0b-1c2d3e4f5a6c",
+        "urn:ngsi-ld:Tree:hel.fi:praha-mesto:green-trees-0F8A3C2E-1b4d-4e6f-9a0b-1c2d3e4f5a6b",
+        "urn:ngsi-ld:Tree:hel.fi:praha-mesto:green-trees-short",
+        "urn:ngsi-ld:Tree:hel.fi:praha-mesto:other-trees-0f8a3c2e-1b4d-4e6f-9a0b-1c2d3e4f5a6b",
+        "urn:ngsi-ld:Tree:hel_fi:praha-mesto:green-trees-0f8a3c2e-1b4d-4e6f-9a0b-1c2d3e4f5a6b",
+        "urn:ngsi-ld:Tree:hel.fi:helsinki:lam-12",
+        "urn:ngsi-ld:Tree:hel.fi:helsinki:lam-12-north",
+        "urn:ngsi-ld:Tree:hel.fi:helsinki:lam-12-",
+        "urn:ngsi-ld:Tree:hel.fi:helsinki:autumn-a07-both-2026",
+        "urn:ngsi-ld:Tree:hel.fi:helsinki:autumn-a07-3-2026",
+        "urn:ngsi-ld:Tree:x:y:a.b",
+        "urn:ngsi-ld:Tree:x:y:aXb",
+    ];
+    for id in ids {
+        let _ = s.delete(&t, id).await;
+        assert!(
+            s.create(&t, id, &expanded(id, "Tree", json!({})))
+                .await
+                .expect("create"),
+            "seed {id}"
+        );
+    }
+    let ex = |t: &str| t.to_owned();
+    for pattern in [
+        "^urn:ngsi-ld:Tree:[a-z0-9.-]+:praha-mesto:green-[a-z-]+-[0-9a-f-]{36}$",
+        "^urn:ngsi-ld:Tree:[a-z0-9.-]+:helsinki:lam-[0-9]+(-[a-z]+)?$",
+        "^urn:ngsi-ld:Tree:[a-z0-9.-]+:helsinki:autumn-[a-z][0-9]{2}-(1|2|both)-[0-9]{4}$",
+        "urn:ngsi-ld:Tree:x:y:a[.]b",
+        "urn:ngsi-ld:Tree:x:y:a\\.b",
+        "urn:ngsi-ld:Tree:x:y:(?i)AXB",
+    ] {
+        let re = antares_ql::regex::compile(&format!("^(?:{pattern})$")).expect("regex");
+        let want: Vec<&str> = {
+            let mut w: Vec<&str> = ids.iter().copied().filter(|i| re.is_match(i)).collect();
+            w.sort_unstable();
+            w
+        };
+        assert!(!want.is_empty(), "{pattern} selects a seeded id");
+        let ps = [pattern.to_owned()];
+        let f = antares_sql::store::pg::entity::EntityFilter {
+            id_patterns: Some(&ps),
+            expand: &ex,
+            ..Default::default()
+        };
+        let out = s.query(&t, &f).await.expect("query");
+        assert!(out.decided, "{pattern}");
+        assert_eq!(ids_of(&out.rows), want, "{pattern}");
+    }
+    let ps = ["urn:ngsi-ld:Tree:x:y:a.b".to_owned()];
+    let f = antares_sql::store::pg::entity::EntityFilter {
+        id_patterns: Some(&ps),
+        expand: &ex,
+        ..Default::default()
+    };
+    let out = s.query(&t, &f).await.expect("query");
+    assert!(!out.decided, "`.` stays with the caller");
+    assert_eq!(out.rows.len(), ids.len(), "and narrows nothing");
+}
+
 /// F-ANT1-011: `list_slice` is never refused for volume (the driver
 /// contract): a Tenant past the undecided-row ceiling still answers a window
 /// and the exact total.

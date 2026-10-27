@@ -1137,8 +1137,17 @@ impl Store {
                 total: f.page.as_ref().filter(|_| decided).map(|_| 0),
             };
         };
+        // a pattern that does not compile matches nothing (`Rule::id_patterns`)
+        let id_res: Option<Vec<_>> = f.id_patterns.map(|ps| {
+            ps.iter()
+                .filter_map(|p| antares_ql::regex::compile(&format!("^(?:{p})$")).ok())
+                .collect()
+        });
         let matches = |id: &str, doc: &Value| {
             !filter::expired_at(doc, &now)
+                && id_res
+                    .as_ref()
+                    .is_none_or(|res| res.iter().any(|re| re.is_match(id)))
                 && f.id_literal.is_none_or(|l| {
                     if l.anchored {
                         id.starts_with(l.text)
