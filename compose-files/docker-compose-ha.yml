@@ -72,6 +72,9 @@ services:
       ANTARES_STORE: ${STORE:-memory}
       ANTARES_DATA_DIR: /data
       ANTARES_EGRESS_ALLOW_PRIVATE: "true"
+      # the 6.3.10 ceiling the TTF 206 cases expect, as on antares1: without
+      # it every read the LB sends here answers 200 (T-4800, T-5858)
+      ANTARES_TEMPORAL_INSTANCE_LIMIT: "9"
       ANTARES_BUS: ${HA_BUS:-nats}
       ANTARES_NATS_URL: nats://localhost:4222
       # Shares antares1's database — that is the whole point.
