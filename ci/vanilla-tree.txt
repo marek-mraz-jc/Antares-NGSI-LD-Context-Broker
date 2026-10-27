@@ -2508,22 +2508,99 @@ antares-broker v0.3.0
 │   │       └── ngsild-ql feature "default" (*)
 │   ├── tower-http feature "catch-panic"
 │   │   ├── tower-http v0.7.1
+│   │   │   ├── futures-core v0.3.34
 │   │   │   ├── futures-util v0.3.34 (*)
+│   │   │   ├── tokio v1.53.3 (*)
 │   │   │   ├── tracing v0.1.44 (*)
 │   │   │   ├── bytes feature "default" (*)
 │   │   │   ├── pin-project-lite feature "default" (*)
 │   │   │   ├── http feature "default" (*)
 │   │   │   ├── http-body feature "default" (*)
 │   │   │   ├── http-body-util feature "default" (*)
+│   │   │   ├── tokio-util feature "io" (*)
 │   │   │   ├── percent-encoding feature "default" (*)
 │   │   │   ├── tower-service feature "default" (*)
 │   │   │   ├── tower-layer feature "default" (*)
-│   │   │   └── bitflags feature "default" (*)
+│   │   │   ├── bitflags feature "default" (*)
+│   │   │   ├── async-compression feature "default"
+│   │   │   │   └── async-compression v0.4.51
+│   │   │   │       ├── tokio v1.53.3 (*)
+│   │   │   │       ├── pin-project-lite feature "default" (*)
+│   │   │   │       ├── compression-codecs feature "default"
+│   │   │   │       │   └── compression-codecs v0.4.46
+│   │   │   │       │       ├── memchr feature "default" (*)
+│   │   │   │       │       ├── brotli feature "default"
+│   │   │   │       │       │   ├── brotli v9.1.0
+│   │   │   │       │       │   │   ├── brotli-decompressor v6.2.0
+│   │   │   │       │       │   │   │   ├── alloc-no-stdlib feature "default"
+│   │   │   │       │       │   │   │   │   └── alloc-no-stdlib v3.0.0
+│   │   │   │       │       │   │   │   └── alloc-stdlib feature "default"
+│   │   │   │       │       │   │   │       └── alloc-stdlib v0.3.0
+│   │   │   │       │       │   │   │           └── alloc-no-stdlib feature "default" (*)
+│   │   │   │       │       │   │   ├── alloc-no-stdlib feature "default" (*)
+│   │   │   │       │       │   │   └── alloc-stdlib feature "default" (*)
+│   │   │   │       │       │   └── brotli feature "std"
+│   │   │   │       │       │       ├── brotli v9.1.0 (*)
+│   │   │   │       │       │       ├── brotli feature "alloc-stdlib"
+│   │   │   │       │       │       │   └── brotli v9.1.0 (*)
+│   │   │   │       │       │       └── brotli-decompressor feature "std"
+│   │   │   │       │       │           ├── brotli-decompressor v6.2.0 (*)
+│   │   │   │       │       │           └── brotli-decompressor feature "alloc-stdlib"
+│   │   │   │       │       │               └── brotli-decompressor v6.2.0 (*)
+│   │   │   │       │       ├── compression-core feature "default"
+│   │   │   │       │       │   └── compression-core v0.4.34
+│   │   │   │       │       └── flate2 feature "default"
+│   │   │   │       │           ├── flate2 v1.1.9
+│   │   │   │       │           │   ├── crc32fast feature "default"
+│   │   │   │       │           │   │   ├── crc32fast v1.5.0
+│   │   │   │       │           │   │   │   └── cfg-if feature "default" (*)
+│   │   │   │       │           │   │   └── crc32fast feature "std"
+│   │   │   │       │           │   │       └── crc32fast v1.5.0 (*)
+│   │   │   │       │           │   ├── miniz_oxide feature "simd"
+│   │   │   │       │           │   │   ├── miniz_oxide v0.8.9
+│   │   │   │       │           │   │   │   ├── adler2 v2.0.1
+│   │   │   │       │           │   │   │   └── simd-adler32 v0.3.10
+│   │   │   │       │           │   │   └── miniz_oxide feature "simd-adler32"
+│   │   │   │       │           │   │       └── miniz_oxide v0.8.9 (*)
+│   │   │   │       │           │   └── miniz_oxide feature "with-alloc"
+│   │   │   │       │           │       └── miniz_oxide v0.8.9 (*)
+│   │   │   │       │           └── flate2 feature "rust_backend"
+│   │   │   │       │               ├── flate2 v1.1.9 (*)
+│   │   │   │       │               ├── flate2 feature "any_impl"
+│   │   │   │       │               │   └── flate2 v1.1.9 (*)
+│   │   │   │       │               └── flate2 feature "miniz_oxide"
+│   │   │   │       │                   ├── flate2 v1.1.9 (*)
+│   │   │   │       │                   └── flate2 feature "any_impl" (*)
+│   │   │   │       └── compression-core feature "default" (*)
+│   │   │   └── async-compression feature "tokio"
+│   │   │       └── async-compression v0.4.51 (*)
 │   │   ├── futures-util feature "std" (*)
 │   │   ├── tower-http feature "futures-util"
 │   │   │   └── tower-http v0.7.1 (*)
 │   │   └── tower-http feature "tracing"
 │   │       └── tower-http v0.7.1 (*)
+│   ├── tower-http feature "compression-br"
+│   │   ├── tower-http v0.7.1 (*)
+│   │   ├── tower-http feature "futures-core"
+│   │   │   └── tower-http v0.7.1 (*)
+│   │   ├── tower-http feature "tokio-util"
+│   │   │   └── tower-http v0.7.1 (*)
+│   │   └── async-compression feature "brotli"
+│   │       ├── async-compression v0.4.51 (*)
+│   │       └── compression-codecs feature "brotli"
+│   │           └── compression-codecs v0.4.46 (*)
+│   ├── tower-http feature "compression-gzip"
+│   │   ├── tower-http v0.7.1 (*)
+│   │   ├── tower-http feature "futures-core" (*)
+│   │   ├── tower-http feature "tokio-util" (*)
+│   │   └── async-compression feature "gzip"
+│   │       ├── async-compression v0.4.51 (*)
+│   │       └── compression-codecs feature "gzip"
+│   │           ├── compression-codecs v0.4.46 (*)
+│   │           ├── compression-codecs feature "flate2"
+│   │           │   └── compression-codecs v0.4.46 (*)
+│   │           └── compression-codecs feature "memchr"
+│   │               └── compression-codecs v0.4.46 (*)
 │   ├── tower-http feature "cors"
 │   │   └── tower-http v0.7.1 (*)
 │   └── tower-http feature "default"

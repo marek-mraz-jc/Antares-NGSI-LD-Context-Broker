@@ -1397,7 +1397,8 @@ async fn run(
         antares_api::router(state)
     } else {
         antares_api::ops_router(state)
-    };
+    }
+    .layer(antares_api::compression());
     let app: App = tower::util::MapRequest::new(routed, antares_api::trim_trailing_slash);
 
     // A connection that never finishes its request headers must not hold a
