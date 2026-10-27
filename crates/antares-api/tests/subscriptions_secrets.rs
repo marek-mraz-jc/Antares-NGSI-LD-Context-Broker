@@ -305,4 +305,15 @@ async fn receiver_info_is_stored_encrypted() {
         .expect("a notification within 10 s")
         .expect("the receiver runs");
     assert_eq!(auth, TOKEN);
+    // the database is shared: a broker started there without this key would
+    // fail every read of the sealed row
+    for table in ["entities", "subscriptions"] {
+        antares_sql::sqlx::query(antares_sql::sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE tenant_id = $1"
+        )))
+        .bind(&tenant)
+        .execute(&pool)
+        .await
+        .expect("clean");
+    }
 }

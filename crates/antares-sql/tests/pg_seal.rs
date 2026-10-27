@@ -34,6 +34,14 @@ fn sub(id: &str) -> Value {
 async fn tenant(pool: &sqlx::PgPool, name: &str) -> TenantId {
     let t = TenantId::new(name).expect("tenant");
     pg::ensure_tenant(pool, &t).await.expect("tenant row");
+    forget(pool, name).await;
+    t
+}
+
+/// Delete what a test sealed: the database is shared with every other pg
+/// test, and a broker started there without this key fails each read of
+/// such a row (antares-broker upsert_transactions never went idle).
+async fn forget(pool: &sqlx::PgPool, name: &str) {
     for table in ["subscriptions", "dead_letters"] {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "DELETE FROM {table} WHERE tenant_id = '{name}'"
@@ -42,7 +50,6 @@ async fn tenant(pool: &sqlx::PgPool, name: &str) -> TenantId {
         .await
         .expect("clean");
     }
-    t
 }
 
 /// The stored text of one row, read past the store.
@@ -158,6 +165,7 @@ async fn every_write_seals_and_every_read_opens_the_credential() {
         SecretKey::from_base64("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=").expect("key");
     let wrong = PgDocStore::new(pool.clone()).with_secret_key(other);
     assert!(wrong.get(&t, DocKind::Subscription, id).await.is_err());
+    forget(&pool, "pgseal").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -208,6 +216,7 @@ async fn rows_written_before_the_key_are_read_and_sealed_at_boot() {
         still.contains("enc:v1:"),
         "{still} after a second pass sealing {again}"
     );
+    forget(&pool, "pgsealboot").await;
 }
 
 /// The bounce of T-5838: a dump holder who can create subscriptions pastes
@@ -267,4 +276,5 @@ async fn a_value_copied_from_another_row_is_never_decrypted() {
     .expect("copy");
     tx.commit().await.expect("commit");
     assert!(s.get(&t, DocKind::Subscription, thief).await.is_err());
+    forget(&pool, "pgsealcopy").await;
 }
