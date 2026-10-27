@@ -62,6 +62,35 @@ external-suites.yml does. Results stay out of git; rerun the same way to reprodu
 
 831 cases per cell. The verdicts come from `compare.py`; "pass" counts the cases that match after its normalisation.
 
+Current numbers: weekly external-suites run 40501072590 (schedule, dev `e48eaf35`, 2026-10-27, Coraine `d313d87`).
+
+| cell | pass | fail | not applicable | error |
+|---|---:|---:|---:|---:|
+| full-file | 335 | 312 | 180 | 4 |
+| full-memory | 331 | 312 | 183 | 5 |
+| full-postgres | 334 | 313 | 180 | 4 |
+| full-timescale | 334 | 313 | 180 | 4 |
+| vanilla-file | 336 | 311 | 180 | 4 |
+| vanilla-memory | 331 | 312 | 183 | 5 |
+| vanilla-postgres | 332 | 315 | 180 | 4 |
+| vanilla-timescale | 334 | 313 | 180 | 4 |
+
+Against run 38860287033, vanilla-file case by case: 20 cases pass now and none passes there that fails here. The 20:
+append_scope_union_single, csource-reg-distops-append-exclusive, csource-reg-distops-create-207,
+csource-reg-distops-create-409, csource-reg-distops-create-excl-no-op, csource-reg-distops-retrieve-exclusive,
+distop_retrieve_timeout_504, duplicate_id_type_alias_every_level, entity_batch_upsert_distops_exclusive,
+entity_batch_upsert_distops_inclusive, entity_patch_geoproperty_validation, expanded_core_terms_input, json_property,
+linked_entities_objecttype_gate, troe_entity_modifiedat_attr_update, troe_timescale_multi_type,
+troe_timescale_subattrs_and_instance_delete, troe_timescale_temporal_deleted_kinds,
+troe_timescale_temporal_linked_projection and value_type_subattr (the T-5213 group fixes T-5463 to T-5467).
+Twelve cases differ between cells, none between the two binaries: the memory-store and timing cases below, plus
+notify_rapid_patches, snapshot_write and subscription_notif_show_changes_delete, each failing on one or two SQL-store
+cells only. In the same run all eight ETSI latest cells failed only the ratchet: 038_05_01 passes since forge commit
+`c5a1343` (suite `c5a13430`; the run of 2026-10-25 had `cc8711ce`) added `Library DateTime` to 038_05.robot, whose
+`Get Current Date` keyword was missing before. No Antares change was involved; T-5852 took the TP off the ratchet.
+
+History: run 38860287033 (2026-10-16, `74b72185`).
+
 | cell | pass | fail | not applicable | error |
 |---|---:|---:|---:|---:|
 | full-file | 315 | 332 | 180 | 4 |

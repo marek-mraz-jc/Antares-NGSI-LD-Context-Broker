@@ -34,7 +34,6 @@
 037_10_02  test bug: TS 104 176 6.2.3 context as Link on application/json, CSR ids passed as entity id; forge
 037_11_01  test bug: TS 104 176 6.4.7.2 Link type equals the requested media type, the TP sends no Accept; etsi-raises.md §19
 037_11_02  test bug: TS 104 176 6.4.7.2 Link type equals the requested media type, the TP sends no Accept; etsi-raises.md §19
-038_05_01  test bug: tooling (missing import, expected_status, unset payload, stub URL, Should Contain on a list); forge
 039_01_01  test bug: TS 104 175 5.2.6.5.2 status is provided by the system; forge
 041_03_01  test bug: TS 104 176 6.4.7.2 Link type equals the requested media type, the TP sends no Accept; etsi-raises.md §19
 041_03_02  test bug: TS 104 176 6.4.7.2 Link type equals the requested media type, the TP sends no Accept; etsi-raises.md §19
