@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: EUPL-1.2
 //! `$filter` and `$orderby` over the resources a collection serves (T-5918): what no NGSI-LD
 //! `q` or `orderBy` can say, such as an Observation's `result` or a Location's `name`, is judged
 //! here on the SensorThings JSON the view already answered, so it reads only members the view
