@@ -267,6 +267,7 @@ impl IntoResponse for ODataErrorResponse {
 /// use odata_url::{Feature, UrlError, UrlErrorKind};
 /// let refused = UrlError { kind: UrlErrorKind::NotImplemented(Feature::Index), offset: 10 };
 /// assert_eq!(url_error(&refused, 9).status, StatusCode::NOT_IMPLEMENTED);
+/// assert!(url_error(&refused, 9).error.message.starts_with("$index: no NGSI-LD equivalent"));
 /// let unknown = UrlError { kind: UrlErrorKind::Unresolved, offset: 0 };
 /// assert_eq!(url_error(&unknown, 6).status, StatusCode::NOT_FOUND);
 /// ```
@@ -296,11 +297,7 @@ pub fn url_error(error: &UrlError, path_len: usize) -> ODataErrorResponse {
             "BadRequest",
             "a system query option is given twice",
         ),
-        UrlErrorKind::NotImplemented(_) => (
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            "this service does not implement that part of OData",
-        ),
+        UrlErrorKind::NotImplemented(feature) => return not_implemented(feature.as_str()),
         UrlErrorKind::Unresolved if error.offset < path_len => (
             StatusCode::NOT_FOUND,
             "NotFound",
@@ -313,6 +310,23 @@ pub fn url_error(error: &UrlError, path_len: usize) -> ODataErrorResponse {
         ),
     };
     ODataErrorResponse::new(status, code, message)
+}
+
+/// `501 NotImplemented` naming the `construct` outside the subset ADR-0024 decision 5 maps, and
+/// why. `construct` is a fixed name, never a byte of the request.
+///
+/// ```
+/// let refused = odata_axum::not_implemented("$index");
+/// assert_eq!(refused.status, axum::http::StatusCode::NOT_IMPLEMENTED);
+/// assert_eq!(refused.error.message, "$index: no NGSI-LD equivalent (ADR-0024 decision 5)");
+/// ```
+#[must_use]
+pub fn not_implemented(construct: &str) -> ODataErrorResponse {
+    ODataErrorResponse::new(
+        StatusCode::NOT_IMPLEMENTED,
+        "NotImplemented",
+        &format!("{construct}: no NGSI-LD equivalent (ADR-0024 decision 5)"),
+    )
 }
 
 /// The router of the two documents every OData service answers: `GET /` (the service document,

@@ -676,7 +676,12 @@ impl Lower<'_> {
             Lit::Int(n) => Some(n.to_string()),
             Lit::Num(n) => n.is_finite().then(|| format!("{n}")),
             Lit::Str(s) => Some(Value::from(s.as_str()).to_string()),
-            Lit::DateTime(_) | Lit::Date(_) | Lit::Time(_) | Lit::Geometry(_) => None,
+            Lit::DateTime(_)
+            | Lit::Date(_)
+            | Lit::Time(_)
+            | Lit::Duration(_)
+            | Lit::Binary(_)
+            | Lit::Geometry(_) => None,
         }
     }
 

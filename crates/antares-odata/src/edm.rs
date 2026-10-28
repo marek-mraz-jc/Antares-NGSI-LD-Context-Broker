@@ -182,6 +182,9 @@ pub struct Set {
     /// Each Property that keys the target of a navigation (R6, T-3761), by
     /// its CSDL name: the target's EntitySet.
     pub references: BTreeMap<String, String>,
+    /// Each navigation with such a Property, by CSDL name: the Property a bind
+    /// of it sets to the target's key (CSDL XML 8.5, T-5906).
+    pub bound: BTreeMap<String, String>,
     /// The filter of the named output this set serves (docs API/11 EP-159, T-5225), a conjunct
     /// of every read of it; `None` for a class's own set.
     pub output: Option<antares_ops::outputs::Filter>,
@@ -297,9 +300,11 @@ pub fn build(
         }
         set.annotations = capabilities(&members, writable, required);
         container.entity_sets.push(set);
+        let (references, bound) = constrain(schema, class, &visible, &mut ty, &members);
         let set = Set {
             type_iri: schema.class_iri(class),
-            references: constrain(schema, class, &visible, &mut ty, &members),
+            references,
+            bound,
             members,
             identifier,
             writable,
@@ -396,16 +401,18 @@ fn own_schema(namespace: String, schema: &linkml_model::Model) -> (Schema, Strin
 /// Property with `odata_referential_constraint` gets a `ReferentialConstraint`
 /// to the target's key, when the view shows all three, the Property is
 /// not required and has the key's Edm type (CSDL XML 8.5). The Properties
-/// that hold, by CSDL name, with the target's EntitySet.
+/// that hold, by CSDL name, with the target's EntitySet, and each such
+/// navigation with its Property.
 fn constrain(
     schema: &linkml_model::Model,
     class: &str,
     visible: &BTreeMap<&str, (String, &BTreeSet<String>)>,
     ty: &mut EntityType,
     members: &BTreeMap<String, Member>,
-) -> BTreeMap<String, String> {
+) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
     let slots = schema.class_slots(class);
     let mut references = BTreeMap::new();
+    let mut bound = BTreeMap::new();
     for (name, slot) in &slots {
         let (Some(dependent), Range::Class(target)) =
             (slot.annotations.get(REFERENCE_TAG), schema.range(slot))
@@ -437,9 +444,10 @@ fn constrain(
         };
         nav.referential_constraints
             .push(ReferentialConstraint::new(property.clone(), key));
+        bound.insert(nav.name.clone(), property.clone());
         references.insert(property, set);
     }
-    references
+    (references, bound)
 }
 
 /// The EntitySet of a visible class, its key's CSDL name and Edm type: the
@@ -858,6 +866,51 @@ fn capabilities(
         restriction("DeepInsertSupport", vec![("Supported", flag(false))]),
         restriction("DeepUpdateSupport", vec![("Supported", flag(false))]),
     ]
+    .into_iter()
+    .chain(paging(members))
+    .collect()
+}
+
+/// A key, `$top` and `$skip` on the set; below one Entity, inside
+/// `$expand(...)` too, only `$select` applies (Q31 to Q33, ADR-0024
+/// decision 5): the rest of a navigation's options are 501.
+fn paging(members: &BTreeMap<String, Member>) -> [Annotation; 4] {
+    let restricted = members
+        .iter()
+        .filter(|(_, m)| matches!(m.shape, Shape::Nav { .. }))
+        .map(|(name, _)| nested_only_select(name))
+        .collect();
+    [
+        Annotation::new(
+            "Capabilities.NavigationRestrictions",
+            Expr::Record(vec![(
+                "RestrictedProperties".into(),
+                Expr::Collection(restricted),
+            )]),
+        ),
+        Annotation::new("Capabilities.IndexableByKey", Expr::Bool(true)),
+        Annotation::new("Capabilities.TopSupported", Expr::Bool(true)),
+        Annotation::new("Capabilities.SkipSupported", Expr::Bool(true)),
+    ]
+}
+
+/// One `NavigationRestrictions` row: the navigation `name` takes `$select`
+/// and no other option.
+fn nested_only_select(name: &str) -> Expr {
+    let off = |member: &str| Expr::Record(vec![(member.into(), Expr::Bool(false))]);
+    Expr::Record(vec![
+        (
+            "NavigationProperty".into(),
+            Expr::NavigationPropertyPath(name.into()),
+        ),
+        ("FilterRestrictions".into(), off("Filterable")),
+        ("SearchRestrictions".into(), off("Searchable")),
+        ("SortRestrictions".into(), off("Sortable")),
+        ("CountRestrictions".into(), off("Countable")),
+        ("TopSupported".into(), Expr::Bool(false)),
+        ("SkipSupported".into(), Expr::Bool(false)),
+        ("IndexableByKey".into(), Expr::Bool(false)),
+    ])
 }
 
 /// C18 to C20.
@@ -866,6 +919,7 @@ fn container_capabilities() -> Vec<Annotation> {
         Annotation::new(format!("Capabilities.{term}"), Expr::Bool(value))
     };
     vec![
+        // the lowest level: the pinned suite proves none higher (docs/src/odata.md section 6)
         Annotation::new(
             "Capabilities.ConformanceLevel",
             Expr::EnumMember {
@@ -898,6 +952,16 @@ fn container_capabilities() -> Vec<Annotation> {
             ]),
         ),
         flag("QuerySegmentSupported", true),
+        // the operators and functions a `$filter` translates, nothing else (T-5907)
+        Annotation::new(
+            "Capabilities.FilterFunctions",
+            Expr::Collection(
+                crate::filter::filter_functions()
+                    .into_iter()
+                    .map(|f| Expr::String(f.into()))
+                    .collect(),
+            ),
+        ),
         flag("CrossJoinSupported", false),
         flag("ComputeSupported", true),
         // Q19: the `$apply` transformations served (T-3937, T-3985)
@@ -1138,6 +1202,10 @@ mod tests {
                 .filter(|n| !n.referential_constraints.is_empty())
                 .map(|n| (n.name.clone(), n.referential_constraints.clone()))
                 .collect();
+            assert_eq!(
+                desc.bound.keys().collect::<Vec<_>>(),
+                navs.keys().collect::<Vec<_>>()
+            );
             (navs, desc.references.clone())
         };
         let (navs, references) = constraints(&shown(

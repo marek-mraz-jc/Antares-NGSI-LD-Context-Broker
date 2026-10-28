@@ -432,6 +432,9 @@ fn boundaries() -> impl Iterator<Item = String> {
 }
 
 fn refused(error: &BatchError, version: ODataVersion) -> Response {
+    if let BatchError::NotImplemented(feature) = error {
+        return crate::read::not_implemented(feature.as_str(), version).into_response();
+    }
     let status = StatusCode::from_u16(error.status()).unwrap_or(StatusCode::BAD_REQUEST);
     // `BadRequest`, `NotImplemented`, `PayloadTooLarge`.
     let code = status

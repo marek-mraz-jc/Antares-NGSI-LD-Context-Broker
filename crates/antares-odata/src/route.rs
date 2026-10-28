@@ -63,10 +63,9 @@ pub(crate) async fn serve(
             .await
             .unwrap_or_else(IntoResponse::into_response);
     }
-    let (ODataUri::Resource { path, options }, None) =
-        (&request.uri, later(&request.uri, &reads.edm.schema_version))
-    else {
-        return not_implemented(version).into_response();
+    let refused = later(&request.uri, &reads.edm.schema_version);
+    let (ODataUri::Resource { path, options }, None) = (&request.uri, refused) else {
+        return not_implemented(refused.unwrap_or("this resource"), version).into_response();
     };
     let answer = match path.as_slice() {
         [_, Segment::Ref] | [_, _, Segment::Ref] if shaped(options) => Err(no_properties(version)),
@@ -88,7 +87,10 @@ pub(crate) async fn serve(
             paths::reference(reads, caller, &ctx, (set, key), options).await
         }
         // Below one Entity only `$select` applies (Q31 to Q33).
-        [_, _, ..] if !only_select(options) => Err(not_implemented(version)),
+        [_, _, ..] if !only_select(options) => Err(not_implemented(
+            "a query option other than $select below one Entity",
+            version,
+        )),
         [Segment::EntitySet(set), Segment::Key(key), Segment::Property(name)] => {
             paths::property(reads, caller, &ctx, (set, key, name), false, options).await
         }
@@ -101,7 +103,7 @@ pub(crate) async fn serve(
         [Segment::EntitySet(set), Segment::Key(key), Segment::Navigation(nav), Segment::Ref] => {
             paths::related(reads, caller, &ctx, (set, key, nav), true, options).await
         }
-        _ => Err(not_implemented(version)),
+        _ => Err(not_implemented("this resource path", version)),
     };
     answer.unwrap_or_else(IntoResponse::into_response)
 }
@@ -144,7 +146,7 @@ async fn write(
     };
     let Some(op) = form.op(reads) else {
         // W19: no operation removes one object of a Relationship.
-        return not_implemented(version).into_response();
+        return not_implemented("removing one object of a Relationship", version).into_response();
     };
     // Rule 4: a write the view does not offer is refused before its body
     // is read, whatever the body holds.
@@ -153,11 +155,12 @@ async fn write(
     }
     // W32: the broker has no conditional write; options shape a read's
     // answer, and a write answers no representation but a create's.
-    if headers.contains_key(IF_MATCH)
-        || headers.contains_key(IF_NONE_MATCH)
-        || *options != QueryOptions::default()
-    {
-        return not_implemented(version).into_response();
+    if headers.contains_key(IF_MATCH) || headers.contains_key(IF_NONE_MATCH) {
+        return not_implemented("a conditional write (If-Match, If-None-Match)", version)
+            .into_response();
+    }
+    if *options != QueryOptions::default() {
+        return not_implemented("a query option on a write", version).into_response();
     }
     let level = match json_level(request, headers, reads.state.max_header_len) {
         Ok(level) => level,
@@ -171,7 +174,9 @@ async fn write(
     };
     let answer = match form {
         Form::Create(set) => create(reads, caller, &ctx, set, headers, body).await,
-        Form::Change(set, key, kind) => change(reads, caller, &ctx, (set, key), kind, body).await,
+        Form::Change(set, key, kind) => {
+            change(reads, caller, &ctx, (set, key), kind, headers, body).await
+        }
         Form::Delete(set, key) => delete(reads, caller, set, key, version).await,
         Form::Attribute(set, key, name, method) => {
             below::property(reads, caller, &ctx, (set, key, name), &method, body).await

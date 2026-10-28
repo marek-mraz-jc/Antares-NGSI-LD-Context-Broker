@@ -736,6 +736,22 @@
           ]
         ]
       }
+    },
+    "Rating": {
+      "type": "Property",
+      "value": 0
+    },
+    "Temperature": {
+      "type": "Property",
+      "value": 0
+    },
+    "Quantity": {
+      "type": "Property",
+      "value": 0
+    },
+    "Weight": {
+      "type": "Property",
+      "value": 0.0
     }
   },
   {
@@ -859,6 +875,22 @@
           ]
         ]
       }
+    },
+    "Rating": {
+      "type": "Property",
+      "value": 0
+    },
+    "Temperature": {
+      "type": "Property",
+      "value": 0
+    },
+    "Quantity": {
+      "type": "Property",
+      "value": 0
+    },
+    "Weight": {
+      "type": "Property",
+      "value": 0.0
     }
   },
   {
@@ -982,6 +1014,22 @@
           ]
         ]
       }
+    },
+    "Rating": {
+      "type": "Property",
+      "value": 0
+    },
+    "Temperature": {
+      "type": "Property",
+      "value": 0
+    },
+    "Quantity": {
+      "type": "Property",
+      "value": 0
+    },
+    "Weight": {
+      "type": "Property",
+      "value": 0.0
     }
   },
   {
