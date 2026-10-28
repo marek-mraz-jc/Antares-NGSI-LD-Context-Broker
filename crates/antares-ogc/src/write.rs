@@ -170,7 +170,7 @@ pub(crate) async fn run(
 /// on as it is and a client fixes the same field whatever surface it wrote
 /// with. `None` for any other 400, whose detail stays the broker's.
 async fn model_refusal(view: &ViewOps, answer: Response) -> Option<String> {
-    let body = view.read_answer(answer.into_body()).await.ok()?;
+    let body = view.read_answer(answer.into_body(), "ogc").await.ok()?;
     let problem = serde_json::from_slice::<Value>(&body).ok()?;
     let detail = problem.get("detail")?.as_str()?;
     detail

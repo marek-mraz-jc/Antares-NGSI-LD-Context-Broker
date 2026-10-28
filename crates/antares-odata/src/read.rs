@@ -1955,15 +1955,14 @@ async fn model_refusal(
     answer: Response,
     version: ODataVersion,
 ) -> ODataErrorResponse {
-    let body = reads
-        .view
-        .read_answer(answer.into_body())
-        .await
-        .unwrap_or_default();
-    let detail = serde_json::from_slice::<Value>(&body).ok().and_then(|p| {
-        let d = p.get("detail")?.as_str()?;
-        d.contains(linkml_model::check::MARK).then(|| d.to_owned())
-    });
+    let body = reads.view.read_answer(answer.into_body(), "odata").await;
+    let detail = body
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|p| {
+            let d = p.get("detail")?.as_str()?;
+            d.contains(linkml_model::check::MARK).then(|| d.to_owned())
+        });
     match detail {
         Some(d) => {
             ODataErrorResponse::new(StatusCode::BAD_REQUEST, "BadRequest", &d).with_version(version)
