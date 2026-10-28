@@ -104,12 +104,21 @@ async fn preview(
         .and_then(|v: &HeaderValue| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or_default();
-    let Ok(bytes) = axum::body::to_bytes(answer.into_body(), r.state.max_answer_bytes).await else {
-        return Ok(problem(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "BadRequestData",
-            antares_api::bounds::ANSWER_TOO_LARGE,
-        ));
+    let bytes = match r.state.read_answer(answer.into_body()).await {
+        Ok(bytes) => bytes,
+        Err(antares_api::bounds::AnswerRefusal::OverBudget) => {
+            return Ok(antares_api::negotiate::ApiError::from(
+                antares_api::bounds::AnswerRefusal::OverBudget,
+            )
+            .into_response())
+        }
+        Err(_) => {
+            return Ok(problem(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "BadRequestData",
+                antares_api::bounds::ANSWER_TOO_LARGE,
+            ))
+        }
     };
     let entities: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     Ok(axum::Json(serde_json::json!({"count": count, "entities": entities})).into_response())

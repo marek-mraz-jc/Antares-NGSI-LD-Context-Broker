@@ -484,6 +484,32 @@ async fn odata_batch_member_past_the_buffer_bound_is_413() {
     );
 }
 
+/// T-5895: a member whose answer the broker's buffered-answer pool has no
+/// room for answers 503 with Retry-After inside the batch, refused whole;
+/// the members under it still answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn odata_batch_member_past_the_answer_pool_is_503() {
+    std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
+    let b = TestBroker::with_answer_pool(512).await.expect("broker");
+    let (_b, app) = city_on(b).await.expect("city");
+    let members = json!([
+        {"id": "1", "method": "get", "url": "$metadata"},
+        {"id": "2", "method": "get", "url": "Car?$top=1&$select=speed"}
+    ]);
+    let go_on = [("Prefer", "odata.continue-on-error")];
+    let (status, _, answer) = json_batch(&app, &members, &go_on).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(statuses(&answer), [503, 200], "{answer}");
+    assert_eq!(
+        answer["responses"][0]["body"]["error"]["code"], "ServiceUnavailable",
+        "{answer}"
+    );
+    assert_eq!(
+        answer["responses"][0]["headers"]["retry-after"], "1",
+        "{answer}"
+    );
+}
+
 /// F-ANT4-004: the member answers one batch buffers share the broker's
 /// `max_answer_bytes`; the member that passes it and every later one answer
 /// 413, and the batch framing stays valid.

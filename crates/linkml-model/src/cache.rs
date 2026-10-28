@@ -30,8 +30,18 @@ use moka::sync::Cache;
 
 use crate::{Error, Limits, Model};
 
-/// The bytes of schema source the cache holds at most.
-pub const MAX_BYTES: u64 = 32 << 20;
+/// The bytes of schema source the cache holds by default: 8 MiB, this
+/// cache's share of the Antares broker's default 200 MiB memory budget
+/// (T-5895); [`set_max_bytes`] sets another.
+pub const MAX_BYTES: u64 = 8 << 20;
+
+static CAPACITY: AtomicU64 = AtomicU64::new(MAX_BYTES);
+
+/// Sets the bytes of schema source the cache holds. The cache is sized at
+/// its first read, so a process calls this before it reads a schema.
+pub fn set_max_bytes(bytes: u64) {
+    CAPACITY.store(bytes, Ordering::Relaxed);
+}
 
 /// What one entry weighs at least, so tiny schemas cannot crowd the cache
 /// past any sensible count.
@@ -51,7 +61,7 @@ struct Entry {
 
 static CACHE: LazyLock<Cache<(u64, Limits), Entry>> = LazyLock::new(|| {
     Cache::builder()
-        .max_capacity(MAX_BYTES)
+        .max_capacity(CAPACITY.load(Ordering::Relaxed))
         .weigher(|_key: &(u64, Limits), entry: &Entry| entry.weight)
         .build()
 });
@@ -101,6 +111,13 @@ pub fn held_bytes() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T-5895: the share a process sets is the capacity the cache takes.
+    #[test]
+    fn a_set_share_is_the_capacity() {
+        set_max_bytes(MAX_BYTES);
+        assert_eq!(CAPACITY.load(Ordering::Relaxed), MAX_BYTES);
+    }
 
     fn schema(name: &str, pad: usize) -> Arc<[u8]> {
         let description = "x".repeat(pad);
