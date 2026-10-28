@@ -719,6 +719,10 @@ pub enum Literal {
     Guid(String),
     /// `geography'SRID=n;Point(...)'` or `...;Polygon(...)'`.
     Geography(Geography),
+    /// `duration'[-]PnDTnHnMn.nS'`, its `durationValue` as written (T-5905).
+    Duration(String),
+    /// `binary'...'`, its base64url text as written, padded or not (T-5905).
+    Binary(String),
 }
 
 /// A geography literal of the subset.

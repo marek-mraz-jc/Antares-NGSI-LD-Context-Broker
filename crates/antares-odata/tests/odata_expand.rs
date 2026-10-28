@@ -385,12 +385,30 @@ async fn odata_filter_navigation_path_reads_hidden_targets_as_absent() {
             "Car?$filter=drivers/name%20eq%20'Ann'",
             StatusCode::BAD_REQUEST,
         ),
-        ("Car?$orderby=owner/name", StatusCode::NOT_IMPLEMENTED),
         ("Car?$filter=owner/pin%20eq%204711", StatusCode::BAD_REQUEST),
     ] {
         let (status, body) = get(&app, path).await;
         assert_eq!(status, want, "{path}: {body}");
     }
+    // T-5906: sorted by the joined target's value; the hidden owner of Car:2 sorts with the
+    // absent one of Car:3, null first ascending
+    let (status, body) = get(&app, "Car?$orderby=owner/name").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ordered: Vec<&str> = body["value"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c["id"].as_str())
+        .collect();
+    assert_eq!(
+        ordered,
+        [
+            "urn:ngsi-ld:Car:2",
+            "urn:ngsi-ld:Car:3",
+            "urn:ngsi-ld:Car:1"
+        ],
+        "{body}"
+    );
 }
 
 async fn text(app: &Router, path: &str) -> (StatusCode, String, String) {

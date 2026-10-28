@@ -13,7 +13,7 @@ use crate::filter::{
     compute, computed, holds_member, inlined, mint, order, program, searched, translate, Refused,
     SortBy, SortKey, Translated,
 };
-use antares_ops::residual::{DateTime, Expr as RExpr, Program};
+use antares_ops::residual::{base64url, decode_base64, DateTime, Expr as RExpr, Program};
 use antares_ops::{
     core_name, pickable, Caller, OperationId, OpsRequest, Page as ScanPage, Pushdown, Refusal,
     Scanned, ViewOps, RESIDUAL_SCAN, TOO_COMPLEX,
@@ -343,9 +343,7 @@ pub(crate) fn query(
             .iter()
             .filter_map(|term| filter.context.get(term)?.as_str());
         let mut iris: Vec<&str> = Vec::new();
-        for iri in names
-            .iter()
-            .filter_map(|name| set.members.get(*name))
+        for iri in asked(set, names)
             .map(|m| m.iri.as_str())
             .chain(expansions.iter().map(|e| e.iri))
             .chain(reads)
@@ -372,7 +370,8 @@ pub(crate) fn query(
         q.push_str("&options=sysAttrs");
     }
     if joined {
-        q.push_str("&join=inline&joinLevel=1");
+        q.push_str("&join=inline&joinLevel=");
+        q.push_str(&filter.linked.max(1).to_string());
     }
     q
 }
@@ -388,7 +387,7 @@ fn nested<'e>(expansions: &'e [Expansion]) -> impl Iterator<Item = Option<&'e [&
 /// Whether a read joins: an expansion of entities or a `q` that follows a
 /// Relationship (5.7.2.4).
 fn joins(expansions: &[Expansion], filter: &Translated) -> bool {
-    filter.linked || nested(expansions).next().is_some()
+    filter.linked > 0 || nested(expansions).next().is_some()
 }
 
 /// The members a join without `$select` projects to: every one but the
@@ -450,9 +449,7 @@ pub(crate) fn pushdown(
         picked => picked,
     };
     let attrs = picked.map(|names| {
-        let iris = names
-            .iter()
-            .filter_map(|name| set.members.get(*name))
+        let iris = asked(set, names)
             .map(|m| m.iri.as_str())
             .chain(expansions.iter().map(|e| e.iri))
             .map(str::to_owned)
@@ -473,7 +470,8 @@ pub(crate) fn pushdown(
     };
     let mut query = selection(set, filter);
     if joined {
-        query.push_str("&join=inline&joinLevel=1");
+        query.push_str("&join=inline&joinLevel=");
+        query.push_str(&filter.linked.max(1).to_string());
     }
     Pushdown {
         query,
@@ -912,7 +910,7 @@ fn filtered(
     match &options.orderby {
         Some(keys) => {
             let mut t = translated;
-            order(keys, set, &mut t).map_err(|refused| refusal(refused, version))?;
+            order(keys, set, sets, &mut t).map_err(|refused| refusal(refused, version))?;
             // each item pushed one key, in order
             t.held_keys = keys
                 .iter()
@@ -1304,8 +1302,13 @@ pub(crate) fn entity_value(
     filter: &Translated,
 ) -> EntityValue {
     let id = doc.get("id").and_then(Value::as_str).unwrap_or_default();
-    let wanted = |name: &str| picked.is_none_or(|p| p.contains(&name));
-    let mut properties = vec![("id".to_owned(), Value::from(id))];
+    // A selection keeps the key (Protocol 11.2.5.1): the E2a identifier, else `id`.
+    let key = key_member(set);
+    let wanted = |name: &str| picked.is_none_or(|p| p.contains(&name)) || key == Some(name);
+    let mut properties = Vec::new();
+    if wanted("id") || key.is_none() {
+        properties.push(("id".to_owned(), Value::from(id)));
+    }
     if wanted("_types") {
         properties.push(("_types".into(), Value::from(visible_types(&reads.edm, doc))));
     }
@@ -1354,6 +1357,20 @@ pub(crate) fn entity_value(
         id: format!("{set_name}{}", key_segment(set, id)),
         properties,
     }
+}
+
+/// The member that keys `set` (E2a), `None` when the key is `id`.
+fn key_member(set: &Set) -> Option<&str> {
+    set.identifier.as_ref().map(|i| i.member.as_str())
+}
+
+/// The members a read of `names` asks the broker for: those, and the key a selection keeps.
+fn asked<'s>(set: &'s Set, names: &'s [&str]) -> impl Iterator<Item = &'s crate::edm::Member> {
+    names
+        .iter()
+        .copied()
+        .chain(key_member(set).filter(|key| !names.contains(key)))
+        .filter_map(|name| set.members.get(name))
 }
 
 /// The key of an Attribute in an answer compacted under the request's
@@ -1494,6 +1511,13 @@ pub(crate) fn served(shape: &Shape, instance: Option<&Value>) -> (Value, Option<
         } | Shape::Url { collection: true }
     );
     let other_kind = instance.is_some_and(Value::is_object) && value.is_none();
+    let value = match (shape, value) {
+        (Shape::Value { edm, .. }, Some(v)) => match as_edm(edm, v) {
+            Ok(v) => Some(v),
+            Err(note) => return (Value::Null, Some(note)),
+        },
+        (_, v) => v,
+    };
     match value {
         // An Untyped member holds any JSON value, an array too.
         Some(v) if *shape == Shape::Json => (v, None),
@@ -1510,6 +1534,28 @@ pub(crate) fn served(shape: &Shape, instance: Option<&Value>) -> (Value, Option<
             Some("the LanguageProperty has no text without a language: ask with ngsild.lang"),
         ),
         None => (Value::Null, other_kind.then_some(KIND_NOTE)),
+    }
+}
+
+/// A stored value in the JSON form of `edm` (JSON Format 7.1), item by item in a list: an
+/// `Edm.Binary` as unpadded base64url whichever base64 NGSI-LD stores, an `Edm.TimeOfDay`
+/// without the `Z` NGSI-LD writes a Time with (TS 104 175 5.2.2.4). `Err` with the reason when
+/// a stored text is no binary value (T-5905).
+fn as_edm(edm: &str, value: Value) -> Result<Value, &'static str> {
+    match (edm, value) {
+        (_, Value::Array(items)) => items
+            .into_iter()
+            .map(|v| as_edm(edm, v))
+            .collect::<Result<_, _>>()
+            .map(Value::Array),
+        ("Edm.Binary", Value::String(text)) => decode_base64(&text)
+            .map(|bytes| Value::String(base64url(&bytes)))
+            .ok_or("the stored value is no base64 text"),
+        ("Edm.TimeOfDay", Value::String(text)) => Ok(Value::String(
+            text.strip_suffix(['Z', 'z'])
+                .map_or(text.clone(), str::to_owned),
+        )),
+        (_, v) => Ok(v),
     }
 }
 
@@ -1721,7 +1767,7 @@ async fn nulls_first(
         .iter()
         .filter_map(|k| match &k.by {
             SortBy::Value(term) => Some(term.as_str()),
-            SortBy::Id | SortBy::System(_) | SortBy::Computed(_) => None,
+            SortBy::Id | SortBy::System(_) | SortBy::Computed(_) | SortBy::Linked(..) => None,
         })
         .collect();
     let unheld: Vec<&&str> = terms
@@ -1863,6 +1909,10 @@ fn sort_value<'d>(doc: &'d Value, by: &SortBy) -> Option<&'d Value> {
         SortBy::System(name) => doc.get(name),
         SortBy::Value(term) => default_instance(doc.get(term)).and_then(|i| i.get("value")),
         SortBy::Computed(name) => doc.get(COMPUTED).and_then(|c| c.get(name)),
+        SortBy::Linked(rel, term) => default_instance(doc.get(rel))
+            .and_then(|i| i.get("entity"))
+            .and_then(|target| default_instance(target.get(term)))
+            .and_then(|i| i.get("value")),
     };
     found
         .map(|v| v.get("@value").unwrap_or(v))
@@ -2018,6 +2068,7 @@ mod tests {
             type_iri: "https://e.org/T".into(),
             identifier: None,
             references: BTreeMap::new(),
+            bound: BTreeMap::new(),
             writable: crate::edm::Writable::default(),
             members: BTreeMap::from([
                 ("geo".into(), member(Shape::Geo)),
@@ -2157,6 +2208,43 @@ mod tests {
             served(&Shape::Language, None),
             (Value::Null, None),
             "absent, no note"
+        );
+        // T-5905: Edm.Binary as unpadded base64url, Edm.TimeOfDay without NGSI-LD's `Z`
+        let typed = |edm, collection| Shape::Value { edm, collection };
+        for (shape, stored, want) in [
+            (
+                typed("Edm.Binary", false),
+                json!("dGVzdA=="),
+                json!("dGVzdA"),
+            ),
+            (
+                typed("Edm.Binary", true),
+                json!(["+/8=", ""]),
+                json!(["-_8", ""]),
+            ),
+            (
+                typed("Edm.TimeOfDay", false),
+                json!("09:30:00Z"),
+                json!("09:30:00"),
+            ),
+            (
+                typed("Edm.TimeOfDay", false),
+                json!("09:30:00"),
+                json!("09:30:00"),
+            ),
+            (typed("Edm.Binary", false), json!(7), json!(7)),
+        ] {
+            assert_eq!(
+                served(&shape, Some(&json!({"value": stored}))),
+                (want, None)
+            );
+        }
+        assert_eq!(
+            served(
+                &typed("Edm.Binary", false),
+                Some(&json!({"value": "no base64!"}))
+            ),
+            (Value::Null, Some("the stored value is no base64 text"))
         );
     }
 
