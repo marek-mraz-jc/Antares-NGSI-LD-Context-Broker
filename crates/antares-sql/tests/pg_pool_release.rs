@@ -181,3 +181,167 @@ async fn a_stalled_stream_does_not_keep_its_pool_slot() {
         pool.num_idle()
     );
 }
+
+/// T-6000: prod held 13 of 13 sessions idle after `ROLLBACK` for up to 11 h
+/// while every acquire timed out. The server ends a session idle past
+/// `IDLE_SESSION`, and the pool closes its own idle ones well before that,
+/// so the bound never cuts a connection the pool still serves from.
+#[tokio::test]
+async fn the_server_ends_a_session_left_idle_past_the_pool() {
+    let url = require_db!();
+    let pool = antares_sql::store::pg::connect_with(&url, 1, Duration::from_secs(30))
+        .await
+        .expect("pool");
+    let set: String = sqlx::query_scalar("SELECT current_setting('idle_session_timeout')")
+        .fetch_one(&pool)
+        .await
+        .expect("setting");
+    assert_eq!(set, "10min", "a broker session carries the idle bound");
+    let pool_idle = pool.options().get_idle_timeout().expect("idle timeout");
+    assert!(
+        pool_idle * 2 < antares_sql::store::pg::IDLE_SESSION,
+        "the pool reaps an idle connection (within twice {pool_idle:?}) before the server bound"
+    );
+}
+
+/// Requests dropped at every stage of a transaction (mid-stream, after a
+/// failed statement, mid-send of a large bind, inside a savepoint) leave
+/// every pool slot usable again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transactions_cancelled_anywhere_give_every_slot_back() {
+    use futures_util::TryStreamExt;
+    use sqlx::Acquire;
+    async fn step(p: sqlx::PgPool, k: u32) -> Result<(), sqlx::Error> {
+        let mut tx = p.begin().await?;
+        match k % 4 {
+            0 => {
+                let mut rows =
+                    sqlx::query("SELECT g FROM generate_series(1, 20000) g").fetch(&mut *tx);
+                while rows.try_next().await?.is_some() {}
+            }
+            1 => {
+                sqlx::query("SELECT 1/0").execute(&mut *tx).await?;
+            }
+            2 => {
+                sqlx::query("SELECT length($1)")
+                    .bind("y".repeat(2_000_000))
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            _ => {
+                let mut sp = (&mut tx).begin().await?;
+                sqlx::query("SELECT pg_sleep(0.005)")
+                    .execute(&mut *sp)
+                    .await?;
+                sp.commit().await?;
+            }
+        }
+        tx.commit().await
+    }
+    let url = require_db!();
+    let pool = antares_sql::store::pg::connect_with(&url, 3, Duration::from_secs(30))
+        .await
+        .expect("pool");
+    let workers: Vec<_> = (0..12u32)
+        .map(|w| {
+            let p = pool.clone();
+            tokio::spawn(async move {
+                for i in 0..100u32 {
+                    let k = w.wrapping_mul(7919).wrapping_add(i.wrapping_mul(104_729));
+                    let wall = Duration::from_millis(u64::from(k % 25));
+                    let _ = tokio::time::timeout(wall, step(p.clone(), k / 25)).await;
+                }
+            })
+        })
+        .collect();
+    for w in workers {
+        w.await.expect("joined");
+    }
+    let p = pool.clone();
+    let served = tokio::time::timeout(Duration::from_secs(10), async move {
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            let mut tx = p.begin().await?;
+            sqlx::query("SELECT 1").execute(&mut *tx).await?;
+            held.push(tx);
+        }
+        Ok::<_, sqlx::Error>(())
+    })
+    .await;
+    assert!(
+        matches!(served, Ok(Ok(()))),
+        "not every slot came back: {served:?} (size {}, idle {})",
+        pool.size(),
+        pool.num_idle()
+    );
+}
+
+/// With every slot taken, /q/ready's store ping answers inside the probe's
+/// 3 s instead of waiting out the 5 s acquire timeout.
+#[tokio::test]
+async fn the_readiness_ping_answers_while_every_slot_is_held() {
+    let url = require_db!();
+    let pool = antares_sql::store::pg::connect_with(&url, 1, Duration::from_secs(30))
+        .await
+        .expect("pool");
+    let store = antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(
+        pool.clone(),
+    ));
+    store.ping().await.expect("ready with a free slot");
+    let held = pool.acquire().await.expect("the only slot");
+    let started = std::time::Instant::now();
+    assert!(store.ping().await.is_err(), "not ready without a slot");
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(2),
+        "the ping waited {took:?}, past the probe timeout"
+    );
+    drop(held);
+}
+
+/// T-6000: a request dropped while its statement runs, the statement then
+/// failing. The release ping reads that ErrorResponse; sqlx answered it by
+/// closing the connection, and over TLS sqlx's close waits for bytes the
+/// idle server never sends, so the slot was held for good (prod
+/// 2026-10-28: 13 of 13 slots, each session idle after `ROLLBACK`). The
+/// release hook now drains the failed statement and keeps the connection.
+/// The hang needs TLS: without it the test passes either way, so it says so.
+#[tokio::test]
+async fn a_statement_failing_after_its_request_left_gives_the_slot_back() {
+    let url = require_db!();
+    let pool = antares_sql::store::pg::connect_with(&url, 1, Duration::from_secs(30))
+        .await
+        .expect("pool");
+    let tls: bool = sqlx::query_scalar("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+        .fetch_one(&pool)
+        .await
+        .expect("pg_stat_ssl");
+    if !tls {
+        eprintln!("NOTE: the server offers no TLS; the close hang this test guards cannot occur");
+    }
+    for round in 0..3 {
+        let p = pool.clone();
+        let dropped = tokio::time::timeout(Duration::from_millis(50), async move {
+            let mut tx = p.begin().await?;
+            sqlx::query("SELECT n / 0 FROM (SELECT count(*)::int AS n FROM pg_sleep(0.2)) s")
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await
+        })
+        .await;
+        assert!(dropped.is_err(), "round {round} finished inside 50 ms");
+        let p = pool.clone();
+        let served = tokio::time::timeout(Duration::from_secs(8), async move {
+            let mut tx = p.begin().await?;
+            sqlx::query("SELECT 1").execute(&mut *tx).await?;
+            tx.commit().await
+        })
+        .await;
+        assert!(
+            matches!(served, Ok(Ok(()))),
+            "round {round}: the slot did not come back: {served:?} (size {}, idle {})",
+            pool.size(),
+            pool.num_idle()
+        );
+    }
+}

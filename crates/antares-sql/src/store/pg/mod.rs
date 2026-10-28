@@ -160,6 +160,19 @@ pub async fn connect(url: &str, max_connections: u32) -> Result<PgPool, sqlx::Er
 /// before it is dropped instead of going back to the pool (T-4298).
 pub const RELEASE_PING: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long the server keeps a broker session that sits idle outside a
+/// transaction (`idle_session_timeout`, T-6000). A pooled connection never
+/// gets there: the pool closes an idle one after [`POOL_IDLE`], and its
+/// reaper runs every [`POOL_IDLE`], so it is gone within twice that. A
+/// session idle longer is one the pool no longer serves from: prod
+/// 2026-10-28 held 13 of 13 such sessions, idle after `ROLLBACK` for 21 min
+/// to 11 h, while every acquire timed out. The server ends it, the socket
+/// closes, and whatever waited on it (or the pool slot behind it) is freed.
+pub const IDLE_SESSION: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// How long a connection may sit idle in the pool before the pool closes it.
+pub const POOL_IDLE: std::time::Duration = std::time::Duration::from_secs(240);
+
 /// [`connect`] with the per-session `statement_timeout` chosen by the
 /// deployment (`ANTARES_PG_STATEMENT_TIMEOUT_MS`).
 pub async fn connect_with(
@@ -167,9 +180,7 @@ pub async fn connect_with(
     max_connections: u32,
     statement_timeout: std::time::Duration,
 ) -> Result<PgPool, sqlx::Error> {
-    let pool = options(max_connections, statement_timeout)
-        .connect(url)
-        .await?;
+    let pool = open(url, max_connections, statement_timeout).await?;
     // DDL is exempt from the per-session statement timeout: building an index
     // on a large attr_instances legitimately runs longer than a query ever
     // should. The lock timeout stays — a migration blocked on a lock must
@@ -202,13 +213,26 @@ pub async fn connect_reserve(
     max_connections: u32,
     statement_timeout: std::time::Duration,
 ) -> Result<PgPool, sqlx::Error> {
-    options(max_connections, statement_timeout)
-        .connect(url)
+    open(url, max_connections, statement_timeout).await
+}
+
+/// A pool with the bounds and session settings every broker pool shares.
+async fn open(
+    url: &str,
+    max_connections: u32,
+    statement_timeout: std::time::Duration,
+) -> Result<PgPool, sqlx::Error> {
+    let connect: sqlx::postgres::PgConnectOptions = url.parse()?;
+    options(connect.clone(), max_connections, statement_timeout)
+        .connect_with(connect)
         .await
 }
 
-/// The bounds and session settings every broker pool shares.
-fn options(max_connections: u32, statement_timeout: std::time::Duration) -> PgPoolOptions {
+fn options(
+    connect: sqlx::postgres::PgConnectOptions,
+    max_connections: u32,
+    statement_timeout: std::time::Duration,
+) -> PgPoolOptions {
     use std::time::Duration;
     // No parallel workers: a request reads a page, and a page whose filter
     // the planner thinks selective (a `q` under RLS is never an index
@@ -221,13 +245,15 @@ fn options(max_connections: u32, statement_timeout: std::time::Duration) -> PgPo
     // checks for interrupts, so `statement_timeout` could not end it (T-5904).
     let session = format!(
         "SET statement_timeout = '{}ms'; SET lock_timeout = '5s'; \
-         SET max_parallel_workers_per_gather = 0; SET jit = off",
-        statement_timeout.as_millis()
+         SET max_parallel_workers_per_gather = 0; SET jit = off; \
+         SET idle_session_timeout = '{}ms'",
+        statement_timeout.as_millis(),
+        IDLE_SESSION.as_millis()
     );
     PgPoolOptions::new()
         .max_connections(max_connections)
         .acquire_timeout(Duration::from_secs(5))
-        .idle_timeout(Duration::from_secs(600))
+        .idle_timeout(POOL_IDLE)
         .max_lifetime(Duration::from_secs(1800))
         // sqlx tests a released connection with a ping it never times out,
         // and holds its pool slot until the ping answers. Through the mesh
@@ -237,13 +263,40 @@ fn options(max_connections: u32, statement_timeout: std::time::Duration) -> PgPo
         // bounded; one that fails or runs out drops the socket at once, and
         // the slot opens a fresh connection on demand. sqlx's own ping after
         // it costs one more round trip on a connection that just answered.
-        .after_release(|conn, _meta| {
+        //
+        // A failed ping answers `Ok(false)`, never `Err` (T-6000). On `Err`
+        // sqlx closes "hard": it only flushes and shuts the socket, and over
+        // TLS (sqlx 0.9 rustls) a flush with nothing to write waits to READ,
+        // which on a healthy idle server never comes: the slot was held for
+        // good (prod 2026-10-28, 13 of 13, each session idle after the
+        // ROLLBACK of a request dropped while its statement failed). On
+        // `Ok(false)` sqlx sends Terminate first, the server closes, and the
+        // read ends. A ping that ran out may sit on a stalled stream, where
+        // no Terminate gets through either: the hook holds the connection
+        // only by reference, so a fresh one takes its place and the stalled
+        // socket is dropped unflushed; sqlx then closes the fresh one.
+        .after_release(move |conn, _meta| {
+            let connect = connect.clone();
             Box::pin(async move {
                 use sqlx::Connection;
                 match tokio::time::timeout(RELEASE_PING, conn.ping()).await {
                     Ok(Ok(())) => Ok(true),
-                    Ok(Err(e)) => Err(e),
-                    Err(_) => Err(sqlx::Error::PoolTimedOut),
+                    Ok(Err(e)) => {
+                        tracing::debug!(%e, "released connection failed its ping; closing it");
+                        Ok(false)
+                    }
+                    Err(_) => {
+                        tracing::debug!("released connection did not answer its ping; closing it");
+                        let fresh = tokio::time::timeout(
+                            RELEASE_PING,
+                            sqlx::PgConnection::connect_with(&connect),
+                        )
+                        .await;
+                        if let Ok(Ok(fresh)) = fresh {
+                            drop(std::mem::replace(conn, fresh));
+                        }
+                        Ok(false)
+                    }
                 }
             })
         })
