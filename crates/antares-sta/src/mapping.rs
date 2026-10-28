@@ -629,7 +629,7 @@ pub fn sensor(base: &str, device: &Value) -> Option<Value> {
         "name": text(device, "name").unwrap_or(did),
         "description": text(device, "description").unwrap_or_default(),
         "encodingType": "application/json",
-        "metadata": metadata.cloned().unwrap_or_default(),
+        "metadata": metadata.cloned().unwrap_or_else(|| json!([])),
     }))
 }
 
@@ -645,7 +645,7 @@ pub fn unknown_sensor(base: &str) -> Value {
         "name": "Unknown sensor",
         "description": "The view names no Device for these Datastreams.",
         "encodingType": "application/json",
-        "metadata": null,
+        "metadata": [],
     })
 }
 
@@ -954,7 +954,7 @@ mod tests {
             BASE,
             &json!({"id": "urn:d", "type": "https://smartdatamodels.org/dataModel.Device/Device"}),
         );
-        assert_eq!(plain.map(|s| at(&s, "/metadata")), Some(Value::Null));
+        assert_eq!(plain.map(|s| at(&s, "/metadata")), Some(json!([])));
         assert_eq!(sensor(BASE, &car()), None);
         assert_eq!(sensor(BASE, &json!({"id": "urn:d"})), None);
         assert_eq!(sensor(BASE, &json!({"type": "Device"})), None);

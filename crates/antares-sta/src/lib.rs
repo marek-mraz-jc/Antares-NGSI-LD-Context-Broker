@@ -179,22 +179,109 @@ async fn serve(ops: &Ops, caller: &Caller, req: Request) -> Response {
         .reply()
     };
     antares_ops::read_only(&parts.method, refused, async {
-        match respond(ops, caller, &parts).await {
-            Ok(doc) => (
+        match Box::pin(respond(ops, caller, &parts)).await {
+            Ok(Answer::Doc(doc)) => (
                 StatusCode::OK,
                 [(CONTENT_TYPE, "application/json")],
                 doc.to_string(),
             )
                 .into_response(),
+            Ok(Answer::Raw(value)) => raw(value),
             Err(problem) => problem.reply(),
         }
     })
     .await
 }
 
+/// A resource path through related resources (15-078r6 9.2.4) as the path of its last
+/// resource: `X(kx)/Y(ky)/...` is `Y(ky)/...` once `Y(ky)` is one of `X(kx)`'s `Y`, and
+/// `X(kx)/Thing/...` (a single navigation property followed by more) is `Things(id)/...`.
+async fn walk(cx: &mut Cx<'_>, steps: &mut Vec<Step>) -> Result<(), Problem> {
+    loop {
+        let (from, owner, next, set) = match steps.as_slice() {
+            [Step {
+                set: from,
+                key: Some(owner),
+            }, next, rest @ ..] => {
+                let set = plural(&next.set).filter(|_| next.key.is_none() && !rest.is_empty());
+                if next.key.is_none() && set.is_none() {
+                    return Ok(());
+                }
+                (from.clone(), owner.clone(), next.clone(), set)
+            }
+            _ => return Ok(()),
+        };
+        let Some(set) = set else {
+            let key = next.key.unwrap_or_default();
+            if !cx.holds(&from, &owner, &next.set, &key).await? {
+                return Err(not_found());
+            }
+            steps.remove(0);
+            continue;
+        };
+        let id = cx
+            .plain(&from, &owner, &next.set)
+            .await?
+            .and_then(|d| d.get("@iot.id").and_then(Value::as_str).map(str::to_owned))
+            .ok_or_else(not_found)?;
+        steps.splice(
+            ..2,
+            [Step {
+                set: set.to_owned(),
+                key: Some(id),
+            }],
+        );
+    }
+}
+
+/// The set a single navigation property names a resource of.
+fn plural(single: &str) -> Option<&'static str> {
+    Some(match single {
+        "Thing" => "Things",
+        "Datastream" => "Datastreams",
+        "Sensor" => "Sensors",
+        "ObservedProperty" => "ObservedProperties",
+        "FeatureOfInterest" => "FeaturesOfInterest",
+        _ => return None,
+    })
+}
+
+/// What a read answers: a JSON document, or one property's raw `$value`.
+enum Answer {
+    Doc(Value),
+    Raw(Value),
+}
+
+/// A property's raw value (SensorThings 1.1 req/request-data/property-value, 15-078r6 9.2.6):
+/// a string as its text, a number or boolean as its literal, an object such as `location` or
+/// `unitOfMeasurement` as its JSON; a null property is `204` (OData 4.0 Part 2 11.2.6.1).
+fn raw(value: Value) -> Response {
+    match value {
+        Value::Null => StatusCode::NO_CONTENT.into_response(),
+        Value::String(text) => (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "text/plain; charset=utf-8")],
+            text,
+        )
+            .into_response(),
+        v @ (Value::Bool(_) | Value::Number(_)) => (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "text/plain; charset=utf-8")],
+            v.to_string(),
+        )
+            .into_response(),
+        v => (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "application/json")],
+            v.to_string(),
+        )
+            .into_response(),
+    }
+}
+
 /// One request below `/{view}/sta/v1.1` or `/{view}/sta/{output}/v1.1`: a view id and an output
 /// name are `[a-z0-9-]`, so their raw segments are their names.
-async fn respond(ops: &Ops, caller: &Caller, req: &Parts) -> Done {
+async fn respond(ops: &Ops, caller: &Caller, req: &Parts) -> Result<Answer, Problem> {
     let uri = &req.uri;
     let mut segments = uri.path().split('/').skip(1);
     let id = segments.next().unwrap_or_default();
@@ -212,8 +299,18 @@ async fn respond(ops: &Ops, caller: &Caller, req: &Parts) -> Done {
     let pairs = Query::<Vec<(String, String)>>::try_from_uri(uri)
         .map(|Query(p)| p)
         .unwrap_or_default();
-    let options = query::options(&pairs)?;
-    let steps = query::steps(&rest);
+    let mut options = query::options(&pairs)?;
+    let mut steps = query::steps(&rest);
+    // `{path}/$ref` (15-078r6 9.2.7): the resources of `{path}` as their self-links alone.
+    let reference =
+        steps.len() > 1 && matches!(steps.last(), Some(Step { set, key: None }) if set == "$ref");
+    if reference {
+        steps.pop();
+    }
+    if reference {
+        options.select.clear();
+        options.expand.clear();
+    }
     let ids = match (&options.filter, steps.as_slice()) {
         (Some(f), [Step { set, key: None }]) => query::by_id(f, set)?,
         _ => ById::default(),
@@ -231,7 +328,21 @@ async fn respond(ops: &Ops, caller: &Caller, req: &Parts) -> Done {
         pairs,
         ids,
     };
-    match steps.as_slice() {
+    let mut cx = cx;
+    walk(&mut cx, &mut steps).await?;
+    let doc = match steps.as_slice() {
+        // The member of the resource as the view serves it; a navigation property has no
+        // raw value.
+        [Step {
+            set: from,
+            key: Some(key),
+        }, Step {
+            set: member,
+            key: None,
+        }, Step {
+            set: value,
+            key: None,
+        }] if value == "$value" => return cx.value(from, key, member).await.map(Answer::Raw),
         [] => Ok(json!({
             "value": SETS.iter().map(|s| json!({ "name": s, "url": format!("{}/{s}", cx.base) })).collect::<Vec<_>>(),
             "serverSettings": { "conformance": CONFORMANCE },
@@ -265,7 +376,41 @@ async fn respond(ops: &Ops, caller: &Caller, req: &Parts) -> Done {
             key: None,
         }] => cx.related(from, key, member).await,
         _ => Err(not_found()),
+    };
+    let doc = doc?;
+    if reference {
+        return references(&doc).map(Answer::Doc).ok_or_else(not_found);
     }
+    Ok(Answer::Doc(doc))
+}
+
+/// An association link's answer (15-078r6 9.2.7): each resource as `{"@iot.selfLink"}`, a
+/// collection's count and next link kept, the next link to the next page of links. A member
+/// that is no resource (`name`) has no association link.
+fn references(doc: &Value) -> Option<Value> {
+    let link = |v: &Value| {
+        v.get("@iot.selfLink")
+            .map(|l| json!({ "@iot.selfLink": l }))
+    };
+    let Some(items) = doc.get("value").and_then(Value::as_array) else {
+        return link(doc);
+    };
+    let mut out = serde_json::Map::new();
+    if let Some(count) = doc.get("@iot.count") {
+        out.insert("@iot.count".into(), count.clone());
+    }
+    out.insert(
+        "value".into(),
+        Value::Array(items.iter().filter_map(link).collect()),
+    );
+    if let Some(next) = doc.get("@iot.nextLink").and_then(Value::as_str) {
+        let (path, query) = next.split_once('?').unwrap_or((next, ""));
+        out.insert(
+            "@iot.nextLink".into(),
+            json!(format!("{path}/$ref?{query}")),
+        );
+    }
+    Some(Value::Object(out))
 }
 
 /// The output `name` of the view's `representations.sta` (T-5225) and the types it reads, as
@@ -595,8 +740,13 @@ impl Cx<'_> {
                 });
                 // The Sensor of the Datastreams whose Entity names no Device, once, first, in
                 // the first Entity's group: a group of its own counted as an Entity served and
-                // the next link skipped one Device (F-ANT5-004).
-                let unknown = (self.opts.skip == 0).then(|| mapping::unknown_sensor(&self.base));
+                // the next link skipped one Device (F-ANT5-004). Listed only while it has a
+                // Datastream (T-5916).
+                let unknown = if self.opts.skip == 0 && self.unknown_measures().await? {
+                    Some(mapping::unknown_sensor(&self.base))
+                } else {
+                    None
+                };
                 let head: Vec<Value> = unknown
                     .into_iter()
                     .chain(groups.next().into_iter().flatten())
@@ -826,7 +976,10 @@ impl Cx<'_> {
                     .first()
                     .and_then(|e| find(mapping::observed_properties(base, e), key))
             }
-            "Sensors" if key == mapping::UNKNOWN_SENSOR => Some(mapping::unknown_sensor(base)),
+            "Sensors" if key == mapping::UNKNOWN_SENSOR => self
+                .unknown_measures()
+                .await?
+                .then(|| mapping::unknown_sensor(base)),
             "Sensors" => self
                 .entity(Some(key))
                 .await?
@@ -853,6 +1006,77 @@ impl Cx<'_> {
             _ => None,
         };
         Ok(found)
+    }
+
+    /// The member `member` of one resource as the view serves it, for its `$value`: a
+    /// navigation property has none.
+    async fn value(&self, from: &str, key: &str, member: &str) -> Result<Value, Problem> {
+        let source = self.one(from, key).await?.ok_or_else(not_found)?;
+        // A navigation property is only its `@iot.navigationLink` here: `$expand` is refused
+        // on a `$value` path.
+        match source.get(member) {
+            Some(v) if !member.contains('@') => Ok(v.clone()),
+            _ => Err(not_found()),
+        }
+    }
+
+    /// Whether `to(key)` is one of `from(owner)`'s `to`: back through `to(key)`'s single
+    /// navigation property where it has one (a Datastream's Thing, an Observation's
+    /// Datastream), else in `from(owner)`'s collection, which is small (a Thing's Locations).
+    /// A hidden or unknown resource on either side holds nothing.
+    async fn holds(
+        &mut self,
+        from: &str,
+        owner: &str,
+        to: &str,
+        key: &str,
+    ) -> Result<bool, Problem> {
+        let back = match (from, to) {
+            ("Things", "Datastreams" | "HistoricalLocations") => Some("Thing"),
+            ("Datastreams", "Observations") => Some("Datastream"),
+            ("Sensors", "Datastreams") => Some("Sensor"),
+            ("ObservedProperties", "Datastreams") => Some("ObservedProperty"),
+            ("FeaturesOfInterest", "Observations") => Some("FeatureOfInterest"),
+            _ => None,
+        };
+        let doc = match back {
+            Some(back) => self.plain(to, key, back).await?,
+            None if SETS.contains(&to) => self.plain(from, owner, to).await?,
+            None => None,
+        };
+        let want = if back.is_some() { owner } else { key };
+        let is = |v: &Value| v.get("@iot.id").and_then(Value::as_str) == Some(want);
+        Ok(
+            match doc
+                .as_ref()
+                .map(|d| (d, d.get("value").and_then(Value::as_array)))
+            {
+                Some((_, Some(items))) => items.iter().any(is),
+                Some((d, None)) => is(d),
+                None => false,
+            },
+        )
+    }
+
+    /// [`Self::related`] without the request's query options, which address the path's last
+    /// step only; `None` for the 404 of a hidden or unknown resource.
+    async fn plain(
+        &mut self,
+        from: &str,
+        key: &str,
+        member: &str,
+    ) -> Result<Option<Value>, Problem> {
+        let mut neutral = query::options(&[])?;
+        neutral.top = query::MAX_TOP;
+        let opts = std::mem::replace(&mut self.opts, neutral);
+        let pairs = std::mem::take(&mut self.pairs);
+        let doc = self.related(from, key, member).await;
+        self.opts = opts;
+        self.pairs = pairs;
+        match doc {
+            Err(Problem(StatusCode::NOT_FOUND, _)) => Ok(None),
+            doc => doc.map(Some),
+        }
     }
 
     /// A navigation property of one resource, or one of its members as `{name: value}`
@@ -937,6 +1161,22 @@ impl Cx<'_> {
         single
             .map(|v| query::selected(v, &self.opts.select))
             .ok_or_else(not_found)
+    }
+
+    /// Whether the Sensor `unknown` has a Datastream: one of the first [`query::MAX_TOP`]
+    /// Entities the view shows without a `refDevice` holds one, the page its own Datastreams
+    /// read first.
+    async fn unknown_measures(&self) -> Result<bool, Problem> {
+        let page = Page {
+            start: 0,
+            size: query::MAX_TOP,
+            whole: false,
+        };
+        let extra = format!("&q={}", encode("!refDevice"));
+        let (entities, _, _) = self.entities(&extra, page).await?;
+        Ok(entities
+            .iter()
+            .any(|e| !mapping::datastreams(&self.base, e, &[]).is_empty()))
     }
 
     /// A page of the resources `make` builds from each Entity `q` keeps: a Sensor's Datastreams,

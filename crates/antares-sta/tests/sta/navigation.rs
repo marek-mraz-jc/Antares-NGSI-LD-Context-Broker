@@ -156,3 +156,259 @@ async fn a_member_path_and_an_earlier_observation_read_by_id() -> Result<(), Str
     assert_eq!(unknown.status, StatusCode::NOT_FOUND);
     Ok(())
 }
+
+/// `{member}/$value` (15-078r6 9.2.6) per kind of property: a string and a number as their
+/// text, an object as its JSON; a navigation property, a member the view hides and a resource
+/// outside the view are the same 404.
+#[tokio::test]
+async fn a_property_value_is_its_raw_text() -> Result<(), String> {
+    let f = fixture().await?;
+    let text = Some("text/plain; charset=utf-8".to_owned());
+    let name = sta(&f.app, "/Things('urn:ngsi-ld:Car:1')/name/$value").await;
+    assert_eq!(
+        (name.status, name.text.as_str(), name.content_type),
+        (StatusCode::OK, "Žltá", text.clone())
+    );
+    let earlier = "/Observations('urn:ngsi-ld:Car:1/speed/2025-12-30T00:00:00.000Z')";
+    let result = sta(&f.app, &format!("{earlier}/result/$value")).await;
+    assert_eq!(
+        (result.status, result.text.as_str(), result.content_type),
+        (StatusCode::OK, "8", text)
+    );
+    // The percent-encoded `$` is the same path.
+    let encoded = sta(&f.app, "/Things('urn:ngsi-ld:Car:1')/name/%24value").await;
+    assert_eq!(encoded.text, "Žltá");
+    // A null member is `204` (OData 4.0 Part 2 11.2.6.1): the `resultTime` of Car:2's speed,
+    // which no sensor timed.
+    let at_stop = sta(
+        &f.app,
+        "/FeaturesOfInterest('urn:ngsi-ld:Stop:1')/Observations",
+    )
+    .await;
+    let untimed = format!("/Observations('{}')", ids(&at_stop.body).concat());
+    let unknown = sta(&f.app, &format!("{untimed}/resultTime")).await;
+    assert_eq!(unknown.body, json!({"resultTime": null}));
+    let none = sta(&f.app, &format!("{untimed}/resultTime/$value")).await;
+    assert_eq!(
+        (none.status, none.text.as_str()),
+        (StatusCode::NO_CONTENT, "")
+    );
+
+    let stream = "/Datastreams('urn:ngsi-ld:Car:1/speed')";
+    let unit = sta(&f.app, &format!("{stream}/unitOfMeasurement/$value")).await;
+    let member = sta(&f.app, &format!("{stream}/unitOfMeasurement")).await;
+    assert_eq!(
+        (unit.status, unit.content_type.as_deref(), unit.body),
+        (
+            StatusCode::OK,
+            Some("application/json"),
+            at(&member.body, "/unitOfMeasurement")
+        )
+    );
+    assert!(unit.text.starts_with('{'), "{}", unit.text);
+
+    // `$expand` names navigation properties, which a raw value has none of.
+    let expanded = sta(
+        &f.app,
+        "/Things('urn:ngsi-ld:Car:1')/name/$value?$expand=Locations",
+    )
+    .await;
+    assert_eq!(expanded.status, StatusCode::BAD_REQUEST);
+
+    let locations = sta(&f.app, "/Things('urn:ngsi-ld:Car:1')/Locations").await;
+    let Ok([location]) = <[String; 1]>::try_from(ids(&locations.body)) else {
+        return Err(format!("one Location of Car:1: {}", locations.body));
+    };
+    let place = sta(&f.app, &format!("/Locations('{location}')/location/$value")).await;
+    assert_eq!(
+        (place.status, at(&place.body, "/type")),
+        (StatusCode::OK, json!("Point"))
+    );
+
+    for path in [
+        "/Things('urn:ngsi-ld:Car:1')/Datastreams/$value",
+        "/Things('urn:ngsi-ld:Car:1')/secret/$value",
+        "/Things('urn:ngsi-ld:Car:1')/Datastreams@iot.navigationLink/$value",
+        "/Things('urn:ngsi-ld:Car:1')/@iot.selfLink/$value",
+        "/Things('urn:ngsi-ld:Radar:1')/name/$value",
+        "/Things('urn:ngsi-ld:Car:1')/name/$value/$value",
+    ] {
+        let a = sta(&f.app, path).await;
+        assert_eq!(
+            (a.status, at(&a.body, "/error/message")),
+            (StatusCode::NOT_FOUND, json!("no such resource")),
+            "{path}"
+        );
+    }
+    Ok(())
+}
+
+/// `{path}/$ref` (15-078r6 9.2.7): a collection, a related collection and a related resource as
+/// their self-links alone, the next link to the next page of links; a property and a hidden
+/// resource have none.
+#[tokio::test]
+async fn an_association_link_is_the_self_links_alone() -> Result<(), String> {
+    let f = fixture().await?;
+    let things = sta(&f.app, "/Things").await;
+    let refs = sta(&f.app, "/Things/$ref?$select=name&$expand=Locations").await;
+    let links = |doc: &Value| -> Vec<Value> {
+        doc.get("value")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|t| json!({ "@iot.selfLink": at(t, "/@iot.selfLink") }))
+            .collect()
+    };
+    assert_eq!(
+        (refs.status, at(&refs.body, "/value")),
+        (StatusCode::OK, Value::Array(links(&things.body)))
+    );
+    let counted = sta(&f.app, "/Things/$ref?$count=true").await;
+    assert_eq!(
+        at(&counted.body, "/@iot.count"),
+        json!(links(&things.body).len())
+    );
+    let page = sta(&f.app, "/Things/$ref?$top=1").await;
+    let next = at(&page.body, "/@iot.nextLink");
+    assert!(
+        next.as_str().is_some_and(|n| n.contains("/Things/$ref?")),
+        "{next}"
+    );
+    assert_eq!(
+        at(&page.body, "/value/0"),
+        json!({ "@iot.selfLink": at(&things.body, "/value/0/@iot.selfLink") })
+    );
+
+    let stream = "/Datastreams('urn:ngsi-ld:Car:1/speed')";
+    let thing = sta(&f.app, &format!("{stream}/Thing/$ref")).await;
+    assert_eq!(
+        (thing.status, thing.body),
+        (
+            StatusCode::OK,
+            json!({ "@iot.selfLink": "http://localhost:9090/x/views/city/sta/v1.1/Things('urn:ngsi-ld:Car:1')" })
+        )
+    );
+    let located = sta(&f.app, "/Things('urn:ngsi-ld:Car:1')/Locations/$ref").await;
+    assert_eq!(
+        at(&located.body, "/value/0")
+            .as_object()
+            .map(serde_json::Map::len),
+        Some(1)
+    );
+    for path in [
+        "/Things('urn:ngsi-ld:Car:1')/name/$ref",
+        "/Things('urn:ngsi-ld:Radar:1')/Datastreams/$ref",
+    ] {
+        let a = sta(&f.app, path).await;
+        assert_eq!(a.status, StatusCode::NOT_FOUND, "{path}");
+    }
+    Ok(())
+}
+
+/// A Sensor's `metadata` is mandatory (15-078r6 Table 8): the Sensor `unknown` answers `[]`.
+/// It is a Sensor only while a Datastream names it: in `every`, Depot:1's `capacity`; in
+/// `city`, where every Entity with a Datastream names a Device, it is neither listed nor read.
+#[tokio::test]
+async fn the_unknown_sensor_is_one_while_it_measures() -> Result<(), String> {
+    let f = fixture().await?;
+    let every = "/x/views/every/sta/v1.1/Sensors";
+    let a = send(
+        &f.app,
+        "GET",
+        &format!("{every}('unknown')/metadata/$value"),
+        "",
+    )
+    .await;
+    assert_eq!((a.status, a.text.as_str()), (StatusCode::OK, "[]"));
+    let listed = send(&f.app, "GET", every, "").await;
+    assert_eq!(
+        ids(&listed.body).first().map(String::as_str),
+        Some("unknown")
+    );
+
+    let city = sta(&f.app, "/Sensors").await;
+    assert!(
+        !ids(&city.body).contains(&"unknown".to_owned()),
+        "{}",
+        city.body
+    );
+    let one = sta(&f.app, "/Sensors('unknown')").await;
+    assert_eq!(one.status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// A resource path through a keyed related resource (15-078r6 9.2.4) reads that resource once
+/// it is related; through an unrelated or hidden one it is the 404 of an unknown resource.
+#[tokio::test]
+async fn a_path_through_a_related_resource_reads_it() -> Result<(), String> {
+    let f = fixture().await?;
+    let through = "/Things('urn:ngsi-ld:Car:1')/Datastreams('urn:ngsi-ld:Car:1/speed')";
+    let direct = sta(&f.app, "/Datastreams('urn:ngsi-ld:Car:1/speed')/Thing").await;
+    let a = sta(&f.app, &format!("{through}/Thing?$select=name")).await;
+    assert_eq!(
+        (a.status, a.body),
+        (StatusCode::OK, json!({"name": at(&direct.body, "/name")}))
+    );
+    let name = sta(&f.app, &format!("{through}/Thing/name/$value")).await;
+    assert_eq!(name.text, "Žltá");
+    let earlier = "Observations('urn:ngsi-ld:Car:1/speed/2025-12-30T00:00:00.000Z')";
+    let deep = sta(&f.app, &format!("{through}/{earlier}/result")).await;
+    assert_eq!(
+        (deep.status, deep.body),
+        (StatusCode::OK, json!({"result": 8}))
+    );
+    // Each single navigation property followed by more, and each set reached back by one.
+    let iri = at(
+        &sta(
+            &f.app,
+            "/Datastreams('urn:ngsi-ld:Car:1/speed')/ObservedProperty",
+        )
+        .await
+        .body,
+        "/@iot.id",
+    );
+    let iri = iri.as_str().unwrap_or_default();
+    let speed = "Datastreams('urn:ngsi-ld:Car:1/speed')";
+    let at_stop = sta(
+        &f.app,
+        "/FeaturesOfInterest('urn:ngsi-ld:Stop:1')/Observations",
+    )
+    .await;
+    let stop = format!("Observations('{}')", ids(&at_stop.body).concat());
+    for path in [
+        format!("/{earlier}/Datastream/Thing"),
+        format!("/{speed}/Sensor/Datastreams"),
+        format!("/{speed}/ObservedProperty/Datastreams"),
+        format!("/{stop}/FeatureOfInterest/Observations"),
+        format!("/Sensors('urn:ngsi-ld:Device:1')/{speed}/Thing"),
+        format!("/ObservedProperties('{iri}')/{speed}/Thing"),
+        format!("/FeaturesOfInterest('urn:ngsi-ld:Stop:1')/{stop}/Datastream"),
+    ] {
+        let a = sta(&f.app, &path).await;
+        assert_eq!(a.status, StatusCode::OK, "{path}: {}", a.body);
+    }
+    let locations = sta(&f.app, "/Things('urn:ngsi-ld:Car:1')/Locations").await;
+    let Ok([location]) = <[String; 1]>::try_from(ids(&locations.body)) else {
+        return Err(format!("one Location of Car:1: {}", locations.body));
+    };
+    let things = sta(
+        &f.app,
+        &format!("/Things('urn:ngsi-ld:Car:1')/Locations('{location}')/Things/$ref"),
+    )
+    .await;
+    assert_eq!(things.status, StatusCode::OK, "{}", things.body);
+
+    for path in [
+        "/Things('urn:ngsi-ld:Car:2')/Datastreams('urn:ngsi-ld:Car:1/speed')",
+        "/Things('urn:ngsi-ld:Radar:1')/Datastreams('urn:ngsi-ld:Car:1/speed')/Thing",
+        "/Things('urn:ngsi-ld:Car:1')/Datastreams('urn:ngsi-ld:Radar:1/speed')/Thing",
+        "/Datastreams('urn:ngsi-ld:Radar:1/speed')/Thing/name",
+        "/Things('urn:ngsi-ld:Car:2')/Locations('{location}')",
+        "/Things('urn:ngsi-ld:Car:1')/Thing('urn:ngsi-ld:Car:1')",
+    ] {
+        let path = path.replace("{location}", &location);
+        let a = sta(&f.app, &path).await;
+        assert_eq!(a.status, StatusCode::NOT_FOUND, "{path}: {}", a.body);
+    }
+    Ok(())
+}
