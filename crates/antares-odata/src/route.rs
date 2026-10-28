@@ -171,7 +171,9 @@ async fn write(
     };
     let answer = match form {
         Form::Create(set) => create(reads, caller, &ctx, set, headers, body).await,
-        Form::Change(set, key, kind) => change(reads, caller, &ctx, (set, key), kind, body).await,
+        Form::Change(set, key, kind) => {
+            change(reads, caller, &ctx, (set, key), kind, headers, body).await
+        }
         Form::Delete(set, key) => delete(reads, caller, set, key, version).await,
         Form::Attribute(set, key, name, method) => {
             below::property(reads, caller, &ctx, (set, key, name), &method, body).await
