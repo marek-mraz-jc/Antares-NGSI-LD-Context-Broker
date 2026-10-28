@@ -214,23 +214,31 @@ async fn count_instances(
     Ok(n.max(0) as u64)
 }
 
+/// The longest the readiness ping waits for the database (see
+/// [`AnyStore::ping`]).
+#[cfg(feature = "postgres")]
+pub const READY_PING: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl AnyStore {
     /// Readiness ping: can the store answer a trivial request
     /// RIGHT NOW? Memory/file are in-process (always ready); the Pg arm runs
     /// `SELECT 1` so a lost database (failover, network partition) flips
     /// /q/ready to 503 and the Service stops routing to this pod.
+    ///
+    /// Bounded by [`READY_PING`]: with every pool slot taken the acquire
+    /// waits its whole 5 s, past the probe's 3 s, and the kubelet logged a
+    /// timeout instead of reading the 503 (prod 2026-10-28, T-6000).
     pub async fn ping(&self) -> Result<(), NgsiError> {
         match self {
             AnyStore::Mem(_) => Ok(()),
             #[cfg(feature = "postgres")]
-            AnyStore::Pg(p) => async {
-                sqlx::query("SELECT 1")
-                    .execute(p.docs.pool())
+            AnyStore::Pg(p) => {
+                tokio::time::timeout(READY_PING, sqlx::query("SELECT 1").execute(p.docs.pool()))
                     .await
+                    .unwrap_or(Err(sqlx::Error::PoolTimedOut))
                     .map(|_| ())
+                    .map_err(db)
             }
-            .await
-            .map_err(db),
         }
     }
 
