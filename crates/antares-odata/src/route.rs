@@ -63,11 +63,15 @@ pub(crate) async fn serve(
             .await
             .unwrap_or_else(IntoResponse::into_response);
     }
-    let (ODataUri::Resource { path, options }, None) =
-        (&request.uri, later(&request.uri, &reads.edm.schema_version))
-    else {
-        return not_implemented(version).into_response();
+    let refused = later(&request.uri, &reads.edm.schema_version);
+    let (ODataUri::Resource { path, options }, None) = (&request.uri, refused) else {
+        return not_implemented(refused.unwrap_or("this resource"), version).into_response();
     };
+    if let Some(set) = history_set(reads, path) {
+        return history(reads, caller, &ctx, set, path, options, headers)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     let answer = match path.as_slice() {
         [_, Segment::Ref] | [_, _, Segment::Ref] if shaped(options) => Err(no_properties(version)),
         [Segment::EntitySet(set)] | [Segment::EntitySet(set), Segment::Ref]
@@ -88,7 +92,10 @@ pub(crate) async fn serve(
             paths::reference(reads, caller, &ctx, (set, key), options).await
         }
         // Below one Entity only `$select` applies (Q31 to Q33).
-        [_, _, ..] if !only_select(options) => Err(not_implemented(version)),
+        [_, _, ..] if !only_select(options) => Err(not_implemented(
+            "a query option other than $select below one Entity",
+            version,
+        )),
         [Segment::EntitySet(set), Segment::Key(key), Segment::Property(name)] => {
             paths::property(reads, caller, &ctx, (set, key, name), false, options).await
         }
@@ -101,9 +108,43 @@ pub(crate) async fn serve(
         [Segment::EntitySet(set), Segment::Key(key), Segment::Navigation(nav), Segment::Ref] => {
             paths::related(reads, caller, &ctx, (set, key, nav), true, options).await
         }
-        _ => Err(not_implemented(version)),
+        _ => Err(not_implemented("this resource path", version)),
     };
     answer.unwrap_or_else(IntoResponse::into_response)
+}
+
+/// The history set the path starts at (T-5908): a path starts at an EntitySet, written as its
+/// name.
+fn history_set<'r>(reads: &'r Reads, path: &[Segment]) -> Option<&'r crate::edm::Set> {
+    reads.edm.histories.get(&path.first()?.to_string())
+}
+
+/// A read of a history set (T-5908): the set, its `$count`, one row by key.
+async fn history(
+    reads: &Reads,
+    caller: &Caller,
+    ctx: &Ctx<'_>,
+    set: &crate::edm::Set,
+    path: &[Segment],
+    options: &QueryOptions,
+    headers: &HeaderMap,
+) -> Result<Response, ODataErrorResponse> {
+    match path {
+        [Segment::EntitySet(name)] | [Segment::EntitySet(name), Segment::Ref] => {
+            crate::history::collection(reads, caller, ctx, (name, set), path, options, headers)
+                .await
+        }
+        [_, Segment::Count] => {
+            crate::history::count(reads, caller, set, options, ctx.version).await
+        }
+        [Segment::EntitySet(name), Segment::Key(key)] => {
+            crate::history::entity(reads, caller, ctx, (name, set), key, options).await
+        }
+        _ => Err(not_implemented(
+            "this path below a history set",
+            ctx.version,
+        )),
+    }
 }
 
 /// A request that is not a `GET`: the write its method and path stand for.
@@ -119,6 +160,10 @@ async fn write(
     let ODataUri::Resource { path, options } = &request.uri else {
         return written(method, &request.uri, version);
     };
+    // A history is read only, whatever the view offers (T-5908).
+    if history_set(reads, path).is_some() {
+        return refused(StatusCode::METHOD_NOT_ALLOWED, version).into_response();
+    }
     let form = match (method, path.as_slice()) {
         (&Method::POST, [Segment::EntitySet(set)]) => Form::Create(set),
         (&Method::PATCH, [Segment::EntitySet(set), Segment::Key(key)]) => {
@@ -144,7 +189,7 @@ async fn write(
     };
     let Some(op) = form.op(reads) else {
         // W19: no operation removes one object of a Relationship.
-        return not_implemented(version).into_response();
+        return not_implemented("removing one object of a Relationship", version).into_response();
     };
     // Rule 4: a write the view does not offer is refused before its body
     // is read, whatever the body holds.
@@ -153,11 +198,12 @@ async fn write(
     }
     // W32: the broker has no conditional write; options shape a read's
     // answer, and a write answers no representation but a create's.
-    if headers.contains_key(IF_MATCH)
-        || headers.contains_key(IF_NONE_MATCH)
-        || *options != QueryOptions::default()
-    {
-        return not_implemented(version).into_response();
+    if headers.contains_key(IF_MATCH) || headers.contains_key(IF_NONE_MATCH) {
+        return not_implemented("a conditional write (If-Match, If-None-Match)", version)
+            .into_response();
+    }
+    if *options != QueryOptions::default() {
+        return not_implemented("a query option on a write", version).into_response();
     }
     let level = match json_level(request, headers, reads.state.max_header_len) {
         Ok(level) => level,

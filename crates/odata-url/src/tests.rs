@@ -1207,7 +1207,7 @@ fn methods_parse_with_their_arity() {
         // dotted one reads as a qualified cast
         let bare = err(&format!("Buildings?$filter={}%20eq%201", method.name()));
         let want = if method.name().contains('.') {
-            "not implemented at byte 18: type cast"
+            "not implemented at byte 18: type cast or bound operation"
         } else {
             "unknown name at byte 18"
         };

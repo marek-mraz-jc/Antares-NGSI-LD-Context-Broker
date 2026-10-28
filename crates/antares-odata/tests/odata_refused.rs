@@ -144,6 +144,125 @@ const BODIES: &[(&str, &str)] = &[
     ),
 ];
 
+/// The construct each `501` row of the matrix names (T-5907): the message
+/// is `<construct>: no NGSI-LD equivalent (ADR-0024 decision 5)`, a fixed
+/// text that echoes no request value.
+const NAMED: &[(&str, &str)] = &[
+    ("odata_index", "$index"),
+    (
+        "odata_schemaversion",
+        "a $schemaversion other than the served one",
+    ),
+    ("odata_actions", "type cast or bound operation"),
+    ("odata_functions", "type cast or bound operation"),
+    ("odata_crossjoin", "$crossjoin and $all"),
+    ("odata_all", "$crossjoin and $all"),
+    ("odata_each", "$each"),
+    (
+        "odata_delta_update",
+        "a write to a whole entity set (delta update)",
+    ),
+    ("odata_media_entities", "media resource"),
+    ("odata_stream_properties", "a write to /$value"),
+    ("odata_batch_atomicity", "atomicity groups"),
+    ("odata_derived_types", "type cast or bound operation"),
+    ("odata_expand_options", "nested query option"),
+    ("odata_deltatoken", "$deltatoken"),
+    ("odata_root", "$root"),
+    ("odata_it_this", "$it and $this"),
+    ("odata_filter_segment", "$filter path segment"),
+    ("odata_ordinal", "ordinal index"),
+    ("odata_deep_update", "deep update"),
+    (
+        "odata_collection_append",
+        "a write appending to a collection property",
+    ),
+    (
+        "odata_batch_references",
+        "references to another member's result",
+    ),
+    (
+        "odata_conditional_write",
+        "a conditional write (If-Match, If-None-Match)",
+    ),
+];
+
+/// The `501`s the surface answers after the URL parsed, beside the matrix
+/// rows: method, path, body, the construct named.
+const AFTER_PARSE: &[(&str, &str, &str, &str)] = &[
+    (
+        "GET",
+        "Car('urn:ngsi-ld:Car:1')?$filter=speed%20gt%201",
+        "",
+        "$filter, $search or $apply on one Entity",
+    ),
+    (
+        "GET",
+        "Car/$count?$apply=filter(speed%20gt%201)",
+        "",
+        "$apply under /$count",
+    ),
+    (
+        "GET",
+        "Car?$apply=filter(speed%20gt%201)&$filter=speed%20gt%202",
+        "",
+        "$apply beside another query option, under /$ref or /$count",
+    ),
+    (
+        "GET",
+        "Car?$apply=groupby((speed))/search(red)",
+        "",
+        "search after aggregate in $apply",
+    ),
+    (
+        "GET",
+        "Car?$select=owner",
+        "",
+        "$select of a navigation, a path or an annotation",
+    ),
+    (
+        "GET",
+        "Car?$expand=owner($levels=2)",
+        "",
+        "a nested $expand, $levels or a path in $expand",
+    ),
+    (
+        "GET",
+        "Car('urn:ngsi-ld:Car:1')/speed?$top=1",
+        "",
+        "a query option other than $select below one Entity",
+    ),
+    ("GET", "Car?$id=red", "", "$id outside $entity"),
+    (
+        "GET",
+        "Car?$filter=speed%20gt%20null%20add%201",
+        "",
+        "this $filter expression",
+    ),
+    (
+        "PATCH",
+        "Car('urn:ngsi-ld:Car:1')?$select=speed",
+        r#"{"speed": 1}"#,
+        "a query option on a write",
+    ),
+    (
+        "POST",
+        "Car('urn:ngsi-ld:Car:1')/owner/$ref",
+        r#"{"@odata.id": "Person('urn:ngsi-ld:Person:1')"}"#,
+        "a write to this resource path",
+    ),
+    (
+        "PUT",
+        "$entity?$id=Car('urn:ngsi-ld:Car:1')",
+        "{}",
+        "a write to this resource path",
+    ),
+];
+
+fn named(construct: &str) -> String {
+    format!("{construct}: no NGSI-LD equivalent (ADR-0024 decision 5)")
+}
+
 /// The rows the operation they stand for answers, so its gate is asked:
 /// an upsert is the Merge or Replace Entity of a key the store does not
 /// hold (W7), whose 404 is the one a hidden Entity gets.
@@ -321,6 +440,14 @@ async fn odata_refused_features_answer_501_before_any_gate() {
             let body = BODIES.iter().find(|(r, _)| r == id).map(|(_, b)| *b);
             let (got, body) = send(&app, method, &format!("{ROOT}/{path}"), headers, body).await;
             assert_eq!(got.as_u16(), *want_status, "{id}: {method} {path}: {body}");
+            if got == StatusCode::NOT_IMPLEMENTED {
+                let construct = NAMED.iter().find(|(r, _)| r == id).map(|(_, c)| named(c));
+                assert_eq!(
+                    body["error"]["message"].as_str().map(str::to_owned),
+                    construct,
+                    "{id}: {method} {path}: {body}"
+                );
+            }
             assert_eq!(
                 body["error"]["code"],
                 want_code.as_str(),
@@ -350,4 +477,66 @@ async fn odata_refused_features_answer_501_before_any_gate() {
         engine.0.load(Ordering::SeqCst) > before,
         "a served read is gated: the count counts"
     );
+}
+
+/// Every `501` past the parser names its construct and echoes no request
+/// value: `red` in a request never reaches the message (T-5907).
+#[tokio::test(flavor = "multi_thread")]
+async fn odata_each_501_names_its_construct() {
+    let engine = Arc::new(Counting::default());
+    let (_b, app) = broker(engine).await.expect("broker");
+    for (method, path, body, construct) in AFTER_PARSE {
+        let body = (!body.is_empty()).then_some(*body);
+        let (got, answer) = send(&app, method, &format!("{ROOT}/{path}"), &[], body).await;
+        assert_eq!(
+            got,
+            StatusCode::NOT_IMPLEMENTED,
+            "{method} {path}: {answer}"
+        );
+        assert_eq!(answer["error"]["code"], "NotImplemented", "{path}");
+        assert_eq!(
+            answer["error"]["message"].as_str(),
+            Some(named(construct).as_str()),
+            "{method} {path}: {answer}"
+        );
+        assert!(!answer.to_string().contains("red"), "{path}: {answer}");
+    }
+    // $metadata says so: a navigation takes $select and no other option
+    let req = Request::get(format!("{ROOT}/$metadata"))
+        .body(Body::empty())
+        .unwrap_or_default();
+    let Ok(resp) = app.clone().oneshot(req).await;
+    let xml = resp
+        .into_body()
+        .collect()
+        .await
+        .map(http_body_util::Collected::to_bytes)
+        .unwrap_or_default();
+    let xml = String::from_utf8_lossy(&xml);
+    let restriction = xml
+        .split(r#"Term="Capabilities.NavigationRestrictions""#)
+        .nth(1)
+        .and_then(|rest| rest.split("</Annotation>").next())
+        .unwrap_or_default();
+    assert!(
+        restriction.contains(r#"NavigationPropertyPath="owner""#),
+        "{xml}"
+    );
+    for member in ["Filterable", "Searchable", "Sortable"] {
+        assert!(
+            restriction.contains(&format!(
+                r#"<PropertyValue Property="{member}" Bool="false"/>"#
+            )),
+            "{member}: {restriction}"
+        );
+    }
+    assert!(!restriction.contains("CountRestrictions"), "{restriction}");
+    for member in ["TopSupported", "SkipSupported", "IndexableByKey"] {
+        assert!(
+            restriction.contains(&format!(
+                r#"<PropertyValue Property="{member}" Bool="false"/>"#
+            )),
+            "{member}: {restriction}"
+        );
+    }
 }

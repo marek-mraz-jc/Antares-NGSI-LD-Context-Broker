@@ -237,6 +237,72 @@ pub(crate) fn translate(
     Ok(out)
 }
 
+/// `filter` over a history set (T-5908): the first `id` conjunct as `ids`, every other conjunct
+/// residual, which the surface evaluates over the rows it builds from the temporal answer.
+pub(crate) fn residual_whole(
+    filter: &Expr,
+    set: &Set,
+    aliases: &[(String, Literal)],
+) -> Result<Translated, Refused> {
+    let mut out = Translated::default();
+    let none = BTreeMap::new();
+    let mut terms = Terms {
+        set,
+        sets: &none,
+        aliases,
+        context: &mut out.context,
+        linked: 0,
+        expand_values: Vec::new(),
+        lambdas: Vec::new(),
+        hops: Vec::new(),
+        lang: "@none",
+    };
+    let (mut ids, mut residual) = (None, Vec::new());
+    for conjunct in conjuncts_of(filter) {
+        match ids_of(conjunct, aliases)? {
+            Some(found) if ids.is_none() => ids = Some(found),
+            Some(found) => residual.push(RExpr::In(
+                Box::new(RExpr::Path(Path::Id)),
+                found.into_iter().map(Lit::Str).collect(),
+            )),
+            None => residual.push(terms.residual(conjunct)?),
+        }
+    }
+    out.ids = ids;
+    out.residual = residual;
+    Ok(out)
+}
+
+/// The instants the top-level conjuncts bound `member` by (T-5908): each `ge`, `gt` or `eq`
+/// literal a lower bound, each `lt` or `le` literal an upper one, `le` and `eq` with whether
+/// the bound is inclusive. Any other conjunct bounds nothing.
+pub(crate) fn bounds_of<'e>(
+    filter: &'e Expr,
+    member: &str,
+    aliases: &'e [(String, Literal)],
+) -> Vec<(CompareOp, &'e str)> {
+    conjuncts_of(filter)
+        .into_iter()
+        .filter_map(|c| {
+            let Expr::Compare(l, op, r) = c else {
+                return None;
+            };
+            let named = |e: &Expr| matches!(plain(e), Some([only]) if only == member);
+            let (op, lit) = if named(l) {
+                (*op, literal(r, aliases).ok()?)
+            } else if named(r) {
+                (mirrored(*op), literal(l, aliases).ok()?)
+            } else {
+                return None;
+            };
+            match lit {
+                Literal::DateTimeOffset(t) => Some((op, t.as_str())),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 /// `$search` (URL 5.1.7, Q14) as the `$filter` conjunct it means here: a word or phrase
 /// matches an Entity when one of its single-valued `Edm.String` properties the view shows holds
 /// it, case-insensitively (`tolower` on both sides); `NOT`, `AND` and `OR` as in a filter. An
@@ -1399,6 +1465,25 @@ type Signature = (
     &'static [&'static [&'static str]],
     Option<&'static str>,
 );
+
+/// `Capabilities.FilterFunctions`: every operator and function a `$filter`
+/// translates to `q` or the residual, in the URL convention's names; a
+/// method parsed without a [`signature`] is not served, `geo.intersects`
+/// is a `georel`.
+pub(crate) fn filter_functions() -> Vec<&'static str> {
+    const OPERATORS: [&str; 18] = [
+        "eq", "ne", "gt", "ge", "lt", "le", "and", "or", "not", "in", "add", "sub", "mul", "div",
+        "divby", "mod", "any", "all",
+    ];
+    OPERATORS
+        .into_iter()
+        .chain(
+            Method::all()
+                .filter(|m| *m == Method::GeoIntersects || signature(*m).is_some())
+                .map(Method::name),
+        )
+        .collect()
+}
 
 fn signature(method: Method) -> Option<Signature> {
     const BOOL: Option<&str> = Some("Edm.Boolean");

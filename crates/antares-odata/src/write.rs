@@ -508,6 +508,9 @@ fn invalid_key() -> BodyError {
 }
 
 pub(crate) fn body_error(error: &BodyError, version: ODataVersion) -> ODataErrorResponse {
+    if let BodyError::NotImplemented(feature) = error {
+        return crate::read::not_implemented(feature.as_str(), version);
+    }
     ODataErrorResponse {
         status: StatusCode::from_u16(error.status()).unwrap_or(StatusCode::BAD_REQUEST),
         error: ODataError::from(error),

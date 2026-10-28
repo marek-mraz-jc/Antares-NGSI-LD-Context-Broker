@@ -63,7 +63,10 @@ pub(crate) async fn collection(
         || options.compute.is_some();
     // `/$ref` and `/$count` of the rows
     if beside || path.len() > 1 {
-        return Err(not_implemented(version));
+        return Err(not_implemented(
+            "$apply beside another query option, under /$ref or /$count",
+            version,
+        ));
     }
     let set = set_of(reads, set_name, version)?;
     let steps = options.apply.as_deref().unwrap_or_default();
@@ -73,7 +76,7 @@ pub(crate) async fn collection(
         mint(&mut t.context, &member.iri);
     }
     ngsild(&reads.view, options, &mut t, set, version)?;
-    let program = whole(&t, now()).map_err(|refused| refusal(refused, version))?;
+    let program = whole(&t, now()).map_err(|r| refused(r, version))?;
     let pushdown = pushdown(set, None, &[], &mut t);
     let cx = Cx {
         set,
@@ -117,7 +120,7 @@ pub(crate) async fn collection(
             };
             // validated as each `compute` came: a refusal here is never reached
             let aliases = &options.aliases;
-            compute(&computes, set, aliases, &mut shown, now()).map_err(|r| refusal(r, version))?;
+            compute(&computes, set, aliases, &mut shown, now()).map_err(|r| refused(r, version))?;
             attach(&mut docs, &shown, version)?;
             let page = Page {
                 count: counted.then_some(total),
@@ -242,7 +245,12 @@ fn one(step: &Transformation, frame: Frame, cx: &Cx<'_>) -> Result<Frame, ODataE
                 searched(search, cx.set).unwrap_or(Expr::Literal(Literal::Bool(true))),
             ))
         }
-        (Transformation::Search(_), Frame::Rows(_)) => return Err(not_implemented(cx.version)),
+        (Transformation::Search(_), Frame::Rows(_)) => {
+            return Err(not_implemented(
+                "search after aggregate in $apply",
+                cx.version,
+            ))
+        }
         (other, _) => Cow::Borrowed(other),
     };
     let (values, types) = evaluated(&exprs_of(&step), &frame, cx)?;
@@ -349,15 +357,15 @@ fn values_of(
         context,
         ..Translated::default()
     };
-    compute(&items, set, cx.aliases, &mut t, now()).map_err(|refused| refusal(refused, version))?;
-    let programs = computed(&t, now()).map_err(|refused| refusal(refused, version))?;
+    compute(&items, set, cx.aliases, &mut t, now()).map_err(|r| refused(r, version))?;
+    let programs = computed(&t, now()).map_err(|r| refused(r, version))?;
     let mut values = Values::with_capacity(docs.len());
     for doc in docs {
         let row: Result<Vec<_>, _> = programs
             .iter()
             .map(|(_, p)| p.value(doc).map(|v| v.filter(|v| !v.is_null())))
             .collect();
-        values.push(row.map_err(|_| refusal(Refused::TooComplex, version))?);
+        values.push(row.map_err(|_| refused(Refused::TooComplex, version))?);
     }
     Ok((values, t.computed_types))
 }
@@ -819,4 +827,9 @@ fn written(
     }
     out.push(b'}');
     out
+}
+
+/// The OData error of a `$apply` the surface does not take.
+fn refused(refused: Refused, version: ODataVersion) -> ODataErrorResponse {
+    refusal(refused, "$apply", version)
 }
