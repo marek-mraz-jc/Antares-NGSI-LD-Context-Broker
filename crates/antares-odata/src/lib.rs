@@ -461,6 +461,16 @@ fn not_found() -> Response {
 mod tests {
     use super::*;
 
+    /// T-5895: the shares the broker sets are what the model caches take.
+    #[test]
+    fn the_set_shares_are_kept() {
+        set_model_cache_bytes(DEFAULT_MODEL_CACHE_BYTES, linkml_model::cache::MAX_BYTES);
+        assert_eq!(
+            MODEL_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+            DEFAULT_MODEL_CACHE_BYTES
+        );
+    }
+
     #[test]
     fn the_surface_names_its_endpoint() {
         assert_eq!((OData.name(), OData.prefix()), ("odata", "/x/views"));

@@ -112,6 +112,13 @@ pub fn held_bytes() -> u64 {
 mod tests {
     use super::*;
 
+    /// T-5895: the share a process sets is the capacity the cache takes.
+    #[test]
+    fn a_set_share_is_the_capacity() {
+        set_max_bytes(MAX_BYTES);
+        assert_eq!(CAPACITY.load(Ordering::Relaxed), MAX_BYTES);
+    }
+
     fn schema(name: &str, pad: usize) -> Arc<[u8]> {
         let description = "x".repeat(pad);
         format!(r#"{{"id": "https://e.org/{name}", "name": "{name}", "classes": {{"Room": {{"description": "{description}"}}}}}}"#)

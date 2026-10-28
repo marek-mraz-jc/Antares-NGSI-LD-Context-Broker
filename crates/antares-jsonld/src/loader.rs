@@ -671,45 +671,57 @@ pub const DEFAULT_MERGED_CACHE_BYTES: u64 = 44 * 1024 * 1024;
 static MERGED_CACHE_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(DEFAULT_MERGED_CACHE_BYTES);
 
+/// Hits and misses of one @context cache.
+#[derive(Debug, Default)]
+pub struct HitCount {
+    /// Lookups the cache answered.
+    pub hits: std::sync::atomic::AtomicU64,
+    /// Lookups it did not.
+    pub misses: std::sync::atomic::AtomicU64,
+}
+
+impl HitCount {
+    const fn new() -> Self {
+        Self {
+            hits: std::sync::atomic::AtomicU64::new(0),
+            misses: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn count(&self, hit: bool) {
+        let n = if hit { &self.hits } else { &self.misses };
+        n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> Value {
+        let load = |n: &std::sync::atomic::AtomicU64| n.load(std::sync::atomic::Ordering::Relaxed);
+        serde_json::json!({"hits": load(&self.hits), "misses": load(&self.misses)})
+    }
+}
+
 /// Hits and misses of the @context caches of every [`Loader`] of the
-/// process (T-5895), so a budget that is too small shows as a falling hit
-/// ratio: `[hits, misses]` per cache. A merge too large to cache is neither.
+/// process (T-5895), so a budget share that is too small shows as a falling
+/// hit ratio. A merge too large to cache is neither.
 #[derive(Debug, Default)]
 pub struct CacheStats {
     /// The merged-context cache.
-    pub merged: [std::sync::atomic::AtomicU64; 2],
+    pub merged: HitCount,
     /// The fetched-document cache (pinned documents are never looked up).
-    pub fetched: [std::sync::atomic::AtomicU64; 2],
+    pub fetched: HitCount,
 }
 
 impl CacheStats {
-    fn count(&self, cache: &[std::sync::atomic::AtomicU64; 2], hit: bool) {
-        cache[usize::from(!hit)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
     /// `{"merged": {"hits", "misses"}, "fetched": {...}}` as counted so far.
     #[must_use]
     pub fn snapshot(&self) -> Value {
-        let pair = |c: &[std::sync::atomic::AtomicU64; 2]| {
-            let [h, m] = c
-                .each_ref()
-                .map(|a| a.load(std::sync::atomic::Ordering::Relaxed));
-            serde_json::json!({"hits": h, "misses": m})
-        };
-        serde_json::json!({"merged": pair(&self.merged), "fetched": pair(&self.fetched)})
+        serde_json::json!({"merged": self.merged.snapshot(), "fetched": self.fetched.snapshot()})
     }
 }
 
 /// The process's @context cache counters.
 pub static CACHE_STATS: CacheStats = CacheStats {
-    merged: [
-        std::sync::atomic::AtomicU64::new(0),
-        std::sync::atomic::AtomicU64::new(0),
-    ],
-    fetched: [
-        std::sync::atomic::AtomicU64::new(0),
-        std::sync::atomic::AtomicU64::new(0),
-    ],
+    merged: HitCount::new(),
+    fetched: HitCount::new(),
 };
 
 /// Sets the byte budgets of the merged-context and fetched-document caches
@@ -1154,7 +1166,7 @@ impl Loader {
             .get(&key)
             .filter(|_| self.merged_hit_is_usable(&key, tenant));
         if key.len() <= MAX_MERGED_KEY_BYTES {
-            CACHE_STATS.count(&CACHE_STATS.merged, hit.is_some());
+            CACHE_STATS.merged.count(hit.is_some());
         }
         if let Some(hit) = hit {
             if count {
@@ -1353,8 +1365,7 @@ impl Loader {
         let err = |m: String| NgsiError::LdContextNotAvailable(m);
         let mut stale_value: Option<Arc<Value>> = None;
         let found = self.fetched.get(url);
-        CACHE_STATS.count(
-            &CACHE_STATS.fetched,
+        CACHE_STATS.fetched.count(
             found
                 .as_ref()
                 .is_some_and(|h| h.serves(tenant) && !h.is_stale()),
@@ -2698,6 +2709,29 @@ mod tests {
             "weighted size {} passed the budget",
             cache.weighted_size()
         );
+    }
+
+    /// The budget the broker sets is what the next Loader's caches take, and
+    /// the counters report every lookup (T-5895). The defaults are set back
+    /// at once, so no other test sees another budget.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn set_shares_reach_the_next_loader_and_lookups_are_counted() {
+        set_cache_bytes(DEFAULT_MERGED_CACHE_BYTES, DEFAULT_FETCHED_CACHE_BYTES);
+        assert_eq!(
+            MERGED_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+            DEFAULT_MERGED_CACHE_BYTES
+        );
+        let stats = CacheStats::default();
+        stats.merged.count(true);
+        stats.merged.count(false);
+        stats.fetched.count(false);
+        assert_eq!(
+            stats.snapshot(),
+            serde_json::json!({"merged": {"hits": 1, "misses": 1},
+                "fetched": {"hits": 0, "misses": 1}})
+        );
+        assert!(CACHE_STATS.snapshot()["merged"]["hits"].is_u64());
     }
 
     /// The share of `ANTARES_MEMORY_BUDGET` the broker sets (T-5895) is the

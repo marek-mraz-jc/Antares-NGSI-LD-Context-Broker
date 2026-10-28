@@ -536,8 +536,8 @@ impl std::ops::DerefMut for AppState {
 }
 
 impl AppState {
-    /// An in-process answer read whole, under [`Self::max_answer_bytes`] and
-    /// charged to [`Self::answer_pool`] until the returned value drops
+    /// An in-process answer read whole, under `max_answer_bytes` and
+    /// charged to `answer_pool` until the returned value drops
     /// (T-5895).
     ///
     /// # Errors

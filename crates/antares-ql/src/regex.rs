@@ -339,6 +339,16 @@ mod tests {
     #[test]
     fn cache_stays_bounded_under_many_distinct_patterns() {
         let _serial = serial_lock();
+        // the default share binds by bytes (512 programs of the first tier),
+        // a 64 MiB share by the entry count: both bounds are driven
+        for share in [DEFAULT_REGEX_CACHE_BYTES, 64 << 20] {
+            set_cache_bytes(share);
+            fill_past_both_bounds();
+        }
+        set_cache_bytes(DEFAULT_REGEX_CACHE_BYTES);
+    }
+
+    fn fill_past_both_bounds() {
         for i in 0..MAX_REGEX_CACHE * 3 {
             let p = format!("^bounded-{i}-[a-z]+$");
             let re = compile(&p).expect("valid pattern");

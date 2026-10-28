@@ -310,8 +310,8 @@ pub fn spawn_sampler(state: antares_api::AppState) {
             }
             // T-5895: the hit ratio of each @context cache under its share
             let stats = &antares_jsonld::CACHE_STATS;
-            for (cache, pair) in [("merged", &stats.merged), ("fetched", &stats.fetched)] {
-                for (result, n) in [("hit", &pair[0]), ("miss", &pair[1])] {
+            for (cache, count) in [("merged", &stats.merged), ("fetched", &stats.fetched)] {
+                for (result, n) in [("hit", &count.hits), ("miss", &count.misses)] {
                     metrics::counter!("antares_context_cache_lookups_total",
                         "cache" => cache, "result" => result)
                     .absolute(n.load(std::sync::atomic::Ordering::Relaxed));

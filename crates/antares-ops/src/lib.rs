@@ -1452,6 +1452,20 @@ pub mod test_kit {
             Ok(Self { state, reload })
         }
 
+        /// [`TestBroker::new`] whose buffered answers share a pool of `bytes`
+        /// (the memory budget's share otherwise, T-5895), so a test fills it
+        /// without holding 64 MiB.
+        ///
+        /// # Errors
+        /// The view table's.
+        pub async fn with_answer_pool(bytes: usize) -> Result<Self, String> {
+            let mut state = AppState::new("antares-test".into());
+            state.answer_pool = antares_api::bounds::AnswerPool::new(bytes);
+            antares_api::wire(&mut state).await;
+            let reload = crate::views::install(&state).await?;
+            Ok(Self { state, reload })
+        }
+
         /// The same broker with the forward transport `make` builds
         /// registered (ADR-0025 rule 8), as the composition root registers
         /// it.

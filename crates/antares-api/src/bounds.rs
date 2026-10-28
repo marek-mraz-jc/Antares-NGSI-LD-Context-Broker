@@ -96,16 +96,17 @@ impl MemoryBudget {
             Some((i, _)) => v.split_at(i),
             None => (v, ""),
         };
-        let shift =
-            match unit {
-                "" => 0,
-                "Ki" => 10,
-                "Mi" => 20,
-                "Gi" => 30,
-                _ => return Err(format!(
+        let shift = match unit {
+            "" => 0,
+            "Ki" => 10,
+            "Mi" => 20,
+            "Gi" => 30,
+            _ => {
+                return Err(format!(
                     "ANTARES_MEMORY_BUDGET={v}: a size in bytes or with Ki, Mi or Gi, e.g. 200Mi"
-                )),
-            };
+                ))
+            }
+        };
         let total = digits
             .parse::<u64>()
             .ok()
