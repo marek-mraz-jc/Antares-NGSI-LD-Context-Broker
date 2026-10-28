@@ -13,8 +13,8 @@ use unicode_normalization::char::is_combining_mark;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::{
-    geometry, Cmp, Date, DateTime, Error, Func, Lit, Member, Node, Path, Shape, Time, Truth,
-    MAX_STEPS, MAX_STRING_BYTES,
+    base64url, decode_base64, geometry, Cmp, Date, DateTime, Duration, Error, Func, Lit, Member,
+    Node, Path, Shape, Time, Truth, MAX_STEPS, MAX_STRING_BYTES,
 };
 
 /// A value while evaluating; strings borrow from the Entity or the program when they can.
@@ -27,6 +27,8 @@ enum Val<'a> {
     DateTime(DateTime),
     Date(Date),
     Time(Time),
+    Duration(Duration),
+    Binary(Cow<'a, [u8]>),
     /// A JSON array or object: a list for `any`/`all`, a complex or `GeoJSON` value.
     Json(&'a Value),
 }
@@ -56,6 +58,8 @@ pub(crate) fn run_value(root: &Node, entity: &Value) -> Result<Option<Value>, Er
         Val::DateTime(d) => Value::String(d.to_string()),
         Val::Date(d) => Value::String(d.to_string()),
         Val::Time(t) => Value::String(t.to_string()),
+        Val::Duration(d) => Value::String(d.to_string()),
+        Val::Binary(b) => Value::String(base64url(&b)),
         Val::Json(v) => v.clone(),
     }))
 }
@@ -219,6 +223,8 @@ fn literal(l: &Lit) -> Val<'_> {
         Lit::DateTime(d) => Val::DateTime(*d),
         Lit::Date(d) => Val::Date(*d),
         Lit::Time(t) => Val::Time(*t),
+        Lit::Duration(d) => Val::Duration(*d),
+        Lit::Binary(b) => Val::Binary(Cow::Borrowed(b)),
         Lit::Geometry(g) => Val::Json(g),
     }
 }
@@ -342,6 +348,22 @@ fn day(v: &Val<'_>) -> Option<Date> {
     as_date(v).or_else(|| as_datetime(v).map(DateTime::utc_date))
 }
 
+fn as_duration(v: &Val<'_>) -> Option<Duration> {
+    match v {
+        Val::Duration(d) => Some(*d),
+        Val::Str(s) => Duration::parse(s),
+        _ => None,
+    }
+}
+
+fn as_binary<'v>(v: &'v Val<'_>) -> Option<Cow<'v, [u8]>> {
+    match v {
+        Val::Binary(b) => Some(Cow::Borrowed(b)),
+        Val::Str(s) => decode_base64(s).map(Cow::Owned),
+        _ => None,
+    }
+}
+
 fn as_time(v: &Val<'_>) -> Option<Time> {
     match v {
         Val::Time(t) => Some(*t),
@@ -382,6 +404,10 @@ fn order(a: &Val<'_>, b: &Val<'_>) -> Option<Ordering> {
         },
         (Val::Date(_), _) | (_, Val::Date(_)) => Some(day(a)?.cmp(&day(b)?)),
         (Val::Time(_), _) | (_, Val::Time(_)) => Some(as_time(a)?.cmp(&as_time(b)?)),
+        (Val::Duration(_), _) | (_, Val::Duration(_)) => {
+            Some(as_duration(a)?.cmp(&as_duration(b)?))
+        }
+        (Val::Binary(_), _) | (_, Val::Binary(_)) => Some(as_binary(a)?.cmp(&as_binary(b)?)),
         _ => None,
     }
 }
@@ -531,6 +557,10 @@ fn call(func: Func, args: Vec<Option<Val<'_>>>) -> Option<Val<'_>> {
         Func::TotalOffsetMinutes => Some(Val::Int(as_datetime(one?)?.offset_minutes())),
         Func::Date => as_datetime(one?)?.local().map(|(d, _)| Val::Date(d)),
         Func::Time => as_datetime(one?)?.local().map(|(_, t)| Val::Time(t)),
+        Func::InRange => {
+            let (value, low, high) = (number(one?)?, number(two?)?, number(third.as_ref()?)?);
+            (low <= value && value <= high).then_some(first)?
+        }
         Func::Round => rounded(one, f64::round),
         Func::Floor => rounded(one, f64::floor),
         Func::Ceiling => rounded(one, f64::ceil),

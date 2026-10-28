@@ -13,7 +13,7 @@ use crate::filter::{
     compute, computed, holds_member, inlined, mint, order, program, searched, translate, Refused,
     SortBy, SortKey, Translated,
 };
-use antares_ops::residual::{DateTime, Expr as RExpr, Program};
+use antares_ops::residual::{base64url, decode_base64, DateTime, Expr as RExpr, Program};
 use antares_ops::{
     core_name, pickable, Caller, OperationId, OpsRequest, Page as ScanPage, Pushdown, Refusal,
     Scanned, ViewOps, RESIDUAL_SCAN, TOO_COMPLEX,
@@ -1497,6 +1497,13 @@ pub(crate) fn served(shape: &Shape, instance: Option<&Value>) -> (Value, Option<
         } | Shape::Url { collection: true }
     );
     let other_kind = instance.is_some_and(Value::is_object) && value.is_none();
+    let value = match (shape, value) {
+        (Shape::Value { edm, .. }, Some(v)) => match as_edm(edm, v) {
+            Ok(v) => Some(v),
+            Err(note) => return (Value::Null, Some(note)),
+        },
+        (_, v) => v,
+    };
     match value {
         // An Untyped member holds any JSON value, an array too.
         Some(v) if *shape == Shape::Json => (v, None),
@@ -1513,6 +1520,28 @@ pub(crate) fn served(shape: &Shape, instance: Option<&Value>) -> (Value, Option<
             Some("the LanguageProperty has no text without a language: ask with ngsild.lang"),
         ),
         None => (Value::Null, other_kind.then_some(KIND_NOTE)),
+    }
+}
+
+/// A stored value in the JSON form of `edm` (JSON Format 7.1), item by item in a list: an
+/// `Edm.Binary` as unpadded base64url whichever base64 NGSI-LD stores, an `Edm.TimeOfDay`
+/// without the `Z` NGSI-LD writes a Time with (TS 104 175 5.2.2.4). `Err` with the reason when
+/// a stored text is no binary value (T-5905).
+fn as_edm(edm: &str, value: Value) -> Result<Value, &'static str> {
+    match (edm, value) {
+        (_, Value::Array(items)) => items
+            .into_iter()
+            .map(|v| as_edm(edm, v))
+            .collect::<Result<_, _>>()
+            .map(Value::Array),
+        ("Edm.Binary", Value::String(text)) => decode_base64(&text)
+            .map(|bytes| Value::String(base64url(&bytes)))
+            .ok_or("the stored value is no base64 text"),
+        ("Edm.TimeOfDay", Value::String(text)) => Ok(Value::String(
+            text.strip_suffix(['Z', 'z'])
+                .map_or(text.clone(), str::to_owned),
+        )),
+        (_, v) => Ok(v),
     }
 }
 
@@ -2184,6 +2213,43 @@ mod tests {
             served(&Shape::Language, None),
             (Value::Null, None),
             "absent, no note"
+        );
+        // T-5905: Edm.Binary as unpadded base64url, Edm.TimeOfDay without NGSI-LD's `Z`
+        let typed = |edm, collection| Shape::Value { edm, collection };
+        for (shape, stored, want) in [
+            (
+                typed("Edm.Binary", false),
+                json!("dGVzdA=="),
+                json!("dGVzdA"),
+            ),
+            (
+                typed("Edm.Binary", true),
+                json!(["+/8=", ""]),
+                json!(["-_8", ""]),
+            ),
+            (
+                typed("Edm.TimeOfDay", false),
+                json!("09:30:00Z"),
+                json!("09:30:00"),
+            ),
+            (
+                typed("Edm.TimeOfDay", false),
+                json!("09:30:00"),
+                json!("09:30:00"),
+            ),
+            (typed("Edm.Binary", false), json!(7), json!(7)),
+        ] {
+            assert_eq!(
+                served(&shape, Some(&json!({"value": stored}))),
+                (want, None)
+            );
+        }
+        assert_eq!(
+            served(
+                &typed("Edm.Binary", false),
+                Some(&json!({"value": "no base64!"}))
+            ),
+            (Value::Null, Some("the stored value is no base64 text"))
         );
     }
 
