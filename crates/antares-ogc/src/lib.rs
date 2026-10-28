@@ -242,7 +242,7 @@ async fn serve(ops: &Ops, caller: &Caller, req: Request) -> Response {
         return answer;
     }
     let (mut parts, body) = answer.into_parts();
-    let Ok(read) = ops.read_answer(body).await else {
+    let Ok(read) = ops.read_answer(body, "ogc").await else {
         let (parts, _) = problem(
             StatusCode::PAYLOAD_TOO_LARGE,
             antares_ops::bounds::ANSWER_TOO_LARGE,

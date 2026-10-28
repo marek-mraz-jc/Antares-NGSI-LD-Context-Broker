@@ -67,6 +67,7 @@ pub const ENV_KEYS: &[&str] = &[
     SCHEMA_MAX_ENV,
     HISTORY_DEFAULT_ENV,
     antares_api::schema_writes::SCHEMA_WRITES_ENV,
+    crate::view_cache::VIEW_IDLE_ENV,
 ];
 
 /// The largest view document `/q/views` accepts, in bytes.
@@ -778,6 +779,7 @@ pub async fn install(state: &AppState) -> Result<Reload, String> {
         .views
         .schema_writes
         .set_mode(schema_writes(std::env::var(SCHEMA_WRITES_ENV).ok())?);
+    crate::view_cache::configure()?;
     install_with(
         state,
         platform_history(std::env::var(HISTORY_DEFAULT_ENV).ok())?,

@@ -253,10 +253,12 @@ async fn the_type_selector_and_the_count_alone_hold_at_their_edges() -> Result<(
 }
 
 /// F-ANT5-004: the unknown Sensor heading the first page is no Entity served, so the next link
-/// resumes at the second Entity and every Device is listed once over the pages.
+/// resumes at the second Entity and every Device is listed once over the pages. Car:9 names no
+/// Device, so the unknown Sensor has its Datastream.
 #[tokio::test]
 async fn sensor_pages_list_every_device_once() -> Result<(), String> {
-    let mut entities = Vec::new();
+    let mut entities = vec![json!({"id": "urn:ngsi-ld:Car:9", "type": "Car",
+        "speed": {"type": "Property", "value": 5}})];
     for i in 1..=3 {
         let device = format!("urn:ngsi-ld:Device:{i}");
         entities.push(json!({"id": format!("urn:ngsi-ld:Car:{i}"), "type": "Car",

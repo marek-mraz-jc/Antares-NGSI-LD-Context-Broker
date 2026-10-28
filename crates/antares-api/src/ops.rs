@@ -259,7 +259,21 @@ pub(super) async fn health(
     body.insert("taskPanics".into(), notify::task_panics().into());
     // Jemalloc heap stats (RSS ≈ live×1.2 is the target).
     if let Some(mem) = &state.mem_stats {
-        body.insert("memory".into(), mem());
+        let mut m = mem();
+        // T-5895: what the budget's pool holds now and the @context caches'
+        // hit counts, so a share set too small shows as a falling ratio
+        if let Some(o) = m.as_object_mut() {
+            o.insert(
+                "answerPool".into(),
+                serde_json::json!({"heldBytes": state.answer_pool.held(),
+                    "capBytes": state.answer_pool.cap()}),
+            );
+            o.insert(
+                "contextCaches".into(),
+                antares_jsonld::CACHE_STATS.snapshot(),
+            );
+        }
+        body.insert("memory".into(), m);
     }
     // Bus visibility: present only when the nats wiring installed the
     // provider — bus=local carries NO bus member.

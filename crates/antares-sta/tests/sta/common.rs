@@ -34,6 +34,9 @@ pub struct Answer {
     pub body: Value,
     pub allow: Option<String>,
     pub bytes: usize,
+    /// The body as text, for an answer that is no JSON (`$value`).
+    pub text: String,
+    pub content_type: Option<String>,
 }
 
 pub async fn send(app: &Router, method: &str, uri: &str, body: &str) -> Answer {
@@ -67,6 +70,11 @@ pub async fn send(app: &Router, method: &str, uri: &str, body: &str) -> Answer {
         .get("allow")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let bytes = resp
         .into_body()
         .collect()
@@ -78,6 +86,8 @@ pub async fn send(app: &Router, method: &str, uri: &str, body: &str) -> Answer {
         body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         allow,
         bytes: bytes.len(),
+        text: String::from_utf8_lossy(&bytes).into_owned(),
+        content_type,
     }
 }
 

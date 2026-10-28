@@ -171,7 +171,7 @@ async fn answer(
 ) -> Result<Response, Refusal> {
     let answer = view.run_unmapped(op, caller, inner).await?;
     let (mut parts, body) = answer.into_parts();
-    let bytes = view.read_answer(body).await?;
+    let bytes = view.read_answer(body, "mapped").await?;
     parts.headers.remove(header::CONTENT_LENGTH);
     if !parts.status.is_success() {
         // the broker words a refusal in the inner request's terms
@@ -180,7 +180,7 @@ async fn answer(
     }
     // HEAD, 204: no body to rebuild
     let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return Ok(Response::from_parts(parts, Body::from(bytes)));
+        return Ok(Response::from_parts(parts, Body::from(bytes.into_bytes())));
     };
     if !rebuild(&mut json) {
         // a value the view cannot translate is not served

@@ -12,6 +12,11 @@ use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use std::sync::atomic::{AtomicU64, Ordering};
+// Clock rule: std Instant panics on wasm32 (T-4937).
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant as Clock;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant as Clock;
 
 /// Hard caps (v1: compile-time constants — a config file is a later knob;
 /// every value is spec-shaped on rejection).
@@ -36,6 +41,400 @@ pub const MAX_JSON_DEPTH: usize = 64; // → 400 BadRequestData
 pub const MAX_ANSWER_BYTES: usize = 64 * 1024 * 1024;
 /// The fixed detail of an answer past [`MAX_ANSWER_BYTES`].
 pub const ANSWER_TOO_LARGE: &str = "the answer is larger than the broker buffers for one request";
+/// The fixed detail of a 503 for a buffered answer the [`AnswerPool`] has no
+/// room for (T-5895): the request is fine, the broker is holding as many
+/// answer bytes as its memory budget allows. It is the marker the HTTP
+/// binding maps to 503 + `Retry-After`, as it does for the database pool.
+pub use antares_model::error::MEMORY_OVERLOADED;
+/// `Retry-After` of a 503 for [`MEMORY_OVERLOADED`]: the pool frees as the
+/// concurrent buffered answers finish, which takes well under a second.
+pub const ANSWER_POOL_RETRY_SECONDS: u64 = 1;
+/// How long a buffered read waits for room in a full [`AnswerPool`] before
+/// it is refused with [`MEMORY_OVERLOADED`] (T-5898). The answers ahead of it
+/// free their share as soon as they are written out, well under a second
+/// each, so a brief burst of large reads queues instead of failing; a client
+/// still sees a 503 long before its own timeout. One deadline covers the
+/// whole read, however many frames wait.
+pub const ANSWER_POOL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The process-wide memory budget (`ANTARES_MEMORY_BUDGET`, T-5895) and its
+/// split over every long-lived cache and the buffered-answer pool. Each share
+/// is `parts` / 200 of the total, so the default 200 MiB gives each the MiB
+/// its parts say:
+///
+/// | share | parts | at 200 MiB |
+/// |---|---|---|
+/// | merged @contexts (`antares_jsonld`) | 44 | 44 MiB |
+/// | fetched @context documents (`antares_jsonld`) | 8 | 8 MiB |
+/// | OData models (`antares_odata`) | 16 | 16 MiB |
+/// | LinkML models (`linkml_model`) | 8 | 8 MiB |
+/// | regex programs (`antares_ql`) | 16 | 16 MiB |
+/// | rendered LinkML schemas (`antares_linkml`) | 8 | 8 MiB |
+/// | ImplicitlyCreated @contexts per Tenant | 8 | 8 MiB |
+/// | buffered answers ([`AnswerPool`]) | 64 | 64 MiB |
+///
+/// The 28 parts left are the process itself: code, runtime, connection
+/// buffers and the stores' own state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryBudget {
+    /// Bytes the whole process plans for.
+    pub total: u64,
+}
+
+impl Default for MemoryBudget {
+    fn default() -> Self {
+        Self {
+            total: Self::DEFAULT,
+        }
+    }
+}
+
+impl MemoryBudget {
+    /// The budget when `ANTARES_MEMORY_BUDGET` is unset.
+    pub const DEFAULT: u64 = 200 << 20;
+    /// The smallest budget accepted: below it the answer pool is smaller
+    /// than one ordinary page of 1000 Entities.
+    pub const MIN: u64 = 64 << 20;
+
+    /// Reads `ANTARES_MEMORY_BUDGET`: bytes, or a number with `Ki`, `Mi` or
+    /// `Gi` (`512Mi`).
+    ///
+    /// # Errors
+    /// A message naming the key and an example, for a value that is not a
+    /// size or is below [`Self::MIN`].
+    pub fn parse(v: &str) -> Result<Self, String> {
+        let v = v.trim();
+        let (digits, unit) = match v.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+            Some((i, _)) => v.split_at(i),
+            None => (v, ""),
+        };
+        let shift = match unit {
+            "" => 0,
+            "Ki" => 10,
+            "Mi" => 20,
+            "Gi" => 30,
+            _ => {
+                return Err(format!(
+                    "ANTARES_MEMORY_BUDGET={v}: a size in bytes or with Ki, Mi or Gi, e.g. 200Mi"
+                ))
+            }
+        };
+        let total = digits
+            .parse::<u64>()
+            .ok()
+            .and_then(|n| n.checked_mul(1 << shift))
+            .ok_or_else(|| {
+                format!(
+                    "ANTARES_MEMORY_BUDGET={v}: a size in bytes or with Ki, Mi or Gi, e.g. 200Mi"
+                )
+            })?;
+        if total < Self::MIN {
+            return Err(format!(
+                "ANTARES_MEMORY_BUDGET={v} is below the 64Mi the broker needs, e.g. 200Mi"
+            ));
+        }
+        Ok(Self { total })
+    }
+
+    fn parts(self, n: u64) -> u64 {
+        (self.total / 200).saturating_mul(n)
+    }
+    /// Heap bytes of the merged-@context cache.
+    #[must_use]
+    pub fn merged_contexts(self) -> u64 {
+        self.parts(44)
+    }
+    /// Bytes of the fetched-@context document cache.
+    #[must_use]
+    pub fn fetched_contexts(self) -> u64 {
+        self.parts(8)
+    }
+    /// Bytes of built OData models.
+    #[must_use]
+    pub fn odata_models(self) -> u64 {
+        self.parts(16)
+    }
+    /// Bytes of LinkML schema source behind the model cache.
+    #[must_use]
+    pub fn linkml_models(self) -> u64 {
+        self.parts(8)
+    }
+    /// Charged bytes of retained regex programs.
+    #[must_use]
+    pub fn regex_programs(self) -> u64 {
+        self.parts(16)
+    }
+    /// Bytes of rendered LinkML schemas.
+    #[must_use]
+    pub fn linkml_renders(self) -> u64 {
+        self.parts(8)
+    }
+    /// Charged bytes of the ImplicitlyCreated @contexts one Tenant holds.
+    #[must_use]
+    pub fn implicit_contexts(self) -> u64 {
+        self.parts(8)
+    }
+    /// Bytes every concurrently buffered answer holds together.
+    #[must_use]
+    pub fn answers(self) -> u64 {
+        self.parts(64)
+    }
+
+    /// Sets the shares of the caches this crate's dependencies keep (the
+    /// @context caches, the regex programs). Called before
+    /// the state is built: a [`antares_jsonld::Loader`] sizes its caches
+    /// when it is made.
+    pub fn apply(self) {
+        antares_jsonld::set_cache_bytes(self.merged_contexts(), self.fetched_contexts());
+        antares_ql::regex::set_cache_bytes(
+            usize::try_from(self.regex_programs()).unwrap_or(usize::MAX),
+        );
+    }
+
+    /// Sets the budget's state fields on `st`: the answer pool, the
+    /// per-answer bound (never above [`MAX_ANSWER_BYTES`] nor the pool) and
+    /// the ImplicitlyCreated byte cap.
+    pub fn set_on(self, st: &mut crate::AppState) {
+        let pool = usize::try_from(self.answers()).unwrap_or(usize::MAX);
+        st.answer_pool = AnswerPool::new(pool);
+        st.max_answer_bytes = MAX_ANSWER_BYTES.min(pool);
+        st.implicit_context_bytes = self.implicit_contexts();
+    }
+}
+
+/// The bytes every in-process answer a handler buffers holds together
+/// (T-5895): [`MAX_ANSWER_BYTES`] bounds one answer, this bounds N of them,
+/// so concurrency cannot multiply the per-request cap past the memory budget.
+/// A read the pool has no room for waits up to [`ANSWER_POOL_WAIT`], then
+/// is refused with [`MEMORY_OVERLOADED`] (503 + `Retry-After`), never cut
+/// short.
+#[derive(Debug)]
+pub struct AnswerPool {
+    cap: usize,
+    held: std::sync::atomic::AtomicUsize,
+    /// The most `held` reached since [`AnswerPool::take_peak`] last read it.
+    peak: std::sync::atomic::AtomicUsize,
+    /// Wakes the reads waiting for room whenever an answer gives its share back.
+    freed: tokio::sync::Notify,
+    wait: std::time::Duration,
+}
+
+impl AnswerPool {
+    /// A pool of `cap` bytes whose reads wait up to [`ANSWER_POOL_WAIT`].
+    #[must_use]
+    pub fn new(cap: usize) -> std::sync::Arc<Self> {
+        Self::with_wait(cap, ANSWER_POOL_WAIT)
+    }
+    /// A pool of `cap` bytes whose reads wait up to `wait` for room.
+    #[must_use]
+    pub fn with_wait(cap: usize, wait: std::time::Duration) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            cap,
+            held: std::sync::atomic::AtomicUsize::new(0),
+            peak: std::sync::atomic::AtomicUsize::new(0),
+            freed: tokio::sync::Notify::new(),
+            wait,
+        })
+    }
+    /// The most bytes held at once since the last call, then starts over
+    /// from what is held now: the metric sampler reads the peak between two
+    /// samples, which a gauge of `held` alone misses.
+    pub fn take_peak(&self) -> usize {
+        self.peak.swap(self.held(), Ordering::AcqRel)
+    }
+    /// The bytes the pool holds at most.
+    #[must_use]
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+    /// The bytes buffered answers hold now.
+    #[must_use]
+    pub fn held(&self) -> usize {
+        self.held.load(Ordering::Acquire)
+    }
+    fn take(&self, n: usize) -> bool {
+        match self
+            .held
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |h| {
+                h.checked_add(n).filter(|t| *t <= self.cap)
+            }) {
+            Ok(before) => {
+                self.peak
+                    .fetch_max(before.saturating_add(n), Ordering::AcqRel);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+    /// [`AnswerPool::take`], waiting until `until` for an answer to give
+    /// room back; a read that already holds `own` and would not fit even an
+    /// otherwise empty pool is refused at once. The wasm build has no tokio
+    /// timer: there a read takes room only when it is free now.
+    async fn take_until(&self, n: usize, own: usize, until: Clock) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        loop {
+            // registered before the try, so a share freed in between wakes it
+            let freed = self.freed.notified();
+            tokio::pin!(freed);
+            freed.as_mut().enable();
+            if self.take(n) {
+                return true;
+            }
+            let left = until.saturating_duration_since(Clock::now());
+            if own.saturating_add(n) > self.cap || tokio::time::timeout(left, freed).await.is_err()
+            {
+                return self.take(n);
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (own, until);
+            self.take(n)
+        }
+    }
+}
+
+/// An answer read whole, holding its bytes of the [`AnswerPool`] until it
+/// is dropped.
+#[derive(Debug)]
+pub struct HeldAnswer {
+    bytes: Bytes,
+    /// Returned to the pool when the answer drops.
+    _charge: Charge,
+}
+
+impl HeldAnswer {
+    /// The bytes of the answer.
+    #[must_use]
+    pub fn bytes(&self) -> &Bytes {
+        &self.bytes
+    }
+    /// The bytes, handed on as a response body: the pool share is returned
+    /// here, as the server writes them out and frees them.
+    #[must_use]
+    pub fn into_bytes(self) -> Bytes {
+        self.bytes
+    }
+}
+
+impl std::ops::Deref for HeldAnswer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// What a read through the pool holds of it, returned on drop.
+#[derive(Debug)]
+struct Charge {
+    pool: std::sync::Arc<AnswerPool>,
+    bytes: usize,
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.pool.held.fetch_sub(self.bytes, Ordering::AcqRel);
+            self.pool.freed.notify_waiters();
+        }
+    }
+}
+
+/// Why a buffered read was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnswerRefusal {
+    /// This answer alone is over the per-request bound
+    /// ([`ANSWER_TOO_LARGE`]).
+    TooLarge,
+    /// The pool has no room within its wait ([`MEMORY_OVERLOADED`]).
+    OverBudget,
+    /// The inner body failed while it was read.
+    Body,
+}
+
+/// The NGSI-LD API's answer to each refusal: 403 TooManyResults past the
+/// per-answer bound (5.5.6), 503 + `Retry-After` while the pool is full.
+impl From<AnswerRefusal> for antares_model::NgsiError {
+    fn from(r: AnswerRefusal) -> Self {
+        match r {
+            AnswerRefusal::TooLarge => Self::TooManyResults(ANSWER_TOO_LARGE.into()),
+            AnswerRefusal::OverBudget => Self::InternalError(MEMORY_OVERLOADED.into()),
+            AnswerRefusal::Body => Self::InternalError("buffered answer body failed".into()),
+        }
+    }
+}
+
+impl From<AnswerRefusal> for crate::negotiate::ApiError {
+    fn from(r: AnswerRefusal) -> Self {
+        antares_model::NgsiError::from(r).into()
+    }
+}
+
+/// Reads `body` whole, at most `max` bytes, charging every frame to `pool`
+/// as it arrives; a frame the pool has no room for waits for it up to the
+/// pool's wait, counted from the start of the read (T-5898). A refusal
+/// releases what the read held. `surface` labels the metrics: the size of
+/// each answer read whole (`antares_answer_bytes`), the time spent waiting
+/// for room and each refusal for a full pool.
+///
+/// # Errors
+/// [`AnswerRefusal`] when the answer is over `max`, the pool had no room
+/// within its wait or the body fails.
+pub async fn read_answer(
+    pool: &std::sync::Arc<AnswerPool>,
+    body: Body,
+    max: usize,
+    surface: &'static str,
+) -> Result<HeldAnswer, AnswerRefusal> {
+    let started = Clock::now();
+    let read = read_charged(pool, body, max, started).await;
+    match &read {
+        Ok(answer) => {
+            metrics::histogram!("antares_answer_bytes", "surface" => surface)
+                .record(answer.len() as f64);
+        }
+        Err(AnswerRefusal::OverBudget) => {
+            metrics::counter!("antares_answer_pool_refusals_total", "surface" => surface)
+                .increment(1);
+        }
+        Err(_) => {}
+    }
+    metrics::histogram!("antares_answer_pool_wait_seconds", "surface" => surface)
+        .record(started.elapsed().as_secs_f64());
+    read
+}
+
+async fn read_charged(
+    pool: &std::sync::Arc<AnswerPool>,
+    body: Body,
+    max: usize,
+    started: Clock,
+) -> Result<HeldAnswer, AnswerRefusal> {
+    use futures_util::StreamExt;
+    let until = started.checked_add(pool.wait).unwrap_or(started);
+    let mut charge = Charge {
+        pool: std::sync::Arc::clone(pool),
+        bytes: 0,
+    };
+    let mut buf = Vec::new();
+    let mut frames = body.into_data_stream();
+    while let Some(frame) = frames.next().await {
+        let frame = frame.map_err(|_| AnswerRefusal::Body)?;
+        let total = buf.len().saturating_add(frame.len());
+        if total > max {
+            return Err(AnswerRefusal::TooLarge);
+        }
+        if !pool.take_until(frame.len(), charge.bytes, until).await {
+            return Err(AnswerRefusal::OverBudget);
+        }
+        charge.bytes = charge.bytes.saturating_add(frame.len());
+        buf.extend_from_slice(&frame);
+    }
+    Ok(HeldAnswer {
+        bytes: Bytes::from(buf),
+        _charge: charge,
+    })
+}
 /// → 400 BadRequestData. Maximum coordinate positions in a QUERY geometry
 /// (4.10 geoQ, 4.23 ordering reference). The spec sets no ceiling, and the
 /// geometry is not bounded by the URI length on the POST query path — the
@@ -190,7 +589,7 @@ pub use antares_jsonld::MAX_CONTEXT_URLS as MAX_CONTEXT_FETCHES;
 pub use antares_ql::eval::MAX_Q_LINK_LOOKUPS;
 /// Regex compile ceiling and retention caps, owned by the shared cache
 /// (`antares_ql::regex`).
-pub use antares_ql::regex::{MAX_REGEX_CACHE, MAX_REGEX_CACHE_BYTES, MAX_REGEX_PROGRAM_BYTES};
+pub use antares_ql::regex::{MAX_REGEX_CACHE, MAX_REGEX_PROGRAM_BYTES};
 /// → 403 TooComplexQuery. The AST size cap, owned by the parser that
 /// enforces it (`antares_ql::parse_q`).
 pub use antares_ql::MAX_Q_NODES;
@@ -447,7 +846,7 @@ impl LimitStats {
             "maxQNodes": MAX_Q_NODES,
             "maxQLinkLookups": MAX_Q_LINK_LOOKUPS,
             "maxRegexCache": MAX_REGEX_CACHE,
-            "maxRegexCacheBytes": MAX_REGEX_CACHE_BYTES,
+            "maxRegexCacheBytes": antares_ql::regex::cache_bytes(),
             "maxRegexProgramBytes": MAX_REGEX_PROGRAM_BYTES,
             "changeQueue": CHANGE_QUEUE,
             "deliveryLane": DELIVERY_LANE,
@@ -589,6 +988,186 @@ pub(crate) async fn bounds_layer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T-5895: `ANTARES_MEMORY_BUDGET` takes bytes or Ki/Mi/Gi, refuses
+    /// anything else and anything under 64 MiB with the key in the message.
+    #[test]
+    fn the_memory_budget_parses_sizes_and_refuses_the_rest() {
+        assert_eq!(MemoryBudget::parse("200Mi").map(|b| b.total), Ok(200 << 20));
+        assert_eq!(MemoryBudget::parse("1Gi").map(|b| b.total), Ok(1 << 30));
+        assert_eq!(
+            MemoryBudget::parse(" 134217728 ").map(|b| b.total),
+            Ok(128 << 20)
+        );
+        assert_eq!(
+            MemoryBudget::parse("65536Ki").map(|b| b.total),
+            Ok(64 << 20)
+        );
+        for bad in [
+            "",
+            "200MB",
+            "-1",
+            "2.5Gi",
+            "Mi",
+            "63Mi",
+            "99999999999999999999Gi",
+        ] {
+            let err = MemoryBudget::parse(bad).expect_err(bad);
+            assert!(err.starts_with("ANTARES_MEMORY_BUDGET="), "{bad}: {err}");
+        }
+    }
+
+    /// The default shares are the defaults the caches carry, so a broker
+    /// without the key is the 200 MiB split, and the shares leave the
+    /// process its 28 parts.
+    #[test]
+    fn the_default_split_is_what_the_caches_hold_without_the_key() {
+        let b = MemoryBudget::default();
+        assert_eq!(
+            b.merged_contexts(),
+            antares_jsonld::DEFAULT_MERGED_CACHE_BYTES
+        );
+        assert_eq!(
+            b.fetched_contexts(),
+            antares_jsonld::DEFAULT_FETCHED_CACHE_BYTES
+        );
+        assert_eq!(
+            usize::try_from(b.regex_programs()).ok(),
+            Some(antares_ql::regex::DEFAULT_REGEX_CACHE_BYTES)
+        );
+        assert_eq!(b.odata_models(), 16 << 20);
+        assert_eq!(b.linkml_models(), 8 << 20);
+        assert_eq!(b.linkml_renders(), 8 << 20);
+        let shares = [
+            b.merged_contexts(),
+            b.fetched_contexts(),
+            b.odata_models(),
+            b.linkml_models(),
+            b.regex_programs(),
+            b.linkml_renders(),
+            b.implicit_contexts(),
+            b.answers(),
+        ];
+        assert_eq!(shares.iter().sum::<u64>(), 172 << 20);
+        let st = &mut crate::AppState::new("antares-budget-split".into());
+        MemoryBudget { total: 100 << 20 }.set_on(st);
+        assert_eq!(st.answer_pool.cap(), 32 << 20);
+        assert_eq!(st.max_answer_bytes, 32 << 20, "one answer fits the pool");
+        MemoryBudget { total: 1 << 30 }.set_on(st);
+        assert_eq!(
+            st.max_answer_bytes, MAX_ANSWER_BYTES,
+            "never above the per-answer cap"
+        );
+    }
+
+    fn body_of(n: usize) -> Body {
+        Body::from(vec![b'x'; n])
+    }
+
+    /// N concurrent buffered answers share one pool: past it a read is
+    /// refused whole, and a dropped answer gives its bytes back.
+    #[tokio::test]
+    async fn the_answer_pool_refuses_past_its_cap_and_frees_on_drop() {
+        let pool = AnswerPool::with_wait(1000, std::time::Duration::ZERO);
+        let first = read_answer(&pool, body_of(600), 800, "test")
+            .await
+            .expect("fits");
+        assert_eq!(first.len(), 600);
+        assert_eq!(pool.held(), 600);
+        assert_eq!(
+            read_answer(&pool, body_of(600), 800, "test").await.err(),
+            Some(AnswerRefusal::OverBudget)
+        );
+        assert_eq!(pool.held(), 600, "a refused read holds nothing");
+        assert_eq!(
+            read_answer(&pool, body_of(900), 800, "test").await.err(),
+            Some(AnswerRefusal::TooLarge),
+            "one answer stays under the per-answer bound"
+        );
+        drop(first);
+        assert_eq!(pool.held(), 0);
+        let again = read_answer(&pool, body_of(600), 800, "test")
+            .await
+            .expect("room again");
+        assert_eq!(again.into_bytes().len(), 600);
+        assert_eq!(pool.held(), 0, "a body handed on leaves the pool");
+        assert_eq!(pool.take_peak(), 600, "the peak between two samples");
+        assert_eq!(pool.take_peak(), 0, "starts over from what is held");
+    }
+
+    /// A read the full pool has no room for waits, and gets its room when an
+    /// answer ahead of it is written out before the wait ends (T-5898).
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_waits_for_room_and_gets_it_before_the_wait_ends() {
+        let pool = AnswerPool::with_wait(1000, std::time::Duration::from_secs(2));
+        let first = read_answer(&pool, body_of(600), 800, "test")
+            .await
+            .expect("fits");
+        let started = tokio::time::Instant::now();
+        let waiting = tokio::spawn({
+            let pool = std::sync::Arc::clone(&pool);
+            async move { read_answer(&pool, body_of(600), 800, "test").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(!waiting.is_finished(), "it waits while the pool is full");
+        drop(first);
+        let second = waiting.await.expect("joined").expect("room freed in time");
+        assert_eq!(second.len(), 600);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(pool.held(), 600);
+    }
+
+    /// Past the wait the read is refused whole and holds nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_is_refused_when_no_room_frees_within_the_wait() {
+        let pool = AnswerPool::with_wait(1000, std::time::Duration::from_secs(2));
+        let _first = read_answer(&pool, body_of(600), 800, "test")
+            .await
+            .expect("fits");
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            read_answer(&pool, body_of(600), 800, "test").await.err(),
+            Some(AnswerRefusal::OverBudget)
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+        assert_eq!(pool.held(), 600, "a refused read holds nothing");
+    }
+
+    /// A read that would not fit even an empty pool beside what it already
+    /// holds is refused at once: no wait can make room for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_too_big_for_the_whole_pool_does_not_wait() {
+        let pool = AnswerPool::with_wait(1000, std::time::Duration::from_secs(2));
+        let frames = futures_util::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; 600])),
+            Ok(Bytes::from(vec![b'x'; 600])),
+        ]);
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            read_answer(&pool, Body::from_stream(frames), 4000, "test")
+                .await
+                .err(),
+            Some(AnswerRefusal::OverBudget)
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        assert_eq!(pool.held(), 0, "a refused read holds nothing");
+    }
+
+    /// The API answers a full pool 503 with Retry-After, never a body cut
+    /// short, and an answer past the per-answer bound 403 TooManyResults.
+    #[test]
+    fn a_full_pool_answers_503_with_retry_after() {
+        let r = crate::negotiate::ApiError::from(AnswerRefusal::OverBudget).into_response();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            r.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .map(|v| v.as_bytes()),
+            Some(&b"1"[..])
+        );
+        let r = crate::negotiate::ApiError::from(AnswerRefusal::TooLarge).into_response();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
 
     /// The scan is a bound, not a parser: unbalanced closers must not
     /// underflow, and the value it reports is the one the middleware compares

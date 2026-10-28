@@ -172,6 +172,10 @@ pub fn init() -> Result<Option<MetricsRender>, Box<dyn std::error::Error>> {
     }
     let handle = metrics_exporter_prometheus::PrometheusBuilder::new()
         .set_buckets(LATENCY_BUCKETS_SECONDS)?
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full("antares_answer_bytes".into()),
+            ANSWER_BUCKETS_BYTES,
+        )?
         .install_recorder()?;
     describe();
     Ok(Some(Arc::new(move || handle.render())))
@@ -195,6 +199,22 @@ pub fn init() -> Result<Option<MetricsRender>, Box<dyn std::error::Error>> {
 /// exists to show.
 const LATENCY_BUCKETS_SECONDS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
+
+/// Bucket bounds, in bytes, of `antares_answer_bytes` (T-5898): from a
+/// one-Entity page to the 64 MiB per-answer cap, so the p99 and the largest
+/// answers of each surface show which pool size the load needs.
+const ANSWER_BUCKETS_BYTES: &[f64] = &[
+    1024.0,
+    16_384.0,
+    131_072.0,
+    524_288.0,
+    1_048_576.0,
+    4_194_304.0,
+    8_388_608.0,
+    16_777_216.0,
+    33_554_432.0,
+    67_108_864.0,
 ];
 
 /// Metric metadata — Prometheus-convention names (antares_ prefix, unit suffixes).
@@ -250,6 +270,36 @@ fn describe() {
         Unit::Bytes,
         "jemalloc resident bytes (RSS ~ live x1.2 is the section-2.1 target)"
     );
+    describe_counter!(
+        "antares_context_cache_lookups_total",
+        Unit::Count,
+        "@context cache lookups by cache (merged, fetched) and result (hit, miss)"
+    );
+    describe_gauge!(
+        "antares_answer_pool_held_bytes",
+        Unit::Bytes,
+        "bytes the buffered in-process answers hold of the memory budget's pool"
+    );
+    describe_gauge!(
+        "antares_answer_pool_peak_bytes",
+        Unit::Bytes,
+        "the most bytes the buffered answers held at once since the previous 5 s sample"
+    );
+    describe_histogram!(
+        "antares_answer_bytes",
+        Unit::Bytes,
+        "size of each in-process answer read whole through the pool, by surface"
+    );
+    describe_histogram!(
+        "antares_answer_pool_wait_seconds",
+        Unit::Seconds,
+        "time a buffered read took, its wait for room in the pool included, by surface"
+    );
+    describe_counter!(
+        "antares_answer_pool_refusals_total",
+        Unit::Count,
+        "buffered reads answered 503 MEMORY_OVERLOADED: no room freed within the wait, by surface"
+    );
     describe_gauge!(
         "antares_commit_queue_depth",
         Unit::Count,
@@ -298,6 +348,18 @@ pub fn spawn_sampler(state: antares_api::AppState) {
                     metrics::gauge!("antares_memory_resident_bytes").set(r as f64);
                 }
             }
+            // T-5895: the hit ratio of each @context cache under its share
+            let stats = &antares_jsonld::CACHE_STATS;
+            for (cache, count) in [("merged", &stats.merged), ("fetched", &stats.fetched)] {
+                for (result, n) in [("hit", &count.hits), ("miss", &count.misses)] {
+                    metrics::counter!("antares_context_cache_lookups_total",
+                        "cache" => cache, "result" => result)
+                    .absolute(n.load(std::sync::atomic::Ordering::Relaxed));
+                }
+            }
+            metrics::gauge!("antares_answer_pool_held_bytes").set(state.answer_pool.held() as f64);
+            metrics::gauge!("antares_answer_pool_peak_bytes")
+                .set(state.answer_pool.take_peak() as f64);
             if let Some((depth, _peak)) = state.store.commit_queue() {
                 metrics::gauge!("antares_commit_queue_depth").set(depth as f64);
             }

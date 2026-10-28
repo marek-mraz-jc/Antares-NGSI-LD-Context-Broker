@@ -10,6 +10,9 @@ GET /x/views/{view}/sta/v1.1/{Set}
 GET /x/views/{view}/sta/v1.1/{Set}('{id}')
 GET /x/views/{view}/sta/v1.1/{Set}('{id}')/{navigation}
 GET /x/views/{view}/sta/v1.1/{Set}('{id}')/{member}
+GET /x/views/{view}/sta/v1.1/{Set}('{id}')/{member}/$value
+GET /x/views/{view}/sta/v1.1/{path}/$ref
+GET /x/views/{view}/sta/v1.1/{Set}('{id}')/{Set}('{id}')/…
 OPTIONS any of them
 ```
 
@@ -36,9 +39,25 @@ HistoricalLocation's `Thing` and `Locations`; a Datastream's `Thing`,
 `Datastreams`; a FeatureOfInterest's `Observations`. Every Datastream has
 exactly one Sensor: the Device its Entity's `refDevice` names (`404` when
 the view hides that Device), else the Sensor `unknown`, whose Datastreams
-are those of every Entity naming no Device (T-5205). A member path such as
-`Things('{urn}')/name` answers `{"name": …}`. A key that is no URI, such as
+are those of every Entity naming no Device (T-5205); `unknown` is listed and
+read only while such a Datastream exists in the view (T-5916). A member
+path such as `Things('{urn}')/name` answers `{"name": …}`. A key that is no URI, such as
 `Sensors(1)`, answers `404`.
+
+`{member}/$value` (15-078r6 9.2.6) answers the member's raw value: a string
+as its text and a number or boolean as its literal (`text/plain;
+charset=utf-8`), an object or array such as `location` or
+`unitOfMeasurement` as its JSON (`application/json`), a `null` member
+`204`. A navigation property has no `$value`: `404`. `{path}/$ref`
+(9.2.7) answers the resources of `{path}` as `{"@iot.selfLink": …}` alone,
+a list's `@iot.count` and `@iot.nextLink` kept, the next link to the next
+page of links; `$select` and `$expand` do not apply to it, and a member that
+is no resource (`name/$ref`) is `404`. A path may walk through related
+resources (9.2.4): `Things('{a}')/Datastreams('{b}')/Observations` reads
+`Datastreams('{b}')/Observations` once `{b}` is one of `{a}`'s Datastreams,
+and `Datastreams('{b}')/Thing/Locations` the Locations of that Thing; a
+resource that is not related, or that the view hides, at any step is the
+`404` of an unknown one. The query options apply to the last step only.
 
 ## 1. What a set holds
 
@@ -63,7 +82,8 @@ common codes, else the code, `definition` the code's IRI), else every member
 `null`. Its `observationType` is `OM_CountObservation` for a whole number
 without a unit, else `OM_Measurement`. A Sensor's `encodingType` is
 `application/json`: its `metadata` is the Device's `controlledProperty` as
-JSON, not a SensorML or PDF document.
+JSON, not a SensorML or PDF document; `[]` for a Device without one and for
+the Sensor `unknown`, since `metadata` is mandatory (15-078r6 Table 8).
 
 ## 2. Query options
 
