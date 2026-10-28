@@ -653,27 +653,29 @@ const MAX_FETCHED_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 /// tiny documents cannot turn a byte budget into an unbounded map.
 const MAX_FETCHED_ENTRIES: u64 = 256;
 
-/// Terms the merged-context cache may hold across all its entries. A merged
-/// Context costs memory in proportion to its term map (the map itself, its
-/// compaction inverse and its prefix index), and an @context document may
-/// spend its 5 MiB budget on hundreds of thousands of short mappings — so an
-/// entry ceiling alone bounds nothing. 256 entries of an ordinary vocabulary
-/// (the core context defines 184 terms; a large domain one runs to tens of
-/// thousands) fit inside this comfortably.
-const MAX_MERGED_CACHE_TERMS: u64 = 2_000_000;
+/// Heap bytes the merged-context cache may hold across all its entries,
+/// each entry weighed by [`Context::heap_bytes`]: its term map, compaction
+/// inverse and prefix index. A term costs ~500 bytes there, so the earlier
+/// budget of 2 million TERMS let the cache pin ~1 GiB, which the broker on
+/// dev held 45 min after each start (T-5894). 64 MiB keeps the 184-term core
+/// context merged with a model context of a few thousand terms warm for
+/// every entry (~0.25 MiB each); a larger context is rebuilt from the warm
+/// fetched-document cache on a miss.
+const MAX_MERGED_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Entry ceiling of the merged-context cache, charged through the term
+/// Entry ceiling of the merged-context cache, charged through the byte
 /// budget exactly as the fetched cache charges its byte budget.
 const MAX_MERGED_ENTRIES: u64 = 256;
 
-/// The merged-context cache, bounded by TERMS held rather than by entries.
-/// The same budget on wasm32: the minicache takes moka's weigher (T-3698).
+/// The merged-context cache, bounded by the heap its entries hold rather
+/// than by entries. The same budget on wasm32: the minicache takes moka's
+/// weigher (T-3698).
 fn merged_cache() -> BoundedCache<String, Arc<Context>> {
-    let floor = (MAX_MERGED_CACHE_TERMS / MAX_MERGED_ENTRIES) as u32;
+    let floor = (MAX_MERGED_CACHE_BYTES / MAX_MERGED_ENTRIES) as u32;
     BoundedCache::builder()
-        .max_capacity(MAX_MERGED_CACHE_TERMS)
-        .weigher(move |_key: &String, ctx: &Arc<Context>| {
-            u32::try_from(ctx.term_count())
+        .max_capacity(MAX_MERGED_CACHE_BYTES)
+        .weigher(move |key: &String, ctx: &Arc<Context>| {
+            u32::try_from(ctx.heap_bytes().saturating_add(key.len()))
                 .unwrap_or(u32::MAX)
                 .max(floor)
         })
@@ -2569,21 +2571,21 @@ mod tests {
         }
     }
 
-    /// The merged-context cache is charged by the TERMS an entry holds, not
-    /// by counting entries: an @context document may spend its whole byte
-    /// budget on short mappings, and a merged Context costs memory in
-    /// proportion to its term map, its compaction inverse and its prefix
-    /// index. An entry ceiling alone would let 256 such documents pin
-    /// hundreds of megabytes.
+    /// The merged-context cache is charged by the HEAP an entry holds, not
+    /// by its terms or by counting entries: a merged Context costs ~500
+    /// bytes per term (term map, compaction inverse, prefix index), and the
+    /// earlier budget of 2 million terms let it pin ~1 GiB on dev (T-5894).
+    /// Contexts of 8 000 terms, a large domain vocabulary, are inserted past
+    /// the budget; what the cache then holds stays inside it.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn the_merged_cache_is_bounded_by_terms_not_by_entries() {
+    fn the_merged_cache_is_bounded_by_heap_bytes() {
         let big = |n: usize| {
             let mut m = serde_json::Map::new();
             for i in 0..n {
                 m.insert(
-                    format!("t{i:06}"),
-                    Value::String(format!("http://a.example/{i}")),
+                    format!("someAttribute{i:06}"),
+                    Value::String(format!("https://smartdatamodels.org/dataModel.X/a{i}")),
                 );
             }
             let mut c = Context::default();
@@ -2593,31 +2595,34 @@ mod tests {
         };
         let cache = merged_cache();
         // one entry far under the floor still costs the floor, so a flood of
-        // tiny contexts cannot turn the term budget into an unbounded map
+        // tiny contexts cannot turn the byte budget into an unbounded map
         cache.insert("small".into(), big(1));
         cache.run_pending_tasks();
-        let floor = MAX_MERGED_CACHE_TERMS / MAX_MERGED_ENTRIES;
+        let floor = MAX_MERGED_CACHE_BYTES / MAX_MERGED_ENTRIES;
         assert_eq!(
             cache.weighted_size(),
             floor,
             "a small entry costs the floor"
         );
-        // and a large one costs what it holds
-        let n = (floor as usize) * 4;
-        cache.insert("large".into(), big(n));
-        cache.run_pending_tasks();
-        assert_eq!(
-            cache.weighted_size(),
-            floor + n as u64,
-            "a large entry is charged its term count"
+        // a large one costs the heap it holds: ~500 bytes a term
+        let one = big(8_000);
+        let bytes = one.heap_bytes() as u64;
+        assert!(
+            (8_000 * 400..=8_000 * 700).contains(&bytes),
+            "8 000 terms estimated at {bytes} bytes"
         );
         // past the budget the cache evicts rather than growing
-        for i in 0..8 {
-            cache.insert(format!("f{i}"), big(n));
+        for i in 0..64 {
+            cache.insert(format!("f{i}"), big(8_000));
         }
         cache.run_pending_tasks();
+        let held: u64 = cache.iter().map(|(_, c)| c.heap_bytes() as u64).sum();
         assert!(
-            cache.weighted_size() <= MAX_MERGED_CACHE_TERMS,
+            held <= MAX_MERGED_CACHE_BYTES,
+            "the cache holds {held} bytes of contexts, budget {MAX_MERGED_CACHE_BYTES}"
+        );
+        assert!(
+            cache.weighted_size() <= MAX_MERGED_CACHE_BYTES,
             "weighted size {} passed the budget",
             cache.weighted_size()
         );

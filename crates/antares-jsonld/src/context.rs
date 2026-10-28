@@ -394,6 +394,32 @@ impl Context {
         self.terms.len()
     }
 
+    /// The heap this context holds in its own maps: the term map, the
+    /// compaction inverse and the prefix index, each entry charged its string
+    /// bytes plus a fixed slot cost. A counting allocator measured 467-574
+    /// bytes per term for 184 to 20 000 terms (T-5894); this estimate lands
+    /// within that. The merged-context cache weighs its entries by it, so its
+    /// budget is a memory budget (2 million terms held ~1 GiB on dev).
+    /// The Core document's scopes are shared by every context and not counted.
+    pub fn heap_bytes(&self) -> usize {
+        // a String header per key and value, hashbrown control bytes and
+        // load-factor slack, and allocator rounding of the two strings
+        const PAIR: usize = 2 * std::mem::size_of::<String>() + 48;
+        let def = std::mem::size_of::<TermDef>() - std::mem::size_of::<String>();
+        let terms: usize = self
+            .terms
+            .iter()
+            .map(|(t, d)| PAIR + def + t.len() + d.iri.len())
+            .sum();
+        let maps = |m: &HashMap<String, String>| -> usize {
+            m.iter().map(|(k, v)| PAIR + k.len() + v.len()).sum()
+        };
+        terms
+            .saturating_add(maps(&self.inverse))
+            .saturating_add(maps(&self.prefixes))
+            .saturating_add(self.prefix_lens.len() * std::mem::size_of::<usize>())
+    }
+
     /// Expand a key/term in vocab position (attribute names, type values).
     pub fn expand_key(&self, key: &str) -> String {
         if let Some(def) = self.term(key) {
