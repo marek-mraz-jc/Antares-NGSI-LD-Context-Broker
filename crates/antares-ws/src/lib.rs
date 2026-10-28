@@ -29,8 +29,10 @@
 pub mod envelope;
 mod hub;
 mod limits;
+mod mqtt;
 mod random;
 mod socket;
+mod sta_mqtt;
 
 pub use hub::{Answer, Forwarded, Hub, Refused, Relay, ENDPOINT_PREFIX};
 pub use limits::{
@@ -142,11 +144,9 @@ impl Surface for Ws {
         let hub = self.0.clone();
         Router::new().route(
             "/ngsi-ld/v1",
-            get(
-                move |caller: Caller, req: Request| async move {
-                    upgrade(hub, ops, None, caller, req)
-                },
-            ),
+            get(move |caller: Caller, req: Request| async move {
+                upgrade(hub, ops, None, caller, req, Channel::Envelope)
+            }),
         )
     }
 }
@@ -170,11 +170,82 @@ impl Surface for ViewWs {
             "/{view}/ws",
             get(
                 move |Path(view): Path<String>, caller: Caller, req: Request| async move {
-                    upgrade(hub, ops, Some(view), caller, req)
+                    upgrade(hub, ops, Some(view), caller, req, Channel::Envelope)
                 },
             ),
         )
     }
+}
+
+/// The `SensorThings` MQTT extension of a view (OGC 18-088 section 14, read side):
+/// MQTT 3.1.1 over a WebSocket at `/x/views/{view}/sta/mqtt` (T-5911).
+#[derive(Clone)]
+pub struct StaMqtt(Arc<Hub>);
+
+impl StaMqtt {
+    /// The surface over `hub`.
+    #[must_use]
+    pub fn new(hub: Arc<Hub>) -> Self {
+        Self(hub)
+    }
+
+    /// The surface over [`Hub::process`].
+    #[must_use]
+    pub fn process() -> Self {
+        Self(Hub::process())
+    }
+}
+
+impl Surface for StaMqtt {
+    fn name(&self) -> &'static str {
+        "sta-mqtt"
+    }
+
+    fn prefix(&self) -> &'static str {
+        VIEW_ROOT
+    }
+
+    fn version_info(&self) -> serde_json::Value {
+        health(&self.0, "/x/views/{view}/sta/mqtt")
+    }
+
+    fn router(&self, ops: Ops) -> Router {
+        let hub = self.0.clone();
+        Router::new().route(
+            "/{view}/sta/mqtt",
+            get(
+                move |Path(view): Path<String>, caller: Caller, req: Request| async move {
+                    if !offers_mqtt(req.headers()) {
+                        return problem(
+                            StatusCode::BAD_REQUEST,
+                            "BadRequestData",
+                            "MQTT over WebSocket: offer the subprotocol mqtt in Sec-WebSocket-Protocol",
+                        );
+                    }
+                    upgrade(hub, ops, Some(view), caller, req, Channel::StaMqtt)
+                },
+            ),
+        )
+    }
+}
+
+/// Whether the handshake offers the `mqtt` subprotocol (MQTT 3.1.1 section 6).
+fn offers_mqtt(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get_all(header::SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|p| p.trim() == "mqtt")
+}
+
+/// What an upgraded socket speaks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Channel {
+    /// The TS 104 243 envelope (ADR-0026).
+    Envelope,
+    /// MQTT 3.1.1, the `SensorThings` extension.
+    StaMqtt,
 }
 
 fn problem(status: StatusCode, title: &str, detail: &str) -> Response {
@@ -268,6 +339,7 @@ fn upgrade(
     view: Option<String>,
     caller: Caller,
     mut req: Request,
+    channel: Channel,
 ) -> Response {
     let (accept, on_upgrade) = match handshake(&mut req) {
         Ok(h) => h,
@@ -292,6 +364,7 @@ fn upgrade(
         Ok(asked) => asked,
         Err(detail) => return problem(StatusCode::BAD_REQUEST, "BadRequestData", detail),
     };
+    let (mqtt_ops, view_id) = (ops.clone(), view.clone().unwrap_or_default());
     let (tenant, runner) = match &view {
         None => (
             asked.unwrap_or_else(|| "default".to_owned()),
@@ -341,12 +414,17 @@ fn upgrade(
                     Some(config),
                 )
                 .await;
-                socket::serve(hub, conn, socket).await;
+                match channel {
+                    Channel::Envelope => socket::serve(hub, conn, socket).await,
+                    Channel::StaMqtt => {
+                        sta_mqtt::serve(hub, conn, socket, mqtt_ops, view_id).await;
+                    }
+                }
             }
             Err(_) => hub.close(&conn.id),
         }
     });
-    (
+    let mut answer = (
         StatusCode::SWITCHING_PROTOCOLS,
         [
             (header::CONNECTION, "upgrade".to_owned()),
@@ -354,7 +432,14 @@ fn upgrade(
             (header::SEC_WEBSOCKET_ACCEPT, accept),
         ],
     )
-        .into_response()
+        .into_response();
+    if channel == Channel::StaMqtt {
+        answer.headers_mut().insert(
+            header::SEC_WEBSOCKET_PROTOCOL,
+            axum::http::HeaderValue::from_static("mqtt"),
+        );
+    }
+    answer
 }
 
 /// The read buffer of one socket.

@@ -6,7 +6,7 @@
 pub mod asyncapi;
 
 use antares_ops::test_kit::TestBroker;
-use antares_ws::{Hub, Limits, Sink, ViewWs, Ws};
+use antares_ws::{Hub, Limits, Sink, StaMqtt, ViewWs, Ws};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::fmt::Write as _;
@@ -93,6 +93,8 @@ async fn start(
     let app = broker.serve_mounted(vec![
         antares_ops::mount(Ws::new(hub.clone())),
         antares_ops::mount(ViewWs::new(hub.clone())),
+        antares_ops::mount(StaMqtt::new(hub.clone())),
+        antares_ops::mount(StubSta),
     ])?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -503,5 +505,67 @@ impl Client {
         let m = json!({"x-op": "x-resume", "x-id": "r", "x-connection": connection, "x-resume-token": token, "x-seq": seq});
         self.send(m, None).await?;
         self.result().await
+    }
+}
+
+/// The `SensorThings` answers [`StubSta`] gives, by `{view}/{path}` and `?{query}` when there is
+/// one; the crate may not depend on the `SensorThings` surface (module rule surface-dev), so a
+/// test scripts what each read answers.
+static STA: std::sync::Mutex<std::collections::BTreeMap<String, (u16, String)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Script the answer of `GET /x/views/{key}` below `/sta/v1.1/`.
+pub fn sta(key: &str, status: u16, body: &Value) {
+    STA.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.to_owned(), (status, body.to_string()));
+}
+
+/// A stand-in for the `SensorThings` surface: the scripted answer, else 404.
+pub struct StubSta;
+
+fn scripted(view: &str, rest: &str, query: Option<String>) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let key = match query {
+        Some(q) => format!("{view}/{rest}?{q}"),
+        None => format!("{view}/{rest}"),
+    };
+    let answer = STA
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .cloned();
+    let (status, body) = answer.unwrap_or((404, "{}".to_owned()));
+    let status = axum::http::StatusCode::from_u16(status).unwrap_or_default();
+    (status, body).into_response()
+}
+
+impl antares_ops::Surface for StubSta {
+    fn name(&self) -> &'static str {
+        "sta"
+    }
+    fn prefix(&self) -> &'static str {
+        "/x/views"
+    }
+    fn version_info(&self) -> Value {
+        Value::Null
+    }
+    fn router(&self, _ops: antares_ops::Ops) -> axum::Router {
+        use axum::extract::{Path, RawQuery};
+        axum::Router::new()
+            .route(
+                "/{view}/sta/v1.1",
+                axum::routing::get(|Path(view): Path<String>, RawQuery(q): RawQuery| {
+                    std::future::ready(scripted(&view, "", q))
+                }),
+            )
+            .route(
+                "/{view}/sta/v1.1/{*rest}",
+                axum::routing::get(
+                    |Path((view, rest)): Path<(String, String)>, RawQuery(q): RawQuery| {
+                        std::future::ready(scripted(&view, &rest, q))
+                    },
+                ),
+            )
     }
 }

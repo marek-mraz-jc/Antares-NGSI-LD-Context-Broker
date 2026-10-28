@@ -631,6 +631,10 @@ const SURFACE_SHELF: &[(&str, SurfaceCtor)] = &[
     ("ws-views", || {
         antares_ops::mount(antares_ws::ViewWs::process())
     }),
+    #[cfg(all(feature = "ws", feature = "sta"))]
+    ("sta-mqtt", || {
+        antares_ops::mount(antares_ws::StaMqtt::process())
+    }),
     #[cfg(feature = "channels")]
     ("channels", || {
         // `ANTARES_CHANNEL_BROKERS` was checked before the shelf is built
@@ -2139,7 +2143,7 @@ mod api_surface_tests {
     #[cfg(feature = "full")]
     #[test]
     fn the_full_build_shelves_every_surface() {
-        let names = "admin,views,mcp,odata,ws,ws-views";
+        let names = "admin,views,mcp,odata,ws,ws-views,sta,sta-mqtt";
         let picked = api_surfaces(Some(names)).expect("every surface is on the shelf");
         assert_eq!(picked.len(), names.split(',').count());
     }

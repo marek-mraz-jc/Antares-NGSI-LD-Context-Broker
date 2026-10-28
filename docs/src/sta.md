@@ -172,6 +172,49 @@ own `/sta/v1.1`, which serves what it served before:
 - An output name the list does not hold, an output that does not hold, or one
   whose types the view shows none of, answers 404.
 
+## 5. MQTT subscriptions
+
+A build with `sta` and `ws` serves the receive side of the SensorThings MQTT
+extension (OGC 18-088 section 14, T-5911): MQTT 3.1.1 over a WebSocket.
+Mount it with `ANTARES_API_SURFACES=admin,views,sta,sta-mqtt`.
+
+```text
+GET /x/views/{view}/sta/mqtt   Upgrade: websocket, Sec-WebSocket-Protocol: mqtt
+```
+
+- **Identity.** The upgrade request is the caller, as a GET of the view is:
+  its token and policy headers decide every read. CONNECT's username and
+  password are read and dropped. A caller who cannot read the view's
+  `/sta/v1.1` root gets CONNACK `5` (not authorized). An upgrade without
+  the `mqtt` subprotocol answers `400`.
+- **Topics.** `v1.1/{Set}('{id}')`, `v1.1/{Set}('{id}')/{navigation}`
+  (`v1.1/Datastreams('{id}')/Observations` among them), `v1.1/Things` and
+  `v1.1/Datastreams`, each with an optional `?$select=a,b`. The `{id}` is
+  written as in a self link, encoded or not. A topic with a wildcard (`+`,
+  `#`), another query option, another whole set, an ObservedProperty, or a
+  resource the caller cannot read now (unknown, hidden or refused) gets
+  SUBACK `0x80` and no message. Every grant is QoS 0.
+- **Messages.** Each topic is one NGSI-LD Subscription made through the
+  view as the caller, endpoint this connection, so the notifier feeds it
+  and nothing polls. On a notification the broker reads the topic's
+  resource again through its own router as the caller. A single resource
+  is published when its read changed. For a collection, each member of its
+  first page (the newest 10 Observations, else the first 100 members) that
+  is new or changed is published as the read of that member. Every message
+  is the HTTP `GET` answer of the resource, byte for byte, `$select`
+  applied. A whole-set topic publishes the Thing of each changed Entity, or
+  its Datastreams.
+- **Read only.** A client PUBLISH, and a CONNECT carrying a Will, closes
+  the connection: the extension takes no SensorThings writes.
+- **Bounds.** The WebSocket channel's limits apply (`ANTARES_WS_*` in
+  [WebSocket notifications](websocket.md)): connections per process and per
+  Tenant, `ANTARES_WS_MAX_SUBSCRIPTIONS` topics per connection, the
+  queue's count and bytes (an overflow closes the connection), the client
+  frame rate, the lifetime. A client packet is at most 64 KiB; a message is
+  at most 1 MiB. A connection with a keep alive closes after 1.5 times it
+  without a packet. Its Subscriptions are deleted when it closes: an MQTT
+  connection does not resume.
+
 ## Related
 
 - [Surfaces](surfaces.md)
