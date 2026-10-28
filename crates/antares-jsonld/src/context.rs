@@ -385,15 +385,6 @@ impl Context {
             .or_else(|| self.terms.get(term))
     }
 
-    /// How many terms this context defines. The merged-context cache charges
-    /// an entry by this rather than counting entries: an @context document
-    /// may spend its whole byte budget on short mappings, and a term map of
-    /// hundreds of thousands of terms is what the cache would then hold,
-    /// times its entry ceiling.
-    pub fn term_count(&self) -> usize {
-        self.terms.len()
-    }
-
     /// The heap this context holds in its own maps: the term map, the
     /// compaction inverse and the prefix index, each entry charged its string
     /// bytes plus a fixed slot cost. A counting allocator measured 467-574
