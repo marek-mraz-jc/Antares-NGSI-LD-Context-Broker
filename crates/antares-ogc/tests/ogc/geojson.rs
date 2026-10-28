@@ -80,6 +80,11 @@ async fn feature_collection_and_feature_shape() -> Result<(), String> {
         antares_ops::residual::DateTime::parse(stamp).is_some(),
         "C17: an RFC 3339 instant, got {stamp:?}"
     );
+    assert_eq!(
+        stamp.len(),
+        "2026-10-28T11:00:00Z".len(),
+        "C17: whole seconds, {stamp}"
+    );
     assert_eq!(page.body.get("type"), Some(&json!("FeatureCollection")));
     Ok(())
 }

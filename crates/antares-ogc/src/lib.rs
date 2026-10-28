@@ -854,8 +854,12 @@ impl Here<'_> {
         let mut body = json!({
             "type": "FeatureCollection",
             "features": page.features,
-            // C17: when the answer was made, a response time and no Entity time.
-            "timeStamp": items::now().as_ref().map(ToString::to_string),
+            // C17: when the answer was made, a response time and no Entity time; whole
+            // seconds, so a HEAD states the length of the GET.
+            "timeStamp": items::now().and_then(|t| {
+                let seconds = t.unix_micros().checked_div(1_000_000)?;
+                antares_ops::residual::DateTime::from_unix_micros(seconds.checked_mul(1_000_000)?)
+            }).as_ref().map(ToString::to_string),
             "numberReturned": returned,
             "links": links,
         });
