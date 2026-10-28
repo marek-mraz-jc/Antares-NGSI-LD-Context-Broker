@@ -98,6 +98,13 @@ async fn every_navigation_path_expands_on_every_set() -> Result<(), String> {
         "{}",
         one.body
     );
+    // a head an earlier path inlined is read once and walked again
+    let twice = sta(
+        &f.app,
+        "/Things?$expand=HistoricalLocations,HistoricalLocations/Thing",
+    )
+    .await;
+    assert_eq!(twice.status, StatusCode::OK, "{}", twice.body);
     // a related collection expands too, each of its resources
     let related = sta(
         &f.app,

@@ -647,6 +647,7 @@ mod tests {
             ("properties/k eq false and result lt 5", vec![1, 3]),
             ("properties/k eq 1", none.clone()),
             ("properties/k ne 1 and result le 1", vec![1]),
+            ("result ne 1 and result lt 3", vec![2]),
             ("not (result ge 2)", vec![1]),
             ("substringof('o 1', name)", vec![1, 10, 11, 12]),
             ("startswith(name,'o 1') and endswith(name, '2')", vec![12]),
