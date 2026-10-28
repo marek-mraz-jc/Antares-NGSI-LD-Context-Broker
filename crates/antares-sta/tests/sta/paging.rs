@@ -190,6 +190,15 @@ async fn a_skip_walks_pages_of_entities_up_to_its_bound() -> Result<(), String> 
             refused.body
         );
     }
+    // T-5918: a generic `$expand` reads at most 500 related resources per request.
+    let wide = sta(&f.app, "/Observations?$top=100&$expand=Datastream/Thing,FeatureOfInterest/Observations,Datastream/Sensor,Datastream/ObservedProperty,Datastream/Observations").await;
+    assert_eq!(
+        (wide.status, at(&wide.body, "/error/message")),
+        (
+            StatusCode::BAD_REQUEST,
+            json!("$expand reads at most 500 related resources per request: lower $top")
+        )
+    );
     // A known count is the operation's only while no id is left out after the read.
     let counted = sta(&f.app, "/Things?$count=true&$top=1").await;
     assert_eq!(at(&counted.body, "/@iot.count"), 1050);

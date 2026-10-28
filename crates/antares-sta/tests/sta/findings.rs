@@ -147,10 +147,15 @@ async fn a_filter_reads_sta_names_and_the_catalogue_link_its_type() -> Result<()
     // T-5918: a property no `q` names is judged over the collection the view answered.
     let all = sta(&f.app, "/Observations?$filter=result gt 0").await;
     assert_eq!(all.status, StatusCode::OK, "{}", all.body);
-    let results = all.body["value"].as_array().cloned().unwrap_or_default();
-    assert!(!results.is_empty());
+    let results = at(&all.body, "/value")
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_ne!(results.len(), 0);
     assert!(
-        results.iter().all(|o| o["result"].as_f64() > Some(0.0)),
+        results
+            .iter()
+            .all(|o| o.get("result").and_then(Value::as_f64) > Some(0.0)),
         "{}",
         all.body
     );
@@ -160,9 +165,13 @@ async fn a_filter_reads_sta_names_and_the_catalogue_link_its_type() -> Result<()
     )
     .await;
     assert_eq!(result.status, StatusCode::OK, "{}", result.body);
-    let kept = result.body["value"].as_array().cloned().unwrap_or_default();
+    let kept = at(&result.body, "/value")
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert!(
-        kept.iter().all(|o| o["result"].as_f64() > Some(8.0)),
+        kept.iter()
+            .all(|o| o.get("result").and_then(Value::as_f64) > Some(8.0)),
         "{}",
         result.body
     );
@@ -227,9 +236,13 @@ async fn select_expand_and_top_answer_as_documented() -> Result<(), String> {
     let count = sta(&f.app, "/Things?$top=0&$count=true").await;
     assert_eq!(count.body, json!({"@iot.count": 5, "value": []}));
     let order = sta(&f.app, "/Things?$orderby=name desc").await;
-    let names: Vec<Value> = order.body["value"]
+    let names: Vec<Value> = at(&order.body, "/value")
         .as_array()
-        .map(|v| v.iter().map(|t| t["name"].clone()).collect())
+        .map(|v| {
+            v.iter()
+                .map(|t| t.get("name").cloned().unwrap_or_default())
+                .collect()
+        })
         .unwrap_or_default();
     let mut sorted = names.clone();
     sorted.sort_by_key(|n| std::cmp::Reverse(n.as_str().map(str::to_owned)));
@@ -320,9 +333,13 @@ async fn sensor_pages_list_every_device_once() -> Result<(), String> {
 async fn query_options_apply_in_their_evaluation_order() -> Result<(), String> {
     let f = fixture().await?;
     let all = sta(&f.app, "/Observations?$filter=result gt 0").await;
-    let mut results: Vec<f64> = all.body["value"]
+    let mut results: Vec<f64> = at(&all.body, "/value")
         .as_array()
-        .map(|v| v.iter().filter_map(|o| o["result"].as_f64()).collect())
+        .map(|v| {
+            v.iter()
+                .filter_map(|o| o.get("result").and_then(Value::as_f64))
+                .collect()
+        })
         .unwrap_or_default();
     results.sort_by(f64::total_cmp);
     assert!(results.len() > 1, "{}", all.body);
@@ -334,7 +351,7 @@ async fn query_options_apply_in_their_evaluation_order() -> Result<(), String> {
     assert_eq!(page.status, StatusCode::OK, "{}", page.body);
     assert_eq!(at(&page.body, "/@iot.count"), json!(results.len()));
     assert_eq!(
-        page.body["value"].as_array().map(Vec::len),
+        at(&page.body, "/value").as_array().map(Vec::len),
         Some(1),
         "{}",
         page.body
@@ -347,6 +364,72 @@ async fn query_options_apply_in_their_evaluation_order() -> Result<(), String> {
     assert!(
         next.as_str().is_some_and(|l| l.ends_with("$skip=2")),
         "{next}"
+    );
+    Ok(())
+}
+
+/// T-5918: what a filter or an order over the collection refuses, and where it applies.
+#[tokio::test]
+async fn a_filter_over_the_collection_names_what_it_cannot_judge() -> Result<(), String> {
+    let f = fixture().await?;
+    let native = sta(
+        &f.app,
+        "/Datastreams('urn:ngsi-ld:Car:1%2Fspeed')/Observations?$orderby=phenomenonTime%20desc",
+    )
+    .await;
+    assert_eq!(native.status, StatusCode::OK, "{}", native.body);
+    for (path, message) in [
+        (
+            "/Things('urn:ngsi-ld:Car:1')?$orderby=name",
+            "$filter and $orderby apply to a collection",
+        ),
+        (
+            "/Things('urn:ngsi-ld:Car:1')/name/$value?$filter=name%20eq%20'a'",
+            "$filter and $orderby apply to a collection",
+        ),
+        (
+            "/Things?$orderby=nosuch",
+            "$orderby: nosuch is no property of these resources; quote a text",
+        ),
+    ] {
+        let a = sta(&f.app, path).await;
+        assert_eq!(
+            (a.status, at(&a.body, "/error/message")),
+            (StatusCode::BAD_REQUEST, json!(message)),
+            "{path}"
+        );
+    }
+    // an empty collection holds no name to check
+    let empty = sta(
+        &f.app,
+        "/Things('urn:ngsi-ld:Device:1')/Datastreams?$filter=zzz%20eq%201",
+    )
+    .await;
+    assert_eq!((empty.status, ids(&empty.body).len()), (StatusCode::OK, 0));
+    let counted = sta(
+        &f.app,
+        "/Observations?$top=0&$count=true&$filter=result%20gt%200",
+    )
+    .await;
+    assert_eq!(at(&counted.body, "/value"), json!([]));
+    assert!(
+        at(&counted.body, "/@iot.count").as_u64() > Some(0),
+        "{}",
+        counted.body
+    );
+    assert_eq!(at(&counted.body, "/@iot.nextLink"), Value::Null);
+    // a Sensor the view hides expands as null, and nothing below it is read
+    let hidden = sta(
+        &f.app,
+        "/Things('urn:ngsi-ld:Car:2')/Datastreams?$expand=Sensor/Datastreams",
+    )
+    .await;
+    assert_eq!(hidden.status, StatusCode::OK, "{}", hidden.body);
+    assert_eq!(
+        at(&hidden.body, "/value/0/Sensor"),
+        Value::Null,
+        "{}",
+        hidden.body
     );
     Ok(())
 }

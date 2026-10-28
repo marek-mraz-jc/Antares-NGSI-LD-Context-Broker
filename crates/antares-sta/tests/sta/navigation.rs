@@ -73,7 +73,7 @@ async fn every_navigation_path_expands_on_every_set() -> Result<(), String> {
         let a = sta(&f.app, &format!("/{set}?$expand={path}&$select=id")).await;
         assert_eq!(a.status, StatusCode::OK, "{set} {path}: {}", a.body);
         let first = at(&a.body, "/value/0");
-        let inlined = &first[head];
+        let inlined = first.get(head).cloned().unwrap_or_default();
         let shape = if inlined.is_array() {
             "array"
         } else if inlined.is_object() {
@@ -104,13 +104,15 @@ async fn every_navigation_path_expands_on_every_set() -> Result<(), String> {
         "/Sensors('urn:ngsi-ld:Device:1')/Datastreams?$expand=Observations",
     )
     .await;
-    let streams = related.body["value"]
+    let streams = at(&related.body, "/value")
         .as_array()
         .cloned()
         .unwrap_or_default();
     assert!(!streams.is_empty(), "{}", related.body);
     assert!(
-        streams.iter().all(|d| d["Observations"].is_array()),
+        streams
+            .iter()
+            .all(|d| d.get("Observations").is_some_and(Value::is_array)),
         "{}",
         related.body
     );

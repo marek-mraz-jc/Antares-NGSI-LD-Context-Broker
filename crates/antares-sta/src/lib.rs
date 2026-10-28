@@ -383,10 +383,8 @@ async fn scan(
     loop {
         let mut p = plain.clone();
         p.extend(cursor);
-        let doc = match Box::pin(read(env, rest, p)).await? {
-            Answer::Doc(doc) => doc,
-            Answer::Raw(_) => return Err(not_found()),
-        };
+        // a resource or a raw `$value` holds no `value` list
+        let (Answer::Doc(doc) | Answer::Raw(doc)) = Box::pin(read(env, rest, p)).await?;
         let Some(Value::Array(page)) = doc.get("value").cloned() else {
             return Err(Problem(
                 StatusCode::BAD_REQUEST,
@@ -415,34 +413,8 @@ async fn scan(
             .filter(|(k, _)| *k == "$skip" || *k == "$skiptoken")
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect();
-        if cursor.is_empty() {
-            break;
-        }
     }
-    // A name no resource holds is a typo or an unquoted text, not a filter that holds for none.
-    let heads = filter.iter().flat_map(residual::heads);
-    let heads = heads.chain(
-        opts.orderby
-            .iter()
-            .filter_map(|(p, _)| p.first().map(String::as_str)),
-    );
-    for head in heads {
-        if !items.is_empty() && !items.iter().any(|i| i.get(head).is_some()) {
-            let option = if opts
-                .orderby
-                .iter()
-                .any(|(p, _)| p.first().is_some_and(|f| f == head))
-            {
-                "$orderby"
-            } else {
-                "$filter"
-            };
-            return Err(Problem(
-                StatusCode::BAD_REQUEST,
-                format!("{option}: {head} is no property of these resources; quote a text"),
-            ));
-        }
-    }
+    unknown(&items, filter.as_ref(), &opts.orderby)?;
     if let Some(expr) = &filter {
         items.retain(|i| residual::matches(expr, i));
     }
@@ -467,6 +439,31 @@ async fn scan(
         opts.count.then_some(total),
         next,
     ))
+}
+
+/// A `$filter` or `$orderby` name no resource of a non-empty collection holds: a typo or an
+/// unquoted text, not a filter that holds for none.
+fn unknown(
+    items: &[Value],
+    filter: Option<&residual::Expr>,
+    orderby: &[(Vec<String>, bool)],
+) -> Result<(), Problem> {
+    let named = |head: &str| items.is_empty() || items.iter().any(|i| i.get(head).is_some());
+    let filtered = filter
+        .into_iter()
+        .flat_map(residual::heads)
+        .map(|h| ("$filter", h));
+    let ordered = orderby
+        .iter()
+        .filter_map(|(p, _)| p.first())
+        .map(|h| ("$orderby", h.as_str()));
+    match filtered.chain(ordered).find(|(_, h)| !named(h)) {
+        Some((option, head)) => Err(Problem(
+            StatusCode::BAD_REQUEST,
+            format!("{option}: {head} is no property of these resources; quote a text"),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// The members `$select` keeps once `$expand` inlined some: the expanded ones too.
@@ -528,27 +525,32 @@ fn expansions(target: &str, expand: &[String]) -> Result<(), Problem> {
 async fn expand_all(env: &Env<'_>, items: &mut [Value], expand: &[String]) -> Result<(), Problem> {
     for item in items.iter_mut() {
         for path in expand {
-            let names: Vec<&str> = path.split('/').collect();
-            Box::pin(expand_one(env, item, &names)).await?;
+            let mut names = path.split('/');
+            let name = names.next().unwrap_or_default();
+            let deeper: Vec<&str> = names.collect();
+            Box::pin(expand_one(env, item, name, &deeper)).await?;
         }
     }
     Ok(())
 }
 
-async fn expand_one(env: &Env<'_>, item: &mut Value, names: &[&str]) -> Result<(), Problem> {
-    let Some((name, deeper)) = names.split_first() else {
-        return Ok(());
-    };
+async fn expand_one(
+    env: &Env<'_>,
+    item: &mut Value,
+    name: &str,
+    deeper: &[&str],
+) -> Result<(), Problem> {
     let present = item
-        .get(*name)
+        .get(name)
         .is_some_and(|v| v.is_array() || v.is_object());
     if !present {
-        let own = item
+        // every resource carries its self link under the request's base
+        let link = item
             .get("@iot.selfLink")
             .and_then(Value::as_str)
-            .and_then(|l| l.strip_prefix(env.base.as_str()))
-            .and_then(|l| antares_ops::percent::decoded(l.trim_start_matches('/')))
-            .ok_or_else(not_found)?;
+            .unwrap_or_default();
+        let own = link.get(env.base.len()..).unwrap_or_default();
+        let own = antares_ops::percent::decoded(own.trim_start_matches('/')).unwrap_or_default();
         let reads = env.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if reads >= MAX_EXPAND_READS {
             return Err(Problem(
@@ -556,24 +558,31 @@ async fn expand_one(env: &Env<'_>, item: &mut Value, names: &[&str]) -> Result<(
                 format!("$expand reads at most {MAX_EXPAND_READS} related resources per request: lower $top"),
             ));
         }
-        let related = match Box::pin(read(env, &format!("{own}/{name}"), Vec::new())).await {
-            Ok(Answer::Doc(doc)) => match doc.get("value") {
-                Some(Value::Array(list)) => Value::Array(list.clone()),
-                _ => doc,
-            },
-            Ok(Answer::Raw(_)) | Err(Problem(StatusCode::NOT_FOUND, _)) => Value::Null,
-            Err(other) => return Err(other),
-        };
-        if let Some(map) = item.as_object_mut() {
-            map.insert((*name).to_owned(), related);
-        }
+        // a related resource the view hides is `null`
+        let read = Box::pin(read(env, &format!("{own}/{name}"), Vec::new())).await;
+        let (Answer::Doc(doc) | Answer::Raw(doc)) = read.or_else(|p| {
+            (p.0 == StatusCode::NOT_FOUND)
+                .then_some(Answer::Raw(Value::Null))
+                .ok_or(p)
+        })?;
+        let related = doc
+            .get("value")
+            .filter(|v| v.is_array())
+            .cloned()
+            .unwrap_or(doc);
+        let _ = item
+            .as_object_mut()
+            .map(|map| map.insert(name.to_owned(), related));
     }
     if deeper.is_empty() {
         return Ok(());
     }
-    match item.get_mut(*name) {
-        Some(Value::Array(list)) => Box::pin(expand_all(env, list, &[deeper.join("/")])).await,
-        Some(child @ Value::Object(_)) => Box::pin(expand_one(env, child, deeper)).await,
+    let path = [deeper.join("/")];
+    match item.get_mut(name) {
+        Some(Value::Array(list)) => Box::pin(expand_all(env, list, &path)).await,
+        Some(child @ Value::Object(_)) => {
+            Box::pin(expand_all(env, std::slice::from_mut(child), &path)).await
+        }
         _ => Ok(()),
     }
 }
@@ -988,12 +997,6 @@ impl Cx<'_> {
         }
         let (ids, extra) = (&self.ids, self.filter());
         let path = format!("{}/{set}", self.base);
-        if self.opts.ordered {
-            return Err(Problem(
-                StatusCode::BAD_REQUEST,
-                "$orderby: served on a Datastream's Observations only".into(),
-            ));
-        }
         if self.opts.top == 0 {
             // A Thing's count alone (T-5205 finding 19): one Entity read for the operation's count.
             let page = Page {

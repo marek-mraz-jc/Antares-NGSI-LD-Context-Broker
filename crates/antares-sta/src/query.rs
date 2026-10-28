@@ -702,11 +702,8 @@ mod tests {
             "resultTime desc,phenomenonTime asc",
             "phenomenonTime asc",
         ] {
-            let o = options(&pairs(&[("$orderby", order)]));
-            assert!(
-                o.is_ok_and(|o| !o.ordered && !o.orderby.is_empty()),
-                "{order}"
-            );
+            let ordered = options(&pairs(&[("$orderby", order)])).map(|o| o.ordered);
+            assert_eq!(ordered, Ok(false), "{order}");
         }
         assert_eq!(
             options(&pairs(&[("$orderby", "name sideways")])).map_err(|b| b.0),

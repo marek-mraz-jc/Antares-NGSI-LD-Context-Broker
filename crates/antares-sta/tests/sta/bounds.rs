@@ -93,10 +93,13 @@ async fn query_options_are_bounded_and_a_refusal_names_the_option() -> Result<()
     // T-5918: what no time window says is judged over the Datastream's Observations.
     let series = sta(&f.app, "/Datastreams('urn:ngsi-ld:Car:1%2Fspeed')/Observations?$filter=result eq -1 or phenomenonTime gt 2026-01-01T00:00:00Z").await;
     assert_eq!(series.status, StatusCode::OK, "{}", series.body);
-    let times = series.body["value"].as_array().cloned().unwrap_or_default();
+    let times = at(&series.body, "/value")
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert!(times
         .iter()
-        .all(|o| o["phenomenonTime"].as_str() > Some("2026-01-01T00:00:00Z")));
+        .all(|o| o.get("phenomenonTime").and_then(Value::as_str) > Some("2026-01-01T00:00:00Z")));
     Ok(())
 }
 

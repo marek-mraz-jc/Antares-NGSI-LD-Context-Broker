@@ -359,28 +359,25 @@ fn days(year: i64, month: i64, day: i64) -> i64 {
 #[must_use]
 pub fn instant(text: &str) -> Option<i64> {
     let text = text.split('/').next()?;
-    let b = text.as_bytes();
-    let num = |from: usize, to: usize| -> Option<i64> {
-        let s = text.get(from..to)?;
-        s.bytes()
-            .all(|c| c.is_ascii_digit())
-            .then(|| s.parse().ok())?
-    };
-    if b.get(4) != Some(&b'-') || b.get(7) != Some(&b'-') || !matches!(b.get(10), Some(b'T' | b't'))
-    {
+    let shape: String = text
+        .chars()
+        .take(19)
+        .map(|c| if c.is_ascii_digit() { '9' } else { c })
+        .collect();
+    if shape != "9999-99-99T99:99:99" {
         return None;
     }
-    if b.get(13) != Some(&b':') || b.get(16) != Some(&b':') {
-        return None;
-    }
+    let num = |from: usize, to: usize| -> Option<i64> { text.get(from..to)?.parse().ok() };
     let (year, month, day) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
     let (hour, minute, second) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
+    let clock = [
+        (month, 1, 12),
+        (day, 1, 31),
+        (hour, 0, 23),
+        (minute, 0, 59),
+        (second, 0, 60),
+    ];
+    if clock.iter().any(|(v, lo, hi)| !(lo..=hi).contains(&v)) {
         return None;
     }
     let mut rest = text.get(19..)?;
@@ -405,12 +402,7 @@ pub fn instant(text: &str) -> Option<i64> {
             if zone.len() != 6 || zone.as_bytes().get(3) != Some(&b':') {
                 return None;
             }
-            let digits = |r: std::ops::Range<usize>| -> Option<i64> {
-                let s = zone.get(r)?;
-                s.bytes()
-                    .all(|c| c.is_ascii_digit())
-                    .then(|| s.parse().ok())?
-            };
+            let digits = |r: std::ops::Range<usize>| -> Option<i64> { zone.get(r)?.parse().ok() };
             let (h, m) = (digits(1..3)?, digits(4..6)?);
             let minutes = h.saturating_mul(60).saturating_add(m);
             if east {
@@ -615,15 +607,13 @@ mod tests {
 
     use super::*;
 
-    fn kept(filter: &str, items: &[Value]) -> Vec<i64> {
-        let Ok(expr) = parse(filter) else {
-            return vec![-1];
-        };
-        items
+    fn kept(filter: &str, items: &[Value]) -> Result<Vec<i64>, Bad> {
+        let expr = parse(filter)?;
+        Ok(items
             .iter()
             .filter(|i| matches(&expr, i))
             .filter_map(|i| i.get("n").and_then(Value::as_i64))
-            .collect()
+            .collect())
     }
 
     fn observations() -> Vec<Value> {
@@ -631,7 +621,7 @@ mod tests {
             .map(|n| {
                 json!({"n": n, "result": n,
                     "phenomenonTime": format!("2015-03-{n:02}T00:00:00.000Z"),
-                    "name": format!("o {n}"), "properties": {"k": n % 2 == 0}})
+                    "name": format!("o {n}"), "properties": {"k": n % 2 == 0}, "tags": [n]})
             })
             .collect()
     }
@@ -639,28 +629,47 @@ mod tests {
     #[test]
     fn a_comparison_reads_each_member_kind() {
         let o = observations();
-        assert_eq!(kept("result gt 10", &o), vec![11, 12]);
-        // a number against a text compares as text (ets-sta10 Capability3Tests)
-        assert_eq!(kept("result gt '3'", &o), vec![4, 5, 6, 7, 8, 9]);
-        assert_eq!(
-            kept("phenomenonTime le 2015-03-02T00:00:00Z", &o),
-            vec![1, 2]
-        );
-        assert_eq!(
-            kept("phenomenonTime eq 2015-03-02T01:00:00+01:00", &o),
-            vec![2]
-        );
-        assert_eq!(kept("name eq 'o 3' or (name eq 'o 4')", &o), vec![3, 4]);
-        assert_eq!(kept("properties/k eq true and result lt 5", &o), vec![2, 4]);
-        assert_eq!(kept("not (result ge 2)", &o), vec![1]);
-        assert_eq!(kept("substringof('o 1', name)", &o), vec![1, 10, 11, 12]);
-        assert_eq!(
-            kept("startswith(name,'o 1') and endswith(name, '2')", &o),
-            vec![12]
-        );
-        assert_eq!(kept("missing eq null and result le 1", &o), vec![1]);
-        assert_eq!(kept("missing ne 'x' and result le 1", &o), vec![1]);
-        assert_eq!(kept("missing gt 'x'", &o), Vec::<i64>::new());
+        let none: Vec<i64> = Vec::new();
+        let every: Vec<i64> = (1..=12).collect();
+        for (filter, want) in [
+            ("result gt 10", vec![11, 12]),
+            // a number against a text compares as text (ets-sta10 Capability3Tests)
+            ("result gt '3'", vec![4, 5, 6, 7, 8, 9]),
+            ("'5' gt result", vec![1, 2, 3, 4, 10, 11, 12]),
+            ("result le +2", vec![1, 2]),
+            ("result lt .5e1", vec![1, 2, 3, 4]),
+            ("result lt -1", none.clone()),
+            ("phenomenonTime le 2015-03-02T00:00:00Z", vec![1, 2]),
+            ("phenomenonTime eq 2015-03-02T01:00:00+01:00", vec![2]),
+            ("2015-03-11T00:00:00Z lt phenomenonTime", vec![12]),
+            ("name eq 'o 3' or (name eq 'o 4')", vec![3, 4]),
+            ("properties/k eq true and result lt 5", vec![2, 4]),
+            ("properties/k eq false and result lt 5", vec![1, 3]),
+            ("properties/k eq 1", none.clone()),
+            ("properties/k ne 1 and result le 1", vec![1]),
+            ("not (result ge 2)", vec![1]),
+            ("substringof('o 1', name)", vec![1, 10, 11, 12]),
+            ("startswith(name,'o 1') and endswith(name, '2')", vec![12]),
+            ("substringof('1', result)", none.clone()),
+            ("missing eq null and result le 1", vec![1]),
+            ("null eq missing and result le 1", vec![1]),
+            ("missing eq 'x'", none.clone()),
+            ("name eq null", none.clone()),
+            ("missing ne 'x' and result le 1", vec![1]),
+            ("missing gt 'x'", none.clone()),
+            ("properties eq properties", every.clone()),
+            ("tags eq tags", every.clone()),
+            ("name eq properties", none.clone()),
+            ("name ne tags", every.clone()),
+        ] {
+            assert_eq!(kept(filter, &o), Ok(want), "{filter}");
+        }
+    }
+
+    #[test]
+    fn heads_are_the_first_member_of_each_path() {
+        let expr = parse("not (a/b eq 1) or startswith(c, 'x') and 2 eq d");
+        assert_eq!(expr.as_ref().map(heads), Ok(vec!["a", "c", "d"]));
     }
 
     #[test]
@@ -669,7 +678,7 @@ mod tests {
             json!({"n": 1, "name": "it's (a) b"}),
             json!({"n": 2, "name": "x"}),
         ];
-        assert_eq!(kept("name eq 'it''s (a) b'", &items), vec![1]);
+        assert_eq!(kept("name eq 'it''s (a) b'", &items), Ok(vec![1]));
     }
 
     #[test]
@@ -685,12 +694,13 @@ mod tests {
             ("(name eq 'a'", "expected )"),
             ("name eq 'a' 'b'", "unexpected text"),
             ("name", "needs eq"),
+            ("a//b eq 1", "not a property name"),
+            ("startswith(name 'a')", "expected ,"),
+            ("eq eq", "expected a property"),
         ] {
-            let refused = parse(filter);
-            assert!(
-                matches!(&refused, Err(Bad("$filter", detail)) if detail.contains(says)),
-                "{filter}: {refused:?}"
-            );
+            let refused = parse(filter).err().unwrap_or(Bad("none", String::new()));
+            assert_eq!(refused.0, "$filter", "{filter}");
+            assert!(refused.1.contains(says), "{filter}: {}", refused.1);
         }
         let deep = format!("{}name eq 'a'{}", "(".repeat(40), ")".repeat(40));
         assert!(parse(&deep).is_err());
@@ -713,6 +723,13 @@ mod tests {
         assert!(matches!(orderby("a sideways"), Err(Bad("$orderby", _))));
         assert!(orderby("a asc desc").is_err());
         assert!(orderby("'a'").is_err());
+        let mut missing = vec![json!({"n": 1}), json!({"n": 2, "a": 1}), json!({"n": 3})];
+        sort(&mut missing, &orderby("a desc").unwrap_or_default());
+        let order: Vec<i64> = missing
+            .iter()
+            .filter_map(|i| i.get("n").and_then(Value::as_i64))
+            .collect();
+        assert_eq!(order, vec![2, 1, 3]);
     }
 
     #[test]
@@ -723,7 +740,19 @@ mod tests {
             instant("2015-03-01T00:00:00Z/2015-03-02T00:00:00Z"),
             instant("2015-03-01T00:00:00.000Z")
         );
-        assert_eq!(instant("2015-13-01T00:00:00Z"), None);
+        assert_eq!(instant("1970-01-01T00:00:00-01:00"), Some(3_600_000));
+        for bad in [
+            "2015-13-01T00:00:00Z",
+            "2015-03-32T00:00:00Z",
+            "2015-03-01T24:00:00Z",
+            "2015-03-01T23:60:00Z",
+            "2015-03-01T23:59:61Z",
+            "2015-03-01T00:00:00+0100",
+            "2015-03-01T00:00:00x01:00",
+            "2015-03-01T00:00:00+01-00",
+        ] {
+            assert_eq!(instant(bad), None, "{bad}");
+        }
         assert_eq!(instant("2015-03-01 00:00:00Z"), None);
         assert_eq!(instant("2015-03-01T00:00:00"), None);
         assert_eq!(instant("2015-03-01T00:00:00.Z"), None);
