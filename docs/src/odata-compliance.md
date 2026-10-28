@@ -125,12 +125,12 @@ references), T-3737 (one `Content-Length` on `HEAD`), T-3738 (`$entity`
 
 | Level | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
-| Minimal | 198 | 75 | 20 | 72.5 % |
-| Intermediate | 266 | 70 | 14 | 79.2 % |
-| Advanced | 306 | 223 | 38 | 57.8 % |
-| **All** (suite summary) | 770 | 368 | 72 | 67.7 % |
+| Minimal | 232 | 41 | 20 | 85.0 % |
+| Intermediate | 268 | 68 | 14 | 79.8 % |
+| Advanced | 323 | 206 | 38 | 61.1 % |
+| **All** (suite summary) | 823 | 315 | 72 | 72.3 % |
 
-Measured by surfaces-conformance 40743685052 on `0bf7619` (train 20261028-1801), written by tasks/train.
+Measured by surfaces-conformance 40759545696 on `b87d2a8` (train 20261028-1942), written by tasks/train.
 
 `$metadata` declares `Capabilities.ConformanceLevel` `Minimal` (row C19). The table above is
 the measured level: the claim is not proven while Minimal stays under 100 %, and each failing
