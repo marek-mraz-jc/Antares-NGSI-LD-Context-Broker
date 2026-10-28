@@ -522,7 +522,7 @@ async fn odata_each_501_names_its_construct() {
         restriction.contains(r#"NavigationPropertyPath="owner""#),
         "{xml}"
     );
-    for member in ["Filterable", "Searchable", "Sortable", "Countable"] {
+    for member in ["Filterable", "Searchable", "Sortable"] {
         assert!(
             restriction.contains(&format!(
                 r#"<PropertyValue Property="{member}" Bool="false"/>"#
@@ -530,6 +530,7 @@ async fn odata_each_501_names_its_construct() {
             "{member}: {restriction}"
         );
     }
+    assert!(!restriction.contains("CountRestrictions"), "{restriction}");
     for member in ["TopSupported", "SkipSupported", "IndexableByKey"] {
         assert!(
             restriction.contains(&format!(

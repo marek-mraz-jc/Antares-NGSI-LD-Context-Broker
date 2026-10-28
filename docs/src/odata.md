@@ -329,9 +329,11 @@ container declares `QuerySegmentSupported`, `ComputeSupported`,
 error, no Content-ID references; T-3723). Since T-5907 each EntitySet also
 declares `IndexableByKey`, `TopSupported` and `SkipSupported`, and
 `NavigationRestrictions` gives each navigation property `$select` and no
-other option (`Filterable`, `Searchable`, `Sortable`, `Countable`,
+other option (`Filterable`, `Searchable`, `Sortable`,
 `TopSupported`, `SkipSupported` and `IndexableByKey` false), as a path below
-one Entity and an `$expand(...)` serve it; `ExpandRestrictions` `MaxLevels`
+one Entity and an `$expand(...)` serve it; the record carries no
+`CountRestrictions`, which the Capabilities vocabulary of the .NET client
+(Microsoft.OData.Edm) lacks and refuses as an extra property; `ExpandRestrictions` `MaxLevels`
 is 1. The container's `FilterFunctions` lists exactly the operators and
 functions a `$filter` translates (`eq` to `mod`, `in`, `any`, `all` and the
 functions of section 4); a name outside it is `501`. `ConformanceLevel` is

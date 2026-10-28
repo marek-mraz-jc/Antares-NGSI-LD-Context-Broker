@@ -895,7 +895,8 @@ fn paging(members: &BTreeMap<String, Member>) -> [Annotation; 4] {
 }
 
 /// One `NavigationRestrictions` row: the navigation `name` takes `$select`
-/// and no other option.
+/// and no other option. No `CountRestrictions` member: the record type in
+/// the vocabulary the .NET client ships has none and refuses `$metadata`.
 fn nested_only_select(name: &str) -> Expr {
     let off = |member: &str| Expr::Record(vec![(member.into(), Expr::Bool(false))]);
     Expr::Record(vec![
@@ -906,7 +907,6 @@ fn nested_only_select(name: &str) -> Expr {
         ("FilterRestrictions".into(), off("Filterable")),
         ("SearchRestrictions".into(), off("Searchable")),
         ("SortRestrictions".into(), off("Sortable")),
-        ("CountRestrictions".into(), off("Countable")),
         ("TopSupported".into(), Expr::Bool(false)),
         ("SkipSupported".into(), Expr::Bool(false)),
         ("IndexableByKey".into(), Expr::Bool(false)),
