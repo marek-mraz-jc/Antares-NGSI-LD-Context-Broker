@@ -182,6 +182,9 @@ pub struct Set {
     /// Each Property that keys the target of a navigation (R6, T-3761), by
     /// its CSDL name: the target's EntitySet.
     pub references: BTreeMap<String, String>,
+    /// Each navigation with such a Property, by CSDL name: the Property a bind
+    /// of it sets to the target's key (CSDL XML 8.5, T-5906).
+    pub bound: BTreeMap<String, String>,
     /// The filter of the named output this set serves (docs API/11 EP-159, T-5225), a conjunct
     /// of every read of it; `None` for a class's own set.
     pub output: Option<antares_ops::outputs::Filter>,
@@ -297,9 +300,11 @@ pub fn build(
         }
         set.annotations = capabilities(&members, writable, required);
         container.entity_sets.push(set);
+        let (references, bound) = constrain(schema, class, &visible, &mut ty, &members);
         let set = Set {
             type_iri: schema.class_iri(class),
-            references: constrain(schema, class, &visible, &mut ty, &members),
+            references,
+            bound,
             members,
             identifier,
             writable,
@@ -396,16 +401,18 @@ fn own_schema(namespace: String, schema: &linkml_model::Model) -> (Schema, Strin
 /// Property with `odata_referential_constraint` gets a `ReferentialConstraint`
 /// to the target's key, when the view shows all three, the Property is
 /// not required and has the key's Edm type (CSDL XML 8.5). The Properties
-/// that hold, by CSDL name, with the target's EntitySet.
+/// that hold, by CSDL name, with the target's EntitySet, and each such
+/// navigation with its Property.
 fn constrain(
     schema: &linkml_model::Model,
     class: &str,
     visible: &BTreeMap<&str, (String, &BTreeSet<String>)>,
     ty: &mut EntityType,
     members: &BTreeMap<String, Member>,
-) -> BTreeMap<String, String> {
+) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
     let slots = schema.class_slots(class);
     let mut references = BTreeMap::new();
+    let mut bound = BTreeMap::new();
     for (name, slot) in &slots {
         let (Some(dependent), Range::Class(target)) =
             (slot.annotations.get(REFERENCE_TAG), schema.range(slot))
@@ -437,9 +444,10 @@ fn constrain(
         };
         nav.referential_constraints
             .push(ReferentialConstraint::new(property.clone(), key));
+        bound.insert(nav.name.clone(), property.clone());
         references.insert(property, set);
     }
-    references
+    (references, bound)
 }
 
 /// The EntitySet of a visible class, its key's CSDL name and Edm type: the
@@ -1138,6 +1146,10 @@ mod tests {
                 .filter(|n| !n.referential_constraints.is_empty())
                 .map(|n| (n.name.clone(), n.referential_constraints.clone()))
                 .collect();
+            assert_eq!(
+                desc.bound.keys().collect::<Vec<_>>(),
+                navs.keys().collect::<Vec<_>>()
+            );
             (navs, desc.references.clone())
         };
         let (navs, references) = constraints(&shown(

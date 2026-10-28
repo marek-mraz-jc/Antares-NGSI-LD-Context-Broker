@@ -192,8 +192,8 @@ Attribute comes from the model, never from the shape of a value.
 |---|---|
 | `POST {Set}` | Create Entity of the set's type, `id` from the body; `201` with the Entity as the view reads it and `Location`, or `204` and `OData-EntityId` under `Prefer: return=minimal` |
 | `nav@odata.bind` (4.0), `nav: {"@id": …}` (4.01) | a Relationship; the target is read first with Retrieve Entity under the view |
-| `PATCH {Set}('{id}')` | Merge Entity `?type=`: a `null` is the NGSI-LD Null and deletes the Attribute; `204` |
-| `PUT {Set}('{id}')` | Replace Entity `?type=`: what the body omits is removed; `204`. The Entity is read under the view first: one holding an Attribute instance with a `datasetId` is `409` (the surface does not serve those instances, so a replace would delete them unseen; `PATCH` keeps them), and one holding an Attribute the view hides is refused by the view (threat-model D6) (T-5206) |
+| `PATCH {Set}('{id}')` | Merge Entity `?type=`: a `null` is the NGSI-LD Null and deletes the Attribute; `204`, or `200` with the Entity as the view reads it under `Prefer: return=representation`; a `return` preference is echoed in `Preference-Applied`. A bind of a navigation with a `ReferentialConstraint` also sets the constrained Property to the target's key |
+| `PUT {Set}('{id}')` | Replace Entity `?type=`: what the body omits is removed; `204` (`Prefer: return=` as for `PATCH`). The Entity is read under the view first: one holding an Attribute instance with a `datasetId` is `409` (the surface does not serve those instances, so a replace would delete them unseen; `PATCH` keeps them), and one holding an Attribute the view hides is refused by the view (threat-model D6) (T-5206) |
 | `DELETE {Set}('{id}')` | Delete Entity `?type=`; `204` |
 | `PUT {Set}('{id}')/{prop}` | Replace Attribute `?type=` in the member's kind; `404` when the Entity does not hold it (a `PATCH` of the Entity adds it); `204` |
 | `PATCH {Set}('{id}')/{prop}` | Partial Attribute Update `?type=`; `null` is the NGSI-LD Null; `204` |
