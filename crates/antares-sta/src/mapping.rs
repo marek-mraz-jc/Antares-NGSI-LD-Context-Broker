@@ -328,7 +328,7 @@ pub fn thing(base: &str, entity: &Value, expand: &[&str]) -> Option<Value> {
 }
 
 /// The Entity's type and its members that are no measurement and no `location`, each flattened
-/// to its value or object.
+/// to its value as [`flat`] reads it.
 fn properties(entity: &Value) -> Value {
     let mut out = Map::new();
     for (name, member) in entity.as_object().into_iter().flatten() {
@@ -341,13 +341,24 @@ fn properties(entity: &Value) -> Value {
         if instances(member).iter().any(numeric) {
             continue;
         }
-        let flat = member
-            .get("value")
-            .or_else(|| member.get("object"))
-            .unwrap_or(member);
-        out.insert(local(name).to_owned(), flat.clone());
+        out.insert(local(name).to_owned(), flat(member));
     }
     Value::Object(out)
+}
+
+/// One member's value as the OGC Features `properties` carry it: the value, object or list, and
+/// a language map, JSON or vocabulary wrapped in its member name; never the whole Attribute with
+/// its system members (T-5913: a LanguageProperty and a ListProperty kept `createdAt`).
+fn flat(member: &Value) -> Value {
+    ["value", "object", "valueList", "objectList"]
+        .into_iter()
+        .find_map(|k| member.get(k).cloned())
+        .or_else(|| {
+            ["languageMap", "json", "vocab"]
+                .into_iter()
+                .find_map(|k| member.get(k).map(|v| json!({ k: v })))
+        })
+        .unwrap_or_else(|| member.clone())
 }
 
 /// The geometry of a GeoProperty instance, when it is one.
@@ -718,6 +729,27 @@ mod tests {
             "colour": {"type": "Property", "value": "red"},
             "at": {"type": "Relationship", "object": "urn:ngsi-ld:Stop:1"}
         })
+    }
+
+    #[test]
+    fn a_thing_property_is_the_value_of_every_kind_never_the_attribute() {
+        let at = "2026-10-01T10:00:00Z";
+        let e = json!({"id": "urn:ngsi-ld:Car:9", "type": "Car",
+            "label": {"type": "LanguageProperty", "languageMap": {"sk": "auto"}, "createdAt": at},
+            "tags": {"type": "ListProperty", "valueList": ["a"], "createdAt": at},
+            "near": {"type": "ListRelationship", "objectList": [{"object": "urn:ngsi-ld:Stop:1"}]},
+            "spec": {"type": "JsonProperty", "json": {"k": 1}},
+            "state": {"type": "VocabProperty", "vocab": "parked"},
+            "owner": {"type": "Relationship", "object": "urn:ngsi-ld:Person:1"},
+            "colour": {"type": "Property", "value": "red"},
+            "odd": [{"type": "Property", "value": "x"}]});
+        assert_eq!(
+            properties(&e),
+            json!({"type": "Car", "label": {"languageMap": {"sk": "auto"}}, "tags": ["a"],
+                   "near": [{"object": "urn:ngsi-ld:Stop:1"}], "spec": {"json": {"k": 1}},
+                   "state": {"vocab": "parked"}, "owner": "urn:ngsi-ld:Person:1",
+                   "colour": "red", "odd": [{"type": "Property", "value": "x"}]})
+        );
     }
 
     #[test]
