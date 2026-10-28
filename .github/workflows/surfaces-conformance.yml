@@ -31,8 +31,10 @@ name: surfaces-conformance
 #                    red on any test ci/sta-compliance-baseline.json passes
 #                    (T-4878); then the same image with the jar of the
 #                    ets-sta10 fork (pinned commit, @iot.id read as ANY,
-#                    T-5916), red on any test ci/sta-compliance-fork-baseline.json
-#                    or the official run passes
+#                    T-5916; Level 3 setup writes nothing, T-5918) against
+#                    view `sta-ets` of ci/views/sta-ets, red on any test
+#                    ci/sta-compliance-fork-baseline.json or the official run
+#                    passes (T-5919)
 #   ws-conformance   docs/api/asyncapi-ws.yaml validated by @asyncapi/cli
 #                    2.16.0, then joinedcontext-conformance tests/ws: the
 #                    scripted sessions of /x/views/all/ws, every message
@@ -550,7 +552,7 @@ jobs:
           dev/ogc-compliance/baseline.py write testng-results.xml official.json > /dev/null 2>&1
           dev/ogc-compliance/baseline.py check fork-testng-results.xml official.json > fork-gap.md 2>&1
           gap=$?
-          { echo "## SensorThings ETS fork ($FORK_REPO@${FORK_COMMIT:0:7}), view sta"; cat fork-gate.md
+          { echo "## SensorThings ETS fork ($FORK_REPO@${FORK_COMMIT:0:7}), view sta-ets"; cat fork-gate.md
             echo "### Against the official run"; cat fork-gap.md; } >> "$GITHUB_STEP_SUMMARY"
           cat fork-gate.md fork-gap.md
           [ "$rc" = 0 ] && [ "$gap" = 0 ]
@@ -576,7 +578,7 @@ jobs:
         uses: ./.github/actions/failure-issue
         with:
           title: sta-compliance-external went red
-          body: A test the SensorThings ETS passed in ci/sta-compliance-baseline.json fails now.
+          body: A test the SensorThings ETS passed in ci/sta-compliance-baseline.json or ci/sta-compliance-fork-baseline.json fails now.
           log-file: gate.md
 
   ws-conformance:
