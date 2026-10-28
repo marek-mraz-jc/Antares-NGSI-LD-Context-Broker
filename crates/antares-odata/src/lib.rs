@@ -24,6 +24,7 @@ mod batch;
 mod below;
 pub mod edm;
 mod filter;
+mod history;
 mod names;
 mod paths;
 mod read;
@@ -297,9 +298,9 @@ async fn query_in_body(req: Request, max: usize) -> Result<Request, ODataErrorRe
 /// The key is compared whole, so two views never share a model by a
 /// collision. ponytail: no engine probe bits yet; section 4's Capabilities
 /// add them to the key when the model reads the engine.
-/// The view, what it shows, its writes, the schema revision, CSDL 4.01, and its
-/// `representations.odata` as written.
-type ModelKey = (String, edm::Shown, edm::Writable, u64, bool, String);
+/// The view, what it shows, its writes, the schema revision, CSDL 4.01, its
+/// `representations.odata` as written, and whether it offers the Temporal Query (T-5908).
+type ModelKey = (String, edm::Shown, edm::Writable, u64, bool, String, bool);
 
 /// A built model, its CSDL document and that document's `ETag`.
 type Built = (Arc<edm::Edm>, Arc<odata_csdl::Model>, Option<String>);
@@ -381,6 +382,7 @@ fn model(
         view.representation("odata")
             .map(ToString::to_string)
             .unwrap_or_default(),
+        view.allows(OperationId::TemporalQuery),
     );
     if let Some((hit, _)) = CACHE.get(&key) {
         return Some(hit);
@@ -399,6 +401,7 @@ fn model(
         .filter_map(|(_, o)| o.ok())
         .collect();
     let edm = edm::outputs(edm, &listed);
+    let edm = if key.6 { edm::histories(edm) } else { edm };
     tracing::debug!(
         view = id,
         schema_revision = revision,

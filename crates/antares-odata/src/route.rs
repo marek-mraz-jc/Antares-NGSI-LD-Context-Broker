@@ -68,6 +68,13 @@ pub(crate) async fn serve(
     else {
         return not_implemented(version).into_response();
     };
+    if let [Segment::EntitySet(set), ..] = path.as_slice() {
+        if reads.edm.histories.contains_key(set) {
+            return history(reads, caller, &ctx, path, options, headers)
+                .await
+                .unwrap_or_else(IntoResponse::into_response);
+        }
+    }
     let answer = match path.as_slice() {
         [_, Segment::Ref] | [_, _, Segment::Ref] if shaped(options) => Err(no_properties(version)),
         [Segment::EntitySet(set)] | [Segment::EntitySet(set), Segment::Ref]
@@ -106,6 +113,29 @@ pub(crate) async fn serve(
     answer.unwrap_or_else(IntoResponse::into_response)
 }
 
+/// A read of a history set (T-5908): the set, its `$count`, one row by key, `$select` below.
+async fn history(
+    reads: &Reads,
+    caller: &Caller,
+    ctx: &Ctx<'_>,
+    path: &[Segment],
+    options: &QueryOptions,
+    headers: &HeaderMap,
+) -> Result<Response, ODataErrorResponse> {
+    match path {
+        [Segment::EntitySet(set)] | [Segment::EntitySet(set), Segment::Ref] => {
+            crate::history::collection(reads, caller, ctx, set, path, options, headers).await
+        }
+        [Segment::EntitySet(set), Segment::Count] => {
+            crate::history::count(reads, caller, set, options, ctx.version).await
+        }
+        [Segment::EntitySet(set), Segment::Key(key)] => {
+            crate::history::entity(reads, caller, ctx, set, key, options).await
+        }
+        _ => Err(not_implemented(ctx.version)),
+    }
+}
+
 /// A request that is not a `GET`: the write its method and path stand for.
 async fn write(
     reads: &Reads,
@@ -119,6 +149,12 @@ async fn write(
     let ODataUri::Resource { path, options } = &request.uri else {
         return written(method, &request.uri, version);
     };
+    // A history is read only, whatever the view offers (T-5908).
+    if let [Segment::EntitySet(set), ..] = path.as_slice() {
+        if reads.edm.histories.contains_key(set) {
+            return refused(StatusCode::METHOD_NOT_ALLOWED, version).into_response();
+        }
+    }
     let form = match (method, path.as_slice()) {
         (&Method::POST, [Segment::EntitySet(set)]) => Form::Create(set),
         (&Method::PATCH, [Segment::EntitySet(set), Segment::Key(key)]) => {

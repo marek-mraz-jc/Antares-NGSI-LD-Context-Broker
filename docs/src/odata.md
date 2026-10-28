@@ -181,6 +181,37 @@ Entity outside it answers the 404 of an absent one. The class's own set and an
 Entity's `_types` stay as they were. An output whose class the model does not
 show, or whose name a class's set already takes, serves nobody.
 
+### 2.2 History sets
+
+A view that offers `temporal_query` serves, beside each class's EntitySet
+`{Set}`, a read-only EntitySet `{Set}_history` (T-5908), the OData form of
+the OGC `{type}-history` collections (`ogc.md` section 7). `-` is no
+SimpleIdentifier character (CSDL XML 17.2), so the name takes `_`.
+
+- One row per Entity and stored `observedAt`, keyed by both:
+  `Car_history(id='urn:ngsi-ld:Car:7',observedAt=2026-10-01T10:05:00Z)`.
+- Its members are the class's, nullable, a navigation as its object URIs:
+  each holds the Attribute's latest default instance (no `datasetId`) at or
+  before the row's `observedAt`, so a row of a label change still holds the
+  speed observed earlier. An Attribute the view or the Policy hides makes no
+  row and holds no value; an instance without `observedAt` is in no row.
+- Every read is the view's Query Temporal Evolution of Entities (`attrs` the
+  members, `lastN=1000`, the broker's default instance ceiling), so the view's
+  rules and the Policy narrow the history as they narrow the current state.
+- `$filter` is evaluated over each row; its top-level bounds on `observedAt`
+  narrow the read: `ge`, `gt` or `eq` give `timeAt` (`timerel=after`), `lt`
+  gives `endTimeAt` (`between`) or `timeAt` (`before`). A lower bound adds one
+  `timerel=before&lastN=1` read, so the first rows of the window hold the
+  values valid then. An `id eq` conjunct is the read's `id`.
+- Rows come in Entity order, then `observedAt` ascending; `$top`, `$skip`
+  and `odata.maxpagesize` page them. `$count`, `/$count` and an `$orderby`
+  other than `id, observedAt` read the whole answer, at most 10 000 rows
+  (`400 TooManyResults` past it: narrow by `id` or `observedAt`).
+- `$select` takes members; `$expand`, `$search`, `$apply` and `$compute` are
+  `501`, an `ngsild.` option `400`, every write `405`.
+- Unlike the OGC history, a GeoProperty written without `observedAt` is in
+  no row, and a row has no `validTo`: a window's upper bound would cut it.
+
 ## 3. Writes
 
 Each write is one NGSI-LD operation of the view, gated like a read, and
@@ -351,8 +382,8 @@ write forms of later rounds are `501`.
 
 These NGSI-LD features have no OData mapping and are not served (T-5206 finding 16):
 
-- temporal representations and history: the surface reads current state only; a later
-  `{Set}('id')/<prop>/history` bound function would need its own operation row;
+- temporal representations: history is served only as the `{Set}_history` sets (section 2.2),
+  never as `temporalValues` or aggregated values;
 - `deletedAt`, `expiresAt` and `ngsildproof`: system and proof members outside the EDM base type;
 - the full LanguageMap: one text per read (`ngsild.lang` or `@none`); writing a LanguageProperty is `400`;
 - named instances (`datasetId`): only the default instance; no `_datasets` member;

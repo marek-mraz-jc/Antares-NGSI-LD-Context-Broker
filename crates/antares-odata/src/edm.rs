@@ -216,7 +216,17 @@ pub struct Edm {
     /// one) then `.m` and [`MAPPING_VERSION`], `1.2.0.m1` (a character outside the URL's unreserved
     /// set becomes `_`); `$schemaversion` takes it.
     pub schema_version: String,
+    /// The `{Set}_history` sets by name (T-5908), apart from `sets` so no read, write, filter
+    /// hop or `$expand` of the current state reaches them.
+    pub histories: BTreeMap<String, Set>,
 }
+
+/// What a history set's name adds to its class set's: `-` is no `SimpleIdentifier` character
+/// (CSDL XML 17.2), so the OGC `{type}-history` is `{Set}_history` here.
+pub const HISTORY_SUFFIX: &str = "_history";
+
+/// The IRI of a history row's `observedAt` member; no Entity has it.
+pub const OBSERVED_AT_IRI: &str = "urn:antares:odata:history:observedAt";
 
 /// Builds the model of view `view` from `schema` and what the view shows.
 /// A class the view does not show, a slot it does not show of that class,
@@ -326,7 +336,187 @@ pub fn build(
         namespace,
         sets,
         schema_version,
+        histories: BTreeMap::new(),
     })
+}
+
+/// `edm` with a read-only `{Set}_history` beside each class's set (T-5908), for a view that
+/// offers the Temporal Query: one row per Entity and `observedAt`, keyed by both, its members
+/// the class's (a navigation as its object URIs, R5) holding the values valid at that instant.
+/// A class whose set would collide with a name the model holds, or whose members name `id` or
+/// `observedAt`, gets none.
+#[must_use]
+pub fn histories(mut edm: Edm) -> Edm {
+    let Some(own) = edm
+        .csdl
+        .schemas
+        .iter_mut()
+        .find(|s| s.entity_container.is_some())
+    else {
+        return edm;
+    };
+    let taken: BTreeSet<String> = own
+        .entity_types
+        .iter()
+        .map(|t| t.name.clone())
+        .chain(edm.sets.keys().cloned())
+        .collect();
+    let mut types = Vec::new();
+    let mut sets = Vec::new();
+    for (name, set) in edm.sets.iter().filter(|(_, s)| s.output.is_none()) {
+        let history = format!("{name}{HISTORY_SUFFIX}");
+        let reserved = set.members.contains_key("id") || set.members.contains_key("observedAt");
+        let class = own.entity_types.iter().find(|t| t.name == *name);
+        let (Some(class), false, false) = (class, reserved, taken.contains(&history)) else {
+            continue;
+        };
+        let (ty, members) = history_type(&history, name, class, set);
+        let mut entity_set =
+            EntitySet::new(history.clone(), format!("{}.{history}", edm.namespace));
+        entity_set.annotations = history_capabilities(&members);
+        types.push(ty);
+        sets.push(entity_set);
+        let set = Set {
+            members,
+            identifier: None,
+            writable: Writable::default(),
+            references: BTreeMap::new(),
+            bound: BTreeMap::new(),
+            output: None,
+            type_iri: set.type_iri.clone(),
+        };
+        edm.histories.insert(history, set);
+    }
+    own.entity_types.extend(types);
+    if let Some(container) = own.entity_container.as_mut() {
+        container.entity_sets.extend(sets);
+    }
+    edm
+}
+
+/// The EntityType of `class`'s history set `history` and its members: the key, then the
+/// class's properties nullable, each navigation as its object URIs (R5).
+fn history_type(
+    history: &str,
+    name: &str,
+    class: &EntityType,
+    set: &Set,
+) -> (EntityType, BTreeMap<String, Member>) {
+    let mut members: BTreeMap<String, Member> = set
+        .members
+        .iter()
+        .map(|(n, m)| {
+            let shape = match &m.shape {
+                Shape::Nav { collection, .. } => Shape::Url {
+                    collection: *collection,
+                },
+                other => other.clone(),
+            };
+            (
+                n.clone(),
+                Member {
+                    shape,
+                    written: Written::Never,
+                    ..m.clone()
+                },
+            )
+        })
+        .collect();
+    let mut ty = EntityType::new(history.to_owned());
+    // a 4.0 model serves an Untyped member as a dynamic property, as the class does
+    ty.open = class.open;
+    ty.key = vec!["id".into(), "observedAt".into()];
+    ty.annotations.push(iri(&set.type_iri));
+    ty.annotations.push(description(&format!(
+            "The stored history of {name}: one row per Entity and observedAt, its values those valid at that instant"
+        )));
+    ty.properties
+        .push(Property::new("id", TypeRef::single("Edm.String")).required());
+    ty.properties
+        .push(Property::new("observedAt", TypeRef::single("Edm.DateTimeOffset")).required());
+    ty.properties
+        .extend(class.properties.iter().cloned().map(|mut p| {
+            p.nullable = true;
+            p
+        }));
+    for nav in &class.navigation_properties {
+        let Some(m) = members.get(&nav.name) else {
+            continue;
+        };
+        let ty_ref = match m.shape {
+            Shape::Url { collection: true } => TypeRef::collection("Edm.String"),
+            _ => TypeRef::single("Edm.String"),
+        };
+        let mut p = Property::new(nav.name.clone(), ty_ref);
+        p.annotations.push(iri(&m.iri));
+        ty.properties.push(p);
+    }
+    members.insert(
+        "observedAt".into(),
+        Member {
+            iri: OBSERVED_AT_IRI.into(),
+            shape: Shape::Value {
+                edm: "Edm.DateTimeOffset",
+                collection: false,
+            },
+            list: false,
+            json: false,
+            untyped: false,
+            written: Written::Never,
+        },
+    );
+    (ty, members)
+}
+
+/// The Capabilities of a history set (T-5908): read only, countable, filtered and sorted by
+/// its single values, no `$search` and no `$expand`.
+fn history_capabilities(members: &BTreeMap<String, Member>) -> Vec<Annotation> {
+    let record = |term: &str, members: Vec<(&str, Expr)>| {
+        Annotation::new(
+            format!("Capabilities.{term}"),
+            Expr::Record(members.into_iter().map(|(m, v)| (m.into(), v)).collect()),
+        )
+    };
+    let not_scalar = || {
+        Expr::Collection(
+            members
+                .iter()
+                .filter(|(_, m)| !m.shape.scalar())
+                .map(|(name, _)| Expr::PropertyPath(name.clone()))
+                .collect(),
+        )
+    };
+    vec![
+        record(
+            "InsertRestrictions",
+            vec![("Insertable", Expr::Bool(false))],
+        ),
+        record("UpdateRestrictions", vec![("Updatable", Expr::Bool(false))]),
+        record("DeleteRestrictions", vec![("Deletable", Expr::Bool(false))]),
+        record("CountRestrictions", vec![("Countable", Expr::Bool(true))]),
+        record(
+            "SearchRestrictions",
+            vec![("Searchable", Expr::Bool(false))],
+        ),
+        record(
+            "FilterRestrictions",
+            vec![
+                ("Filterable", Expr::Bool(true)),
+                ("NonFilterableProperties", not_scalar()),
+            ],
+        ),
+        record(
+            "SortRestrictions",
+            vec![
+                ("Sortable", Expr::Bool(true)),
+                ("NonSortableProperties", not_scalar()),
+            ],
+        ),
+        record(
+            "ExpandRestrictions",
+            vec![("Expandable", Expr::Bool(false))],
+        ),
+    ]
 }
 
 /// `edm` with one EntitySet per output of the view's `representations.odata` (docs API/11
