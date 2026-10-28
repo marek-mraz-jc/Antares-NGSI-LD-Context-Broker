@@ -381,7 +381,7 @@ async fn read(view: &ViewOps, answer: Response) -> Result<Result<Upstream, Respo
         .get("NGSILD-Results-Count")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok());
-    let bytes = view.read_answer(answer.into_body()).await?;
+    let bytes = view.read_answer(answer.into_body(), "scan").await?;
     match serde_json::from_slice(&bytes).ok() {
         Some(Value::Array(entities)) => Ok(Ok((entities, total, truncated))),
         _ => Err(Refusal::Malformed(

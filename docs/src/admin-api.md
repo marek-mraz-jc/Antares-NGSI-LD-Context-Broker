@@ -148,6 +148,10 @@ Prometheus text with the `antares_` prefix:
 | `antares_memory_allocated_bytes`, `antares_memory_resident_bytes` | jemalloc live and resident bytes. |
 | `antares_context_cache_lookups_total{cache, result}` | @context cache lookups: `cache` is `merged` or `fetched`, `result` is `hit` or `miss`. |
 | `antares_answer_pool_held_bytes` | Bytes buffered in-process answers hold of the memory budget's pool. |
+| `antares_answer_pool_peak_bytes` | The most bytes the pool held at once since the previous 5 s sample. |
+| `antares_answer_bytes{surface}` | Size histogram of each in-process answer read whole through the pool (`temporal`, `snapshots`, `scan`, `mapped`, `odata`, `sta`, `ogc`, `views`). |
+| `antares_answer_pool_wait_seconds{surface}` | Time a buffered read took, its wait for room in a full pool included. |
+| `antares_answer_pool_refusals_total{surface}` | Buffered reads answered 503 because no room freed within the 2 s wait. |
 | `antares_uptime_seconds` | Seconds since process start. |
 | `antares_draining` | 1 while this instance drains. |
 | `antares_temporal_drain_errors_total` | Failed post-response history writes. |

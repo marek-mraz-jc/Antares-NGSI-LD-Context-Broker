@@ -861,7 +861,7 @@ async fn run_temporal_query(
             ApiError::Ngsi(n) => n,
             other => opaque("temporal query execution", &other),
         })?;
-        let bytes = st.read_answer(resp.into_body()).await?;
+        let bytes = st.read_answer(resp.into_body(), "snapshots").await?;
         let arr: Vec<Value> = serde_json::from_slice::<Value>(&bytes)
             .ok()
             .and_then(|v| v.as_array().cloned())

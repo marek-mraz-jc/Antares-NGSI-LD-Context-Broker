@@ -29,7 +29,10 @@ name: surfaces-conformance
 #   sta-compliance-external  the OGC CITE ets-sta10 1.5 (TEAM Engine image
 #                    pinned by digest) against view `sta` of ci/views/sta,
 #                    red on any test ci/sta-compliance-baseline.json passes
-#                    (T-4878)
+#                    (T-4878); then the same image with the jar of the
+#                    ets-sta10 fork (pinned commit, @iot.id read as ANY,
+#                    T-5916), red on any test ci/sta-compliance-fork-baseline.json
+#                    or the official run passes
 #   ws-conformance   docs/api/asyncapi-ws.yaml validated by @asyncapi/cli
 #                    2.16.0, then joinedcontext-conformance tests/ws: the
 #                    scripted sessions of /x/views/all/ws, every message
@@ -442,8 +445,12 @@ jobs:
           path: |
             testng-results.xml
             gate.md
+            fork-testng-results.xml
+            fork-gate.md
+            fork-gap.md
             broker.log
             teamengine.log
+            fork-teamengine.log
           retention-days: 14
       - name: File an issue on nightly failure
         if: failure() && github.event_name == 'schedule'
@@ -468,8 +475,28 @@ jobs:
       TE_IMAGE: ogccite/ets-sta10:1.5-teamengine-6.0.0-RC2@sha256:e1ec8dc3508ea3355f059abee98737f5d2c00434aeffa298d80ea04361c93db3
       IUT: http://localhost:9090/x/views/sta/sta/v1.1
       BASELINE: ci/sta-compliance-baseline.json
+      # The fork's one patch over tag 1.5: @iot.id read as ANY (15-078r6 Table 2,
+      # ets-sta10#40), docs/src/sta-compliance.md section 3. Built by the pinned Maven
+      # image into the official image above, so the jar is the only difference.
+      FORK_REPO: marek-mraz-jc/ets-sta10
+      FORK_COMMIT: 0db93839a7d141331928443a1edfadfd8082ac5e
+      MAVEN_IMAGE: maven:3.9-eclipse-temurin-17@sha256:1a352420f7aba21f5ad08df31bab55f74c013fb491f1ae8ab1dd7ff9ed698584
+      FORK_BASELINE: ci/sta-compliance-fork-baseline.json
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.FORK_REPO }}
+          ref: ${{ env.FORK_COMMIT }}
+          path: ets-sta10-fork
+          persist-credentials: false
+      - name: Build the fork's jar into the official image
+        run: |
+          test "$(git -C ets-sta10-fork rev-parse HEAD)" = "$FORK_COMMIT"
+          docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD/ets-sta10-fork:/src" -w /src \
+            "$MAVEN_IMAGE" mvn -B -q -Dmaven.repo.local=/tmp/m2 -DskipTests package
+          printf 'FROM %s\nCOPY ets-sta10-1.5.jar /usr/local/tomcat/webapps/teamengine/WEB-INF/lib/ets-sta10-1.5.jar\n' \
+            "$TE_IMAGE" | docker build -t ets-sta10-fork -f - ets-sta10-fork/target
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: broker-surfaces
@@ -499,9 +526,33 @@ jobs:
           { echo "## SensorThings ETS (ets-sta10 1.5), view sta"; cat gate.md; } >> "$GITHUB_STEP_SUMMARY"
           cat gate.md
           exit $rc
+      - name: The fork's ETS, gated by ci/sta-compliance-fork-baseline.json and the official run
+        if: always()
+        run: |
+          docker logs teamengine > teamengine.log 2>&1 || true
+          docker rm -f teamengine
+          docker run -d --name teamengine --network host ets-sta10-fork
+          for _ in $(seq 1 60); do
+            curl -fsS -m 5 -u ogctest:ogctest -o /dev/null localhost:8080/teamengine/rest/suites && break
+            sleep 5
+          done
+          iut=$(jq -rn --arg u "$IUT" '$u|@uri')
+          curl -sS -m 1500 -u ogctest:ogctest -H 'Accept: application/xml' -o fork-testng-results.xml \
+            "localhost:8080/teamengine/rest/suites/sta10/run?iut=$iut&ics=3" || true
+          set +e
+          dev/ogc-compliance/baseline.py check fork-testng-results.xml "$FORK_BASELINE" > fork-gate.md 2>&1
+          rc=$?
+          # The patch only adds passes: every test the official image passes passes on the fork.
+          dev/ogc-compliance/baseline.py write testng-results.xml official.json > /dev/null 2>&1
+          dev/ogc-compliance/baseline.py check fork-testng-results.xml official.json > fork-gap.md 2>&1
+          gap=$?
+          { echo "## SensorThings ETS fork ($FORK_REPO@${FORK_COMMIT:0:7}), view sta"; cat fork-gate.md
+            echo "### Against the official run"; cat fork-gap.md; } >> "$GITHUB_STEP_SUMMARY"
+          cat fork-gate.md fork-gap.md
+          [ "$rc" = 0 ] && [ "$gap" = 0 ]
       - name: TEAM Engine log
         if: always()
-        run: docker logs teamengine > teamengine.log 2>&1 || true
+        run: docker logs teamengine > fork-teamengine.log 2>&1 || true
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
@@ -509,8 +560,12 @@ jobs:
           path: |
             testng-results.xml
             gate.md
+            fork-testng-results.xml
+            fork-gate.md
+            fork-gap.md
             broker.log
             teamengine.log
+            fork-teamengine.log
           retention-days: 14
       - name: File an issue on nightly failure
         if: failure() && github.event_name == 'schedule'
