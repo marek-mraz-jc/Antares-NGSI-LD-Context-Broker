@@ -531,6 +531,32 @@ async fn select_orderby_keys_and_what_a_history_does_not_serve() {
         let (got, body) = get(&app, &path).await;
         assert_eq!(got, status, "{path}: {body}");
     }
+    // Each 501 names its construct from a fixed text, never the request's value.
+    let named = [
+        ("Car_history/$ref".to_owned(), "$ref of a history set"),
+        (
+            "Car_history?$search=seven".to_owned(),
+            "$expand, $search, $apply or $compute on a history set",
+        ),
+        (format!("{row}/speed"), "this path below a history set"),
+        (
+            format!("{row}?$filter=speed%20gt%201"),
+            "a query option other than $select on one history row",
+        ),
+    ];
+    for (path, construct) in named {
+        let (got, body) = get(&app, &path).await;
+        assert_eq!(
+            (got, &body["error"]["message"]),
+            (
+                StatusCode::NOT_IMPLEMENTED,
+                &json!(format!(
+                    "{construct}: no NGSI-LD equivalent (ADR-0024 decision 5)"
+                ))
+            ),
+            "{path}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
