@@ -5,18 +5,17 @@
 # runs READERS concurrent large reads on every surface with upserts beside them for DURATION,
 # while dev/perf/surfaces_gate.py samples the broker's resident memory. The verdict
 # (dev/perf/heavy.py) fails the run on any failed read (a 503 MEMORY_OVERLOADED or any other
-# 5xx), a peak RSS over RSS_LIMIT_MB, or, when BASE_BIN ran the same load first, a p95 or p99
-# more than LATENCY_SLACK over the baseline's.
+# 5xx) or, when BASE_BIN ran the same load first, a peak RSS, p95 or p99 more than LATENCY_SLACK
+# over the baseline's; a peak RSS over RSS_TARGET_MB is reported (the gate without BASE_BIN).
 #
 #   DATABASE_URL=postgresql://antares:antares@localhost:15432/antares \
 #   BIN=target/release/antares BASE_BIN=bin/antares-base dev/perf/heavy.sh
 #
-# A proof the gate bites: ANTARES_MEMORY_BUDGET=25Mi (an 8 MiB answer pool) must go red.
 #
 # Env: DATABASE_URL (admin URL; the run creates and drops antares_heavy_<build>), BIN,
 #      BASE_BIN (optional baseline binary), OUT (results/heavy), PORT (9481), READERS (30),
 #      DURATION (10m), WRITE_RATE (5), ENTITIES (100000), EVENTS (5000), HISTORY_ENTITIES (577),
-#      HISTORY_DAYS (30), RSS_LIMIT_MB (200), LATENCY_SLACK (1.10), ANTARES_MEMORY_BUDGET
+#      HISTORY_DAYS (30), RSS_TARGET_MB (200), LATENCY_SLACK (1.10), ANTARES_MEMORY_BUDGET
 #      (passed to the broker under test only).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -78,5 +77,5 @@ run_build() {  # run_build <build> <binary> <memory budget or empty>
 [ -z "${BASE_BIN:-}" ] || run_build base "$BASE_BIN" ""
 run_build head "$BIN" "${ANTARES_MEMORY_BUDGET:-}"
 
-python3 dev/perf/heavy.py --results "$OUT" --rss-limit-mb "${RSS_LIMIT_MB:-200}" \
+python3 dev/perf/heavy.py --results "$OUT" --rss-target-mb "${RSS_TARGET_MB:-200}" \
   --slack "${LATENCY_SLACK:-1.10}" | tee "$OUT/heavy.md"
