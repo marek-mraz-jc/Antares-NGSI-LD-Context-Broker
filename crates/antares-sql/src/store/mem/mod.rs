@@ -1425,12 +1425,15 @@ impl Store {
             .contexts
             .values()
             .filter(|v| context_row_visible(v, tenant))
-            .map(|v| {
-                let mut row = v.clone();
-                if let Some(o) = row.as_object_mut() {
-                    o.remove("body");
-                }
-                row
+            // every member but the body, which is never copied (T-5895)
+            .map(|v| match v.as_object() {
+                Some(o) => Value::Object(
+                    o.iter()
+                        .filter(|(k, _)| k.as_str() != "body")
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                ),
+                None => v.clone(),
             })
             .collect()
     }

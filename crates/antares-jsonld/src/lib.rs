@@ -41,7 +41,8 @@ pub use expand::{
 #[cfg(feature = "fetch")]
 pub use loader::{
     allow_private_egress, client_builder, http_interaction, install_crypto_provider, io_deadline,
-    slow_factor, with_timeouts, wrap_client, CtxUsage, EgressPolicy, HttpClient, Loader,
+    set_cache_bytes, slow_factor, with_timeouts, wrap_client, CacheStats, CtxUsage, EgressPolicy,
+    HttpClient, Loader, CACHE_STATS, DEFAULT_FETCHED_CACHE_BYTES, DEFAULT_MERGED_CACHE_BYTES,
     INTERNAL_FETCH_HEADER, MAX_REDIRECTS,
 };
 pub use pinned::{

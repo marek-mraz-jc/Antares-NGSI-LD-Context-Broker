@@ -60,6 +60,11 @@ pub enum NgsiError {
 /// so the two ends cannot drift.
 pub const DB_OVERLOADED: &str = "database overloaded";
 
+/// The `InternalError` detail of a buffered answer the broker's memory budget
+/// has no room for now (T-5895). Like [`DB_OVERLOADED`] it is overload, not a
+/// fault: the HTTP binding answers it 503 with `Retry-After`.
+pub const MEMORY_OVERLOADED: &str = "memory budget for buffered answers in use";
+
 impl NgsiError {
     /// HTTP status per Table 6.3.2-1.
     pub fn status(&self) -> u16 {
