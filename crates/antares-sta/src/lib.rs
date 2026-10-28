@@ -501,7 +501,7 @@ impl Cx<'_> {
         }
         let bytes = self
             .view
-            .read_answer(answer.into_body())
+            .read_answer(answer.into_body(), "sta")
             .await
             .map_err(|r| refused(&r))?;
         Ok(Some(serde_json::from_slice(&bytes).unwrap_or_default()))

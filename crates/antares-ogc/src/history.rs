@@ -297,7 +297,7 @@ async fn read(
         s if !s.is_success() => return Err(Problem(s, REFUSED)),
         _ => {}
     }
-    let bytes = view.read_answer(answer.into_body()).await;
+    let bytes = view.read_answer(answer.into_body(), "ogc").await;
     let bytes = bytes.map_err(|r| Problem(r.status(), REFUSED))?;
     serde_json::from_slice(&bytes).map_err(|_| Problem(StatusCode::BAD_GATEWAY, NO_LIST))
 }

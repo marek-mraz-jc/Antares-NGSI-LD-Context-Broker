@@ -171,7 +171,7 @@ async fn answer(
 ) -> Result<Response, Refusal> {
     let answer = view.run_unmapped(op, caller, inner).await?;
     let (mut parts, body) = answer.into_parts();
-    let bytes = view.read_answer(body).await?;
+    let bytes = view.read_answer(body, "mapped").await?;
     parts.headers.remove(header::CONTENT_LENGTH);
     if !parts.status.is_success() {
         // the broker words a refusal in the inner request's terms
