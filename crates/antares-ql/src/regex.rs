@@ -472,6 +472,14 @@ mod tests {
     #[test]
     fn below_the_bounds_every_entry_is_kept() {
         let _serial = serial_lock();
+        // other tests of this binary leave the shared cache near its byte
+        // share (512 small programs at 16 MiB): start empty so only this
+        // test's 300 programs are measured against the bounds
+        CACHE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        BYTES.store(0, Ordering::Relaxed);
         let a = q_node("keep_a>1").expect("valid q");
         q_node("keep_b>1").expect("valid q");
         assert!(Arc::ptr_eq(&a, &q_node("keep_a>1").expect("valid q")));
