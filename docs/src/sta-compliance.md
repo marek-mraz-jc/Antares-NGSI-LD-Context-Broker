@@ -27,7 +27,7 @@ keeps its requirement classes, so the 1.0 suite is the one that applies.
 |---|---|---|
 | Conformance Level 1, Sensing Core (`Capability1Tests`) | datamodel, resource-path, request-data (read) | declares all three in `serverSettings.conformance` |
 | Conformance Level 2, Create-Update-Delete (`Capability2Tests`) | create-update-delete | not served: read only |
-| Conformance Level 3, Filtering Extension (`Capability3Tests`) | request-data query options | served; the ETS cannot reach it (section 4) |
+| Conformance Level 3, Filtering Extension (`Capability3Tests`) | request-data query options | 4 of 8 on the fork; the 4 others need fixture counts the derived mapping cannot hold (section 4) |
 
 ## 2. The run
 
@@ -53,7 +53,12 @@ runs on every pull request to `dev`, nightly and on `v*` tags:
    `maven:3.9-eclipse-temurin-17@sha256:1a352420…` and copies it over
    `WEB-INF/lib/ets-sta10-1.5.jar` of the pinned image above, so the jar is
    the only difference between the two runs. It runs that image against the
-   same view and checks the result twice: against
+   view `sta-ets` (`ci/views/sta-ets`, T-5918): the fixtures of
+   `Capability3Tests` as NGSI-LD Entities, two Things with two measured
+   Attributes each, their `location` and value history, and a Device per
+   Thing, which `dev/views-rig.sh` writes through NGSI-LD Batch Create and
+   Temporal Create before the run, since the fork's Level 3 setup writes
+   nothing (section 4). It checks the result twice: against
    `ci/sta-compliance-fork-baseline.json`, and against the official run of
    step 4, red when the fork loses a test the official image passes. The
    fork only adds passes.
@@ -113,13 +118,24 @@ reads, Level 1 found three endpoint defects, fixed in T-5916:
   Sensor `unknown` was listed with none when every Entity of the view
   names a Device; it is listed only while one does not.
 
+From a local run of the fork at `5d5d979` against `sta-ets` on
+`agent/worker-t5918/T-5918` (2026-10-28), which rewrote
+`ci/sta-compliance-fork-baseline.json`: Level 1 6 passed, Level 2 8
+skipped, Level 3 4 passed and 4 failed. Before T-5918 the same run
+answered `400` to `$orderby` on any property but an Observation's
+`phenomenonTime`, to `$filter` on any property but a Thing's, and to
+`$expand` beyond five paths; the endpoint now reads those over the
+collection ([the endpoint page](sta.md) section 2).
+
 ## 4. The tests that do not pass
 
 | Test | Status | Why | Decision |
 |---|---|---|---|
 | Level 1 `readEntityAndCheckResponse`, `readPropertyOfEntityAndCheckResponse`, `checkResourcePaths` | FAIL on the official image, PASS on the fork | The ETS reads `@iot.id` with `getLong` and stops: `JSONObject["@iot.id"] is not a long`. 15-078r6 table 2 types `@iot.id` as ANY; the endpoint's ids are the Entity URNs and ids derived from them (sta-mapping rule 2). Upstream issue [ets-sta10#40](https://github.com/opengeospatial/ets-sta10/issues/40), "Test suite assumes IDs are long", is open. | ETS defect, fixed in the fork. Numeric ids would make URNs unstable across views and are not planned. |
 | Level 2, all 8 | SKIP (setup fails) | Create-Update-Delete: the setup DELETEs every resource first (`deleteEverythings`), and every test POSTs, PATCHes or DELETEs. The endpoint is read only (`405` with `Allow`); on the official image the setup stops earlier, at the `getLong` read. | Native writes: T-5917. |
-| Level 3, all 8 | SKIP (setup fails) | The setup creates its own Things, Datastreams and Observations with POST and reads their ids from the `Location` header (`begin 0, end -1`): a read-only endpoint answers `405`. The query options themselves are served and tested in `crates/antares-sta/tests/sta/sets.rs` and `bounds.rs`. | Native queries: T-5918, after T-5917. |
+| Level 3 `readEntitiesWithSelectQO`, `readEntitiesWithExpandQO`, `readEntitiesWithOrderbyQO`, `readEntitiesWithFilterQO` | PASS on the fork | `$select`, `$expand` one and two deep on every navigation property, `$orderby` and `$filter` on every property of every set and related collection. | Served (T-5918). |
+| Level 3 `readEntitiesWithTopQO`, `readEntitiesWithSkipQO`, `readEntitiesWithCountQO` | FAIL on the fork: not reachable without writes | Each asserts exact sizes per set: 2 Things, 2 Locations, 4 Datastreams, 4 Sensors, 3 ObservedProperties, 4 HistoricalLocations, 12 Observations, 2 FeaturesOfInterest. The derived mapping cannot hold them together: every Entity of the view is a Thing, the Devices that are Sensors included (`Things?$count=true` answers 4); a Sensor is the Device its Entity's `refDevice` names, one per Thing, so 4 Datastreams of 2 Things have 2 Sensors; the `Observations` set lists each Datastream's current instance (4), the earlier ones only under `Datastreams('…')/Observations`. | Not reachable: only stored SensorThings resources (native writes, out of scope by the owner's order of 2026-10-28) hold these counts. |
+| Level 3 `checkQueriesPriorityOrdering` | FAIL on the fork: not reachable without writes | `Observations?$count=true&$top=1&$skip=2&$orderby=phenomenonTime asc&$filter=result gt '3'` must count 6 of the 12 fixture Observations; the `Observations` set holds the 4 current ones, so the count is 2. The order of the options is applied as 15-078r6 9.3.3.1 says (filter, count, order, skip, top): `crates/antares-sta/tests/sta/findings.rs`. | Not reachable, as above. |
 
 The fork's patch over tag 1.5, the only one (owner rule 2026-10-28: a
 suite defect may be fixed in a fork, each patch minimal, with the clause
@@ -133,7 +149,15 @@ that justifies it; never a test patched because the endpoint fails it):
   gets the same requests as before. `VerifyServiceURLBuilder` tests both
   kinds; `mvn test` passes.
 
-The same patch goes upstream as a pull request from the fork's branch
+- **Level 3 setup writes nothing** (T-5918, owner order 2026-10-28: "do not
+  implement sensorthings writes", setup changes allowed with the
+  assertions untouched). `createEntities` (POST, PATCH) and
+  `deleteEverythings` (DELETE) are removed from `Capability3Tests`; the
+  fixtures are the view's NGSI-LD seed (section 2 step 5). No test read
+  the ids the setup kept. Branch `level3-seeded` (commit `5d5d979`, on top
+  of `iot-id-any`); this one is not proposed upstream.
+
+The `@iot.id` patch goes upstream as a pull request from the fork's branch
 `iot-id-any` to `opengeospatial/ets-sta10` `master`
 ([compare](https://github.com/opengeospatial/ets-sta10/compare/master...marek-mraz-jc:ets-sta10:iot-id-any)).
 

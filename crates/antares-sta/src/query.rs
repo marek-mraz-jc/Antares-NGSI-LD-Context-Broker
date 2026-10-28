@@ -37,8 +37,10 @@ pub struct Options {
     pub select: Vec<String>,
     /// Each `$expand` path, its nested options left out.
     pub expand: Vec<String>,
-    /// `$orderby=phenomenonTime desc`, the one order served: a Datastream's Observations.
+    /// `$orderby=phenomenonTime desc`, the order a Datastream's Observations are read in.
     pub ordered: bool,
+    /// `$orderby`: member paths, each with `true` for `desc`; empty without.
+    pub orderby: Vec<(Vec<String>, bool)>,
     /// `$filter`, as sent.
     pub filter: Option<String>,
     /// `$skiptoken` of a set whose Entity holds several resources, as its `@iot.nextLink` writes
@@ -58,6 +60,7 @@ pub fn options(pairs: &[(String, String)]) -> Result<Options, Bad> {
         select: Vec::new(),
         expand: Vec::new(),
         ordered: false,
+        orderby: Vec::new(),
         filter: None,
         resume: None,
     };
@@ -83,17 +86,12 @@ pub fn options(pairs: &[(String, String)]) -> Result<Options, Bad> {
                 out.expand = paths.into_iter().map(str::to_owned).collect();
             }
             "$orderby" => {
-                let words: Vec<String> = value
-                    .split_whitespace()
-                    .map(str::to_ascii_lowercase)
-                    .collect();
-                if words != ["phenomenontime", "desc"] {
-                    return Err(Bad(
-                        "$orderby",
-                        "only phenomenonTime desc is served, on a Datastream's Observations".into(),
-                    ));
-                }
-                out.ordered = true;
+                out.orderby = crate::residual::orderby(value)?;
+                out.ordered = out.orderby.len() == 1
+                    && out
+                        .orderby
+                        .first()
+                        .is_some_and(|(p, desc)| *desc && *p == ["phenomenonTime"]);
             }
             "$filter" if value.len() > MAX_FILTER => {
                 return Err(Bad("$filter", format!("at most {MAX_FILTER} bytes")));
@@ -676,6 +674,7 @@ mod tests {
                 select: vec!["@iot.id".into(), "name".into()],
                 expand: vec!["Locations".into(), "Datastreams/Observations".into()],
                 ordered: true,
+                orderby: vec![(vec!["phenomenonTime".into()], true)],
                 filter: Some("a eq 1".into()),
                 resume: None,
             })
@@ -695,19 +694,21 @@ mod tests {
                 "{token}"
             );
         }
-        // T-5205 finding 19: `$top=0` is the count alone; an order not served is refused.
+        // T-5205 finding 19: `$top=0` is the count alone. Any other order is read over the
+        // collection (T-5918); one that names no property is refused.
         assert_eq!(options(&pairs(&[("$top", "0")])).map(|o| o.top), Ok(0));
         for order in [
             "name",
             "resultTime desc,phenomenonTime asc",
             "phenomenonTime asc",
         ] {
-            assert_eq!(
-                options(&pairs(&[("$orderby", order)])).map_err(|b| b.0),
-                Err("$orderby"),
-                "{order}"
-            );
+            let ordered = options(&pairs(&[("$orderby", order)])).map(|o| o.ordered);
+            assert_eq!(ordered, Ok(false), "{order}");
         }
+        assert_eq!(
+            options(&pairs(&[("$orderby", "name sideways")])).map_err(|b| b.0),
+            Err("$orderby")
+        );
         assert!(options(&pairs(&[("$top", "x")])).is_err());
         assert_eq!(
             options(&pairs(&[("$skip", "10001")])).map_err(|b| b.0),
