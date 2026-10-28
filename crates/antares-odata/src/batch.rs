@@ -133,7 +133,7 @@ pub(crate) async fn serve(
     let mut left = ops.max_answer_bytes();
     for (member, (target, headers)) in batch.requests.into_iter().zip(checked) {
         let id = member.id.clone();
-        let skip = skipped(ops, &member.depends_on, &failed, left).await;
+        let skip = skipped(&member.depends_on, &failed, left).await;
         let answer = if let Some(answer) = skip {
             answer
         } else {
@@ -154,13 +154,12 @@ pub(crate) async fn serve(
 /// is spent (F-ANT4-004), 424 when a member it depends on failed. Either is
 /// reached only under `continue-on-error`: a failure stops the batch otherwise.
 async fn skipped(
-    ops: &Ops,
     depends_on: &[usize],
     failed: &[bool],
     left: usize,
 ) -> Option<odata_batch::Response> {
     if left == 0 {
-        return Some(member_too_large(ops).await);
+        return Some(member_too_large().await);
     }
     depends_on
         .iter()
@@ -225,27 +224,53 @@ async fn run(
     // fits alone but passes what the batch's bound has left answers 413 and
     // spends the bound, so every later member answers 413 too.
     let (parts, body) = answer.into_parts();
-    let Ok(body) = ops.read_answer(body).await else {
-        return member_too_large(ops).await;
+    let body = match ops.read_answer(body).await {
+        Ok(body) => body,
+        // the broker's buffered-answer pool is full: the member is refused
+        // whole with a 503 that says when to ask again (T-5895)
+        Err(antares_ops::Refusal::Overloaded { .. }) => {
+            return member_refused(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ServiceUnavailable",
+                antares_ops::bounds::MEMORY_OVERLOADED,
+            )
+            .await
+        }
+        Err(_) => return member_too_large().await,
     };
     let Some(rest) = left.checked_sub(body.len()) else {
         *left = 0;
-        return member_too_large(ops).await;
+        return member_too_large().await;
     };
     *left = rest;
     framed(&parts, &body)
 }
 
 /// The 413 a member answers past the buffer bound.
-async fn member_too_large(ops: &Ops) -> odata_batch::Response {
-    let (parts, body) = ODataErrorResponse::new(
+async fn member_too_large() -> odata_batch::Response {
+    member_refused(
         StatusCode::PAYLOAD_TOO_LARGE,
         "PayloadTooLarge",
         antares_ops::bounds::ANSWER_TOO_LARGE,
     )
-    .into_response()
-    .into_parts();
-    let body = ops.read_answer(body).await.unwrap_or_default();
+    .await
+}
+
+/// A member refused with `status` and its fixed text; a 503 says when to
+/// ask again. The error document is the broker's own few hundred bytes, read
+/// outside the pool it may have found full.
+async fn member_refused(status: StatusCode, code: &str, message: &str) -> odata_batch::Response {
+    let mut answer = ODataErrorResponse::new(status, code, message).into_response();
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        answer.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            antares_ops::bounds::ANSWER_POOL_RETRY_SECONDS.into(),
+        );
+    }
+    let (parts, body) = answer.into_parts();
+    let body = axum::body::to_bytes(body, 64 * 1024)
+        .await
+        .unwrap_or_default();
     framed(&parts, &body)
 }
 

@@ -28,7 +28,7 @@
 //!
 //! Every outcome is retained, refusals included, so no pattern is compiled
 //! twice. Retention is bounded in entries and in bytes —
-//! `MAX_REGEX_CACHE` and `MAX_REGEX_CACHE_BYTES` — because the key is
+//! `MAX_REGEX_CACHE` and `cache_bytes()` — because the key is
 //! client input and an unbounded map of it is a memory attack, not a cache.
 //! Crossing a bound drops the least recently used half, never the whole map:
 //! a subscription fan-out evaluates the same few patterns per event, and
@@ -52,13 +52,28 @@ pub const MAX_REGEX_PROGRAM_BYTES: usize = 256 * 1024;
 /// most a low hundreds of distinct patterns, which the cache holds whole:
 /// one request never evicts its own working set.
 pub const MAX_REGEX_CACHE: usize = 1024;
-/// Retained program bytes. Each entry is charged the tier it compiled
-/// within, not its true size, so the number is an upper bound on what the
-/// map holds.
-pub const MAX_REGEX_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// Retained program bytes by default. Each entry is charged the tier it
+/// compiled within, not its true size, so the number is an upper bound on
+/// what the map holds. 16 MiB is this cache's share of the broker's default
+/// 200 MiB memory budget (T-5895); the broker sets the share of its own
+/// `ANTARES_MEMORY_BUDGET` with [`set_cache_bytes`] at start.
+pub const DEFAULT_REGEX_CACHE_BYTES: usize = 16 << 20;
+
+static CACHE_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_REGEX_CACHE_BYTES);
+
+/// Sets the retained program bytes; the next insert evicts down to it.
+pub fn set_cache_bytes(bytes: usize) {
+    CACHE_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// The retained program bytes the cache holds at most.
+#[must_use]
+pub fn cache_bytes() -> usize {
+    CACHE_BYTES.load(Ordering::Relaxed)
+}
 
 /// A program that fits this is charged this much against
-/// [`MAX_REGEX_CACHE_BYTES`]; anything larger is charged the full
+/// [`cache_bytes`]; anything larger is charged the full
 /// [`MAX_REGEX_PROGRAM_BYTES`]. Almost every pattern a deployment writes
 /// lands in the first tier, so the byte budget holds thousands of
 /// Subscription `idPattern`s and still bounds a mix of the largest programs
@@ -162,7 +177,7 @@ pub fn compile(pattern: &str) -> Result<Arc<regex::Regex>, String> {
         // which halves what is left each pass — is what makes the bound hold.
         let mut bytes = BYTES.load(Ordering::Relaxed);
         while !c.is_empty()
-            && (c.len() >= MAX_REGEX_CACHE || bytes.saturating_add(charge) > MAX_REGEX_CACHE_BYTES)
+            && (c.len() >= MAX_REGEX_CACHE || bytes.saturating_add(charge) > cache_bytes())
         {
             evict_lru_half(&mut c);
             bytes = c.values().map(|e| e.0 .1).sum();
@@ -194,7 +209,7 @@ pub fn len() -> usize {
     CACHE.read().map(|c| c.len()).unwrap_or(0)
 }
 
-/// Program bytes currently charged — never above `MAX_REGEX_CACHE_BYTES`.
+/// Program bytes currently charged — never above `cache_bytes()`.
 pub fn retained_bytes() -> usize {
     BYTES.load(Ordering::Relaxed)
 }
@@ -319,11 +334,21 @@ mod tests {
 
     /// Retention is bounded in both dimensions: distinct patterns are
     /// client input, so many of them must grow the map past neither
-    /// `MAX_REGEX_CACHE` nor `MAX_REGEX_CACHE_BYTES`, and the programs
+    /// `MAX_REGEX_CACHE` nor `cache_bytes()`, and the programs
     /// handed out across an eviction stay correct.
     #[test]
     fn cache_stays_bounded_under_many_distinct_patterns() {
         let _serial = serial_lock();
+        // the default share binds by bytes (512 programs of the first tier),
+        // a 64 MiB share by the entry count: both bounds are driven
+        for share in [DEFAULT_REGEX_CACHE_BYTES, 64 << 20] {
+            set_cache_bytes(share);
+            fill_past_both_bounds();
+        }
+        set_cache_bytes(DEFAULT_REGEX_CACHE_BYTES);
+    }
+
+    fn fill_past_both_bounds() {
         for i in 0..MAX_REGEX_CACHE * 3 {
             let p = format!("^bounded-{i}-[a-z]+$");
             let re = compile(&p).expect("valid pattern");
@@ -335,7 +360,7 @@ mod tests {
                 len()
             );
             assert!(
-                retained_bytes() <= MAX_REGEX_CACHE_BYTES,
+                retained_bytes() <= cache_bytes(),
                 "charged {} bytes after {i} distinct patterns",
                 retained_bytes()
             );
@@ -480,14 +505,14 @@ mod tests {
 
     /// The byte budget evicts on its own, before the entry count does:
     /// programs past the 32 KiB tier are charged 256 KiB each, so ~260 of
-    /// them overrun MAX_REGEX_CACHE_BYTES long before MAX_REGEX_CACHE.
+    /// them overrun cache_bytes() long before MAX_REGEX_CACHE.
     #[test]
     fn the_byte_budget_evicts_before_the_entry_count() {
         let _serial = serial_lock();
         for i in 0..300 {
             compile(&format!("^[a-z]{{{}}}$", 3000 + i)).expect("compiles");
             assert!(
-                retained_bytes() <= MAX_REGEX_CACHE_BYTES,
+                retained_bytes() <= cache_bytes(),
                 "after {i}: {} bytes retained",
                 retained_bytes()
             );

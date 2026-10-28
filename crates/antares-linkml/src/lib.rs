@@ -42,6 +42,14 @@ pub const PREFIX: &str = "/x/views";
 /// How many rendered schemas one pod keeps (`odata-linkml-mapping.md` 7.3).
 pub const CACHE_ENTRIES: usize = 256;
 
+/// Sets the bytes of rendered schemas one pod keeps (T-5895), which the
+/// next rendering evicts down to, and of the LinkML schema source behind
+/// them, which is sized at its first read.
+pub fn set_cache_bytes(renders: usize, linkml_models: u64) {
+    render::CACHE_BYTES.store(renders, std::sync::atomic::Ordering::Relaxed);
+    linkml_model::cache::set_max_bytes(linkml_models);
+}
+
 /// The LinkML surface: `/x/views/{view}/linkml`.
 #[derive(Debug, Clone, Copy)]
 pub struct Linkml;

@@ -327,6 +327,17 @@ async fn a_preview_asks_the_engine_and_answers_its_refusal() {
     assert_eq!(body["type"], "urn:antares:error:AccessDenied");
 }
 
+/// T-5895: a preview the broker's buffered-answer pool has no room for is
+/// 503 with Retry-After, refused whole, never a page cut short.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_preview_past_the_answer_pool_is_503() {
+    let b = TestBroker::with_answer_pool(32).await.expect("broker");
+    let app = b.serve(Nothing).expect("mounts");
+    seed(&app).await;
+    let (s, _) = preview(&app, "cars", "?type=Car", &view("cars", "speed>0")).await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+}
+
 /// T-3773: a preview page larger than the broker buffers for one request is
 /// 413, not held whole in memory.
 #[tokio::test(flavor = "multi_thread")]
