@@ -25,7 +25,8 @@
 
 use crate::edm::{Member, Set, Shape};
 use antares_ops::residual::{
-    self, Cmp, Date, DateTime, Expr as RExpr, Func, Lit, Member as RMember, Path, Spatial, Time,
+    self, decode_base64, Cmp, Date, DateTime, Duration, Expr as RExpr, Func, Lit,
+    Member as RMember, Path, Spatial, Time,
 };
 use odata_url::{
     ArithOp, CompareOp, Compute, Expr, Geography, Literal, MemberPath, Method, OrderBy, Search,
@@ -1199,7 +1200,7 @@ fn plain(e: &Expr) -> Option<&[String]> {
 
 /// The Edm types this surface checks; a value of another type is taken
 /// where a function asks (as [`fits`] takes any literal for it).
-const KNOWN: [&str; 14] = [
+const KNOWN: [&str; 16] = [
     "Edm.String",
     "Edm.Boolean",
     "Edm.Guid",
@@ -1214,6 +1215,8 @@ const KNOWN: [&str; 14] = [
     "Edm.Single",
     "Edm.Double",
     "Edm.Decimal",
+    "Edm.Duration",
+    "Edm.Binary",
 ];
 
 /// The families a numeric parameter takes.
@@ -1254,6 +1257,8 @@ fn literal_edm(lit: &Literal) -> Option<&'static str> {
         Literal::DateTimeOffset(_) => "Edm.DateTimeOffset",
         Literal::TimeOfDay(_) => "Edm.TimeOfDay",
         Literal::Geography(_) => "Edm.Geography",
+        Literal::Duration(_) => "Edm.Duration",
+        Literal::Binary(_) => "Edm.Binary",
     })
 }
 
@@ -1325,6 +1330,8 @@ fn fits(edm: &str, lit: &Literal) -> bool {
             | ("Edm.Date", Literal::Date(_))
             | ("Edm.DateTimeOffset", Literal::DateTimeOffset(_))
             | ("Edm.TimeOfDay", Literal::TimeOfDay(_))
+            | ("Edm.Duration", Literal::Duration(_))
+            | ("Edm.Binary", Literal::Binary(_))
             | (
                 "Edm.Single" | "Edm.Double" | "Edm.Decimal",
                 Literal::Int(_) | Literal::Decimal(_)
@@ -1336,6 +1343,9 @@ fn fits(edm: &str, lit: &Literal) -> bool {
             )
     );
     match edm {
+        // a finite decimal past the `Edm.Single` range is no Single (5.1.1.5)
+        "Edm.Single" if same => !matches!(lit, Literal::Decimal(raw)
+            if raw.parse::<f64>().is_ok_and(|n| n.is_finite() && n.abs() > f64::from(f32::MAX))),
         _ if same => true,
         "Edm.Byte" => range(0, 255),
         "Edm.SByte" => range(-128, 127),
@@ -1343,7 +1353,8 @@ fn fits(edm: &str, lit: &Literal) -> bool {
         "Edm.Int32" => range(i32::MIN.into(), i32::MAX.into()),
         "Edm.Int64" => range(i64::MIN, i64::MAX),
         "Edm.String" | "Edm.Boolean" | "Edm.Guid" | "Edm.Date" | "Edm.DateTimeOffset"
-        | "Edm.TimeOfDay" | "Edm.Single" | "Edm.Double" | "Edm.Decimal" | "Edm.Untyped" => false,
+        | "Edm.TimeOfDay" | "Edm.Single" | "Edm.Double" | "Edm.Decimal" | "Edm.Untyped"
+        | "Edm.Duration" | "Edm.Binary" => false,
         _ => true,
     }
 }
@@ -1390,11 +1401,16 @@ fn residual_lit(lit: &Literal) -> Result<Lit, Refused> {
     match lit {
         Literal::Bool(b) => Ok(Lit::Bool(*b)),
         Literal::Int(n) => Ok(Lit::Int(*n)),
-        Literal::Decimal(raw) => match raw.parse::<f64>() {
-            Ok(n) if n.is_finite() => Ok(Lit::Num(n)),
+        Literal::Decimal(raw) => match (raw.as_str(), raw.parse::<f64>()) {
+            ("INF", _) => Ok(Lit::Num(f64::INFINITY)),
+            ("-INF", _) => Ok(Lit::Num(f64::NEG_INFINITY)),
+            ("NaN", _) => Ok(Lit::Num(f64::NAN)),
+            (_, Ok(n)) if n.is_finite() => Ok(Lit::Num(n)),
             _ => Err(Refused::Bad),
         },
         Literal::String(s) | Literal::Guid(s) => Ok(Lit::Str(s.clone())),
+        Literal::Duration(d) => parsed(Duration::parse(d).map(Lit::Duration)),
+        Literal::Binary(b) => parsed(decode_base64(b).map(Lit::Binary)),
         Literal::Date(d) => parsed(Date::parse(d).map(Lit::Date)),
         Literal::DateTimeOffset(t) => parsed(DateTime::parse(t).map(Lit::DateTime)),
         Literal::TimeOfDay(t) => parsed(Time::parse(t).map(Lit::Time)),
@@ -1456,6 +1472,10 @@ fn value(lit: &Literal) -> Result<String, Refused> {
         Literal::Bool(b) => Ok(b.to_string()),
         Literal::Int(n) if (-MAX_EXACT..=MAX_EXACT).contains(n) => Ok(n.to_string()),
         Literal::Int(_) => Err(Refused::Bad),
+        // INF, -INF and NaN have no NGSI-LD number: the residual compares them (T-5905)
+        Literal::Decimal(raw) if matches!(raw.as_str(), "INF" | "-INF" | "NaN") => {
+            Err(Refused::Later)
+        }
         Literal::Decimal(raw) => match raw.parse::<f64>() {
             Ok(n) if n.is_finite() => Ok(Value::from(n).to_string()),
             _ => Err(Refused::Bad),
@@ -1464,9 +1484,16 @@ fn value(lit: &Literal) -> Result<String, Refused> {
         Literal::String(s) | Literal::Guid(s) => Ok(Value::from(s.as_str()).to_string()),
         Literal::Date(d) => Ok(d.clone()),
         Literal::DateTimeOffset(t) if t.ends_with('Z') => Ok(t.clone()),
-        Literal::TimeOfDay(t) => Ok(format!("{t}Z")),
-        // An offset other than Z, null in a list, a geography: later rounds.
-        Literal::DateTimeOffset(_) | Literal::Null | Literal::Geography(_) => Err(Refused::Later),
+        // An offset other than Z, null in a list, a geography: later rounds. A time of day, a
+        // duration and bytes NGSI-LD stores as text the q string order does not compare
+        // (`09:30:00` and `09:30:00Z`, `PT2H` and `P1D`, padded and unpadded base64): the
+        // residual compares the values they spell (T-5905).
+        Literal::DateTimeOffset(_)
+        | Literal::Null
+        | Literal::Geography(_)
+        | Literal::TimeOfDay(_)
+        | Literal::Duration(_)
+        | Literal::Binary(_) => Err(Refused::Later),
     }
 }
 
@@ -1849,11 +1876,6 @@ mod tests {
             ),
             cmp(m("doc"), CompareOp::Eq, lit(Literal::Int(1))),
             cmp(m("speed"), CompareOp::Eq, lit(Literal::Int(MAX_EXACT + 1))),
-            cmp(
-                m("speed"),
-                CompareOp::Eq,
-                lit(Literal::Decimal("INF".into())),
-            ),
         ] {
             assert_eq!(q(&e), Err(Refused::Bad), "{e:?}");
         }
@@ -1968,9 +1990,8 @@ mod tests {
                 arith(m("speed"), ArithOp::Add, int(1)),
             ),
             cmp(m("name"), CompareOp::Ne, m("name")),
-            // a type this surface does not check compares with any
-            cmp(m("span"), CompareOp::Eq, m("name")),
-            cmp(m("name"), CompareOp::Eq, m("span")),
+            // two durations compare as durations (T-5905)
+            cmp(m("span"), CompareOp::Lt, m("span")),
             cmp(
                 call_of(Method::Year, vec![lit(Literal::Date("2026-01-02".into()))]),
                 CompareOp::Eq,
@@ -2104,7 +2125,6 @@ mod tests {
                 CompareOp::Eq,
                 int(1),
             ),
-            call_of(Method::Round, vec![m("span")]),
             // a lambda over a Relationship's object
             Expr::Any {
                 collection: MemberPath {
@@ -2117,6 +2137,11 @@ mod tests {
         for e in later {
             assert_eq!(q(&e), Err(Refused::Later), "{e:?}");
         }
+        // a duration is no number (T-5905)
+        assert_eq!(
+            q(&call_of(Method::Round, vec![m("span")])),
+            Err(Refused::Bad)
+        );
     }
 
     #[test]
@@ -2134,10 +2159,11 @@ mod tests {
         assert_eq!(family("Edm.Int16"), "integer");
         assert_eq!(family("Edm.Single"), "number");
         assert_eq!(
-            takes_arg(STRING, "Edm.Duration"),
+            takes_arg(STRING, "Edm.Stream"),
             Ok(()),
             "an unknown type is taken"
         );
+        assert_eq!(takes_arg(STRING, "Edm.Duration"), Err(Refused::Bad));
         assert_eq!(literal_edm(&Literal::Null), None);
     }
 
@@ -2372,9 +2398,18 @@ mod tests {
                 Literal::DateTimeOffset("2026-10-11T08:00:00Z".into()),
                 "2026-10-11T08:00:00Z",
             ),
-            (Literal::TimeOfDay("08:00:00".into()), "08:00:00Z"),
         ] {
             assert_eq!(value(&lit), Ok(want.to_owned()), "{lit:?}");
+        }
+        // NGSI-LD stores these as text q does not order: the residual compares them (T-5905)
+        for lit in [
+            Literal::TimeOfDay("08:00:00".into()),
+            Literal::Duration("P1D".into()),
+            Literal::Binary("AQID".into()),
+            Literal::Decimal("INF".into()),
+            Literal::Decimal("NaN".into()),
+        ] {
+            assert_eq!(value(&lit), Err(Refused::Later), "{lit:?}");
         }
     }
 
@@ -2744,11 +2779,6 @@ mod tests {
             ))),
             not(m("speed")),
             not(cmp(m("doc"), CompareOp::Eq, int(1))),
-            not(cmp(
-                m("speed"),
-                CompareOp::Gt,
-                lit(Literal::Decimal("NaN".into())),
-            )),
         ] {
             assert_eq!(q(&e), Err(Refused::Bad), "{e:?}");
         }
@@ -2776,10 +2806,19 @@ mod tests {
         ] {
             assert_eq!(q(&e).as_deref(), Ok(want), "{e:?}");
         }
-        // a type this surface does not check takes any literal
+        // a duration takes a duration literal, which the residual compares (T-5905)
         assert_eq!(
-            q(&cmp(m("span"), CompareOp::Eq, lit(Literal::Int(1)))).as_deref(),
-            Ok("(t0==1)")
+            q(&cmp(m("span"), CompareOp::Eq, lit(Literal::Int(1)))),
+            Err(Refused::Bad)
+        );
+        assert_eq!(
+            q(&cmp(
+                m("span"),
+                CompareOp::Eq,
+                lit(Literal::Duration("P1D".into()))
+            ))
+            .as_deref(),
+            Ok("")
         );
         let below = Expr::Not(Box::new(reading(CompareOp::Ge, Literal::Int(5))));
         assert_eq!(evaluated(&below, Some(json!(3))), Some(True));
@@ -2863,6 +2902,143 @@ mod tests {
         assert_eq!(
             translate(&bad, &timed, &BTreeMap::new(), &[]).map(|_| ()),
             Err(Refused::Bad)
+        );
+    }
+
+    /// T-5905: each Edm type NGSI-LD stores as text or as a JSON number is compared as its
+    /// value in the residual: its literal is read, a literal past its range or of another type
+    /// is 400 before any read, and the filter keeps the Entities whose value holds it.
+    #[test]
+    fn every_edm_type_ngsi_ld_carries_is_filtered_by_its_value() {
+        use residual::Truth::{self, False, True};
+        use serde_json::{json, Value as J};
+        let mut typed = set();
+        for (name, edm) in [
+            ("weight", "Edm.Single"),
+            ("price", "Edm.Double"),
+            ("rating", "Edm.Byte"),
+            ("qty", "Edm.Int16"),
+            ("ship", "Edm.Duration"),
+            ("data", "Edm.Binary"),
+            ("opens", "Edm.TimeOfDay"),
+        ] {
+            typed.members.insert(
+                name.into(),
+                Member {
+                    iri: format!("https://e.org/{name}"),
+                    shape: Shape::Value {
+                        edm,
+                        collection: false,
+                    },
+                    list: false,
+                    json: false,
+                    untyped: false,
+                    written: crate::edm::Written::Always,
+                },
+            );
+        }
+        let now = DateTime::parse("2026-10-28T12:00:00Z");
+        let on = |e: &Expr, stored: J| -> Result<Truth, Refused> {
+            let t = translate(e, &typed, &BTreeMap::new(), &[])?;
+            assert_eq!(t.q, None, "{e:?} is the residual's");
+            let p = program(&t, now.ok_or(Refused::Later)?)?.ok_or(Refused::Later)?;
+            let entity = json!({"id": "urn:ngsi-ld:P:1", "type": "P",
+                "t0": {"type": "Property", "value": stored}});
+            p.eval(&entity).map_err(|_| Refused::Later)
+        };
+        let c = |name: &str, op, l: Literal| cmp(m(name), op, lit(l));
+        let dec = |t: &str| Literal::Decimal(t.into());
+        for (e, stored, want) in [
+            (c("weight", CompareOp::Ne, dec("INF")), json!(3.14), True),
+            (c("weight", CompareOp::Lt, dec("INF")), json!(3.14), True),
+            (c("price", CompareOp::Gt, dec("-INF")), json!(0.0), True),
+            (c("price", CompareOp::Eq, dec("NaN")), json!(15.5), False),
+            (
+                c("ship", CompareOp::Eq, Literal::Duration("PT95400S".into())),
+                json!("P1DT2H30M"),
+                True,
+            ),
+            (
+                c("ship", CompareOp::Gt, Literal::Duration("PT1H".into())),
+                json!("PT45S"),
+                False,
+            ),
+            (
+                c("ship", CompareOp::Eq, Literal::Duration("-P1D".into())),
+                json!("-PT24H"),
+                True,
+            ),
+            (
+                c("data", CompareOp::Eq, Literal::Binary("dGVzdA".into())),
+                json!("dGVzdA=="),
+                True,
+            ),
+            (
+                c("data", CompareOp::Eq, Literal::Binary(String::new())),
+                json!(""),
+                True,
+            ),
+            (
+                c("data", CompareOp::Ne, Literal::Binary("AQID".into())),
+                json!("dGVzdA=="),
+                True,
+            ),
+            (
+                c(
+                    "opens",
+                    CompareOp::Eq,
+                    Literal::TimeOfDay("09:30:00".into()),
+                ),
+                json!("09:30:00"),
+                True,
+            ),
+            (
+                c(
+                    "opens",
+                    CompareOp::Eq,
+                    Literal::TimeOfDay("09:30:00".into()),
+                ),
+                json!("09:30:00Z"),
+                True,
+            ),
+            (
+                c(
+                    "opens",
+                    CompareOp::Ge,
+                    Literal::TimeOfDay("09:30:00".into()),
+                ),
+                json!("09:29:59.5Z"),
+                False,
+            ),
+        ] {
+            assert_eq!(on(&e, stored), Ok(want), "{e:?}");
+        }
+        // past the type's range, or of another type: 400 before any read
+        for e in [
+            c("weight", CompareOp::Eq, dec("3.5e38")),
+            c("rating", CompareOp::Eq, Literal::Int(256)),
+            c("qty", CompareOp::Gt, Literal::Int(32768)),
+            c("ship", CompareOp::Eq, Literal::String("P1D".into())),
+            c("ship", CompareOp::Eq, Literal::Int(86400)),
+            c("data", CompareOp::Eq, Literal::String("dGVzdA==".into())),
+            c("opens", CompareOp::Eq, Literal::Duration("PT1H".into())),
+        ] {
+            assert_eq!(
+                translate(&e, &typed, &BTreeMap::new(), &[]).map(|_| ()),
+                Err(Refused::Bad),
+                "{e:?}"
+            );
+        }
+        // a Single within its range is pushed as a q number
+        assert_eq!(
+            translate(
+                &c("weight", CompareOp::Gt, dec("1.5e2")),
+                &typed,
+                &BTreeMap::new(),
+                &[]
+            )
+            .map(|t| t.q),
+            Ok(Some("(t0>150.0)".into()))
         );
     }
 

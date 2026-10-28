@@ -175,8 +175,8 @@ pub enum Feature {
     InExpression,
     /// JSON arrays and objects in a URL.
     JsonLiteral,
-    /// Literals without an NGSI-LD value type: duration, binary, enum, geometry, and
-    /// geography other than points and polygons (F27).
+    /// Literals without an NGSI-LD value type: enum, geometry, and geography other than
+    /// points and polygons (F27).
     Literal,
     /// Identifiers with percent-encoded non-ASCII characters.
     NonAsciiIdentifier,

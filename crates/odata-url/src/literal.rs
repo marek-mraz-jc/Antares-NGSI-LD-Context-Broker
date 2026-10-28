@@ -50,11 +50,15 @@ fn any_literal(c: &mut Cursor<'_>) -> Result<Option<Literal>, UrlError> {
     if prefixed(c, "geography") {
         return geography(c).map(|g| Some(Literal::Geography(g)));
     }
-    for prefix in ["geometry", "binary", "duration"] {
-        if prefixed(c, prefix) {
-            c.reset(start);
-            return Err(c.not_implemented(Feature::Literal));
-        }
+    if prefixed(c, "geometry") {
+        c.reset(start);
+        return Err(c.not_implemented(Feature::Literal));
+    }
+    if prefixed(c, "duration") {
+        return quoted(c, "durationValue", is_duration).map(|d| Some(Literal::Duration(d)));
+    }
+    if prefixed(c, "binary") {
+        return quoted(c, "binaryValue", is_base64url).map(|b| Some(Literal::Binary(b)));
     }
     if enum_prefix(c)? {
         c.reset(start);
@@ -110,6 +114,67 @@ fn prefixed(c: &mut Cursor<'_>, prefix: &str) -> bool {
     }
     c.reset(start);
     false
+}
+
+/// The text up to the closing quote of a `duration'..'` or `binary'..'` literal, when `valid`
+/// holds for it; a syntax error naming `expected` otherwise. The text is ASCII by both rules,
+/// and its length is bounded by the literal's (`max_literal_len`).
+fn quoted(
+    c: &mut Cursor<'_>,
+    expected: &'static str,
+    valid: fn(&str) -> bool,
+) -> Result<String, UrlError> {
+    let body = c.pos();
+    while c.peek().is_some_and(|b| b != b'\'' && b != b'%') {
+        c.advance(1);
+    }
+    let text = c.slice(body).to_owned();
+    if valid(&text) && c.squote() {
+        Ok(text)
+    } else {
+        c.reset(body);
+        Err(c.syntax(expected))
+    }
+}
+
+/// `durationValue` (ABNF): `[ sign ] "P" [ 1*DIGIT "D" ] [ "T" [ 1*DIGIT "H" ] [ 1*DIGIT "M" ]
+/// [ 1*DIGIT [ "." 1*DIGIT ] "S" ] ]`, with at least one component and none after a bare `T`.
+pub(crate) fn is_duration(text: &str) -> bool {
+    let rest = text.strip_prefix(['-', '+']).unwrap_or(text);
+    let Some(rest) = rest.strip_prefix('P') else {
+        return false;
+    };
+    let (days, time) = rest.split_once('T').map_or((rest, None), |(d, t)| (d, Some(t)));
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let days_ok = days.is_empty() || days.strip_suffix('D').is_some_and(digits);
+    let time_ok = time.is_none_or(|mut t| {
+        let mut any = false;
+        for unit in ['H', 'M'] {
+            if let Some((n, after)) = t.split_once(unit) {
+                if !digits(n) {
+                    return false;
+                }
+                (t, any) = (after, true);
+            }
+        }
+        if let Some(seconds) = t.strip_suffix('S') {
+            let (whole, fraction) = seconds.split_once('.').unwrap_or((seconds, "1"));
+            return digits(whole) && digits(fraction);
+        }
+        any && t.is_empty()
+    });
+    days_ok && time_ok && (!days.is_empty() || time.is_some())
+}
+
+/// `binaryValue` (ABNF): base64url (`A-Z a-z 0-9 - _`), padded with `=` to a multiple of four
+/// or unpadded; a length of one past a multiple of four encodes no whole byte.
+pub(crate) fn is_base64url(text: &str) -> bool {
+    let data = text.trim_end_matches('=');
+    let padding = text.len().saturating_sub(data.len());
+    data.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        && data.len() % 4 != 1
+        && (padding == 0 || (padding <= 2 && text.len() % 4 == 0))
 }
 
 /// `qualifiedEnumTypeName SQUOTE`: a dotted name directly followed by a quote.
@@ -301,6 +366,16 @@ fn date_time_offset(c: &mut Cursor<'_>) -> Option<String> {
 /// [`Literal::Decimal`] text.
 pub(crate) fn number(c: &mut Cursor<'_>) -> Option<Literal> {
     let (text, integer) = number_text(c, true)?;
+    // The `f` suffix of an `Edm.Single` literal (OData 2.0 and 3.0 URL conventions, still sent
+    // by clients and the NLstn compliance suite): the same decimal value.
+    if !text.ends_with(['N', 'F']) && c.peek().is_some_and(|b| b == b'f' || b == b'F') {
+        let at = c.pos();
+        c.advance(1);
+        if !continues_identifier(c) {
+            return Some(Literal::Decimal(text));
+        }
+        c.reset(at);
+    }
     if integer {
         if let Ok(value) = text.parse::<i64>() {
             return Some(Literal::Int(value));
@@ -715,8 +790,6 @@ mod tests {
         for other in [
             "geography'SRID=0;LineString(1 1,2 2)'",
             "geometry'SRID=0;Point(1 1)'",
-            "binary'T0RhdGE'",
-            "duration'P12DT23H59M59.999999999999S'",
             "Namespace.Pattern'Yellow'",
         ] {
             assert_eq!(
@@ -728,6 +801,53 @@ mod tests {
         // A dotted name without a quote is a path, not an enum.
         assert_eq!(read("Namespace.Pattern").unwrap(), None);
         assert_eq!(read("Name").unwrap(), None);
+    }
+
+    #[test]
+    fn durations_binaries_and_the_single_suffix_are_read() {
+        // T-5905: the Edm types an NGSI-LD Property carries as text.
+        for (text, want) in [
+            ("duration'P1D'", Literal::Duration("P1D".into())),
+            ("duration'-P1D'", Literal::Duration("-P1D".into())),
+            ("duration'PT1.5S'", Literal::Duration("PT1.5S".into())),
+            ("duration'P1DT2H30M'", Literal::Duration("P1DT2H30M".into())),
+            (
+                "duration'P12DT23H59M59.999999999999S'",
+                Literal::Duration("P12DT23H59M59.999999999999S".into()),
+            ),
+            ("binary'T0RhdGE'", Literal::Binary("T0RhdGE".into())),
+            ("binary'dGVzdA=='", Literal::Binary("dGVzdA==".into())),
+            ("binary''", Literal::Binary(String::new())),
+            ("1.5f", Literal::Decimal("1.5".into())),
+            ("0.0F", Literal::Decimal("0.0".into())),
+            ("1.5e2f", Literal::Decimal("1.5e2".into())),
+            ("-3f", Literal::Decimal("-3".into())),
+        ] {
+            assert_eq!(ok(text), want, "{text}");
+        }
+        // a malformed body is a syntax error, before any operation runs
+        for bad in [
+            "duration'invalid'",
+            "duration'P'",
+            "duration'PT'",
+            "duration'P1Y'",
+            "duration'PT1S2H'",
+            "duration'PT.5S'",
+            "binary'!!!invalid!!!'",
+            "binary'A'",
+            "binary'AB='",
+            "binary'A==='",
+        ] {
+            assert!(
+                matches!(read(bad).unwrap_err().kind, crate::UrlErrorKind::Syntax { .. }),
+                "{bad}"
+            );
+        }
+        // `f` that starts a name is no suffix, and INF/NaN take none
+        let mut c = Cursor::new("1foo");
+        assert_eq!(number(&mut c), Some(Literal::Int(1)));
+        assert_eq!(c.rest(), "foo");
+        assert_eq!(read("INFf").unwrap(), None);
     }
 
     #[test]

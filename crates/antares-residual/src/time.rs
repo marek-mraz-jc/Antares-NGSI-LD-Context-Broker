@@ -29,6 +29,11 @@ pub struct Date(i64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Time(i64);
 
+/// A day-time duration (XML Schema `dayTimeDuration`, `OData` `Edm.Duration`), as signed
+/// microseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Duration(i64);
+
 impl DateTime {
     /// The earliest value: `0000-01-01T00:00:00Z`.
     pub const MIN: Self = Self {
@@ -150,6 +155,8 @@ impl Time {
     pub fn parse(text: &str) -> Option<Self> {
         let mut t = Text::new(text);
         let tod = t.time()?;
+        // NGSI-LD writes a Time in UTC with its `Z` (TS 104 175 5.2.2.4), `OData` without one.
+        let _ = t.eat(b'Z');
         t.done().then_some(Self(tod))
     }
 
@@ -162,6 +169,98 @@ impl Time {
             seconds.checked_rem(60)?,
             self.0.checked_rem(MICROS_PER_SECOND)?,
         ))
+    }
+}
+
+impl Duration {
+    /// `[-]P[nD][T[nH][nM][n[.f]S]]` with at least one component; `None` for anything else, a
+    /// year or month component (no fixed length) or a value past the `i64` microseconds.
+    ///
+    /// ```
+    /// use ngsild_residual::Duration;
+    ///
+    /// assert_eq!(Duration::parse("P1DT2H30M"), Duration::parse("PT95400S"));
+    /// assert!(Duration::parse("P1Y").is_none());
+    /// ```
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut t = Text::new(text);
+        let negative = t.eat(b'-');
+        if !negative {
+            let _ = t.eat(b'+');
+        }
+        if !t.eat(b'P') {
+            return None;
+        }
+        let mut total = 0i64;
+        let mut parts = 0u8;
+        if let Some(days) = t.count(b'D') {
+            total = days.checked_mul(MICROS_PER_DAY)?;
+            parts = 1;
+        }
+        if t.eat(b'T') {
+            let before = parts;
+            for (unit, scale) in [(b'H', 60 * MICROS_PER_MINUTE), (b'M', MICROS_PER_MINUTE)] {
+                if let Some(n) = t.count(unit) {
+                    total = total.checked_add(n.checked_mul(scale)?)?;
+                    parts = parts.saturating_add(1);
+                }
+            }
+            if let Some(seconds) = t.seconds() {
+                total = total.checked_add(seconds)?;
+                parts = parts.saturating_add(1);
+            }
+            if parts == before {
+                return None;
+            }
+        }
+        (parts > 0 && t.done()).then_some(Self(if negative {
+            total.checked_neg()?
+        } else {
+            total
+        }))
+    }
+}
+
+impl std::fmt::Display for Duration {
+    /// The canonical form: `[-]P[nD][T[nH][nM][n[.ffffff]S]]`, `PT0S` for zero.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let all = self.0.unsigned_abs();
+        let split = |n: u64, unit: i64| {
+            let unit = unit.unsigned_abs();
+            (
+                n.checked_div(unit).unwrap_or_default(),
+                n.checked_rem(unit).unwrap_or_default(),
+            )
+        };
+        let (days, rest) = split(all, MICROS_PER_DAY);
+        let (hours, rest) = split(rest, 60 * MICROS_PER_MINUTE);
+        let (minutes, rest) = split(rest, MICROS_PER_MINUTE);
+        let (seconds, micros) = split(rest, MICROS_PER_SECOND);
+        if self.0 < 0 {
+            f.write_str("-")?;
+        }
+        f.write_str("P")?;
+        if days > 0 {
+            write!(f, "{days}D")?;
+        }
+        if all == 0 || hours > 0 || minutes > 0 || seconds > 0 || micros > 0 {
+            f.write_str("T")?;
+        }
+        if hours > 0 {
+            write!(f, "{hours}H")?;
+        }
+        if minutes > 0 {
+            write!(f, "{minutes}M")?;
+        }
+        if micros > 0 {
+            let fraction = format!("{micros:06}");
+            write!(f, "{seconds}.{}S", fraction.trim_end_matches('0'))
+        } else if seconds > 0 || all == 0 {
+            write!(f, "{seconds}S")
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -342,6 +441,41 @@ impl<'a> Text<'a> {
             .checked_add(second)?
             .checked_mul(MICROS_PER_SECOND)?
             .checked_add(micros)
+    }
+
+    /// `1*DIGIT unit`, the digits' value; `None` (nothing read) when no such component starts
+    /// here.
+    fn count(&mut self, unit: u8) -> Option<i64> {
+        let start = self.at;
+        let read = self.whole().filter(|_| self.eat(unit));
+        if read.is_none() {
+            self.at = start;
+        }
+        read
+    }
+
+    /// `1*DIGIT [ "." 1*DIGIT ] "S"` as microseconds; `None` (nothing read) when no such
+    /// component starts here.
+    fn seconds(&mut self) -> Option<i64> {
+        let start = self.at;
+        let read = self.whole().and_then(|n| {
+            let micros = self.fraction()?;
+            self.eat(b'S')
+                .then(|| n.checked_mul(MICROS_PER_SECOND)?.checked_add(micros))?
+        });
+        if read.is_none() {
+            self.at = start;
+        }
+        read
+    }
+
+    /// `1*DIGIT` as a number; `None` when no digit is here or the value is past `i64`.
+    fn whole(&mut self) -> Option<i64> {
+        let mut n = self.digit()?;
+        while let Some(d) = self.digit() {
+            n = n.checked_mul(10)?.checked_add(d)?;
+        }
+        Some(n)
     }
 
     /// `.ddd…` as microseconds; digits past the sixth are read and dropped.
