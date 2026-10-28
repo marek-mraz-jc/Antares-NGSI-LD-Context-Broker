@@ -123,7 +123,7 @@ progress). A memory-store broker answers:
 | `policy` | The policy engine this binary was started with (`ANTARES_POLICY`, `allow-all` unless a deployment registered another) and the deadline one decision gets (`ANTARES_POLICY_TIMEOUT_MS`). An engine that overruns it is a refusal, not a delay. In a `views` build, `documents` lists the engine's rule documents by tenant and revision, `loaded` or `refused` ([Policy rule documents](#policy-rule-documents)); `null` when the engine reads none. |
 | `surfaces` | The mounted admin surfaces by name, each with its prefix and route count. |
 | `limits` | The bounds wall: every `max*` cap in force, the page defaults (`defaultLimit`, `temporalDefaultInstances`: what a request naming no `limit` or `lastN` gets) and the `rejected*` counters of requests refused by it, plus the notification-pipeline ceilings (`changeQueue`, `deliveryLane`, `deliveryWidth`, `deliveryWidthPerTenant`, `maxTrackedDestinations`). No request is rejected against those five — they are published because reaching one is what a dropped change or a stalled fan-out looks like from outside. Each subscription is delivered on a lane of its own, `deliveryLane` groups deep: a slow or dead endpoint fills its own lane, which drops for that subscription alone (counted in `antares_notification_lane_dropped_total`, logged with tenant and subscription), and never holds the matching of other subscriptions' changes. |
-| `memory` | jemalloc live (`allocatedBytes`) and resident (`residentBytes`) bytes. |
+| `memory` | jemalloc live (`allocatedBytes`) and resident (`residentBytes`) bytes; `answerPool` the bytes buffered in-process answers hold (`heldBytes`) of the pool `ANTARES_MEMORY_BUDGET` gives them (`capBytes`); `contextCaches` the `hits` and `misses` of the merged and fetched @context caches since start. |
 | `commitQueueDepth`, `commitQueuePeak` | Present only for a store with a single committer to queue behind (`file`, and the browser build over OPFS): writers queued now and at peak. |
 | `bus` | `ANTARES_BUS=nats` only: `{mode, connected, reconnects}`. |
 
@@ -146,6 +146,8 @@ Prometheus text with the `antares_` prefix:
 | `antares_limit_rejections_total` | Bounds-wall rejections, by limit. |
 | `antares_commit_queue_depth` | `file` store: writers queued behind the redb committer. |
 | `antares_memory_allocated_bytes`, `antares_memory_resident_bytes` | jemalloc live and resident bytes. |
+| `antares_context_cache_lookups_total{cache, result}` | @context cache lookups: `cache` is `merged` or `fetched`, `result` is `hit` or `miss`. |
+| `antares_answer_pool_held_bytes` | Bytes buffered in-process answers hold of the memory budget's pool. |
 | `antares_uptime_seconds` | Seconds since process start. |
 | `antares_draining` | 1 while this instance drains. |
 | `antares_temporal_drain_errors_total` | Failed post-response history writes. |
@@ -155,6 +157,7 @@ Prometheus text with the `antares_` prefix:
 | `antares_claim_check_unresolved_total` | Changes too big for the bus whose kept outbox row was already reaped: the before-image is gone and the change notifies nobody. Non-zero means a matcher lagged past the retention window. |
 | `antares_retention_deleted_total` | Entities (`kind="entity"`) and attribute instances (`kind="history"`) the [retention](#retention) sweep deleted, by `tenant` and `type`. |
 | `antares_views_doc_reads_total` | Reads of one stored view, schema, retention, quality, policy or grant document by its id, by `by`: `reload` (a body whose digest moved since the last reload), `admin` (a GET on `/q/views/{id}`, `/q/schemas`, `/q/retention`, `/q/quality` or `/q/policy`, or a PUT on `/q/policy`) or `grant` (the export grant a delivery checks). An unchanged view table keeps `reload` flat. |
+| `antares_view_builds_total` | Narrowed view handles a surface built (T-5896): one per view on its first request, again after `ANTARES_VIEW_IDLE` without one or after the view changed. Concurrent first requests share one build. A view served steadily keeps this flat. |
 | `antares_notification_task_panics_total` | Delivery tasks that panicked (a bug, never expected). |
 | `antares_change_lag_seconds` | Age of the change a notifier is handling. |
 | `antares_policy_failures_total` | Decisions the policy seam had to make itself because the engine did not, by reason (`panic`, `timeout`). Always zero under the built-in `allow-all` engine. |

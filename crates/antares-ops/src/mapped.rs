@@ -180,7 +180,7 @@ async fn answer(
     }
     // HEAD, 204: no body to rebuild
     let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return Ok(Response::from_parts(parts, Body::from(bytes)));
+        return Ok(Response::from_parts(parts, Body::from(bytes.into_bytes())));
     };
     if !rebuild(&mut json) {
         // a value the view cannot translate is not served

@@ -526,6 +526,37 @@ async fn a_pooled_session_starts_no_parallel_workers() {
     );
 }
 
+/// T-5904: a pooled session compiles no JIT. A `q` page's expiry subplans
+/// (`LIVE_ENTITY`) cost it ~5e8, past every JIT threshold: 4.4 s of LLVM
+/// compile for a 1 ms page, which `statement_timeout` cannot interrupt. The
+/// threshold is forced to 0 here, so the plan would carry a JIT block on any
+/// seed size if the session allowed one.
+#[tokio::test]
+async fn a_pooled_session_compiles_no_jit() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    seed_rls(&pool).await;
+    let jit: String = sqlx::query_scalar("SHOW jit")
+        .fetch_one(&pool)
+        .await
+        .expect("show");
+    assert_eq!(jit, "off");
+    let mut tx = pool.begin().await.expect("tx");
+    sqlx::query("SET LOCAL jit_above_cost = 0")
+        .execute(&mut *tx)
+        .await
+        .expect("threshold");
+    let w = format!("tenant_id = '{RLS_A}' AND (expires_at IS NULL OR expires_at > now())");
+    let q = r#"entity @? '$."https://x/speed"[*]."value" ? (@ == 42)'::jsonpath"#;
+    let page = type_page(&format!("{w} AND {q}"), &[&["https://x/T1"]], 21);
+    let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXPLAIN {page}")))
+        .fetch_all(&mut *tx)
+        .await
+        .expect("explain");
+    let plan = rows.join("\n");
+    assert!(!plan.contains("JIT"), "a page compiles JIT:\n{plan}");
+}
+
 /// T-4907: a deep page skips its OFFSET over ids read from the type index
 /// and fetches only the page's documents by primary key; a keyset page
 /// (the cursor behind rel=next) seeks the type index past its last id.
