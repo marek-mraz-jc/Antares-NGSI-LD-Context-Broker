@@ -95,6 +95,8 @@ impl Surface for OData {
     }
 
     fn router(&self, ops: Ops) -> Router {
+        // T-5912: every NGSI-LD write of a Tenant with a schema keeps to it.
+        ops.check_writes(linkml_model::check::entity_text);
         let handler = any(move |req: Request| {
             let ops = ops.clone();
             async move { serve(&ops, req).await }

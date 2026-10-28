@@ -122,6 +122,7 @@ module's header comment.
 | `state.rs` | `AppState`: store, bus flag, mirror, HTTP clients, delivery policy, sinks, surfaces, hooks, the forward transport, and the endpoint view a state is narrowed to (feature `views`), and the task-local @context a surface calls in (`call_in_context`) |
 | `fuzzing.rs` | the request parsers the `fuzz/` targets drive, behind the `fuzzing` feature that no broker build enables (T-3463) |
 | `views.rs` | feature `views` (ADR-0023, ADR-0027 section 5): `CompiledView` and the composition `gate!` applies after the engine answers, effective = view ∧ engine, neither side widening, rule pairs keeping both id narrowings (G2); `WriteGuard`, rule 7 checked inside the store's read-modify-write; the `ViewTable` a pod serves from (views and each Tenant's schema bytes with their revision) and the `Kind::View` documents under `antares-views`; never in a vanilla build |
+| `schema_writes.rs` | feature `views` (T-5912): the hook every NGSI-LD write route asks after its policy gate whether the expanded Entity or fragment keeps to its Tenant's `LinkML` schema; the check is a fn a schema-reading surface registers (`Ops::check_writes`, `linkml_model::check`), so a vanilla build links no protocol crate; `ANTARES_SCHEMA_WRITES` `enforce`/`report`/`off` |
 Geoquery evaluation, the `q=` evaluator and the caches of compiled client
 query text are not in that table because they are not this crate's: they are
 `antares_ql::geo`, `::eval` and `::regex`, named by those paths at every call
