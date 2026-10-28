@@ -400,7 +400,7 @@ async fn whole(
         all.extend(batch.into_iter().flatten());
         offset = offset.saturating_add(BATCH);
         let scanned = usize::try_from(offset).unwrap_or(usize::MAX);
-        if (all.len() > RESIDUAL_SCAN) | (more & (scanned >= WHOLE_ENTITIES)) {
+        if all.len() > RESIDUAL_SCAN || (more && scanned >= WHOLE_ENTITIES) {
             return Err(ODataErrorResponse::new(
                 StatusCode::BAD_REQUEST,
                 "TooManyResults",
