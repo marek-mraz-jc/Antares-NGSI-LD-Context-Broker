@@ -1515,3 +1515,52 @@ async fn a_read_prohibition_naming_an_attribute_drops_it_and_its_filters() -> Re
     assert_eq!(code, StatusCode::FORBIDDEN);
     Ok(())
 }
+
+/// S-49 (platform T-5955): a read-only connector's write forged past the gateway's tools reaches
+/// the broker as the admin with `x-jc-read-only`; each is refused 403 and nothing changes,
+/// while a read goes on.
+#[tokio::test]
+async fn a_read_only_caller_writes_nothing_whatever_it_is_granted() -> Res {
+    let (st, _) = broker(doc(&[])).await?;
+    let id = "urn:ngsi-ld:Car:ro";
+    seed(
+        &st,
+        &[json!({"id": id, "type": "Car", "speed": prop(json!(1))})],
+    )
+    .await?;
+    let read_only = [ADMIN[0], ADMIN[1], ("x-jc-read-only", "true")];
+    let attrs = json!({"speed": prop(json!(9))});
+    let at = format!("/ngsi-ld/v1/entities/{id}");
+    let attrs_at = format!("{at}/attrs");
+    let writes = [
+        (
+            "POST",
+            "/ngsi-ld/v1/entities",
+            json!({"id": "urn:ngsi-ld:Car:new", "type": "Car"}),
+        ),
+        ("PATCH", attrs_at.as_str(), attrs.clone()),
+        ("POST", attrs_at.as_str(), attrs),
+        ("DELETE", at.as_str(), Value::Null),
+    ];
+    for (method, uri, body) in &writes {
+        let body = (!body.is_null()).then_some(body);
+        let (code, problem) = send(&st, method, uri, &read_only, body).await?;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{method} {uri}: {problem}");
+    }
+    let (code, car) = send(&st, "GET", &at, &read_only, None).await?;
+    assert_eq!(code, StatusCode::OK, "{car}");
+    assert_eq!(car.pointer("/speed/value"), Some(&json!(1)), "{car}");
+    let (code, _) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities/urn:ngsi-ld:Car:new",
+        &ADMIN,
+        None,
+    )
+    .await?;
+    assert_eq!(code, StatusCode::NOT_FOUND);
+    // the same write without the marker passes, so the refusal above is the marker's
+    let (code, body) = send(&st, "DELETE", &at, &ADMIN, None).await?;
+    assert_eq!(code, StatusCode::NO_CONTENT, "{body}");
+    Ok(())
+}

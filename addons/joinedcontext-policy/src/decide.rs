@@ -34,6 +34,13 @@ pub const PROHIBITED: &str = "a policy prohibits this operation";
 /// Why a read under a policy granting every type with a condition is
 /// refused when it names no type: a rule needs a type.
 pub const NAME_THE_TYPES: &str = "name the Entity types to read";
+/// Why a read-only caller's operation other than a read is refused (README section 1).
+pub const READ_ONLY: &str = "a read-only caller reads and never writes";
+/// What a read-only caller may do besides [`FILTERABLE`] and [`NAME_READS`]: retrieve one
+/// Subscription, Registration or Registration Subscription by id. Every other clause is
+/// refused, so a clause added later is a write until listed here.
+const READ_ONLY_RETRIEVES: [&str; 3] = ["5.8.3", "5.10.1", "5.11.4"];
+
 /// Why a call from inside the cluster is refused (README section 1).
 pub const INTERNAL_ONLY: &str =
     "a request without a subject reaches the Context Source operations only";
@@ -59,6 +66,9 @@ pub fn decide(
         }
         Caller::Platform(p) => p,
     };
+    if platform.read_only && !reads(op.clause) {
+        return Decision::Deny(READ_ONLY.into());
+    }
     let Some(table) = table else {
         return Decision::Deny(NOT_GRANTED.into());
     };
@@ -125,6 +135,13 @@ pub fn decide(
     }
 }
 
+/// Whether `clause` only reads: what a read-only caller may ask.
+fn reads(clause: &str) -> bool {
+    FILTERABLE.contains(&clause)
+        || NAME_READS.contains(&clause)
+        || READ_ONLY_RETRIEVES.contains(&clause)
+}
+
 /// Whether some request of `op.clause` could be allowed for `caller`: the
 /// probe a surface lists its tools by (T-3784), where `op` names nothing.
 /// A read is decided per type the request names, and a prohibition refuses
@@ -145,7 +162,8 @@ pub fn probe(
     let (Caller::Platform(platform), Some(table)) = (caller, table) else {
         return decide(table, caller, op, now);
     };
-    if WHOLE_TENANT.contains(&op.clause) {
+    // a read-only caller is offered no write (S-49): decided as a request, which refuses it
+    if WHOLE_TENANT.contains(&op.clause) || (platform.read_only && !reads(op.clause)) {
         return decide(Some(table), caller, op, now);
     }
     let applying: Vec<&Policy> = held(table, platform, now)
@@ -679,6 +697,61 @@ mod tests {
 
     /// T-3729: a prohibition naming no type covers a typed operation, and
     /// one naming types covers an operation that names none.
+    /// Every clause the operation layer gates (`gate!` in antares-api and antares-ops).
+    const CLAUSES: [&str; 62] = [
+        "5.6.1", "5.6.2", "5.6.3", "5.6.4", "5.6.5", "5.6.6", "5.6.7", "5.6.8", "5.6.9", "5.6.10",
+        "5.6.11", "5.6.12", "5.6.13", "5.6.14", "5.6.15", "5.6.16", "5.6.17", "5.6.18", "5.6.19",
+        "5.6.20", "5.6.21", "5.7.1", "5.7.2", "5.7.3", "5.7.4", "5.7.5", "5.7.6", "5.7.7", "5.7.8",
+        "5.7.9", "5.7.10", "5.8.1", "5.8.2", "5.8.3", "5.8.4", "5.8.5", "5.9.2", "5.9.3", "5.9.4",
+        "5.10.1", "5.10.2", "5.11.2", "5.11.3", "5.11.4", "5.11.5", "5.11.6", "5.13.2", "5.13.3",
+        "5.13.4", "5.13.5", "5.14.1", "5.14.2", "5.14.3", "5.14.4", "5.14.5", "5.15.1", "5.16.1",
+        "5.16.2", "5.16.3", "5.16.4", "5.16.5", "5.16.7",
+    ];
+
+    /// S-49 (T-5955): a read-only caller granted every clause is refused each one that is no
+    /// read, by the request and by the tool probe, and decided on each read as before.
+    #[test]
+    fn a_read_only_caller_is_refused_every_write_whatever_it_is_granted() -> Result<(), String> {
+        let t = compile(&json!({ "policies": [{"id": "all",
+            "assignee": {"kind": "role", "id": "r"}, "operations": CLAUSES.to_vec()}] }))?;
+        let full = caller();
+        let read_only = Caller::Platform(Platform {
+            roles: ["r".to_owned()].into(),
+            read_only: true,
+            ..Platform::default()
+        });
+        let types = car();
+        let mut refused = Vec::new();
+        for clause in CLAUSES {
+            let op = Operation {
+                types: &types,
+                ..Operation::new(clause)
+            };
+            let asked = decide(Some(&t), &read_only, &op, Utc::now());
+            let offered = probe(Some(&t), &read_only, &op, Utc::now());
+            if asked == Decision::Deny(READ_ONLY.into()) {
+                assert_eq!(offered, asked, "{clause}");
+                refused.push(clause);
+            } else {
+                assert_eq!(asked, decide(Some(&t), &full, &op, Utc::now()), "{clause}");
+            }
+        }
+        let read: Vec<&str> = CLAUSES.into_iter().filter(|c| reads(c)).collect();
+        assert_eq!(
+            refused.len(),
+            CLAUSES.len().saturating_sub(read.len()),
+            "{refused:?}"
+        );
+        assert!(refused.iter().all(|c| !reads(c)), "{refused:?}");
+        // a read-only caller with no rule document is refused a write for being read-only
+        let op = Operation::new("5.6.1");
+        assert_eq!(
+            decide(None, &read_only, &op, Utc::now()),
+            Decision::Deny(READ_ONLY.into())
+        );
+        Ok(())
+    }
+
     #[test]
     fn a_prohibition_covers_what_its_types_do_not_tell_apart() -> Result<(), String> {
         let prohibited = Decision::Deny(PROHIBITED.into());
