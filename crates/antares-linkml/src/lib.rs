@@ -71,6 +71,8 @@ impl Surface for Linkml {
     }
 
     fn router(&self, ops: Ops) -> Router {
+        // T-5912: every NGSI-LD write of a Tenant with a schema keeps to it.
+        ops.check_writes(linkml_model::check::entity_text);
         let cache = Arc::new(render::Cache::default());
         let serve =
             move |Path((id, rest)): Path<(String, String)>, caller: Caller, req: Request| {

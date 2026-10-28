@@ -546,6 +546,8 @@ pub struct ViewTable {
     more_admin: std::sync::Mutex<Vec<axum::Router>>,
     policy: std::sync::RwLock<serde_json::Value>,
     schemas: std::sync::RwLock<Arc<BTreeMap<String, Schema>>>,
+    /// What every write is held to against its Tenant's schema (T-5912).
+    pub schema_writes: crate::schema_writes::Hook,
 }
 
 /// The id prefix a Tenant's schema document is stored under, beside the

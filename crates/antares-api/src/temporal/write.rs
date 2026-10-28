@@ -82,6 +82,8 @@ pub async fn upsert_temporal(
             body: Some(&expanded),
         )
         .await?;
+        #[cfg(feature = "views")]
+        crate::schema_writes::admits_typed(&st, &tenant, &expanded, false)?;
         // the create rule on a comma id (F-ANT2-013) holds for a new Entity,
         // judged after the gate so a refused caller learns nothing stored;
         // a stored legacy one is still upserted
@@ -339,6 +341,8 @@ pub async fn add_temporal_attrs(
                 ..Default::default()
             },
         )?;
+        #[cfg(feature = "views")]
+        crate::schema_writes::admits(&st, &tenant, &id, &expanded, &pre.types).await?;
         // 5.6.12.4: forwarding — proxy modes without appendAttrsTemporal
         // are Conflict; supporting registrations receive the fragment and
         // the matching attributes are stripped from the local half.
@@ -727,6 +731,15 @@ pub async fn modify_temporal_instance(
         ))?;
         let attr_iri = antares_jsonld::expand_attr_name(&attr, &parsed.ctx)?;
         let frag_inst = instance_fragment(obj, &attr, &attr_iri, &parsed.ctx)?;
+        #[cfg(feature = "views")]
+        crate::schema_writes::admits(
+            &st,
+            &tenant,
+            &id,
+            &serde_json::json!({ attr_iri.clone(): [frag_inst.clone()] }),
+            &pre.types,
+        )
+        .await?;
         let regs =
             match temporal_write_regs(&st, &tenant, &headers, &parsed.ctx, &params, &id).await {
                 Ok(regs) => regs,

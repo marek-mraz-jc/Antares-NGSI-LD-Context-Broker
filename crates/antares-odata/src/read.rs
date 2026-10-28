@@ -1259,6 +1259,9 @@ pub(crate) async fn run_request(
             _ => Err(not_found(version)),
         };
     }
+    if answer.status() == StatusCode::BAD_REQUEST {
+        return Err(model_refusal(reads, answer, version).await);
+    }
     if !answer.status().is_success() {
         return Err(refused(answer.status(), version));
     }
@@ -1972,6 +1975,30 @@ fn max_page(headers: &HeaderMap, max_len: usize) -> u64 {
 }
 
 pub(crate) use antares_ops::percent::encode;
+
+/// A 400 of the operation: the data model's refusal (T-5912) passed on as
+/// it is, since it names the attribute and the rule and never the value or
+/// anything the view hides; any other 400 as [`refused`].
+async fn model_refusal(
+    reads: &Reads,
+    answer: Response,
+    version: ODataVersion,
+) -> ODataErrorResponse {
+    let body = reads.view.read_answer(answer.into_body(), "odata").await;
+    let detail = body
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|p| {
+            let d = p.get("detail")?.as_str()?;
+            d.contains(linkml_model::check::MARK).then(|| d.to_owned())
+        });
+    match detail {
+        Some(d) => {
+            ODataErrorResponse::new(StatusCode::BAD_REQUEST, "BadRequest", &d).with_version(version)
+        }
+        None => refused(StatusCode::BAD_REQUEST, version),
+    }
+}
 
 /// A refused or failed operation as an OData error with the same status.
 /// The text is fixed: no detail of the broker's reaches the caller.
