@@ -215,9 +215,13 @@ fn options(max_connections: u32, statement_timeout: std::time::Duration) -> PgPo
     // condition) got a Gather of two workers, two processes started per
     // statement. On the distinct-1000 rig (2 PostgreSQL cores, 1 000 req/s)
     // that took a `q` page from 2.5 ms to 106 ms (T-5136).
+    // No JIT: a `q` page over `LIVE_ENTITY` is costed at ~5e8 by its expiry
+    // subplans, far past `jit_above_cost`, so PostgreSQL compiled ~900 LLVM
+    // functions (4.4 s) for a page that runs in 1 ms, and a compile never
+    // checks for interrupts, so `statement_timeout` could not end it (T-5904).
     let session = format!(
         "SET statement_timeout = '{}ms'; SET lock_timeout = '5s'; \
-         SET max_parallel_workers_per_gather = 0",
+         SET max_parallel_workers_per_gather = 0; SET jit = off",
         statement_timeout.as_millis()
     );
     PgPoolOptions::new()
