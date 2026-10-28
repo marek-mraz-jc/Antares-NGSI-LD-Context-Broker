@@ -194,6 +194,8 @@ async fn write_attrs(
         body: Some(&fragment),
     )
     .await?;
+    #[cfg(feature = "views")]
+    crate::schema_writes::admits(st, &tenant, id, &fragment, &pre.types).await?;
     let cond = Condition::of(&granted);
     #[cfg(feature = "views")]
     let guard =
@@ -952,6 +954,15 @@ async fn partial_update_inner(
         body: Some(&frag_inst),
     )
     .await?;
+    #[cfg(feature = "views")]
+    crate::schema_writes::admits(
+        st,
+        &tenant,
+        id,
+        &serde_json::json!({ attr_iri.clone(): [frag_inst.clone()] }),
+        &pre.types,
+    )
+    .await?;
     let cond = Condition::of(&granted);
     #[cfg(feature = "views")]
     let guard = crate::views::WriteGuard::of(st, [attr_iri.as_str()]).map(|g| g.matching(headers));
@@ -1158,6 +1169,8 @@ pub async fn replace_attr(
             body: Some(&fragment),
         )
         .await?;
+        #[cfg(feature = "views")]
+        crate::schema_writes::admits(&st, &tenant, &id, &fragment, &pre.types).await?;
         let cond = Condition::of(&granted);
         #[cfg(feature = "views")]
         let guard =
@@ -1355,6 +1368,10 @@ async fn set_attr_value_inner(
         body: judged.as_ref(),
     )
     .await?;
+    #[cfg(feature = "views")]
+    if let Some(j) = &judged {
+        crate::schema_writes::admits(st, &tenant, id, j, &pre.types).await?;
+    }
     let cond = Condition::of(&granted);
     #[cfg(feature = "views")]
     let guard = crate::views::WriteGuard::of(st, [attr_iri.as_str()]).map(|g| g.matching(headers));

@@ -113,6 +113,8 @@ pub(crate) mod types_attrs;
 // never in a vanilla build.
 mod ops;
 mod router;
+#[cfg(feature = "views")]
+pub mod schema_writes;
 #[cfg(test)]
 mod tests;
 #[cfg(feature = "views")]
