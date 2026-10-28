@@ -348,7 +348,7 @@ fn properties(entity: &Value) -> Value {
 
 /// One member's value as the OGC Features `properties` carry it: the value, object or list, and
 /// a language map, JSON or vocabulary wrapped in its member name; never the whole Attribute with
-/// its system members (T-5913: a LanguageProperty and a ListProperty kept `createdAt`).
+/// its system members (T-5913: a `LanguageProperty` and a `ListProperty` kept `createdAt`).
 fn flat(member: &Value) -> Value {
     ["value", "object", "valueList", "objectList"]
         .into_iter()
