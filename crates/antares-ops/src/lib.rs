@@ -1234,6 +1234,13 @@ impl Ops {
     pub fn add_admin(&self, routes: Router) {
         self.state.views.add_admin(routes);
     }
+
+    /// Hold every NGSI-LD write of a Tenant with a schema to `check`
+    /// (T-5912, [`antares_api::schema_writes`]): a surface that reads
+    /// schemas registers it; the first registration holds.
+    pub fn check_writes(&self, check: antares_api::schema_writes::SchemaCheck) {
+        self.state.views.schema_writes.set(check);
+    }
 }
 
 /// A surface as the broker mounts it: closed, every route 404, while no

@@ -324,6 +324,18 @@ impl BatchRun<'_> {
             } else {
                 (prep_write(&item, &ctx, self.opts.mode), &mut prepped)
             };
+            // T-5912: each member against the Tenant's schema, refused alone
+            // as any other invalid member (5.6.7.4: the rest are applied).
+            #[cfg(feature = "views")]
+            let prep = prep.and_then(|(id, doc)| {
+                let whole = match self.opts.mode {
+                    BatchMode::Create => true,
+                    BatchMode::Upsert => !self.opts.update,
+                    BatchMode::Update | BatchMode::Merge => false,
+                };
+                crate::schema_writes::admits_typed(self.st, &self.tenant, &doc, whole)?;
+                Ok((id, doc))
+            });
             match prep {
                 Ok(pair) => into.push(pair),
                 Err(e) => self.out.errors.push(err_entry(id_hint.as_deref(), &e)),

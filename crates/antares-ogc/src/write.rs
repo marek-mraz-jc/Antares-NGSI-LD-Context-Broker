@@ -140,10 +140,17 @@ pub(crate) async fn run(
             Problem(status, "the view refused the write")
         }
     };
-    let status = match view.run(op, caller, req).await {
-        Ok(answer) => answer.status(),
-        Err(refusal) => refusal.status(),
+    let answer = match view.run(op, caller, req).await {
+        Ok(answer) => answer,
+        Err(refusal) => return Err(refused(refusal.status())),
     };
+    let status = answer.status();
+    if status == StatusCode::BAD_REQUEST {
+        return match model_refusal(view, answer).await {
+            Some(d) => Ok(crate::problem(status, &d)),
+            None => Err(refused(status)),
+        };
+    }
     if !status.is_success() {
         return Err(refused(status));
     }
@@ -160,6 +167,19 @@ pub(crate) async fn run(
 
 /// The body of a write: its media type checked (415), its size bounded (413), its JSON read
 /// (400). A merge takes `application/merge-patch+json` (W5), the others `GeoJSON` or JSON.
+/// The data model's refusal in a 400 (T-5912): it names the attribute and
+/// the rule, never the value or anything the view hides, so it is passed
+/// on as it is and a client fixes the same field whatever surface it wrote
+/// with. `None` for any other 400, whose detail stays the broker's.
+async fn model_refusal(view: &ViewOps, answer: Response) -> Option<String> {
+    let body = view.read_answer(answer.into_body()).await.ok()?;
+    let problem = serde_json::from_slice::<Value>(&body).ok()?;
+    let detail = problem.get("detail")?.as_str()?;
+    detail
+        .contains(linkml_model::check::MARK)
+        .then(|| detail.to_owned())
+}
+
 async fn read(headers: &HeaderMap, body: Body, merge: bool) -> Result<Value, Problem> {
     let media = headers
         .get(CONTENT_TYPE)

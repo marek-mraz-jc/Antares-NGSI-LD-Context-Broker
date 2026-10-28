@@ -22,6 +22,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cache;
+pub mod check;
 mod error;
 mod model;
 mod schema;

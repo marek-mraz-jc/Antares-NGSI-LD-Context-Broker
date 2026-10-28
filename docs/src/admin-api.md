@@ -457,6 +457,19 @@ the surface says so in `/q/health`. The document is stored beside the views
 under `antares-views` and reloaded with them; `/q/health` lists each Tenant's
 `bytes` and `revision` under `schemas`, never the document.
 
+Every NGSI-LD write to the Tenant, on its root or through a view, and so
+every OData and OGC API Features write, is held to the schema (T-5912):
+each Attribute a class of the Entity lists keeps to that slot's NGSI-LD
+kind, range (built-in type, enum, class), `multivalued` and `unece:` unit,
+and a create or replace carries every `required` slot. A batch refuses the
+breaking member alone. `ANTARES_SCHEMA_WRITES` ([configuration](configuration.md))
+picks `enforce` (400 naming the attribute and the rule, never the value),
+`report` (the default: logged, written) or `off`. The subset holds no
+`pattern`, minimum, maximum or closed class, so none is checked; an
+Attribute no class lists, an Entity of no class of the schema, a fragment
+of a history-only Entity and a batch update member without `type` pass;
+a Relationship's target type is not read.
+
 The path names the Tenant, and only one a client can name; nothing in the
 body does.
 
