@@ -206,7 +206,8 @@ SimpleIdentifier character (CSDL XML 17.2), so the name takes `_`.
 - Rows come in Entity order, then `observedAt` ascending; `$top`, `$skip`
   and `odata.maxpagesize` page them. `$count`, `/$count` and an `$orderby`
   other than `id, observedAt` read the whole answer, at most 10 000 rows
-  (`400 TooManyResults` past it: narrow by `id` or `observedAt`).
+  kept and 1 000 Entities read, so a `$filter` keeping no row still stops
+  there (`400 TooManyResults` past either: narrow by `id` or `observedAt`).
 - `$select` takes members; `$expand`, `$search`, `$apply` and `$compute` are
   `501`, an `ngsild.` option `400`, every write `405`.
 - Unlike the OGC history, a GeoProperty written without `observedAt` is in

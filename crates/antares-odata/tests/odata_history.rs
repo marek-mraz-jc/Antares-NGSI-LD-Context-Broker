@@ -596,3 +596,39 @@ async fn a_page_ends_short_past_its_reads_and_a_count_past_the_scan_is_refused()
         "{refused}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_count_whose_filter_keeps_no_row_stops_at_the_scan_bound() {
+    let app = past().await.expect("fixture");
+    let cars: Vec<Value> = (0..1000)
+        .map(|n| {
+            json!({"id": format!("urn:ngsi-ld:Car:s{n}"), "type": format!("{CITY}Car"),
+                   format!("{CITY}speed"): at(&json!(1.0), T0)})
+        })
+        .collect();
+    for chunk in cars.chunks(1000) {
+        let body = Value::from(chunk.to_vec()).to_string();
+        let (status, answer) = send(
+            &app,
+            Method::POST,
+            "/ngsi-ld/v1/entityOperations/create",
+            Some(&body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{answer}");
+    }
+    // 1 002 Entities with a history, none faster than 1000: the count reads 1 000 and refuses
+    let (status, refused) = get(&app, "Car_history/$count?$filter=speed%20gt%201000").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(
+        refused["error"]["code"],
+        json!("TooManyResults"),
+        "{refused}"
+    );
+    let (status, one) = get(
+        &app,
+        "Car_history/$count?$filter=id%20eq%20'urn:ngsi-ld:Car:7'%20and%20speed%20gt%201000",
+    )
+    .await;
+    assert_eq!((status, one), (StatusCode::OK, json!(0)));
+}

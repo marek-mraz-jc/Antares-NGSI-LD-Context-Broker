@@ -10,7 +10,8 @@
 //! `observedAt` narrow the temporal read (`timerel`, `timeAt`, `endTimeAt`), and a lower bound
 //! reads each Attribute's last instance before it (`timerel=before&lastN=1`) so the first rows
 //! in the window still hold the values valid then. Rows come in Entity then `observedAt` order;
-//! `$count` and any other `$orderby` read the whole answer, at most `RESIDUAL_SCAN` rows.
+//! `$count` and any other `$orderby` read the whole answer, at most `RESIDUAL_SCAN` rows over
+//! `WHOLE_ENTITIES` Entities.
 //! ponytail: each Entity's newest [`INSTANCES`] instances per Attribute in the window are read
 //! (the broker's own default ceiling), as the OGC history does.
 
@@ -38,6 +39,9 @@ const INSTANCES: usize = 1_000;
 /// page ends short with its next link.
 const BATCH: u64 = 4;
 const MAX_READS: usize = 25;
+/// The Entities one whole read ([`whole`]: `$count`, a sort) may walk. Each temporal read pages
+/// by offset, so a walk costs the square of its Entities: 1 000 is 250 reads, ten natural pages.
+const WHOLE_ENTITIES: usize = 1_000;
 /// The start of a read no lower bound narrows.
 const EPOCH: &str = "1970-01-01T00:00:00Z";
 
@@ -379,7 +383,9 @@ fn ordered(keys: &[(By<'_>, bool)], a: &Row, b: &Row) -> Ordering {
         .unwrap_or_else(|| a.urn.cmp(&b.urn).then(a.micros.cmp(&b.micros)))
 }
 
-/// Every row of the answer (of the one Entity `urn`), at most [`RESIDUAL_SCAN`].
+/// Every row of the answer (of the one Entity `urn`): at most [`RESIDUAL_SCAN`] rows kept and
+/// [`WHOLE_ENTITIES`] Entities read, as a residual scan is bounded (ADR-0028), so a filter that
+/// keeps no row never walks the whole type.
 async fn whole(
     reads: &Reads,
     caller: &Caller,
@@ -392,12 +398,14 @@ async fn whole(
     loop {
         let (batch, more) = batch(reads, caller, plan, urn, offset, version).await?;
         all.extend(batch.into_iter().flatten());
-        if all.len() > RESIDUAL_SCAN {
+        offset = offset.saturating_add(BATCH);
+        let scanned = usize::try_from(offset).unwrap_or(usize::MAX);
+        if (all.len() > RESIDUAL_SCAN) | (more & (scanned >= WHOLE_ENTITIES)) {
             return Err(ODataErrorResponse::new(
                 StatusCode::BAD_REQUEST,
                 "TooManyResults",
                 &format!(
-                    "the history holds more than the {RESIDUAL_SCAN} rows one count or sort may read: narrow it with $filter on id or observedAt"
+                    "the history holds more than the {RESIDUAL_SCAN} rows or {WHOLE_ENTITIES} Entities one count or sort may read: narrow it with $filter on id or observedAt"
                 ),
             )
             .with_version(version));
@@ -405,7 +413,6 @@ async fn whole(
         if !more {
             return Ok(all);
         }
-        offset = offset.saturating_add(BATCH);
     }
 }
 
