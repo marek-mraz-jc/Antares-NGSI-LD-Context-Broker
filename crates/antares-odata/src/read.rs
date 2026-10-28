@@ -142,16 +142,16 @@ pub(crate) fn only_select(options: &QueryOptions) -> bool {
 /// later round maps. `None` for what this round serves.
 pub(crate) fn later(uri: &ODataUri, schema_version: &str) -> Option<&'static str> {
     let ODataUri::Resource { options, .. } = uri else {
-        return Some("this resource is not served");
+        return Some("this resource");
     };
     let refused = [
-        (options.id.is_some(), "$id"),
+        (options.id.is_some(), "$id outside $entity"),
         (
             options
                 .schemaversion
                 .as_deref()
                 .is_some_and(|v| v != "*" && v != schema_version),
-            "$schemaversion",
+            "a $schemaversion other than the served one",
         ),
     ];
     refused
@@ -679,12 +679,13 @@ pub(crate) async fn collection(
 ) -> Result<Response, ODataErrorResponse> {
     let version = ctx.version;
     let set = set_of(reads, set_name, version)?;
-    let expansions =
-        expanded(&reads.edm, set, options, version).map_err(|()| not_implemented(version))?;
+    let expansions = expanded(&reads.edm, set, options, version)
+        .map_err(|()| not_implemented("a nested $expand, $levels or a path in $expand", version))?;
     let mut filter = filtered(set, &reads.edm.sets, options, version)?;
     filter.annotate = annotated(headers);
-    let picked = selected_of(set, options.select.as_ref(), &filter.computed)
-        .map_err(|()| not_implemented(version))?;
+    let picked = selected_of(set, options.select.as_ref(), &filter.computed).map_err(|()| {
+        not_implemented("$select of a navigation, a path or an annotation", version)
+    })?;
     let projection = ngsild(&reads.view, options, &mut filter, set, version)?;
     let picked = projected(set, picked, &projection);
     let digest = digest(&reads.state.service_root, path, options);
@@ -768,7 +769,7 @@ pub(crate) async fn count(
 ) -> Result<Response, ODataErrorResponse> {
     let set = set_of(reads, set_name, version)?;
     if options.apply.is_some() {
-        return Err(not_implemented(version));
+        return Err(not_implemented("$apply under /$count", version));
     }
     let mut filter = filtered(set, &reads.edm.sets, options, version)?;
     ngsild(&reads.view, options, &mut filter, set, version)?;
@@ -821,7 +822,10 @@ pub(crate) async fn entity(
     let version = ctx.version;
     let set = set_of(reads, set_name, version)?;
     if options.filter.is_some() || options.search.is_some() || options.apply.is_some() {
-        return Err(not_implemented(version));
+        return Err(not_implemented(
+            "$filter, $search or $apply on one Entity",
+            version,
+        ));
     }
     // `$compute` alone: its values over the one Entity
     let computing = Translated {
@@ -832,10 +836,11 @@ pub(crate) async fn entity(
         Some(items) => computed_over(set, items, options, computing, version)?,
         None => computing,
     };
-    let picked = selected_of(set, options.select.as_ref(), &computing.computed)
-        .map_err(|()| not_implemented(version))?;
-    let expansions =
-        expanded(&reads.edm, set, options, version).map_err(|()| not_implemented(version))?;
+    let picked = selected_of(set, options.select.as_ref(), &computing.computed).map_err(|()| {
+        not_implemented("$select of a navigation, a path or an annotation", version)
+    })?;
+    let expansions = expanded(&reads.edm, set, options, version)
+        .map_err(|()| not_implemented("a nested $expand, $levels or a path in $expand", version))?;
     let id = admitted(reads, caller, set, key, options, version).await?;
     let target = format!(
         "/ngsi-ld/v1/entities/{}?{}",
@@ -905,12 +910,13 @@ fn filtered(
         || Ok(Translated::default()),
         |f| translate(f, set, sets, &options.aliases, lang),
     );
-    let translated = translated.map_err(|refused| refusal(refused, version))?;
+    let translated = translated.map_err(|refused| refusal(refused, "$filter", version))?;
     let translated = computed_over(set, items, options, translated, version)?;
     match &options.orderby {
         Some(keys) => {
             let mut t = translated;
-            order(keys, set, sets, &mut t).map_err(|refused| refusal(refused, version))?;
+            order(keys, set, sets, &mut t)
+                .map_err(|refused| refusal(refused, "$orderby", version))?;
             // each item pushed one key, in order
             t.held_keys = keys
                 .iter()
@@ -943,7 +949,7 @@ fn computed_over(
 ) -> Result<Translated, ODataErrorResponse> {
     compute(items, set, &options.aliases, &mut t, now())
         .map(|()| t)
-        .map_err(|refused| refusal(refused, version))
+        .map_err(|refused| refusal(refused, "$compute", version))
 }
 
 /// The name under which [`attach`] keeps an Entity's computed values: no
@@ -962,7 +968,8 @@ pub(crate) fn attach(
     if filter.computed.is_empty() {
         return Ok(());
     }
-    let programs = computed(filter, now()).map_err(|refused| refusal(refused, version))?;
+    let programs =
+        computed(filter, now()).map_err(|refused| refusal(refused, "$compute", version))?;
     for doc in docs {
         if doc.get(COMPUTED).is_some() {
             continue;
@@ -971,7 +978,7 @@ pub(crate) fn attach(
         for (name, program) in &programs {
             let value = program
                 .value(doc)
-                .map_err(|_| refusal(Refused::TooComplex, version))?;
+                .map_err(|_| refusal(Refused::TooComplex, "$compute", version))?;
             values.insert(name.clone(), value.unwrap_or(Value::Null));
         }
         // an Entity is a JSON object: the broker answers no other document
@@ -983,9 +990,10 @@ pub(crate) fn attach(
 }
 
 /// The OData error of a filter the surface does not take.
-pub(crate) fn refusal(refused: Refused, version: ODataVersion) -> ODataErrorResponse {
+/// `option` names the query option the refused construct sits in.
+pub(crate) fn refusal(refused: Refused, option: &str, version: ODataVersion) -> ODataErrorResponse {
     match refused {
-        Refused::Later => not_implemented(version),
+        Refused::Later => not_implemented(&format!("this {option} expression"), version),
         Refused::Bad => ODataErrorResponse::new(
             StatusCode::BAD_REQUEST,
             "BadRequest",
@@ -1816,7 +1824,7 @@ fn residual_of(
     filter: &Translated,
     version: ODataVersion,
 ) -> Result<Option<Program>, ODataErrorResponse> {
-    program(filter, now()).map_err(|refused| refusal(refused, version))
+    program(filter, now()).map_err(|refused| refusal(refused, "$filter", version))
 }
 
 /// The wall clock; one before 1970 reads as 1970, one past 9999 as the last instant.
@@ -2015,13 +2023,10 @@ pub(crate) fn not_found(version: ODataVersion) -> ODataErrorResponse {
         .with_version(version)
 }
 
-pub(crate) fn not_implemented(version: ODataVersion) -> ODataErrorResponse {
-    ODataErrorResponse::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "NotImplemented",
-        "this request is not supported",
-    )
-    .with_version(version)
+/// `501` naming the `construct` and why (`odata_axum::not_implemented`); a
+/// fixed name, never a request value (surfaces-threat-model O19).
+pub(crate) fn not_implemented(construct: &str, version: ODataVersion) -> ODataErrorResponse {
+    odata_axum::not_implemented(construct).with_version(version)
 }
 
 /// A write this surface does not serve: `405` where the method has no
@@ -2041,10 +2046,18 @@ pub(crate) fn written(method: &Method, uri: &ODataUri, version: ODataVersion) ->
         _ => false,
     };
     if read_only {
-        odata_axum::read_only(version)
-    } else {
-        not_implemented(version).into_response()
+        return odata_axum::read_only(version);
     }
+    let construct = match uri {
+        ODataUri::Resource { path, .. } => match path.as_slice() {
+            [Segment::EntitySet(_)] => "a write to a whole entity set (delta update)",
+            [.., Segment::Value] => "a write to /$value",
+            [.., Segment::Property(_)] => "a write appending to a collection property",
+            _ => "a write to this resource path",
+        },
+        _ => "a write to this resource path",
+    };
+    not_implemented(construct, version).into_response()
 }
 
 #[cfg(test)]

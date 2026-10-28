@@ -866,6 +866,51 @@ fn capabilities(
         restriction("DeepInsertSupport", vec![("Supported", flag(false))]),
         restriction("DeepUpdateSupport", vec![("Supported", flag(false))]),
     ]
+    .into_iter()
+    .chain(paging(members))
+    .collect()
+}
+
+/// A key, `$top` and `$skip` on the set; below one Entity, inside
+/// `$expand(...)` too, only `$select` applies (Q31 to Q33, ADR-0024
+/// decision 5): the rest of a navigation's options are 501.
+fn paging(members: &BTreeMap<String, Member>) -> [Annotation; 4] {
+    let restricted = members
+        .iter()
+        .filter(|(_, m)| matches!(m.shape, Shape::Nav { .. }))
+        .map(|(name, _)| nested_only_select(name))
+        .collect();
+    [
+        Annotation::new(
+            "Capabilities.NavigationRestrictions",
+            Expr::Record(vec![(
+                "RestrictedProperties".into(),
+                Expr::Collection(restricted),
+            )]),
+        ),
+        Annotation::new("Capabilities.IndexableByKey", Expr::Bool(true)),
+        Annotation::new("Capabilities.TopSupported", Expr::Bool(true)),
+        Annotation::new("Capabilities.SkipSupported", Expr::Bool(true)),
+    ]
+}
+
+/// One `NavigationRestrictions` row: the navigation `name` takes `$select`
+/// and no other option.
+fn nested_only_select(name: &str) -> Expr {
+    let off = |member: &str| Expr::Record(vec![(member.into(), Expr::Bool(false))]);
+    Expr::Record(vec![
+        (
+            "NavigationProperty".into(),
+            Expr::NavigationPropertyPath(name.into()),
+        ),
+        ("FilterRestrictions".into(), off("Filterable")),
+        ("SearchRestrictions".into(), off("Searchable")),
+        ("SortRestrictions".into(), off("Sortable")),
+        ("CountRestrictions".into(), off("Countable")),
+        ("TopSupported".into(), Expr::Bool(false)),
+        ("SkipSupported".into(), Expr::Bool(false)),
+        ("IndexableByKey".into(), Expr::Bool(false)),
+    ])
 }
 
 /// C18 to C20.
@@ -874,6 +919,7 @@ fn container_capabilities() -> Vec<Annotation> {
         Annotation::new(format!("Capabilities.{term}"), Expr::Bool(value))
     };
     vec![
+        // the lowest level: the pinned suite proves none higher (docs/src/odata.md section 6)
         Annotation::new(
             "Capabilities.ConformanceLevel",
             Expr::EnumMember {
@@ -906,6 +952,16 @@ fn container_capabilities() -> Vec<Annotation> {
             ]),
         ),
         flag("QuerySegmentSupported", true),
+        // the operators and functions a `$filter` translates, nothing else (T-5907)
+        Annotation::new(
+            "Capabilities.FilterFunctions",
+            Expr::Collection(
+                crate::filter::filter_functions()
+                    .into_iter()
+                    .map(|f| Expr::String(f.into()))
+                    .collect(),
+            ),
+        ),
         flag("CrossJoinSupported", false),
         flag("ComputeSupported", true),
         // Q19: the `$apply` transformations served (T-3937, T-3985)

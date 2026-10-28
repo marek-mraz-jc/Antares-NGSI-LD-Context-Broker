@@ -1400,6 +1400,25 @@ type Signature = (
     Option<&'static str>,
 );
 
+/// `Capabilities.FilterFunctions`: every operator and function a `$filter`
+/// translates to `q` or the residual, in the URL convention's names; a
+/// method parsed without a [`signature`] is not served, `geo.intersects`
+/// is a `georel`.
+pub(crate) fn filter_functions() -> Vec<&'static str> {
+    const OPERATORS: [&str; 18] = [
+        "eq", "ne", "gt", "ge", "lt", "le", "and", "or", "not", "in", "add", "sub", "mul", "div",
+        "divby", "mod", "any", "all",
+    ];
+    OPERATORS
+        .into_iter()
+        .chain(
+            Method::all()
+                .filter(|m| *m == Method::GeoIntersects || signature(*m).is_some())
+                .map(Method::name),
+        )
+        .collect()
+}
+
 fn signature(method: Method) -> Option<Signature> {
     const BOOL: Option<&str> = Some("Edm.Boolean");
     const INT: Option<&str> = Some("Edm.Int32");

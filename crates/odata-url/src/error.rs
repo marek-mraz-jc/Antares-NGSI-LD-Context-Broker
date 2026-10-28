@@ -266,7 +266,7 @@ impl Feature {
             Self::AliasExpression => "parameter alias bound to an expression",
             Self::FilterSegment => "$filter path segment",
             Self::CrossJoin => "$crossjoin and $all",
-            Self::TypeCast => "type cast",
+            Self::TypeCast => "type cast or bound operation",
             Self::Ordinal => "ordinal index",
             Self::Operation => "function or action",
             Self::Each => "$each",
