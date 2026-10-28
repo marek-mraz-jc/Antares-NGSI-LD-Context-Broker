@@ -854,16 +854,14 @@ impl Here<'_> {
         let mut body = json!({
             "type": "FeatureCollection",
             "features": page.features,
+            // C17: when the answer was made, a response time and no Entity time.
+            "timeStamp": items::now().as_ref().map(ToString::to_string),
             "numberReturned": returned,
             "links": links,
         });
         // Optional in Part 1: omitted when the count would need more than the budget reads.
         if let (Some(matched), Some(members)) = (page.matched, body.as_object_mut()) {
             members.insert("numberMatched".into(), json!(matched));
-        }
-        // C17: when the answer was made, a response time and no Entity time.
-        if let (Some(now), Some(members)) = (items::now(), body.as_object_mut()) {
-            members.insert("timeStamp".into(), json!(now.to_string()));
         }
         in_crs(p.crs, document(GEOJSON, &body))
     }

@@ -268,3 +268,33 @@ async fn a_schema_of_another_vocabulary_serves_the_entities_the_view_names() -> 
     drop(broker);
     Ok(())
 }
+
+/// M8 (T-5909): a collection past the 1 000 Features one extent read takes states none, in
+/// `/collections/{c}` and in `/collections` alike.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_collection_past_the_extent_read_states_no_extent() -> Result<(), String> {
+    let f = fixture().await?;
+    let cars: Vec<Value> = (0..1000)
+        .map(|n| {
+            serde_json::json!({"id": format!("urn:ngsi-ld:Car:wide-{n:04}"), "type": "Car",
+                "location": {"type": "GeoProperty", "value": {"type": "Point", "coordinates": [0.0, 0.0]}}})
+        })
+        .collect();
+    let a = send(
+        &f.app,
+        "POST",
+        "/ngsi-ld/v1/entityOperations/create",
+        &Value::from(cars).to_string(),
+        &[("NGSILD-Tenant", "city")],
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
+    assert_eq!(extent(&f.app, "city", "Car").await, None);
+    let list = get(&f.app, "/x/views/city/ogc/features/collections").await;
+    assert!(
+        !list.body.to_string().contains("\"extent\""),
+        "{}",
+        list.body
+    );
+    Ok(())
+}

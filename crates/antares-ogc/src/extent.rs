@@ -26,9 +26,6 @@ pub(crate) const EXTENT_SCAN: u64 = 1_000;
 /// How long a computed extent is served before it is read again.
 const FRESH_MICROS: i64 = 60_000_000;
 
-/// The most extents kept; the cache is emptied when it is full.
-const KEPT: usize = 4_096;
-
 /// (Tenant, view, collection, the caller's policy subject).
 type Key = (String, String, String, Vec<(String, Vec<u8>)>);
 
@@ -70,9 +67,8 @@ pub(crate) async fn of(
     } else {
         let bbox = read(view, caller, c).await;
         let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
-        if cache.len() >= KEPT {
-            cache.clear();
-        }
+        // ponytail: stale extents go on each insert, so the cache holds one minute of keys.
+        cache.retain(|_, k| now.saturating_sub(k.at) < FRESH_MICROS);
         cache.insert(
             key,
             Kept {
