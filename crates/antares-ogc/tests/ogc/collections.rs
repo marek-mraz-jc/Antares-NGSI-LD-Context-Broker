@@ -39,7 +39,7 @@ async fn lists_the_view_types_only() -> Result<(), String> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn no_extent_member() -> Result<(), String> {
+async fn one_collection_states_its_members() -> Result<(), String> {
     let f = fixture().await?;
     let a = get(&f.app, "/x/views/city/ogc/features/collections/Car").await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
@@ -52,7 +52,6 @@ async fn no_extent_member() -> Result<(), String> {
         a.body.get("itemType").and_then(Value::as_str),
         Some("feature")
     );
-    assert!(a.body.get("extent").is_none(), "M8: no extent");
     assert_eq!(
         href(&a.body, "items").as_deref(),
         Some("http://localhost:9090/x/views/city/ogc/features/collections/Car/items")
@@ -62,6 +61,47 @@ async fn no_extent_member() -> Result<(), String> {
         .body
         .get("description")
         .is_none());
+    Ok(())
+}
+
+/// The `extent` member of collection `c` of `view`, from `/collections/{c}`.
+async fn extent(app: &axum::Router, view: &str, c: &str) -> Option<Value> {
+    let a = get(
+        app,
+        &format!("/x/views/{view}/ogc/features/collections/{c}"),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    a.body.get("extent").cloned()
+}
+
+/// C6, M8 (T-5909): the extent bounds what the caller reads through the view, the same in
+/// `/collections` and `/collections/{c}`; a hidden Entity never widens it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_extent_bounds_what_the_view_shows() -> Result<(), String> {
+    let f = fixture().await?;
+    let crs84 = "http://www.opengis.net/def/crs/OGC/1.3/CRS84";
+    // Car 1 at (17.1, 48.1), Car 2 at (179.5, 0), Car 4 at (-179.5, 0); Car 3 has none.
+    let every =
+        serde_json::json!({"spatial": {"bbox": [[-179.5, 0.0, 179.5, 48.1]], "crs": crs84}});
+    assert_eq!(extent(&f.app, "city", "Car").await, Some(every.clone()));
+    let list = get(&f.app, "/x/views/city/ogc/features/collections").await;
+    let listed = list
+        .body
+        .get("collections")
+        .and_then(Value::as_array)
+        .and_then(|all| {
+            all.iter()
+                .find(|c| c.get("id").and_then(Value::as_str) == Some("Car"))
+        })
+        .and_then(|c| c.get("extent"))
+        .cloned();
+    assert_eq!(listed, Some(every));
+    // View `slow` (speed<50) shows Car 1 and Car 3: Cars 2 and 4 stay out of its extent.
+    let slow = serde_json::json!({"spatial": {"bbox": [[17.1, 48.1, 17.1, 48.1]], "crs": crs84}});
+    assert_eq!(extent(&f.app, "slow", "Car").await, Some(slow));
+    // Stop has no geometry: no extent.
+    assert_eq!(extent(&f.app, "city", "Stop").await, None);
     Ok(())
 }
 

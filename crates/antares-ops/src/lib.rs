@@ -632,6 +632,15 @@ impl ViewOps {
             .await
     }
 
+    /// A handle on the view compilation this request reads through (T-5909): it compares
+    /// equal ([`std::sync::Weak::ptr_eq`]) only to the same compilation, so a surface cache
+    /// keyed by it is not served after the view's rules change.
+    #[must_use]
+    pub fn generation(&self) -> std::sync::Weak<dyn std::any::Any + Send + Sync> {
+        let any: Arc<dyn std::any::Any + Send + Sync> = self.view.clone();
+        Arc::downgrade(&any)
+    }
+
     /// The one Tenant the view serves (ADR-0023 rule 10).
     #[must_use]
     pub fn tenant(&self) -> &str {
