@@ -4,6 +4,11 @@
 //! with distinct inline @contexts of 2 000 terms. Each distinct @context used
 //! to become an ImplicitlyCreated row in the memory store (~390 KB of heap
 //! each, 1 000 per Tenant); the byte share bounds them now.
+//!
+//! ~66 s of load: it runs in the all-features lanes only, not once per
+//! feature in the each-feature job (30 min cap, train 20261028-0937). The
+//! budget does not depend on the surfaces built in.
+#![cfg(all(feature = "full", feature = "jc-policy"))]
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
