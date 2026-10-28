@@ -67,9 +67,9 @@ pub(crate) struct Translated {
     pub(crate) order: Option<String>,
     /// The terms `q` and `orderBy` use, term to IRI.
     pub(crate) context: Map<String, Value>,
-    /// Whether `q` follows a Relationship (F24): the broker evaluates a
-    /// hop only under a `join` (5.7.2.4).
-    pub(crate) linked: bool,
+    /// How many Relationships deep `q` follows one (F24, T-5906), 0 for none: the broker
+    /// evaluates a hop only under a `join` at least that deep (5.7.2.4).
+    pub(crate) linked: usize,
     /// F29: the `geoQ` of a `geo.intersects` conjunct, the GeoProperty's
     /// term and the polygon's `coordinates`.
     pub(crate) geo: Option<(String, String)>,
@@ -149,6 +149,9 @@ pub(crate) enum SortBy {
     System(String),
     /// The `$compute` value of this name.
     Computed(String),
+    /// The value of the Attribute of the second term on the Entity the Relationship of the
+    /// first term targets, as the join inlined it (T-5906).
+    Linked(String, String),
 }
 
 impl SortBy {
@@ -156,7 +159,10 @@ impl SortBy {
     fn key(&self) -> &str {
         match self {
             Self::Id => "id",
-            Self::Value(name) | Self::System(name) | Self::Computed(name) => name,
+            Self::Value(name)
+            | Self::System(name)
+            | Self::Computed(name)
+            | Self::Linked(name, _) => name,
         }
     }
 }
@@ -178,9 +184,10 @@ pub(crate) fn translate(
         sets,
         aliases,
         context: &mut out.context,
-        linked: false,
+        linked: 0,
         expand_values: Vec::new(),
         lambdas: Vec::new(),
+        hops: Vec::new(),
         lang: lang.unwrap_or("@none"),
     };
     let mut conjuncts = Vec::new();
@@ -336,32 +343,46 @@ pub(crate) fn holds_member(filter: &Expr, name: &str) -> bool {
 
 /// Adds `$orderby` to `out` as `orderBy` (Q9) over the same terms: `id`, or
 /// a scalar Attribute; a member the model marks not sortable (C12) is 400,
-/// the base members and the other shapes are a later round's.
-pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Result<(), Refused> {
-    // `orderBy` names Attributes of the Entity itself: no navigation.
-    let sets = BTreeMap::new();
+/// the base members and the other shapes are a later round's. A scalar of the
+/// target of a single-valued navigation (`Category/Name`, URL 5.1.5) has no
+/// `orderBy` form: the surface sorts by it over the joined answer (T-5906).
+pub(crate) fn order(
+    items: &[OrderBy],
+    set: &Set,
+    sets: &BTreeMap<String, Set>,
+    out: &mut Translated,
+) -> Result<(), Refused> {
     let mut terms = Terms {
         set,
-        sets: &sets,
+        sets,
         aliases: &[],
         context: &mut out.context,
-        linked: false,
+        linked: 0,
         expand_values: Vec::new(),
         lambdas: Vec::new(),
+        hops: Vec::new(),
         lang: "@none",
     };
     let mut keys = Vec::new();
     for item in items {
-        let single = match &item.expr {
+        let (single, hop) = match &item.expr {
             Expr::Member(MemberPath {
                 variable: None,
                 path,
             }) => match path.as_slice() {
-                [name] => Some(name.as_str()),
-                _ => None,
+                [name] => (Some(name.as_str()), None),
+                [nav, name] => (None, Some((nav, name))),
+                _ => (None, None),
             },
-            _ => None,
+            _ => (None, None),
         };
+        if let Some(hop) = hop {
+            keys.push(SortKey {
+                by: terms.linked_key(hop)?,
+                descending: item.descending,
+            });
+            continue;
+        }
         let by = match single {
             None => return Err(Refused::Later),
             Some(name) if out.computed.iter().any(|(c, _)| c == name) => {
@@ -382,15 +403,18 @@ pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Resul
             descending: item.descending,
         });
     }
-    if keys
-        .iter()
-        .any(|k| matches!(k.by, SortBy::System(_) | SortBy::Computed(_)))
-    {
+    if keys.iter().any(|k| {
+        matches!(
+            k.by,
+            SortBy::System(_) | SortBy::Computed(_) | SortBy::Linked(..)
+        )
+    }) {
+        out.linked = out.linked.max(terms.linked);
         out.sort_system = true;
         out.sort_reads = keys
             .iter()
             .filter_map(|k| match &k.by {
-                SortBy::Value(term) => Some(term.clone()),
+                SortBy::Value(term) | SortBy::Linked(term, _) => Some(term.clone()),
                 SortBy::Id | SortBy::System(_) | SortBy::Computed(_) => None,
             })
             .collect();
@@ -431,9 +455,10 @@ pub(crate) fn compute(
         sets: &sets,
         aliases,
         context: &mut out.context,
-        linked: false,
+        linked: 0,
         expand_values: Vec::new(),
         lambdas: Vec::new(),
+        hops: Vec::new(),
         lang: "@none",
     };
     for item in items {
@@ -556,19 +581,34 @@ struct Terms<'a> {
     sets: &'a BTreeMap<String, Set>,
     aliases: &'a [(String, Literal)],
     context: &'a mut Map<String, Value>,
-    linked: bool,
+    linked: usize,
     expand_values: Vec<String>,
     /// The `any`/`all` variables the residual is inside, innermost last,
     /// each with the Edm type of its list's items.
     lambdas: Vec<(String, &'static str)>,
+    /// The `any` variables over a collection-valued navigation `q` is inside, innermost last.
+    hops: Vec<Hop<'a>>,
     /// The `LanguageMap` entry a LanguageProperty is compared in, as it is read.
     lang: &'a str,
+}
+
+/// An `any` variable over a collection-valued navigation (T-5906): an item is an Entity of
+/// `set`, and a member `m` of it is the linked-entity term `{open}m` closed by `depth` braces
+/// (TS 104 175 4.9, `rel{Type:m}`).
+struct Hop<'a> {
+    variable: String,
+    set: &'a Set,
+    open: String,
+    depth: usize,
 }
 
 impl<'a> Terms<'a> {
     /// One boolean expression as `q`.
     fn term(&mut self, e: &Expr) -> Result<String, Refused> {
         match e {
+            // Inside `any` over a navigation each term may match another target: `and` is the
+            // residual's, `or` distributes (`any(a or b)` is `any(a) or any(b)`).
+            Expr::And(..) if !self.hops.is_empty() => Err(Refused::Later),
             Expr::And(l, r) => Ok(format!("({});({})", self.term(l)?, self.term(r)?)),
             Expr::Or(l, r) => Ok(format!("({})|({})", self.term(l)?, self.term(r)?)),
             Expr::Compare(l, op, r) => self.compare(l, *op, r),
@@ -591,6 +631,9 @@ impl<'a> Terms<'a> {
             },
             // `$filter=flag`: a Boolean member as the predicate.
             Expr::Member(_) => Ok(format!("{}==true", self.scalar(e)?)),
+            Expr::Any { collection, lambda } if self.navigation(collection).is_some() => {
+                self.linked_any(collection, lambda.as_ref())
+            }
             Expr::Any {
                 collection,
                 lambda: Some((variable, body)),
@@ -649,6 +692,60 @@ impl<'a> Terms<'a> {
             self.term_of(&member.iri),
             values.join(",")
         ))
+    }
+
+    /// The collection-valued navigation a lambda ranges over, of the set or of the item of an
+    /// enclosing `any` over a navigation: the Relationship, the target set, and the term the
+    /// path is inside with its depth.
+    fn navigation(&self, collection: &MemberPath) -> Option<(&'a Member, &'a Set, String, usize)> {
+        let (from, open, depth) = match &collection.variable {
+            None => (self.set, String::new(), 0),
+            Some(v) => {
+                let hop = self.hops.iter().rev().find(|h| &h.variable == v)?;
+                (hop.set, hop.open.clone(), hop.depth)
+            }
+        };
+        let [name] = collection.path.as_slice() else {
+            return None;
+        };
+        let member = from.members.get(name)?;
+        let Shape::Nav {
+            target,
+            collection: true,
+        } = &member.shape
+        else {
+            return None;
+        };
+        Some((member, self.sets.get(target)?, open, depth))
+    }
+
+    /// T-5906: `nav/any(d: body)` over a collection-valued navigation as the linked-entity terms
+    /// of TS 104 175 4.9, which hold when one target the caller may read matches (the broker
+    /// resolves each object through the caller's narrowing, a hidden one like a dangling link,
+    /// O26); `nav/any()` is the Relationship being present.
+    fn linked_any(
+        &mut self,
+        collection: &MemberPath,
+        lambda: Option<&(String, Box<Expr>)>,
+    ) -> Result<String, Refused> {
+        let (rel, target, open, depth) = self.navigation(collection).ok_or(Refused::Later)?;
+        let rel = self.term_of(&rel.iri);
+        let Some((variable, body)) = lambda else {
+            // the Relationship itself, as deep as the enclosing hops
+            self.linked = self.linked.max(depth);
+            return Ok(format!("{open}{rel}{}", "}".repeat(depth)));
+        };
+        self.linked = self.linked.max(depth.saturating_add(1));
+        let ty = self.term_of(&target.type_iri);
+        self.hops.push(Hop {
+            variable: variable.clone(),
+            set: target,
+            open: format!("{open}{rel}{{{ty}:"),
+            depth: depth.saturating_add(1),
+        });
+        let term = self.term(body);
+        self.hops.pop();
+        term
     }
 
     /// F29: `geo.intersects(p, geography'SRID=4326;Polygon(...)')` as a
@@ -779,12 +876,10 @@ impl<'a> Terms<'a> {
         else {
             return Err(Refused::Later);
         };
-        let name = self.scalar(member)?;
+        let (name, edm) = self.typed_member(member)?;
         // URL 5.1.1.5: the string functions take a string; NGSI-LD would
         // match no other value without saying why.
-        let string = matches!(member, Expr::Member(MemberPath { path, .. })
-            if self.leaf(path).is_some_and(|(_, m)| matches!(m.shape, Shape::Value { edm: "Edm.String", .. })));
-        if !string {
+        if edm != "Edm.String" {
             return Err(Refused::Bad);
         }
         let escaped = escape(s);
@@ -830,13 +925,29 @@ impl<'a> Terms<'a> {
 
     /// [`Self::scalar`]'s term and the Edm type of its value.
     fn typed_member(&mut self, e: &Expr) -> Result<(String, &'static str), Refused> {
-        let Expr::Member(MemberPath {
-            variable: None,
-            path,
-        }) = e
-        else {
+        let Expr::Member(MemberPath { variable, path }) = e else {
             return Err(Refused::Later);
         };
+        let hop = match variable {
+            None => None,
+            Some(v) => Some(
+                self.hops
+                    .iter()
+                    .rev()
+                    .find(|h| &h.variable == v)
+                    .ok_or(Refused::Later)?,
+            ),
+        };
+        if let Some(hop) = hop {
+            let (open, close) = (hop.open.clone(), "}".repeat(hop.depth));
+            let [name] = path.as_slice() else {
+                return Err(Refused::Later);
+            };
+            let member = hop.set.members.get(name).ok_or(Refused::Later)?;
+            let edm = scalar_edm(member)?;
+            let attr = self.term_of(&member.iri);
+            return Ok((format!("{open}{attr}{close}"), edm));
+        }
         // F21: the `observedAt` of a member of the set, as EXAMPLE 9's
         // `temperature.observedAt`.
         if let [name, annotation] = path.as_slice() {
@@ -850,30 +961,32 @@ impl<'a> Terms<'a> {
         // `_types`, the system members) and complex paths (F20, F28, F33)
         // are a later round's.
         let (via, member) = self.leaf(path).ok_or(Refused::Later)?;
-        let edm = match &member.shape {
-            // The shapes `Shape::scalar` names, the test the model's
-            // NonFilterableProperties and NonSortableProperties are written
-            // from (C11, C12).
-            Shape::Value {
-                edm,
-                collection: false,
-            } => *edm,
-            // T-5333: an Untyped Property compares by its JSON value, as `q` does.
-            Shape::Json if member.untyped => "Edm.Untyped",
-            Shape::Json => return Err(Refused::Bad),
-            _ => return Err(Refused::Later),
-        };
+        let edm = scalar_edm(member)?;
         let attr = self.term_of(&member.iri);
         let term = match via {
             None => attr,
             Some((rel, target)) => {
-                self.linked = true;
+                self.linked = self.linked.max(1);
                 let rel = self.term_of(&rel.iri);
                 let ty = self.term_of(&target.type_iri);
                 format!("{rel}{{{ty}:{attr}}}")
             }
         };
         Ok((term, edm))
+    }
+
+    /// The sort key of `nav/name`, a sortable scalar of the target of a single-valued navigation.
+    fn linked_key(&mut self, (nav, name): (&String, &String)) -> Result<SortBy, Refused> {
+        let Some((Some((rel, _)), member)) = self.leaf(&[nav.clone(), name.clone()]) else {
+            return Err(Refused::Later);
+        };
+        if !member.shape.sortable() {
+            return Err(Refused::Bad);
+        }
+        scalar_edm(member)?;
+        self.linked = self.linked.max(1);
+        let rel = self.term_of(&rel.iri);
+        Ok(SortBy::Linked(rel, self.term_of(&member.iri)))
     }
 
     /// The term `t{n}` of an IRI, minted on first use.
@@ -1174,6 +1287,21 @@ impl<'a> Terms<'a> {
             _ => return Err(Refused::Later),
         };
         Ok((Path::value(&self.term_of(&member.iri)), edm))
+    }
+}
+
+/// The Edm type a member compares as: the shapes `Shape::scalar` names, the test the model's
+/// `NonFilterableProperties` and `NonSortableProperties` are written from (C11, C12).
+fn scalar_edm(member: &Member) -> Result<&'static str, Refused> {
+    match &member.shape {
+        Shape::Value {
+            edm,
+            collection: false,
+        } => Ok(*edm),
+        // T-5333: an Untyped Property compares by its JSON value, as `q` does.
+        Shape::Json if member.untyped => Ok("Edm.Untyped"),
+        Shape::Json => Err(Refused::Bad),
+        _ => Err(Refused::Later),
     }
 }
 
@@ -1545,6 +1673,7 @@ mod tests {
             type_iri: "https://e.org/Car".into(),
             identifier: None,
             references: BTreeMap::new(),
+            bound: BTreeMap::new(),
             writable: crate::edm::Writable::default(),
             members: BTreeMap::from([
                 (
@@ -2216,7 +2345,7 @@ mod tests {
             descending: false,
         }];
         assert_eq!(
-            order(&by, &set(), &mut Translated::default()),
+            order(&by, &set(), &BTreeMap::new(), &mut Translated::default()),
             Err(Refused::Later),
             "orderBy reads a `.` as a path: not this round's"
         );
@@ -2441,6 +2570,7 @@ mod tests {
             order(
                 &[by("speed", true), by("id", false), by("name", false)],
                 &set(),
+                &BTreeMap::new(),
                 &mut t
             ),
             Ok(())
@@ -2474,7 +2604,11 @@ mod tests {
                 Refused::Later,
             ),
         ] {
-            assert_eq!(order(&items, &set(), &mut t), Err(refused), "{items:?}");
+            assert_eq!(
+                order(&items, &set(), &BTreeMap::new(), &mut t),
+                Err(refused),
+                "{items:?}"
+            );
         }
     }
 
@@ -2571,7 +2705,7 @@ mod tests {
         let t = translate(&e, &set(), &BTreeMap::new(), &[]).unwrap_or_default();
         assert_eq!(t.q.as_deref(), Some("(t0>1)"));
         assert_eq!(t.residual.len(), 1);
-        assert!(!t.linked, "a failed push leaves no join behind");
+        assert_eq!(t.linked, 0, "a failed push leaves no join behind");
         // an offset date-time is one instant `q` cannot say: evaluated
         let offset = cmp(
             Expr::Member(MemberPath {
@@ -2672,7 +2806,7 @@ mod tests {
             })
             .collect();
         let mut t = Translated::default();
-        order(&items, set, &mut t).map(|()| t)
+        order(&items, set, &BTreeMap::new(), &mut t).map(|()| t)
     }
 
     #[test]
@@ -3153,6 +3287,217 @@ mod tests {
         assert_eq!(
             translated.ok().map(|t| (t.q.is_some(), t.residual.len())),
             Some((true, 1))
+        );
+    }
+
+    /// T-5906: a Car whose `parts` (collection) and `maker` (single) navigate to Parts, a Part
+    /// with `lang` and `parts` of its own.
+    fn navigating() -> (Set, BTreeMap<String, Set>) {
+        let mut car = set();
+        let nav = |iri: &str, collection| Member {
+            iri: iri.into(),
+            shape: Shape::Nav {
+                target: "Parts".into(),
+                collection,
+            },
+            list: false,
+            json: false,
+            untyped: false,
+            written: crate::edm::Written::Always,
+        };
+        car.members
+            .insert("parts".into(), nav("https://e.org/parts", true));
+        car.members
+            .insert("maker".into(), nav("https://e.org/maker", false));
+        let mut part = set();
+        part.type_iri = "https://e.org/Part".into();
+        part.members
+            .insert("parts".into(), nav("https://e.org/parts", true));
+        (car, BTreeMap::from([("Parts".to_owned(), part)]))
+    }
+
+    fn mp(variable: Option<&str>, names: &[&str]) -> MemberPath {
+        MemberPath {
+            variable: variable.map(str::to_owned),
+            path: names.iter().map(|n| (*n).to_owned()).collect(),
+        }
+    }
+
+    fn over(variable: &str, names: &[&str]) -> Expr {
+        Expr::Member(mp(Some(variable), names))
+    }
+
+    fn any(collection: MemberPath, lambda: Option<(&str, Expr)>) -> Expr {
+        Expr::Any {
+            collection,
+            lambda: lambda.map(|(v, body)| (v.to_owned(), Box::new(body))),
+        }
+    }
+
+    #[test]
+    fn any_over_a_navigation_is_a_linked_entity_term() {
+        let (car, sets) = navigating();
+        let q =
+            |e: &Expr| translate(e, &car, &sets, &[]).map(|t| (t.q.unwrap_or_default(), t.linked));
+        let en = |v: &str| {
+            cmp(
+                over(v, &["name"]),
+                CompareOp::Eq,
+                lit(Literal::String("EN".into())),
+            )
+        };
+        // URL 5.1.1.13.1 over a Relationship: one target the caller reads matches (4.9)
+        assert_eq!(
+            q(&any(mp(None, &["parts"]), Some(("d", en("d"))))),
+            Ok((r#"(t0{t1:t2}=="EN")"#.to_owned(), 1))
+        );
+        // `or` distributes over the targets, `contains` is a pattern on the target's term
+        let or = Expr::Or(Box::new(en("d")), Box::new(en("d")));
+        assert_eq!(
+            q(&any(mp(None, &["parts"]), Some(("d", or)))),
+            Ok((r#"((t0{t1:t2}=="EN")|(t0{t1:t2}=="EN"))"#.to_owned(), 1))
+        );
+        let contains = Expr::Call(
+            Method::Contains,
+            vec![over("d", &["name"]), lit(Literal::String("a.b".into()))],
+        );
+        assert_eq!(
+            q(&any(mp(None, &["parts"]), Some(("d", contains)))),
+            Ok((r#"(t0{t1:t2}~="a\.b")"#.to_owned(), 1))
+        );
+        // `any()` is the Relationship being there
+        assert_eq!(
+            q(&any(mp(None, &["parts"]), None)),
+            Ok(("(t0)".to_owned(), 0))
+        );
+        // two hops nest the terms and the join
+        let nested = any(
+            mp(None, &["parts"]),
+            Some(("r", any(mp(Some("r"), &["parts"]), Some(("d", en("d")))))),
+        );
+        assert_eq!(
+            q(&nested),
+            Ok((r#"(t0{t1:t0{t1:t2}}=="EN")"#.to_owned(), 2))
+        );
+        let nested_empty = any(
+            mp(None, &["parts"]),
+            Some(("r", any(mp(Some("r"), &["parts"]), None))),
+        );
+        assert_eq!(q(&nested_empty), Ok(("(t0{t1:t0})".to_owned(), 1)));
+    }
+
+    #[test]
+    fn what_any_over_a_navigation_cannot_say_in_q_is_refused() {
+        let (car, sets) = navigating();
+        let q = |e: &Expr| translate(e, &car, &sets, &[]).map(|t| t.q);
+        let en = cmp(
+            over("d", &["name"]),
+            CompareOp::Eq,
+            lit(Literal::String("EN".into())),
+        );
+        // `and` may hold on two targets, `all` has no q form: neither is pushed
+        let and = Expr::And(Box::new(en.clone()), Box::new(en.clone()));
+        assert_eq!(
+            q(&any(mp(None, &["parts"]), Some(("d", and)))),
+            Err(Refused::Later)
+        );
+        let all = Expr::All {
+            collection: mp(None, &["parts"]),
+            lambda: ("d".into(), Box::new(en.clone())),
+        };
+        assert_eq!(q(&all), Err(Refused::Later));
+        // a member the target does not have, a path below it, a variable out of scope
+        let missing = cmp(over("d", &["nope"]), CompareOp::Eq, lit(Literal::Int(1)));
+        assert_eq!(
+            q(&any(mp(None, &["parts"]), Some(("d", missing)))),
+            Err(Refused::Later)
+        );
+        let deep = cmp(
+            over("d", &["name", "x"]),
+            CompareOp::Eq,
+            lit(Literal::Int(1)),
+        );
+        assert_eq!(
+            q(&any(mp(None, &["parts"]), Some(("d", deep)))),
+            Err(Refused::Later)
+        );
+        let stray = cmp(over("x", &["name"]), CompareOp::Eq, lit(Literal::Int(1)));
+        assert_eq!(
+            q(&any(mp(None, &["parts"]), Some(("d", stray)))),
+            Err(Refused::Later)
+        );
+        // a single-valued navigation is no collection to range over
+        assert_eq!(q(&any(mp(None, &["maker"]), None)), Err(Refused::Later));
+        // a path through a single navigation to a collection is no lambda this round maps
+        assert_eq!(
+            q(&any(mp(None, &["maker", "parts"]), None)),
+            Err(Refused::Later)
+        );
+        // a value of another type than the target's member is 400, as on the set itself
+        let typed = cmp(over("d", &["name"]), CompareOp::Eq, lit(Literal::Int(1)));
+        assert_eq!(
+            q(&any(mp(None, &["parts"]), Some(("d", typed)))),
+            Err(Refused::Bad)
+        );
+        let doc = cmp(over("d", &["doc"]), CompareOp::Eq, lit(Literal::Int(1)));
+        assert_eq!(
+            q(&any(mp(None, &["parts"]), Some(("d", doc)))),
+            Err(Refused::Bad)
+        );
+    }
+
+    #[test]
+    fn orderby_a_member_of_a_single_navigation_target_is_a_surface_sort() {
+        let (car, sets) = navigating();
+        let by = |names: &[&str], descending| OrderBy {
+            expr: path(names),
+            descending,
+        };
+        let mut t = Translated::default();
+        assert_eq!(
+            order(
+                &[by(&["maker", "name"], true), by(&["name"], false)],
+                &car,
+                &sets,
+                &mut t
+            ),
+            Ok(())
+        );
+        let keys: Vec<(SortBy, bool)> = t
+            .sort
+            .unwrap_or_default()
+            .into_iter()
+            .map(|k| (k.by, k.descending))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                (SortBy::Linked("t0".into(), "t1".into()), true),
+                (SortBy::Value("t1".into()), false)
+            ]
+        );
+        assert_eq!(
+            (t.linked, t.sort_reads),
+            (1, vec!["t0".to_owned(), "t1".to_owned()])
+        );
+        // a collection, a member the target lacks or does not sort, a deeper path
+        for names in [
+            &["parts", "name"][..],
+            &["maker", "nope"],
+            &["maker", "doc"],
+            &["maker", "name", "x"],
+        ] {
+            let refused = order(&[by(names, false)], &car, &sets, &mut Translated::default());
+            assert!(refused.is_err(), "{names:?}");
+        }
+        assert_eq!(
+            order(
+                &[by(&["maker", "doc"], false)],
+                &car,
+                &sets,
+                &mut Translated::default()
+            ),
+            Err(Refused::Bad)
         );
     }
 }

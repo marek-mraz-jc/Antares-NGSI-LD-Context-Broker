@@ -733,6 +733,7 @@ fn row_set(names: &[(String, &'static str)]) -> Set {
         identifier: None,
         writable: crate::edm::Writable::default(),
         references: BTreeMap::new(),
+        bound: BTreeMap::new(),
     }
 }
 
