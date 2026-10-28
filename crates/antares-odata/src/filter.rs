@@ -2961,6 +2961,7 @@ mod tests {
         // past the type's range, or of another type: 400 before any read
         for e in [
             c("weight", CompareOp::Eq, dec("3.5e38")),
+            c("weight", CompareOp::Eq, Literal::String("3.5".into())),
             c("rating", CompareOp::Eq, Literal::Int(256)),
             c("qty", CompareOp::Gt, Literal::Int(32768)),
             c("ship", CompareOp::Eq, Literal::String("P1D".into())),
@@ -2990,8 +2991,8 @@ mod tests {
             literal_edm(&Literal::Binary("AQID".into())),
             Some("Edm.Binary")
         );
-        assert!(matches!(residual_lit(&dec("-INF")), Ok(Lit::Num(n)) if n == f64::NEG_INFINITY));
-        assert!(matches!(residual_lit(&dec("NaN")), Ok(Lit::Num(n)) if n.is_nan()));
+        assert_eq!(residual_lit(&dec("-INF")), Ok(Lit::Num(f64::NEG_INFINITY)));
+        assert_eq!(format!("{:?}", residual_lit(&dec("NaN"))), "Ok(Num(NaN))");
         assert_eq!(residual_lit(&dec("1e999")), Err(Refused::Bad));
         assert_eq!(value(&dec("1e999")), Err(Refused::Bad));
         // a Single within its range is pushed as a q number
