@@ -418,3 +418,181 @@ async fn pages_cross_the_batches_the_temporal_api_is_read_in() {
     }
     assert_eq!(walked, rows(&whole)[3..].to_vec());
 }
+
+/// The status and the (id, observedAt) of each row of a read.
+async fn read(app: &axum::Router, path: &str) -> (StatusCode, Vec<(String, String)>) {
+    let (status, body) = get(app, path).await;
+    let rows = rows(&body).into_iter().map(|r| (r.0, r.1)).collect();
+    (status, rows)
+}
+
+fn key(n: u8, t: &str) -> (String, String) {
+    (car(n), t.to_owned())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_bound_on_observed_at_and_each_other_conjunct_narrows_the_rows() {
+    let app = past().await.expect("fixture");
+    let ok = StatusCode::OK;
+    let cases = [
+        (
+            format!("observedAt%20ge%20{T2}"),
+            vec![key(7, T2), key(8, T3)],
+        ),
+        (
+            format!("observedAt%20lt%20{T1}"),
+            vec![key(7, T0)],
+        ),
+        (
+            format!("observedAt%20le%20{T1}"),
+            vec![key(7, T0), key(7, T1), key(8, T1)],
+        ),
+        (
+            format!("{T1}%20le%20observedAt%20and%20observedAt%20ne%20null%20and%20(speed%20gt%2065%20or%20speed%20lt%2015)"),
+            vec![key(7, T1), key(8, T3)],
+        ),
+        (
+            "id%20eq%20'urn:ngsi-ld:Car:7'%20and%20id%20eq%20'urn:ngsi-ld:Car:8'".to_owned(),
+            vec![],
+        ),
+    ];
+    for (filter, expected) in cases {
+        let got = read(&app, &format!("Car_history?$filter={filter}")).await;
+        assert_eq!(got, (ok, expected), "{filter}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn select_orderby_keys_and_what_a_history_does_not_serve() {
+    let app = past().await.expect("fixture");
+    let (status, body) = get(&app, "Car_history?$select=id,label").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first = body["value"].get(1).cloned().unwrap_or_default();
+    assert_eq!(
+        first,
+        json!({"id": car(7), "observedAt": T1, "label": "seven"}),
+        "the key is always selected"
+    );
+    let (_, star) = get(&app, "Car_history?$select=*").await;
+    assert_eq!(rows(&star).len(), 5);
+    let (_, by_speed) = read(&app, "Car_history?$orderby=speed%20desc").await;
+    assert_eq!(
+        by_speed,
+        [key(8, T3), key(8, T1), key(7, T2), key(7, T0), key(7, T1)],
+        "equal speeds keep the natural order"
+    );
+    let (_, natural) = get(&app, "Car_history").await;
+    for order in ["id", "id,observedAt"] {
+        let (_, got) = get(&app, &format!("Car_history?$orderby={order}")).await;
+        assert_eq!(rows(&got), rows(&natural), "{order}");
+    }
+    let row = format!("Car_history(id='urn:ngsi-ld:Car:7',observedAt={T1})");
+    let (status, one) = get(&app, &row).await;
+    assert_eq!(
+        (status, &one["speed"]),
+        (StatusCode::OK, &json!(10.0)),
+        "{one}"
+    );
+    let (status, aliased) = get(
+        &app,
+        &format!("Car_history(id=@i,observedAt=@t)?@i='urn:ngsi-ld:Car:7'&@t={T1}"),
+    )
+    .await;
+    assert_eq!(
+        (status, &aliased["label"]),
+        (StatusCode::OK, &json!("seven")),
+        "{aliased}"
+    );
+    let refused = [
+        ("Car_history/$ref".to_owned(), StatusCode::NOT_IMPLEMENTED),
+        (
+            "Car_history?$search=seven".to_owned(),
+            StatusCode::NOT_IMPLEMENTED,
+        ),
+        (
+            "Car_history?ngsild.q=speed%3E1".to_owned(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "Car_history?$orderby=tolower(label)".to_owned(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (format!("{row}/speed"), StatusCode::NOT_IMPLEMENTED),
+        (
+            format!("{row}?$filter=speed%20gt%201"),
+            StatusCode::NOT_IMPLEMENTED,
+        ),
+        (
+            "Car_history('urn:ngsi-ld:Car:7')".to_owned(),
+            StatusCode::NOT_FOUND,
+        ),
+    ];
+    for (path, status) in refused {
+        let (got, body) = get(&app, &path).await;
+        assert_eq!(got, status, "{path}: {body}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_ends_short_past_its_reads_and_a_count_past_the_scan_is_refused() {
+    let app = past().await.expect("fixture");
+    let post = |h: Value| {
+        let app = app.clone();
+        async move {
+            let (status, answer) = send(
+                &app,
+                Method::POST,
+                "/ngsi-ld/v1/temporal/entities",
+                Some(&h.to_string()),
+            )
+            .await;
+            assert!(status.is_success(), "{answer}");
+        }
+    };
+    for n in 100..=200u16 {
+        post(
+            json!({"id": format!("urn:ngsi-ld:Car:{n}"), "type": format!("{CITY}Car"),
+            format!("{CITY}speed"): [at(&json!(f64::from(n)), T0)]}),
+        )
+        .await;
+    }
+    let (status, first) = send_paged(&app, &format!("{PAST}/Car_history"), 1000).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(
+        rows(&first).len(),
+        100,
+        "25 reads of 4 Entities end the page"
+    );
+    let mut walked = rows(&first);
+    let mut uri = first["@nextLink"]
+        .as_str()
+        .and_then(|l| l.split_once("/x/views"))
+        .map(|(_, p)| format!("/x/views{p}"));
+    while let Some(u) = uri {
+        let (_, page) = send_paged(&app, &u, 1000).await;
+        walked.extend(rows(&page));
+        uri = page["@nextLink"]
+            .as_str()
+            .and_then(|l| l.split_once("/x/views"))
+            .map(|(_, p)| format!("/x/views{p}"));
+    }
+    assert_eq!(walked.len(), 106);
+    let (_, count) = get(&app, "Car_history/$count").await;
+    assert_eq!(count, json!(106));
+    let minute = |m: u32| format!("2026-10-02T{:02}:{:02}:00Z", m / 60, m % 60);
+    for n in 300..310u16 {
+        let speed: Vec<Value> = (0..1000).map(|m| at(&json!(1.0), &minute(m))).collect();
+        post(
+            json!({"id": format!("urn:ngsi-ld:Car:{n}"), "type": format!("{CITY}Car"),
+            format!("{CITY}speed"): speed}),
+        )
+        .await;
+    }
+    let (status, refused) = get(&app, "Car_history/$count").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(
+        refused["error"]["code"],
+        json!("TooManyResults"),
+        "{refused}"
+    );
+}

@@ -14,19 +14,19 @@
 //! ponytail: each Entity's newest [`INSTANCES`] instances per Attribute in the window are read
 //! (the broker's own default ceiling), as the OGC history does.
 
-use crate::edm::Set;
-use crate::filter::{bounds_of, program, residual_whole, Translated};
+use crate::edm::{Member, Set, OBSERVED_AT_IRI};
+use crate::filter::{bounds_of, mint, program, residual_whole, Refused, Translated};
 use crate::read::{
     compare, default_instance, encode, not_found, not_implemented, now, page_link, paged, position,
-    refusal, resource, run, served, token, Reads,
+    refusal, resource, run, selected, served, token, Reads,
 };
 use antares_ops::residual::{DateTime, Program, Truth};
-use antares_ops::{Caller, OperationId, RESIDUAL_SCAN, TOO_COMPLEX};
+use antares_ops::{Caller, OperationId, RESIDUAL_SCAN};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use odata_axum::{json_response, ODataErrorResponse};
 use odata_json::{write_collection, write_entity, Ctx, EntityValue, ODataVersion, Page};
-use odata_url::{CompareOp, Expr, Key, KeyValue, Literal, QueryOptions, Segment, SelectItem};
+use odata_url::{CompareOp, Expr, Key, KeyValue, Literal, QueryOptions, Segment};
 use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
 use std::fmt::Write as _;
@@ -58,8 +58,10 @@ struct Plan<'s> {
     set: &'s Set,
     filter: Translated,
     program: Option<Program>,
-    /// The term of each member, `observedAt`'s included.
-    terms: Vec<(&'s str, String)>,
+    /// Each member but `observedAt`, with its term.
+    terms: Vec<(&'s str, &'s Member, String)>,
+    /// The term of `observedAt`.
+    observed: String,
     /// The `timerel` part of the temporal query.
     window: String,
     /// The inclusive lower bound, whose earlier instances a second read fills in.
@@ -72,13 +74,12 @@ pub(crate) async fn collection(
     reads: &Reads,
     caller: &Caller,
     ctx: &Ctx<'_>,
-    set_name: &str,
+    (set_name, set): (&str, &Set),
     path: &[Segment],
     options: &QueryOptions,
     headers: &HeaderMap,
 ) -> Result<Response, ODataErrorResponse> {
     let version = ctx.version;
-    let set = history_of(reads, set_name, version)?;
     if path.last() == Some(&Segment::Ref) {
         return Err(not_implemented(version));
     }
@@ -89,24 +90,12 @@ pub(crate) async fn collection(
     let link = |cursor: u64, skip: u64, top: Option<u64>| {
         page_link(reads, path, options, token(cursor, skip, top, digest))
     };
-    let sort = sort_keys(set, options, version)?;
+    let sort = sort_keys(&plan, options, version)?;
     let counted = options.count == Some(true);
     let (rows, total, next) = if counted || sort.is_some() {
         let mut all = whole(reads, caller, &plan, None, version).await?;
         if let Some(keys) = &sort {
-            // a member's value sits under its term in a row
-            let keys: Vec<(String, bool)> = keys
-                .iter()
-                .map(|(name, descending)| {
-                    let term = plan.terms.iter().find(|(n, _)| n == name);
-                    let by = match term {
-                        Some((n, t)) if *n != "observedAt" => t.clone(),
-                        _ => name.clone(),
-                    };
-                    (by, *descending)
-                })
-                .collect();
-            all.sort_by(|a, b| ordered(&keys, a, b));
+            all.sort_by(|a, b| ordered(keys, a, b));
         }
         paged(all, (cursor, skip, top, page), &link)
     } else {
@@ -146,11 +135,10 @@ pub(crate) async fn collection(
 pub(crate) async fn count(
     reads: &Reads,
     caller: &Caller,
-    set_name: &str,
+    set: &Set,
     options: &QueryOptions,
     version: ODataVersion,
 ) -> Result<Response, ODataErrorResponse> {
-    let set = history_of(reads, set_name, version)?;
     let plan = plan(set, options, version)?;
     let total = whole(reads, caller, &plan, None, version).await?.len();
     Ok((
@@ -166,18 +154,14 @@ pub(crate) async fn entity(
     reads: &Reads,
     caller: &Caller,
     ctx: &Ctx<'_>,
-    set_name: &str,
+    (set_name, set): (&str, &Set),
     key: &Key,
     options: &QueryOptions,
 ) -> Result<Response, ODataErrorResponse> {
     let version = ctx.version;
-    let set = history_of(reads, set_name, version)?;
-    let Some((urn, at)) = key_of(key, &options.aliases) else {
+    let Some((urn, micros)) = key_of(key, &options.aliases) else {
         return Err(not_found(version));
     };
-    let micros = DateTime::parse(at)
-        .map(DateTime::unix_micros)
-        .ok_or_else(|| not_found(version))?;
     let bare = QueryOptions {
         select: options.select.clone(),
         aliases: options.aliases.clone(),
@@ -191,7 +175,7 @@ pub(crate) async fn entity(
     let rows = whole(reads, caller, &plan, Some(urn), version).await?;
     let row = rows
         .iter()
-        .find(|r| r.urn == urn && r.micros == micros)
+        .find(|r| r.micros == micros)
         .ok_or_else(|| not_found(version))?;
     let value = value(set_name, &plan, row, picked.as_deref());
     let resource = resource(reads, set_name, version)?;
@@ -208,20 +192,8 @@ pub(crate) async fn entity(
     Ok(json_response(version, ctx.level, body))
 }
 
-fn history_of<'r>(
-    reads: &'r Reads,
-    name: &str,
-    version: ODataVersion,
-) -> Result<&'r Set, ODataErrorResponse> {
-    reads
-        .edm
-        .histories
-        .get(name)
-        .ok_or_else(|| not_found(version))
-}
-
-/// The id and `observedAt` a key names, through the request's aliases.
-fn key_of<'k>(key: &'k Key, aliases: &'k [(String, Literal)]) -> Option<(&'k str, &'k str)> {
+/// The id and `observedAt` (in microseconds) a key names, through the request's aliases.
+fn key_of<'k>(key: &'k Key, aliases: &'k [(String, Literal)]) -> Option<(&'k str, i64)> {
     let Key::Compound(parts) = key else {
         return None;
     };
@@ -233,7 +205,9 @@ fn key_of<'k>(key: &'k Key, aliases: &'k [(String, Literal)]) -> Option<(&'k str
         }
     };
     match (parts.len(), value("id")?, value("observedAt")?) {
-        (2, Literal::String(urn), Literal::DateTimeOffset(at)) => Some((urn, at)),
+        (2, Literal::String(urn), Literal::DateTimeOffset(at)) => {
+            Some((urn, DateTime::parse(at)?.unix_micros()))
+        }
         _ => None,
     }
 }
@@ -245,11 +219,13 @@ fn plan<'s>(
     options: &QueryOptions,
     version: ODataVersion,
 ) -> Result<Plan<'s>, ODataErrorResponse> {
-    if options.expand.is_some()
-        || options.search.is_some()
-        || options.apply.is_some()
-        || options.compute.is_some()
-    {
+    let unserved = [
+        options.expand.is_some(),
+        options.search.is_some(),
+        options.apply.is_some(),
+        options.compute.is_some(),
+    ];
+    if unserved.contains(&true) {
         return Err(not_implemented(version));
     }
     if !options.custom.is_empty() {
@@ -268,37 +244,28 @@ fn plan<'s>(
     let terms = set
         .members
         .iter()
-        .map(|(name, m)| {
-            (
-                name.as_str(),
-                crate::filter::mint(&mut filter.context, &m.iri),
-            )
-        })
+        .filter(|(_, m)| m.iri != OBSERVED_AT_IRI)
+        .map(|(name, m)| (name.as_str(), m, mint(&mut filter.context, &m.iri)))
         .collect();
-    let (mut lower, mut upper): (Option<Bound>, Option<Bound>) = (None, None);
-    let bounds = options
+    let observed = mint(&mut filter.context, OBSERVED_AT_IRI);
+    let bounds: Vec<(CompareOp, Bound)> = options
         .filter
         .as_ref()
         .map(|f| bounds_of(f, "observedAt", &options.aliases))
-        .unwrap_or_default();
-    for (op, at) in bounds {
-        let Some(micros) = DateTime::parse(at).map(DateTime::unix_micros) else {
-            continue;
-        };
-        match op {
-            CompareOp::Ge | CompareOp::Gt | CompareOp::Eq => {
-                if lower.as_ref().is_none_or(|(l, _)| micros > *l) {
-                    lower = Some((micros, at.to_owned()));
-                }
-            }
-            CompareOp::Lt => {
-                if upper.as_ref().is_none_or(|(u, _)| micros < *u) {
-                    upper = Some((micros, at.to_owned()));
-                }
-            }
-            CompareOp::Le | CompareOp::Ne => {}
-        }
-    }
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(op, at)| Some((op, (DateTime::parse(at)?.unix_micros(), at.to_owned()))))
+        .collect();
+    let lower = bounds
+        .iter()
+        .filter(|(op, _)| matches!(op, CompareOp::Ge | CompareOp::Gt | CompareOp::Eq))
+        .map(|(_, b)| b.clone())
+        .max_by_key(|(micros, _)| *micros);
+    let upper = bounds
+        .iter()
+        .filter(|(op, _)| matches!(op, CompareOp::Lt))
+        .map(|(_, b)| b.clone())
+        .min_by_key(|(micros, _)| *micros);
     let empty = matches!((&lower, &upper), (Some((l, _)), Some((u, _))) if l >= u);
     let window = match (&lower, &upper) {
         (Some((_, l)), Some((_, u))) => format!(
@@ -315,93 +282,93 @@ fn plan<'s>(
         filter,
         program,
         terms,
+        observed,
         window,
         lower,
         empty,
     })
 }
 
-/// The members `$select` names, `None` for every one; a path, a navigation or an annotation
-/// is not served.
+/// The members `$select` names (the key always among them, Protocol 11.2.5.1), `None` for
+/// every one; a path, a navigation or an annotation is not served.
 fn picked(
     set: &Set,
     options: &QueryOptions,
     version: ODataVersion,
 ) -> Result<Option<Vec<String>>, ODataErrorResponse> {
-    let Some(items) = &options.select else {
-        return Ok(None);
-    };
-    let mut names: Vec<String> = Vec::new();
-    for item in items {
-        match item {
-            SelectItem::Star => return Ok(None),
-            SelectItem::Path(path) => match path.as_slice() {
-                [name] if name == "id" || set.members.contains_key(name) => {
-                    names.push(name.clone());
-                }
-                _ => return Err(not_implemented(version)),
-            },
-            SelectItem::Annotation(_) => return Err(not_implemented(version)),
-        }
-    }
-    // The key is always selected (Protocol 11.2.5.1).
-    for key in ["id", "observedAt"] {
-        if !names.iter().any(|n| n == key) {
-            names.push(key.to_owned());
-        }
-    }
-    Ok(Some(names))
+    let names = selected(set, options.select.as_ref()).map_err(|()| not_implemented(version))?;
+    Ok(names.map(|names| {
+        let asked = names
+            .into_iter()
+            .filter(|n| *n == "id" || set.members.contains_key(*n));
+        let mut out: Vec<String> = ["id", "observedAt"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        out.extend(
+            asked
+                .filter(|n| !matches!(*n, "id" | "observedAt"))
+                .map(str::to_owned),
+        );
+        out
+    }))
+}
+
+/// What a sort key reads from a row.
+enum By<'s> {
+    Id,
+    Observed,
+    Member(&'s Member, String),
 }
 
 /// `$orderby` as keys over the rows, `None` for the natural order (Entity, then
-/// `observedAt` ascending), which a page streams.
-fn sort_keys(
-    set: &Set,
+/// `observedAt` ascending), which a page streams. A key that is no single-valued member is
+/// `400`.
+fn sort_keys<'s>(
+    plan: &Plan<'s>,
     options: &QueryOptions,
     version: ODataVersion,
-) -> Result<Option<Vec<(String, bool)>>, ODataErrorResponse> {
+) -> Result<Option<Vec<(By<'s>, bool)>>, ODataErrorResponse> {
     let Some(items) = &options.orderby else {
         return Ok(None);
     };
     let mut keys = Vec::new();
     for item in items {
-        let Expr::Member(m) = &item.expr else {
-            return Err(not_implemented(version));
+        let name = match &item.expr {
+            Expr::Member(m) => m.path.join("/"),
+            _ => String::new(),
         };
-        let (None, [name]) = (m.variable.as_ref(), m.path.as_slice()) else {
-            return Err(not_implemented(version));
+        let member = plan
+            .terms
+            .iter()
+            .find(|(n, m, _)| *n == name && m.shape.sortable());
+        let by = match (name.as_str(), member) {
+            ("id", _) => By::Id,
+            ("observedAt", _) => By::Observed,
+            (_, Some((_, m, term))) => By::Member(m, term.clone()),
+            (_, None) => return Err(refusal(Refused::Bad, version)),
         };
-        let sortable = name == "id" || set.members.get(name).is_some_and(|m| m.shape.sortable());
-        if !sortable {
-            return Err(refusal(crate::filter::Refused::Bad, version));
-        }
-        keys.push((name.clone(), item.descending));
+        keys.push((by, item.descending));
     }
     let natural = matches!(
         keys.as_slice(),
-        [(id, false)] | [(id, false), (_, false)] if id == "id"
-    ) && keys.get(1).is_none_or(|(n, _)| n == "observedAt");
+        [(By::Id, false)] | [(By::Id, false), (By::Observed, false)]
+    );
     Ok((!natural).then_some(keys))
 }
 
-/// `a` against `b` by `keys` (`id`, `observedAt` or a member's term), then in the natural
-/// order.
-fn ordered(keys: &[(String, bool)], a: &Row, b: &Row) -> Ordering {
-    let by = |row: &Row, name: &str| -> Option<Value> {
-        match name {
-            "id" => Some(Value::from(row.urn.as_str())),
-            "observedAt" => Some(Value::from(row.micros)),
-            _ => default_instance(row.doc.get(name)).and_then(|i| {
-                i.get("value")
-                    .or_else(|| i.get("vocab"))
-                    .or_else(|| i.get("object"))
-                    .cloned()
-            }),
+/// `a` against `b` by `keys`, then in the natural order.
+fn ordered(keys: &[(By<'_>, bool)], a: &Row, b: &Row) -> Ordering {
+    let by = |row: &Row, key: &By<'_>| -> Value {
+        match key {
+            By::Id => Value::from(row.urn.as_str()),
+            By::Observed => Value::from(row.micros),
+            By::Member(m, term) => served(&m.shape, default_instance(row.doc.get(term))).0,
         }
     };
     keys.iter()
-        .map(|(name, descending)| {
-            let o = compare(by(a, name).as_ref(), by(b, name).as_ref());
+        .map(|(key, descending)| {
+            let o = compare(Some(&by(a, key)), Some(&by(b, key)));
             if *descending {
                 o.reverse()
             } else {
@@ -511,8 +478,7 @@ async fn batch(
     let attrs: Vec<&str> = plan
         .terms
         .iter()
-        .filter(|(name, _)| *name != "observedAt")
-        .map(|(_, term)| term.as_str())
+        .map(|(_, _, term)| term.as_str())
         .collect();
     let ids = urn
         .map(|u| vec![u.to_owned()])
@@ -522,9 +488,7 @@ async fn batch(
             "/ngsi-ld/v1/temporal/entities?type={}&{window}&lastN={last}&limit={BATCH}&offset={offset}",
             encode(&plan.set.type_iri)
         );
-        if !attrs.is_empty() {
-            let _ = write!(target, "&attrs={}", encode(&attrs.join(",")));
-        }
+        let _ = write!(target, "&attrs={}", encode(&attrs.join(",")));
         if let Some(ids) = ids {
             let _ = write!(target, "&id={}", encode(&ids.join(",")));
         }
@@ -570,12 +534,8 @@ async fn batch(
     }
     let rows = entities
         .iter()
-        .map(|e| rows(plan, e))
-        .collect::<Result<_, _>>()
-        .map_err(|()| {
-            ODataErrorResponse::new(StatusCode::BAD_REQUEST, "TooComplexQuery", TOO_COMPLEX)
-                .with_version(version)
-        })?;
+        .map(|e| rows(plan, e, version))
+        .collect::<Result<_, _>>()?;
     Ok((rows, more))
 }
 
@@ -588,9 +548,10 @@ fn merge(e: &mut Value, old: &Value, attrs: &[&str]) {
         }
         let mut now: Vec<Value> = instances_of(e.get(*term)).into_iter().cloned().collect();
         now.extend(earlier.into_iter().cloned());
-        if let Some(obj) = e.as_object_mut() {
-            obj.insert((*term).to_owned(), Value::Array(now));
-        }
+        let list = Value::Array(now);
+        e.as_object_mut()
+            .into_iter()
+            .for_each(|obj| drop(obj.insert((*term).to_owned(), list.clone())));
     }
 }
 
@@ -622,19 +583,13 @@ fn timed(attr: Option<&Value>) -> Vec<Timed<'_>> {
 }
 
 /// The rows of one temporal Entity, oldest first: one per distinct `observedAt` at or past the
-/// lower bound, kept when the residual holds. `Err` when the residual is past its bounds.
-fn rows(plan: &Plan<'_>, e: &Value) -> Result<Vec<Row>, ()> {
+/// lower bound, kept when the residual holds; refused when the residual is past its bounds.
+fn rows(plan: &Plan<'_>, e: &Value, version: ODataVersion) -> Result<Vec<Row>, ODataErrorResponse> {
     let urn = e.get("id").and_then(Value::as_str).unwrap_or_default();
-    let observed = plan
-        .terms
-        .iter()
-        .find(|(name, _)| *name == "observedAt")
-        .map(|(_, term)| term.as_str());
     let attrs: Vec<(&str, Vec<Timed<'_>>)> = plan
         .terms
         .iter()
-        .filter(|(name, _)| *name != "observedAt")
-        .map(|(_, term)| (term.as_str(), timed(e.get(term.as_str()))))
+        .map(|(_, _, term)| (term.as_str(), timed(e.get(term.as_str()))))
         .collect();
     let mut times: Vec<(i64, &str)> = attrs
         .iter()
@@ -653,16 +608,18 @@ fn rows(plan: &Plan<'_>, e: &Value) -> Result<Vec<Row>, ()> {
                 doc.insert((*term).to_owned(), (*instance).clone());
             }
         }
-        if let Some(term) = observed {
-            doc.insert(
-                term.to_owned(),
-                json!({"type": "Property", "value": {"@type": "DateTime", "@value": text}}),
-            );
-        }
+        doc.insert(
+            plan.observed.clone(),
+            json!({"type": "Property", "value": {"@type": "DateTime", "@value": text}}),
+        );
         let doc = Value::Object(doc);
         let keep = match &plan.program {
             None => true,
-            Some(p) => p.eval(&doc).map_err(|_| ())? == Truth::True,
+            Some(p) => {
+                p.eval(&doc)
+                    .map_err(|_| refusal(Refused::TooComplex, version))?
+                    == Truth::True
+            }
         };
         if let (true, Value::Object(doc)) = (keep, doc) {
             out.push(Row {
@@ -684,13 +641,7 @@ fn value(set_name: &str, plan: &Plan<'_>, row: &Row, picked: Option<&[String]>) 
         ("id".to_owned(), Value::from(row.urn.as_str())),
         ("observedAt".to_owned(), Value::from(row.at.as_str())),
     ];
-    for (name, term) in &plan.terms {
-        let Some(member) = plan.set.members.get(*name) else {
-            continue;
-        };
-        if *name == "observedAt" || !wanted(name) {
-            continue;
-        }
+    for (name, member, term) in plan.terms.iter().filter(|(name, _, _)| wanted(name)) {
         let instance = default_instance(row.doc.get(term.as_str()));
         let (value, _) = served(&member.shape, instance);
         properties.push(((*name).to_owned(), value));
@@ -708,5 +659,40 @@ fn value(set_name: &str, plan: &Plan<'_>, row: &Row, picked: Option<&[String]>) 
     EntityValue {
         id: format!("{set_name}{}", Segment::Key(key)),
         properties,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unlisted_instance_is_one_and_only_timed_default_instances_count() {
+        let one = json!({"type": "Property", "value": 4, "observedAt": "2026-10-21T10:00:00Z"});
+        assert_eq!(instances_of(Some(&one)).len(), 1);
+        assert_eq!(instances_of(Some(&json!(3))).len(), 0);
+        let list = json!([
+            {"type": "Property", "value": 1, "datasetId": "urn:x", "observedAt": "2026-10-21T10:00:00Z"},
+            {"type": "Property", "value": 2},
+            {"type": "Property", "value": 3, "observedAt": "2026-10-21T11:00:00+01:00"},
+            {"type": "Property", "value": 5, "observedAt": "2026-10-21T09:00:00Z"}
+        ]);
+        let got: Vec<&str> = timed(Some(&list))
+            .into_iter()
+            .map(|(_, at, _)| at)
+            .collect();
+        assert_eq!(got, ["2026-10-21T09:00:00Z", "2026-10-21T11:00:00+01:00"]);
+    }
+
+    #[test]
+    fn merge_adds_the_earlier_instances_of_each_attribute() {
+        let mut e = json!({"id": "urn:a", "t0": {"type": "Property", "value": 2, "observedAt": "2026-10-21T10:00:00Z"}});
+        let old = json!({"id": "urn:a", "t0": [{"type": "Property", "value": 1, "observedAt": "2026-10-21T09:00:00Z"}]});
+        merge(&mut e, &old, &["t0", "t1"]);
+        assert_eq!(timed(e.get("t0")).len(), 2);
+        assert!(
+            e.get("t1").is_none(),
+            "an attribute with no earlier instance stays absent"
+        );
     }
 }

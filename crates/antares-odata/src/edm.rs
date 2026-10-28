@@ -365,9 +365,15 @@ pub fn histories(mut edm: Edm) -> Edm {
     let mut sets = Vec::new();
     for (name, set) in edm.sets.iter().filter(|(_, s)| s.output.is_none()) {
         let history = format!("{name}{HISTORY_SUFFIX}");
-        let reserved = set.members.contains_key("id") || set.members.contains_key("observedAt");
+        // a row's key takes `id` and `observedAt`; a set showing no member has no history
+        let plain = set
+            .members
+            .keys()
+            .filter(|k| !matches!(k.as_str(), "id" | "observedAt"))
+            .count();
+        let serves = plain == set.members.len() && plain > 0;
         let class = own.entity_types.iter().find(|t| t.name == *name);
-        let (Some(class), false, false) = (class, reserved, taken.contains(&history)) else {
+        let (Some(class), true, false) = (class, serves, taken.contains(&history)) else {
             continue;
         };
         let (ty, members) = history_type(&history, name, class, set);
@@ -388,9 +394,9 @@ pub fn histories(mut edm: Edm) -> Edm {
         edm.histories.insert(history, set);
     }
     own.entity_types.extend(types);
-    if let Some(container) = own.entity_container.as_mut() {
-        container.entity_sets.extend(sets);
-    }
+    own.entity_container
+        .iter_mut()
+        .for_each(|c| c.entity_sets.append(&mut sets));
     edm
 }
 
@@ -439,18 +445,19 @@ fn history_type(
             p.nullable = true;
             p
         }));
-    for nav in &class.navigation_properties {
-        let Some(m) = members.get(&nav.name) else {
-            continue;
-        };
-        let ty_ref = match m.shape {
-            Shape::Url { collection: true } => TypeRef::collection("Edm.String"),
-            _ => TypeRef::single("Edm.String"),
+    let urls = class.navigation_properties.iter().filter_map(|nav| {
+        let m = members.get(&nav.name)?;
+        let many = m.shape == Shape::Url { collection: true };
+        let ty_ref = if many {
+            TypeRef::collection("Edm.String")
+        } else {
+            TypeRef::single("Edm.String")
         };
         let mut p = Property::new(nav.name.clone(), ty_ref);
         p.annotations.push(iri(&m.iri));
-        ty.properties.push(p);
-    }
+        Some(p)
+    });
+    ty.properties.extend(urls.collect::<Vec<_>>());
     members.insert(
         "observedAt".into(),
         Member {
@@ -1389,6 +1396,84 @@ mod tests {
             );
         }
         assert!(constraints(&shown(&s, &[("Desc", &every)])).0.is_empty());
+    }
+
+    #[test]
+    fn a_history_set_stands_beside_each_class_set_keyed_by_id_and_observed_at() {
+        let s = schema();
+        let shown = shown(
+            &s,
+            &[("Car", CAR_ALL), ("Person", &["name"]), ("Garage", &[])],
+        );
+        for version in [CsdlVersion::V4_01, CsdlVersion::V4_0] {
+            let edm =
+                histories(build("city-cars", &s, &shown, Writable::default(), version).unwrap());
+            odata_csdl::validate(&edm.csdl, &odata_csdl::Limits::strict()).unwrap();
+            let names: Vec<&str> = edm.histories.keys().map(String::as_str).collect();
+            assert_eq!(
+                names,
+                ["Car_history", "Person_history"],
+                "Garage shows no member"
+            );
+            let car = edm.histories.get("Car_history").unwrap();
+            let shape = |name: &str| car.members.get(name).map(|m| m.shape.clone());
+            assert_eq!(shape("drivers"), Some(Shape::Url { collection: true }));
+            assert_eq!(shape("owner"), Some(Shape::Url { collection: false }));
+            assert_eq!(car.writable, Writable::default());
+            let ty = edm
+                .csdl
+                .schemas
+                .iter()
+                .flat_map(|s| &s.entity_types)
+                .find(|t| t.name == "Car_history")
+                .unwrap();
+            assert_eq!(ty.key, ["id", "observedAt"]);
+            assert_eq!(ty.navigation_properties.len(), 0);
+            let drivers = ty.properties.iter().find(|p| p.name == "drivers").unwrap();
+            assert_eq!(drivers.ty, TypeRef::collection("Edm.String"));
+        }
+        let built = || {
+            build(
+                "city-cars",
+                &s,
+                &shown,
+                Writable::default(),
+                CsdlVersion::V4_01,
+            )
+            .unwrap()
+        };
+        let mut reserved = built();
+        let name = reserved
+            .sets
+            .get("Person")
+            .unwrap()
+            .members
+            .get("name")
+            .unwrap()
+            .clone();
+        reserved
+            .sets
+            .get_mut("Person")
+            .unwrap()
+            .members
+            .insert("observedAt".into(), name);
+        let mut taken = built();
+        let person = taken.sets.get("Person").unwrap().clone();
+        taken.sets.insert("Car_history".into(), person);
+        for (edm, kept) in [(reserved, "Car_history"), (taken, "Person_history")] {
+            let names: Vec<String> = histories(edm).histories.into_keys().collect();
+            assert_eq!(
+                names,
+                [kept],
+                "a reserved member or a taken name makes no history"
+            );
+        }
+        let mut bare = built();
+        bare.csdl.schemas.clear();
+        assert!(
+            histories(bare).histories.is_empty(),
+            "no container, no history"
+        );
     }
 
     #[test]
