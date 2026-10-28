@@ -474,12 +474,15 @@ jobs:
       # Sensing 1.0; none exists for 1.1), its only image tag, pinned by digest
       TE_IMAGE: ogccite/ets-sta10:1.5-teamengine-6.0.0-RC2@sha256:e1ec8dc3508ea3355f059abee98737f5d2c00434aeffa298d80ea04361c93db3
       IUT: http://localhost:9090/x/views/sta/sta/v1.1
+      # The fork's run reads the Capability3Tests fixtures, seeded through NGSI-LD (T-5918)
+      FORK_IUT: http://localhost:9090/x/views/sta-ets/sta/v1.1
       BASELINE: ci/sta-compliance-baseline.json
-      # The fork's one patch over tag 1.5: @iot.id read as ANY (15-078r6 Table 2,
-      # ets-sta10#40), docs/src/sta-compliance.md section 3. Built by the pinned Maven
-      # image into the official image above, so the jar is the only difference.
+      # The fork's patches over tag 1.5: @iot.id read as ANY (15-078r6 Table 2,
+      # ets-sta10#40) and a Level 3 setup that writes nothing (T-5918),
+      # docs/src/sta-compliance.md section 4. Built by the pinned Maven image into
+      # the official image above, so the jar is the only difference.
       FORK_REPO: marek-mraz-jc/ets-sta10
-      FORK_COMMIT: 0db93839a7d141331928443a1edfadfd8082ac5e
+      FORK_COMMIT: 5d5d9793c1cbae502a603f4630d1984b97044fd3
       MAVEN_IMAGE: maven:3.9-eclipse-temurin-17@sha256:1a352420f7aba21f5ad08df31bab55f74c013fb491f1ae8ab1dd7ff9ed698584
       FORK_BASELINE: ci/sta-compliance-fork-baseline.json
     steps:
@@ -508,6 +511,7 @@ jobs:
           ANTARES_HTTP_PORT=9090 ANTARES_API_SURFACES=admin,views,sta ./antares > broker.log 2>&1 &
           for _ in $(seq 1 100); do curl -sf -o /dev/null localhost:9090/q/health && break; sleep 0.2; done
           dev/views-rig.sh http://localhost:9090 ci/views/sta
+          dev/views-rig.sh http://localhost:9090 ci/views/sta-ets
           # the image's own public test account (ogctest), not a secret
           for _ in $(seq 1 60); do
             curl -fsS -m 5 -u ogctest:ogctest -o /dev/null localhost:8080/teamengine/rest/suites && break
@@ -536,7 +540,7 @@ jobs:
             curl -fsS -m 5 -u ogctest:ogctest -o /dev/null localhost:8080/teamengine/rest/suites && break
             sleep 5
           done
-          iut=$(jq -rn --arg u "$IUT" '$u|@uri')
+          iut=$(jq -rn --arg u "$FORK_IUT" '$u|@uri')
           curl -sS -m 1500 -u ogctest:ogctest -H 'Accept: application/xml' -o fork-testng-results.xml \
             "localhost:8080/teamengine/rest/suites/sta10/run?iut=$iut&ics=3" || true
           set +e

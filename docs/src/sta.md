@@ -90,11 +90,11 @@ the Sensor `unknown`, since `metadata` is mandatory (15-078r6 Table 8).
 | Option | Behaviour |
 |---|---|
 | `$top`, `$skip` | resources per page, at most 100 (default 100); `$top=0` answers `@iot.count` alone (on a set other than `Things`, only when the first 100 resources are the whole set); `$skip` at most 10 000; on `Datastreams`, `Observations` and `ObservedProperties` a `$skip` reaching past the first 1 000 Entities is `400`: follow `@iot.nextLink`. A page of those sets reads past Entities that hold none of its resources, up to 1 000 Entities per request |
-| `$count=true` | `@iot.count`: the Query Entities count on `Things`, and on any other set only when the page is the whole answer |
+| `$count=true` | `@iot.count`: the Query Entities count on `Things`, and on any other set only when the page is the whole answer; on a collection read whole for `$filter` or `$orderby` (below), its exact count |
 | `$filter` | see below; at most 4 096 bytes; anything else `400` naming it |
-| `$expand` | `Locations`, `Datastreams` and `Datastreams/Observations` on a Thing, `Observations` on a Datastream; an inlined `Observations` is the current Observation, so its nested options are not read; any other path is `400` naming it |
+| `$expand` | every navigation property, one or two deep (`Datastreams/Sensor`), on a list and on one resource: a collection inlined as an array, a single resource as an object, `null` when the view hides it. `Locations`, `Datastreams` and `Datastreams/Observations` on `Things` and `Observations` on `Datastreams` come with the page's Query Entities (an inlined `Observations` there is the current Observation); every other path is read through each resource's navigation link, at most 500 reads per request, past which it is `400`. Nested options (`Observations($top=1)`) are not read; a path that is no navigation property is `400` naming it |
 | `$select` | the members each resource keeps, on a list and on one resource; `id` is `@iot.id` |
-| `$orderby` | `phenomenonTime desc` alone, on a Datastream's Observations; any other order is `400` |
+| `$orderby` | `phenomenonTime desc` alone on a Datastream's Observations is their read order; any other, on any collection: properties or member paths (`unitOfMeasurement/name`), each `asc` (default) or `desc`, a missing or `null` member first, read over the collection (below) |
 
 `$filter` takes comparisons (`eq`, `ne`, `gt`, `ge`, `lt`, `le`), `and`,
 `or`, parentheses and `substringof('text', property)`, its text matched
@@ -116,8 +116,23 @@ of the Entity behind the resource:
 A Datastream's Observations take `phenomenonTime` predicates on the
 top-level `and`, as the temporal window: `ge t` holds `t`, `gt t` starts one
 millisecond after it, `lt t` ends before it, `le t` one millisecond after
-it, and `eq t` is the millisecond at `t`. Every other property, `result`
-included, is `400` naming it.
+it, and `eq t` is the millisecond at `t`.
+
+Any other `$filter`, and every `$orderby` but the read order above, is read
+over the collection (T-5918): the endpoint reads the collection whole, at
+most 1 000 resources (past them `400`: narrow the path to one Thing or
+Datastream, or filter a top-level set on Thing properties), and judges
+each resource on the members it answers, so a filter reads nothing the
+view hides. Such a `$filter` also takes `not`, `startswith(p, 'text')`,
+`endswith(p, 'text')`, `null`, and any member path of the resource
+(`result`, `unitOfMeasurement/symbol`, `properties/owner`); a path through a
+related resource (`Thing/name`) only where the table above lists it. A
+number compares with a number by value and with a text as text
+(`result gt '3'`), an instant literal with an instant member by time, and
+a comparison with a missing member holds only for `ne`. A name no
+resource of the collection holds is `400` naming it, since an unquoted
+text would otherwise match nothing. `@iot.nextLink` of such a page carries
+`$skip`.
 
 A Datastream's Observations are newest first: its Entity's current instance
 and the newest `$skip + $top + 1` instances of its history, read with their
@@ -163,8 +178,8 @@ here:
   Location.
 - `@iot.count` on a set other than `Things` past the first page, or on a
   first page that is not the whole answer.
-- `result` and every other non-time property in a Datastream's Observations
-  `$filter`: Retrieve Temporal Evolution takes no `q`.
+- A `$filter` or `$orderby` read over a collection of more than 1 000
+  resources (section 2).
 - A neutral observation model shared with a SensorThings 2.0 encoding: the
   `/sta/v1.1` path leaves room for `/sta/v2.0` beside it, and the shared
   representation contract of T-5207 decides the model first.

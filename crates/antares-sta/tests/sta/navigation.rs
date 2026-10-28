@@ -51,6 +51,80 @@ async fn every_navigation_link_of_every_set_answers() -> Result<(), String> {
     Ok(())
 }
 
+/// T-5918: every navigation path one and two deep expands on every set, inlined as an array
+/// for a collection and an object for a single resource (15-078r6 9.3.2.1; ets-sta10
+/// Capability3Tests.readEntitiesWithExpandQO); a path that is none is refused by name.
+#[tokio::test]
+async fn every_navigation_path_expands_on_every_set() -> Result<(), String> {
+    let f = fixture().await?;
+    for (set, path, kind) in [
+        ("Things", "HistoricalLocations/Locations", "array"),
+        ("Things", "Datastreams/Sensor", "array"),
+        ("Locations", "Things/Datastreams", "array"),
+        ("HistoricalLocations", "Thing/Locations", "object"),
+        ("Datastreams", "ObservedProperty/Datastreams", "object"),
+        ("Datastreams", "Sensor", "object"),
+        ("Sensors", "Datastreams/Observations", "array"),
+        ("ObservedProperties", "Datastreams/Thing", "array"),
+        ("Observations", "FeatureOfInterest/Observations", "object"),
+        ("FeaturesOfInterest", "Observations/Datastream", "array"),
+    ] {
+        let head = path.split('/').next().unwrap_or_default();
+        let a = sta(&f.app, &format!("/{set}?$expand={path}&$select=id")).await;
+        assert_eq!(a.status, StatusCode::OK, "{set} {path}: {}", a.body);
+        let first = at(&a.body, "/value/0");
+        let inlined = &first[head];
+        let shape = if inlined.is_array() {
+            "array"
+        } else if inlined.is_object() {
+            "object"
+        } else {
+            "none"
+        };
+        assert_eq!(shape, kind, "{set} {path}: {first}");
+        // `$select=id` keeps the id and the expanded member, and no navigation link.
+        assert!(
+            first.get("@iot.selfLink").is_none(),
+            "{set} {path}: {first}"
+        );
+    }
+    let one = sta(
+        &f.app,
+        "/Things('urn:ngsi-ld:Car:1')?$expand=HistoricalLocations",
+    )
+    .await;
+    assert!(
+        at(&one.body, "/HistoricalLocations").is_array(),
+        "{}",
+        one.body
+    );
+    // a related collection expands too, each of its resources
+    let related = sta(
+        &f.app,
+        "/Sensors('urn:ngsi-ld:Device:1')/Datastreams?$expand=Observations",
+    )
+    .await;
+    let streams = related.body["value"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(!streams.is_empty(), "{}", related.body);
+    assert!(
+        streams.iter().all(|d| d["Observations"].is_array()),
+        "{}",
+        related.body
+    );
+    let bad = sta(&f.app, "/Sensors?$expand=Thing").await;
+    assert_eq!(
+        (bad.status, at(&bad.body, "/error/message")),
+        (
+            StatusCode::BAD_REQUEST,
+            json!("$expand: Thing is not a navigation path of Sensors")
+        )
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_single_navigation_answers_the_entity_and_a_collection_its_page() -> Result<(), String> {
     let f = fixture().await?;

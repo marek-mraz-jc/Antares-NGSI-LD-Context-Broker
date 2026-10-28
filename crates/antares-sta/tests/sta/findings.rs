@@ -144,20 +144,28 @@ async fn each_historical_location_has_its_own_geometry() -> Result<(), String> {
 #[tokio::test]
 async fn a_filter_reads_sta_names_and_the_catalogue_link_its_type() -> Result<(), String> {
     let f = fixture().await?;
+    // T-5918: a property no `q` names is judged over the collection the view answered.
     let all = sta(&f.app, "/Observations?$filter=result gt 0").await;
-    assert_eq!(
-        (all.status, at(&all.body, "/error/message")),
-        (
-            StatusCode::BAD_REQUEST,
-            json!("$filter: result is not a property Observations are filtered on")
-        )
+    assert_eq!(all.status, StatusCode::OK, "{}", all.body);
+    let results = all.body["value"].as_array().cloned().unwrap_or_default();
+    assert!(!results.is_empty());
+    assert!(
+        results.iter().all(|o| o["result"].as_f64() > Some(0.0)),
+        "{}",
+        all.body
     );
     let result = sta(
         &f.app,
         "/Datastreams('urn:ngsi-ld:Car:1%2Fspeed')/Observations?$filter=result gt 8",
     )
     .await;
-    assert_eq!(result.status, StatusCode::BAD_REQUEST);
+    assert_eq!(result.status, StatusCode::OK, "{}", result.body);
+    let kept = result.body["value"].as_array().cloned().unwrap_or_default();
+    assert!(
+        kept.iter().all(|o| o["result"].as_f64() > Some(8.0)),
+        "{}",
+        result.body
+    );
     let cars = sta(
         &f.app,
         "/Datastreams?$filter=Thing/properties/type eq 'Car' and Thing/name eq 'Žltá'",
@@ -200,18 +208,33 @@ async fn select_expand_and_top_answer_as_documented() -> Result<(), String> {
         "{}",
         deep.body
     );
-    let refused = sta(&f.app, "/Observations?$expand=Datastream").await;
+    // T-5918: every navigation path is expanded, one through its navigation link.
+    let inlined = sta(&f.app, "/Observations?$expand=Datastream/Thing").await;
+    assert_eq!(inlined.status, StatusCode::OK, "{}", inlined.body);
+    assert!(
+        at(&inlined.body, "/value/0/Datastream/Thing/@iot.id").is_string(),
+        "{}",
+        inlined.body
+    );
+    let refused = sta(&f.app, "/Observations?$expand=Sensor").await;
     assert_eq!(
         (refused.status, at(&refused.body, "/error/message")),
         (
             StatusCode::BAD_REQUEST,
-            json!("$expand: Datastream is not served on Observations")
+            json!("$expand: Sensor is not a navigation path of Observations")
         )
     );
     let count = sta(&f.app, "/Things?$top=0&$count=true").await;
     assert_eq!(count.body, json!({"@iot.count": 5, "value": []}));
-    let order = sta(&f.app, "/Things?$orderby=phenomenonTime desc").await;
-    assert_eq!(order.status, StatusCode::BAD_REQUEST);
+    let order = sta(&f.app, "/Things?$orderby=name desc").await;
+    let names: Vec<Value> = order.body["value"]
+        .as_array()
+        .map(|v| v.iter().map(|t| t["name"].clone()).collect())
+        .unwrap_or_default();
+    let mut sorted = names.clone();
+    sorted.sort_by_key(|n| std::cmp::Reverse(n.as_str().map(str::to_owned)));
+    assert_eq!((order.status, names.len()), (StatusCode::OK, 5));
+    assert_eq!(names, sorted);
     Ok(())
 }
 
@@ -287,6 +310,43 @@ async fn sensor_pages_list_every_device_once() -> Result<(), String> {
             "urn:ngsi-ld:Device:2",
             "urn:ngsi-ld:Device:3"
         ]
+    );
+    Ok(())
+}
+
+/// T-5918: options combine in the order 15-078r6 9.3.3.1 gives: `$filter`, then `$count`,
+/// `$orderby`, `$skip`, `$top` (ets-sta10 Capability3Tests.checkQueriesPriorityOrdering).
+#[tokio::test]
+async fn query_options_apply_in_their_evaluation_order() -> Result<(), String> {
+    let f = fixture().await?;
+    let all = sta(&f.app, "/Observations?$filter=result gt 0").await;
+    let mut results: Vec<f64> = all.body["value"]
+        .as_array()
+        .map(|v| v.iter().filter_map(|o| o["result"].as_f64()).collect())
+        .unwrap_or_default();
+    results.sort_by(f64::total_cmp);
+    assert!(results.len() > 1, "{}", all.body);
+    let page = sta(
+        &f.app,
+        "/Observations?$count=true&$top=1&$skip=1&$orderby=result%20asc&$filter=result%20gt%200",
+    )
+    .await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    assert_eq!(at(&page.body, "/@iot.count"), json!(results.len()));
+    assert_eq!(
+        page.body["value"].as_array().map(Vec::len),
+        Some(1),
+        "{}",
+        page.body
+    );
+    assert_eq!(
+        at(&page.body, "/value/0/result").as_f64(),
+        results.get(1).copied()
+    );
+    let next = at(&page.body, "/@iot.nextLink");
+    assert!(
+        next.as_str().is_some_and(|l| l.ends_with("$skip=2")),
+        "{next}"
     );
     Ok(())
 }

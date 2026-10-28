@@ -25,6 +25,7 @@
 
 pub mod mapping;
 pub mod query;
+pub mod residual;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -287,20 +288,315 @@ async fn respond(ops: &Ops, caller: &Caller, req: &Parts) -> Result<Answer, Prob
     let id = segments.next().unwrap_or_default();
     // `sta`, then `v1.1` or the output's name and `v1.1`: the route matched them.
     let named = segments.nth(1).filter(|s| *s != "v1.1");
-    let rest = segments
+    let raw_rest = segments
         .skip(usize::from(named.is_some()))
         .collect::<Vec<_>>()
         .join("/");
     let view = ops.view(id).ok_or_else(not_found)?;
     let output = named.map(|name| output(&view, name)).transpose()?;
     let root = named.map_or_else(|| "sta/v1.1".to_owned(), |n| format!("sta/{n}/v1.1"));
-    let rest = antares_ops::percent::decoded(&rest).ok_or_else(not_found)?;
+    let rest = antares_ops::percent::decoded(&raw_rest).ok_or_else(not_found)?;
     // A list of pairs takes every query string: a name without `=` is a pair with an empty value.
     let pairs = Query::<Vec<(String, String)>>::try_from_uri(uri)
         .map(|Query(p)| p)
         .unwrap_or_default();
+    let env = Env {
+        view: &view,
+        output,
+        caller,
+        base: format!(
+            "{}{PREFIX}/{id}/{root}",
+            antares_ops::public_base(&req.headers)
+        ),
+        reads: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let steps = query::steps(&rest);
+    let options = query::options(&pairs)?;
+    if residual_needed(&steps, &options) {
+        let link = format!("{}/{raw_rest}", env.base);
+        return scan(&env, &rest, &link, &pairs, &options)
+            .await
+            .map(Answer::Doc);
+    }
+    read(&env, &rest, pairs).await
+}
+
+/// What every read of one request shares: the view, its named output, the caller, the base of
+/// every link, and how many reads a generic `$expand` made.
+struct Env<'a> {
+    view: &'a ViewOps,
+    output: Option<Named>,
+    caller: &'a Caller,
+    base: String,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+/// The most related reads one request's `$expand` makes (T-5918).
+const MAX_EXPAND_READS: usize = 500;
+
+/// Whether a request's `$filter` or `$orderby` is judged over the collection
+/// ([`residual`]): an order other than a Datastream's Observations newest first, and a filter
+/// no `q`, id or time window of the path can say.
+fn residual_needed(steps: &[Step], opts: &Options) -> bool {
+    let series = matches!(steps, [Step { set: from, key: Some(_) }, Step { set, key: None }]
+        if from == "Datastreams" && set == "Observations");
+    let reference = matches!(steps.last(), Some(Step { set, key: None }) if set == "$ref");
+    if reference {
+        return false;
+    }
+    let ordered = !opts.orderby.is_empty() && (!series || !opts.ordered);
+    let filtered = opts.filter.as_deref().is_some_and(|f| match steps {
+        [Step { set, key: None }] => query::by_id(f, set).is_err(),
+        _ if series => query::series_filter(f).is_err(),
+        _ => true,
+    });
+    ordered || filtered
+}
+
+/// A collection read whole (at most [`residual::MAX_SCAN`] resources), then filtered, ordered,
+/// counted and paged here: the members each resource is judged on are those the view answered.
+async fn scan(
+    env: &Env<'_>,
+    rest: &str,
+    link: &str,
+    pairs: &[(String, String)],
+    opts: &Options,
+) -> Done {
+    const OWN: [&str; 8] = [
+        "$filter",
+        "$orderby",
+        "$top",
+        "$skip",
+        "$count",
+        "$skiptoken",
+        "$select",
+        "$expand",
+    ];
+    let filter = opts.filter.as_deref().map(residual::parse).transpose()?;
+    let plain: Vec<(String, String)> = pairs
+        .iter()
+        .filter(|(k, _)| !OWN.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    let mut items = Vec::new();
+    let mut cursor = Vec::new();
+    loop {
+        let mut p = plain.clone();
+        p.extend(cursor);
+        let doc = match Box::pin(read(env, rest, p)).await? {
+            Answer::Doc(doc) => doc,
+            Answer::Raw(_) => return Err(not_found()),
+        };
+        let Some(Value::Array(page)) = doc.get("value").cloned() else {
+            return Err(Problem(
+                StatusCode::BAD_REQUEST,
+                "$filter and $orderby apply to a collection".into(),
+            ));
+        };
+        items.extend(page);
+        if items.len() > residual::MAX_SCAN {
+            return Err(Problem(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "$filter and $orderby here read at most {} resources and this collection holds more: narrow it to one Thing or Datastream, or filter on Thing properties",
+                    residual::MAX_SCAN
+                ),
+            ));
+        }
+        let Some(next) = doc.get("@iot.nextLink").and_then(Value::as_str) else {
+            break;
+        };
+        cursor = next
+            .split_once('?')
+            .map(|(_, q)| q)
+            .unwrap_or_default()
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .filter(|(k, _)| *k == "$skip" || *k == "$skiptoken")
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        if cursor.is_empty() {
+            break;
+        }
+    }
+    // A name no resource holds is a typo or an unquoted text, not a filter that holds for none.
+    let heads = filter.iter().flat_map(residual::heads);
+    let heads = heads.chain(
+        opts.orderby
+            .iter()
+            .filter_map(|(p, _)| p.first().map(String::as_str)),
+    );
+    for head in heads {
+        if !items.is_empty() && !items.iter().any(|i| i.get(head).is_some()) {
+            let option = if opts
+                .orderby
+                .iter()
+                .any(|(p, _)| p.first().is_some_and(|f| f == head))
+            {
+                "$orderby"
+            } else {
+                "$filter"
+            };
+            return Err(Problem(
+                StatusCode::BAD_REQUEST,
+                format!("{option}: {head} is no property of these resources; quote a text"),
+            ));
+        }
+    }
+    if let Some(expr) = &filter {
+        items.retain(|i| residual::matches(expr, i));
+    }
+    residual::sort(&mut items, &opts.orderby);
+    let total = items.len();
+    let mut page: Vec<Value> = items.into_iter().skip(opts.skip).take(opts.top).collect();
+    let more = opts.top > 0 && total > opts.skip.saturating_add(page.len());
+    let next = more.then(|| {
+        let mut q: Vec<String> = pairs
+            .iter()
+            .filter(|(k, _)| k != "$skip" && k != "$skiptoken")
+            .map(|(k, v)| format!("{}={}", encode(k), encode(v)))
+            .collect();
+        q.push(format!("$skip={}", opts.skip.saturating_add(page.len())));
+        format!("{link}?{}", q.join("&"))
+    });
+    expand_all(env, &mut page, &opts.expand).await?;
+    let select = selection(&opts.select, &opts.expand);
+    Ok(query::collection(
+        page,
+        &select,
+        opts.count.then_some(total),
+        next,
+    ))
+}
+
+/// The members `$select` keeps once `$expand` inlined some: the expanded ones too.
+fn selection(select: &[String], expand: &[String]) -> Vec<String> {
+    if select.is_empty() {
+        return Vec::new();
+    }
+    let heads = expand.iter().filter_map(|p| p.split('/').next());
+    select
+        .iter()
+        .cloned()
+        .chain(heads.map(str::to_owned))
+        .collect()
+}
+
+/// The navigation properties of each set's resources (15-078r6 Table 2 to 9).
+fn navigation(set: &str) -> &'static [&'static str] {
+    match set {
+        "Things" => &["Locations", "HistoricalLocations", "Datastreams"],
+        "Locations" => &["Things", "HistoricalLocations"],
+        "HistoricalLocations" => &["Thing", "Locations"],
+        "Datastreams" => &["Thing", "Sensor", "ObservedProperty", "Observations"],
+        "Sensors" | "ObservedProperties" => &["Datastreams"],
+        "Observations" => &["Datastream", "FeatureOfInterest"],
+        "FeaturesOfInterest" => &["Observations"],
+        _ => &[],
+    }
+}
+
+/// The set a navigation property's resources are in.
+fn set_of(name: &str) -> &str {
+    if SETS.contains(&name) {
+        return name;
+    }
+    plural(name).unwrap_or_default()
+}
+
+/// Each `$expand` path walks navigation properties from `target` (the path's last set): any
+/// other is refused by name.
+fn expansions(target: &str, expand: &[String]) -> Result<(), Problem> {
+    for path in expand {
+        let mut set = set_of(target);
+        for name in path.split('/') {
+            if !navigation(set).contains(&name) {
+                return Err(Problem(
+                    StatusCode::BAD_REQUEST,
+                    format!("$expand: {path} is not a navigation path of {target}"),
+                ));
+            }
+            set = set_of(name);
+        }
+    }
+    Ok(())
+}
+
+/// Each resource of `items` with each `$expand` path inlined: a member the read already
+/// inlined is kept, any other is read through its navigation link, so it shows only what the
+/// view shows. A related resource the view hides is `null`.
+async fn expand_all(env: &Env<'_>, items: &mut [Value], expand: &[String]) -> Result<(), Problem> {
+    for item in items.iter_mut() {
+        for path in expand {
+            let names: Vec<&str> = path.split('/').collect();
+            Box::pin(expand_one(env, item, &names)).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn expand_one(env: &Env<'_>, item: &mut Value, names: &[&str]) -> Result<(), Problem> {
+    let Some((name, deeper)) = names.split_first() else {
+        return Ok(());
+    };
+    let present = item
+        .get(*name)
+        .is_some_and(|v| v.is_array() || v.is_object());
+    if !present {
+        let own = item
+            .get("@iot.selfLink")
+            .and_then(Value::as_str)
+            .and_then(|l| l.strip_prefix(env.base.as_str()))
+            .and_then(|l| antares_ops::percent::decoded(l.trim_start_matches('/')))
+            .ok_or_else(not_found)?;
+        let reads = env.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if reads >= MAX_EXPAND_READS {
+            return Err(Problem(
+                StatusCode::BAD_REQUEST,
+                format!("$expand reads at most {MAX_EXPAND_READS} related resources per request: lower $top"),
+            ));
+        }
+        let related = match Box::pin(read(env, &format!("{own}/{name}"), Vec::new())).await {
+            Ok(Answer::Doc(doc)) => match doc.get("value") {
+                Some(Value::Array(list)) => Value::Array(list.clone()),
+                _ => doc,
+            },
+            Ok(Answer::Raw(_)) | Err(Problem(StatusCode::NOT_FOUND, _)) => Value::Null,
+            Err(other) => return Err(other),
+        };
+        if let Some(map) = item.as_object_mut() {
+            map.insert((*name).to_owned(), related);
+        }
+    }
+    if deeper.is_empty() {
+        return Ok(());
+    }
+    match item.get_mut(*name) {
+        Some(Value::Array(list)) => Box::pin(expand_all(env, list, &[deeper.join("/")])).await,
+        Some(child @ Value::Object(_)) => Box::pin(expand_one(env, child, deeper)).await,
+        _ => Ok(()),
+    }
+}
+
+/// A read's answer with the `$expand` paths one Query Entities could not inline, then its
+/// `$select`: on each resource of a collection, or on the one resource.
+async fn expanded(env: &Env<'_>, mut doc: Value, generic: &[String], select: &[String]) -> Done {
+    if let Some(Value::Array(list)) = doc.get_mut("value") {
+        expand_all(env, list, generic).await?;
+        for item in list.iter_mut() {
+            *item = query::selected(std::mem::take(item), select);
+        }
+        return Ok(doc);
+    }
+    expand_all(env, std::slice::from_mut(&mut doc), generic).await?;
+    Ok(query::selected(doc, select))
+}
+
+/// One path of a request, read with `pairs`: what [`respond`] answers once no residual
+/// `$filter` or `$orderby` is left, and what a scan or an `$expand` reads.
+async fn read(env: &Env<'_>, rest: &str, pairs: Vec<(String, String)>) -> Result<Answer, Problem> {
     let mut options = query::options(&pairs)?;
-    let mut steps = query::steps(&rest);
+    let mut steps = query::steps(rest);
     // `{path}/$ref` (15-078r6 9.2.7): the resources of `{path}` as their self-links alone.
     let reference =
         steps.len() > 1 && matches!(steps.last(), Some(Step { set, key: None }) if set == "$ref");
@@ -315,16 +611,34 @@ async fn respond(ops: &Ops, caller: &Caller, req: &Parts) -> Result<Answer, Prob
         (Some(f), [Step { set, key: None }]) => query::by_id(f, set)?,
         _ => ById::default(),
     };
-    expandable(&steps, &options.expand)?;
+    let target = match steps.as_slice() {
+        [.., Step { set, .. }] => set.clone(),
+        [] => String::new(),
+    };
+    expansions(&target, &options.expand)?;
+    // The paths one Query Entities of a set or a resource inlines are read so; every other, and
+    // every one on a related collection, is read after the page.
+    let served: &[&str] = match (target.as_str(), steps.len()) {
+        ("Things", 1) => &["Locations", "Datastreams", "Datastreams/Observations"],
+        ("Datastreams", 1) => &["Observations"],
+        _ => &[],
+    };
+    let (native, generic): (Vec<String>, Vec<String>) = std::mem::take(&mut options.expand)
+        .into_iter()
+        .partition(|p| served.contains(&p.as_str()));
+    let select = if generic.is_empty() {
+        Vec::new()
+    } else {
+        // the self link a generic `$expand` reads through is kept until it is done
+        selection(&std::mem::take(&mut options.select), &generic)
+    };
+    options.expand = native;
     let cx = Cx {
         opts: options,
-        base: format!(
-            "{}{PREFIX}/{id}/{root}",
-            antares_ops::public_base(&req.headers)
-        ),
-        view: &view,
-        output,
-        caller,
+        base: env.base.clone(),
+        view: env.view,
+        output: env.output.clone(),
+        caller: env.caller,
         pairs,
         ids,
     };
@@ -377,9 +691,12 @@ async fn respond(ops: &Ops, caller: &Caller, req: &Parts) -> Result<Answer, Prob
         }] => cx.related(from, key, member).await,
         _ => Err(not_found()),
     };
-    let doc = doc?;
+    let mut doc = doc?;
     if reference {
         return references(&doc).map(Answer::Doc).ok_or_else(not_found);
+    }
+    if !generic.is_empty() {
+        doc = expanded(env, doc, &generic, &select).await?;
     }
     Ok(Answer::Doc(doc))
 }
@@ -439,6 +756,7 @@ fn output(view: &ViewOps, name: &str) -> Result<Named, Problem> {
 }
 
 /// A named output and the types it reads.
+#[derive(Clone)]
 struct Named {
     output: Output,
     types: Vec<String>,
@@ -488,26 +806,6 @@ impl Named {
             .map(|(k, v)| format!("{k}={}", encode(v)))
             .collect::<Vec<_>>()
             .join("&"))
-    }
-}
-
-/// The `$expand` paths each set renders (T-5205 finding 18); any other is refused by name.
-fn expandable(steps: &[Step], expand: &[String]) -> Result<(), Problem> {
-    let target = match steps {
-        [.., Step { set, .. }] => set.as_str(),
-        [] => "",
-    };
-    let served: &[&str] = match target {
-        "Things" | "Thing" => &["Locations", "Datastreams", "Datastreams/Observations"],
-        "Datastreams" | "Datastream" => &["Observations"],
-        _ => &[],
-    };
-    match expand.iter().find(|p| !served.contains(&p.as_str())) {
-        Some(p) => Err(Problem(
-            StatusCode::BAD_REQUEST,
-            format!("$expand: {p} is not served on {target}"),
-        )),
-        None => Ok(()),
     }
 }
 

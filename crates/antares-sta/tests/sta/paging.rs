@@ -114,8 +114,14 @@ async fn an_id_filter_is_read_by_id_and_its_negation_excludes_it() -> Result<(),
     )
     .await;
     assert_eq!(ids(&hidden.body).len(), 0);
+    // T-5918: an id order is judged over the collection; a related resource's property
+    // beside an `or` is no `q` and no member of an Observation.
+    let ordered = sta(&f.app, "/Observations?$filter=id gt 'urn:ngsi-ld:Car:2'").await;
+    assert_eq!(ordered.status, StatusCode::OK);
+    assert!(ids(&ordered.body)
+        .iter()
+        .all(|i| i.as_str() > "urn:ngsi-ld:Car:2"));
     for refused in [
-        "id gt 'a'",
         "Datastream/Thing/name gt 1 or id eq 'a'",
         "id eq 'a' and Datastream/Thing/name gt 1",
     ] {
@@ -168,6 +174,22 @@ async fn a_skip_walks_pages_of_entities_up_to_its_bound() -> Result<(), String> 
     assert!(at(&deep.body, "/error/message")
         .as_str()
         .is_some_and(|m| m.contains("@iot.nextLink")));
+    // T-5918: a filter or an order judged over the collection reads at most 1 000 resources.
+    for over in [
+        "/Observations?$filter=result gt 5",
+        "/Things?$orderby=name",
+        "/Datastreams?$filter=name eq 'speed'&$top=1",
+    ] {
+        let refused = sta(&f.app, over).await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{over}");
+        assert!(
+            at(&refused.body, "/error/message")
+                .as_str()
+                .is_some_and(|m| m.contains("at most 1000 resources")),
+            "{over}: {}",
+            refused.body
+        );
+    }
     // A known count is the operation's only while no id is left out after the read.
     let counted = sta(&f.app, "/Things?$count=true&$top=1").await;
     assert_eq!(at(&counted.body, "/@iot.count"), 1050);
