@@ -590,7 +590,11 @@ fn filter_errors() {
         ("@Core.Messages/any()", Feature::AnnotationPath, 0),
         ("name/@Core.Size/x", Feature::AnnotationPath, 5),
         ("tags/@Core.Size/x", Feature::AnnotationPath, 5),
-        ("height gt geometry'SRID=0;Point(1 1)'", Feature::Literal, 10),
+        (
+            "height gt geometry'SRID=0;Point(1 1)'",
+            Feature::Literal,
+            10,
+        ),
     ] {
         refused(
             &format!("Buildings?$filter={text}"),

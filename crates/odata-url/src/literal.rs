@@ -144,7 +144,9 @@ pub(crate) fn is_duration(text: &str) -> bool {
     let Some(rest) = rest.strip_prefix('P') else {
         return false;
     };
-    let (days, time) = rest.split_once('T').map_or((rest, None), |(d, t)| (d, Some(t)));
+    let (days, time) = rest
+        .split_once('T')
+        .map_or((rest, None), |(d, t)| (d, Some(t)));
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let days_ok = days.is_empty() || days.strip_suffix('D').is_some_and(digits);
     let time_ok = time.is_none_or(|mut t| {
@@ -839,7 +841,10 @@ mod tests {
             "binary'A==='",
         ] {
             assert!(
-                matches!(read(bad).unwrap_err().kind, crate::UrlErrorKind::Syntax { .. }),
+                matches!(
+                    read(bad).unwrap_err().kind,
+                    crate::UrlErrorKind::Syntax { .. }
+                ),
                 "{bad}"
             );
         }
