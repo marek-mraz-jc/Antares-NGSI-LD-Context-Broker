@@ -405,19 +405,25 @@ impl Context {
         // a String header per key and value, hashbrown control bytes and
         // load-factor slack, and allocator rounding of the two strings
         const PAIR: usize = 2 * std::mem::size_of::<String>() + 48;
-        let def = std::mem::size_of::<TermDef>() - std::mem::size_of::<String>();
-        let terms: usize = self
-            .terms
-            .iter()
-            .map(|(t, d)| PAIR + def + t.len() + d.iri.len())
-            .sum();
-        let maps = |m: &HashMap<String, String>| -> usize {
-            m.iter().map(|(k, v)| PAIR + k.len() + v.len()).sum()
+        const DEF: usize = std::mem::size_of::<TermDef>() - std::mem::size_of::<String>();
+        let pair = |acc: usize, k: &String, v: &str| {
+            acc.saturating_add(PAIR)
+                .saturating_add(k.len())
+                .saturating_add(v.len())
         };
-        terms
-            .saturating_add(maps(&self.inverse))
-            .saturating_add(maps(&self.prefixes))
-            .saturating_add(self.prefix_lens.len() * std::mem::size_of::<usize>())
+        let terms = self.terms.iter().fold(0usize, |acc, (t, d)| {
+            pair(acc, t, &d.iri).saturating_add(DEF)
+        });
+        let maps = self
+            .inverse
+            .iter()
+            .chain(self.prefixes.iter())
+            .fold(terms, |acc, (k, v)| pair(acc, k, v));
+        maps.saturating_add(
+            self.prefix_lens
+                .len()
+                .saturating_mul(std::mem::size_of::<usize>()),
+        )
     }
 
     /// Expand a key/term in vocab position (attribute names, type values).
@@ -539,6 +545,27 @@ mod tests {
         c.merge_object(v.as_object().unwrap()).unwrap();
         c.freeze();
         c
+    }
+
+    /// The heap estimate grows with every map a term lands in: a prefix-capable
+    /// term (IRI ending in a gen-delim) costs the term map, the inverse and the
+    /// prefix index; the measured ~500 bytes a term sits inside its range (T-5894).
+    #[test]
+    fn heap_bytes_counts_each_map_a_term_lands_in() {
+        assert_eq!(Context::default().heap_bytes(), 0);
+        let plain = ctx(json!({"a": {"@id": "https://example.org/a"}}));
+        let prefix = ctx(json!({"a": "https://example.org/a/"}));
+        assert!(plain.heap_bytes() > 0);
+        assert!(prefix.heap_bytes() > plain.heap_bytes());
+        let mut m = serde_json::Map::new();
+        for i in 0..1000 {
+            m.insert(
+                format!("attr{i}"),
+                json!(format!("https://example.org/m/attr{i}")),
+            );
+        }
+        let wide = ctx(Value::Object(m));
+        assert!((400_000..=700_000).contains(&wide.heap_bytes()));
     }
 
     /// 5.5.7: the user @context "shall not contain JSON-LD Scoped Contexts"
