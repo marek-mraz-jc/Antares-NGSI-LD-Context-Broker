@@ -52,8 +52,10 @@ pub(super) fn cap_keeps_shown(
 /// `rules` (T-5616): `Some(None)` any, `Some(Some(list))` only these, `None`
 /// where the rules' verdict on an Entity is not the store's, so it may not
 /// page. It is where every rule names Entities by type alone (no condition,
-/// id or idPattern), all show the same Attributes through the same windows,
-/// no type hides Attributes of its own, each requested type is named by a
+/// id or idPattern) through the same windows, every type the rules name
+/// shows the same Attributes (the union of its rules: a list longer than a
+/// rule holds is split over several rules of the same types, T-5835), no
+/// type hides Attributes of its own, each requested type is named by a
 /// rule, and the windows hold the whole request window (open towards now,
 /// opened by its `after` or `between` instant on `observedAt`): an Entity
 /// with an instance of a shown Attribute in the request window then shows
@@ -79,29 +81,36 @@ pub(super) fn page_attrs(
                     .iter()
                     .all(|w| w.to.is_none() && w.opens_by(s, late))
             }));
-    let alike = rules.rules.iter().all(|r| {
-        r.admits_by_type_alone()
-            && r.attributes == first.attributes
-            && r.every_attribute == first.every_attribute
-            && r.temporal == first.temporal
-    });
+    let alike = rules
+        .rules
+        .iter()
+        .all(|r| r.admits_by_type_alone() && r.temporal == first.temporal);
+    // what an Entity of `t` shows: every Attribute, or the union of its rules' lists
+    let shown = |t: &String| {
+        let of = || rules.rules.iter().filter(|r| r.types.contains(t));
+        let every = of().any(|r| r.every_attribute);
+        let names: std::collections::BTreeSet<&String> = if every {
+            Default::default()
+        } else {
+            of().flat_map(|r| &r.attributes).collect()
+        };
+        (every, names)
+    };
+    let mut typed = rules.rules.iter().flat_map(|r| &r.types).map(shown);
+    let (every, names) = typed.next()?;
+    let uniform = typed.all(|other| other == (every, names.clone()));
     let named = types.is_some_and(|ts| {
         ts.iter()
             .all(|t| rules.rules.iter().any(|r| r.types.contains(t)))
     });
-    if !(windows_hold && alike && named && rules.omit_by_type.is_empty()) {
+    if !(windows_hold && alike && uniform && named && rules.omit_by_type.is_empty()) {
         return None;
     }
-    Some(match (first.every_attribute, attrs) {
+    Some(match (every, attrs) {
         (true, None) => None,
         (true, Some(a)) => Some(a.to_vec()),
-        (false, None) => Some(first.attributes.clone()),
-        (false, Some(a)) => Some(
-            a.iter()
-                .filter(|x| first.attributes.contains(x))
-                .cloned()
-                .collect(),
-        ),
+        (false, None) => Some(names.into_iter().cloned().collect()),
+        (false, Some(a)) => Some(a.iter().filter(|x| names.contains(x)).cloned().collect()),
     })
 }
 

@@ -169,6 +169,11 @@ async fn state(rule: Rule) -> (AppState, Arc<Recording>) {
 
 /// [`state`] with `more` appended to the evolution before the rule applies.
 async fn state_with(rule: Rule, more: &[Value]) -> (AppState, Arc<Recording>) {
+    state_ruled(vec![rule], more).await
+}
+
+/// [`state_with`] under several rules.
+async fn state_ruled(rules: Vec<Rule>, more: &[Value]) -> (AppState, Arc<Recording>) {
     let mut st = AppState::new("me".into());
     antares_api::wire(&mut st).await;
     let (status, body) = send(&st, "/ngsi-ld/v1/temporal/entities", Some(evolution())).await;
@@ -184,7 +189,7 @@ async fn state_with(rule: Rule, more: &[Value]) -> (AppState, Arc<Recording>) {
         paged: Mutex::new(Vec::new()),
     });
     st.temporal = recording.clone();
-    st.policy = Some(Arc::new(Ruled(vec![rule])));
+    st.policy = Some(Arc::new(Ruled(rules)));
     (st, recording)
 }
 
@@ -607,6 +612,50 @@ async fn a_type_only_rule_pages_in_the_store_through_its_attributes() {
             *recording.paged.lock().expect("lock"),
             vec![paged],
             "{query} {rule:?}"
+        );
+    }
+}
+
+/// T-5835: a view splits a type's Attribute list longer than a rule holds over
+/// several rules of the same types (KeyPerformanceIndicator: 501 Attributes,
+/// two rules), and an Entity shows their union. The store still pages through
+/// that union, so a history read of the type reads one page of Entities, not
+/// every Entity and its history (prod: 503 after 10 s). Rules of other types
+/// that show another set keep the page in the API.
+#[tokio::test(flavor = "multi_thread")]
+async fn rules_splitting_one_list_page_in_the_store_through_their_union() {
+    let zone = Rule {
+        attributes: vec!["zone".into()],
+        ..plain()
+    };
+    let zone_of_more = Rule {
+        types: vec!["Vehicle".into(), "Bus".into()],
+        ..zone.clone()
+    };
+    let both = vec![format!("{DC}speed"), format!("{DC}zone")];
+    for (rules, paged) in [
+        (vec![plain(), zone], Some(Some(both))),
+        (vec![plain(), zone_of_more], None),
+    ] {
+        let (st, recording) = state_ruled(rules.clone(), &[]).await;
+        let (status, body) = send(
+            &st,
+            &format!("/ngsi-ld/v1/temporal/entities?type=Vehicle&{AFTER}&limit=5"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{rules:?}: {body}");
+        assert_eq!(speeds(&body[0]), vec![7, 8, 9, 10], "{rules:?}: {body}");
+        let zones = body[0]
+            .get("zone")
+            .or_else(|| body[0].get(format!("{DC}zone")))
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        assert_eq!(zones, 4, "{rules:?}: {body}");
+        assert_eq!(
+            *recording.paged.lock().expect("lock"),
+            vec![paged],
+            "{rules:?}"
         );
     }
 }
