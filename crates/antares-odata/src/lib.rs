@@ -24,6 +24,7 @@ mod batch;
 mod below;
 pub mod edm;
 mod filter;
+mod functions;
 mod history;
 mod names;
 mod paths;
