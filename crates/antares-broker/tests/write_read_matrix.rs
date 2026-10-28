@@ -12,6 +12,8 @@
 //!   `tabular` features also the `GeoJSON` surface and OGC `f=csv`.
 //! - Readers temporal: NGSI-LD temporal, OGC `{type}-history`, STA Datastream Observations;
 //!   OData history is `not served` until T-5908.
+//! - Expiry rows (T-5933): an instance written with `expiresAt` 2 s ahead shows on every reader
+//!   (the expiresAt windows of the temporal API and MCP included) and on none after it expired.
 //! - Readers stream: the NGSI-LD Subscription's HTTP notification and the view's WebSocket; STA
 //!   MQTT is `not served` until T-5911.
 //!
@@ -1178,6 +1180,121 @@ fn text(v: &Value, key: &str) -> String {
         .to_owned()
 }
 
+/// `t` as a 4.6.3 DateTime, UTC, whole seconds (days to civil date: H. Hinnant's algorithm).
+fn stamp(t: std::time::SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    let z = days + 719_468;
+    let (era, doe) = (z / 146_097, z % 146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + u64::from(m <= 2);
+    let (h, mi, sec) = (rem / 3600, rem % 3600 / 60, rem % 60);
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{sec:02}Z")
+}
+
+/// The Probe whose `level` expires: the T-5933 rows.
+const EXPIRING: &str = "urn:ngsi-ld:Probe:expiry";
+
+/// Each expiry row's reader and whether it shows the expiring `level` (`21.375`). `earlier` opens
+/// the expiresAt windows: `after` it holds the instance until it expires, `before` it never does.
+async fn expiry_reads(app: &Router, earlier: &str) -> Vec<(&'static str, bool)> {
+    let e = enc(EXPIRING);
+    let shows = |b: &Value| b.to_string().contains("21.375");
+    let get = |uri: String| async move { send(app, "GET", &uri, None).await };
+    let temporal = |q: &str| format!("{VIEW}/ngsi-ld/v1/temporal/entities/{e}?attrs=level&{q}");
+    let window = |rel: &str| format!("timeproperty=expiresAt&timerel={rel}&timeAt={earlier}");
+    let mut rows = Vec::new();
+    let (_, b) = get(format!("{VIEW}/ngsi-ld/v1/entities/{e}")).await;
+    rows.push(("NGSI-LD current", shows(&b)));
+    let (_, b) = get(temporal("timerel=after&timeAt=2026-01-01T00:00:00Z")).await;
+    rows.push(("NGSI-LD temporal observedAt", shows(&b)));
+    let (_, b) = get(temporal(&window("after"))).await;
+    rows.push(("NGSI-LD temporal expiresAt after", shows(&b)));
+    let (_, b) = get(temporal(&window("before"))).await;
+    rows.push(("NGSI-LD temporal expiresAt before", shows(&b)));
+    let (_, b) = get(format!(
+        "{VIEW}/ngsi-ld/v1/temporal/entities?type=Probe&attrs=level&{}",
+        window("after")
+    ))
+    .await;
+    rows.push(("NGSI-LD temporal query expiresAt after", shows(&b)));
+    let args = json!({"id": EXPIRING, "attrs": ["level"], "timerel": "after",
+        "timeAt": earlier, "timeproperty": "expiresAt"});
+    let b = mcp(app, "retrieve_temporal", args).await;
+    rows.push(("MCP retrieve_temporal expiresAt after", shows(&b["result"])));
+    let (_, b) = get(format!(
+        "{VIEW}/ogc/features/collections/Probe-history/items?limit=100"
+    ))
+    .await;
+    let mine = b
+        .get("features")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|f| f.to_string().contains(EXPIRING))
+        .any(shows);
+    rows.push(("OGC history", mine));
+    let (_, b) = get(format!(
+        "{VIEW}/sta/v1.1/Datastreams('{e}%2Flevel')/Observations"
+    ))
+    .await;
+    rows.push(("STA Observations", shows(&b)));
+    rows
+}
+
+/// TS 104 175 5.2.4: an instance "shall become invalid" at its expiresAt, whenever the deletion
+/// runs. `level` expires 2 s after its write; each reader shows it before (the expiresAt `before`
+/// window never does) and none after, with no reap run in between. OData history is not served
+/// (T-5908). The failures, empty when every row holds, and the printed table.
+async fn expiry_rows(app: &Router) -> (Vec<String>, String) {
+    let now = std::time::SystemTime::now();
+    let soon = stamp(now + Duration::from_secs(2));
+    let earlier = stamp(now - Duration::from_secs(60));
+    let probe = json!({"id": EXPIRING, "type": "Probe",
+        "count": {"type": "Property", "value": 7, "observedAt": T0},
+        "level": {"type": "Property", "value": 21.375, "observedAt": T0, "expiresAt": soon}});
+    let (s, b) = send(
+        app,
+        "POST",
+        &format!("{VIEW}/ngsi-ld/v1/entities"),
+        Some(&probe),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{b}");
+    let before = expiry_reads(app, &earlier).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let after = expiry_reads(app, &earlier).await;
+    let uri = format!("/ngsi-ld/v1/entities/{}", enc(EXPIRING));
+    let _ = send(app, "DELETE", &uri, None).await;
+    let mut red = Vec::new();
+    let mut table = String::from("| reader | before expiry | after expiry |\n|---|---|---|\n");
+    for ((reader, was), (_, is)) in before.into_iter().zip(after) {
+        let _ = writeln!(table, "| {reader} | {was} | {is} |");
+        if was != !reader.ends_with(" before") {
+            red.push(format!("{reader}: before expiry shows level = {was}"));
+        }
+        if is {
+            red.push(format!("{reader}: still shows level after expiry"));
+        }
+    }
+    (red, table)
+}
+
+/// The expiry rows over the built-in store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_expired_instance_leaves_every_reader_before_the_reap() {
+    let (app, _port, _reload) = broker(AppState::new("matrix".into())).await;
+    let (red, table) = expiry_rows(&app).await;
+    println!("{table}");
+    assert!(red.is_empty(), "{red:?}\n{table}");
+}
+
 /// The matrix over the built-in store: every cell green, every gap named.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_probe_written_on_any_surface_reads_the_same_on_every_surface() {
@@ -1226,6 +1343,9 @@ async fn the_matrix_holds_over_postgres() {
     let table = matrix.table();
     println!("{table}");
     assert!(!matrix.red(), "{table}");
+    let (red, table) = expiry_rows(&app).await;
+    println!("{table}");
+    assert!(red.is_empty(), "{red:?}\n{table}");
 }
 
 /// The comparison itself: a rounded float, a dropped unit and a leaked hidden attribute are

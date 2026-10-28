@@ -36,7 +36,14 @@ const JOINS: &[&str] = &["flat", "inline"];
 const TIMERELS: &[&str] = &["before", "after", "between"];
 /// The instant a history is ordered by (TS 104 175 4.11); `observedAt`
 /// when absent, so data without it needs another.
-const TIMEPROPERTIES: &[&str] = &["observedAt", "createdAt", "modifiedAt", "deletedAt"];
+/// The 4.8 set (TS 104 175 5.2.4 NOTE 2), as antares-api's `TIMEPROPERTIES`.
+const TIMEPROPERTIES: &[&str] = &[
+    "observedAt",
+    "createdAt",
+    "modifiedAt",
+    "deletedAt",
+    "expiresAt",
+];
 /// The entity representations (6.3.7); `options=sysAttrs` rides as the
 /// `sysAttrs` flag, which [`query`] turns into the option.
 const FORMATS: &[&str] = &["normalized", "concise", "keyValues"];
@@ -1062,6 +1069,21 @@ mod tests {
                 argument_names(inner, out);
             }
         }
+    }
+
+    /// TS 104 175 5.2.4 NOTE 2: every temporal tool offers expiresAt as a
+    /// timeproperty, the schema enum the client sees included.
+    #[test]
+    fn every_temporal_tool_offers_expires_at() {
+        let offered: Vec<Kind> = TOOLS
+            .iter()
+            .flat_map(|t| t.args)
+            .filter(|a| a.name == "timeproperty")
+            .map(|a| a.kind)
+            .collect();
+        // query_temporal, retrieve_temporal, batch_query_temporal
+        assert_eq!(offered, vec![Kind::Word(TIMEPROPERTIES); 3]);
+        assert_eq!(TIMEPROPERTIES.last(), Some(&"expiresAt"));
     }
 
     /// T-4532: an argument a tool takes is explained in the primer, so a new one without its
