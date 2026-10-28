@@ -32,6 +32,10 @@ use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
 use std::fmt::Write as _;
 
+/// The constructs a history set refuses with `501`, named in its message.
+const ONE_ROW: &str = "a query option other than $select on one history row";
+const UNSERVED: &str = "$expand, $search, $apply or $compute on a history set";
+const SELECT: &str = "$select of a navigation, a path or an annotation";
 /// The instances of each Attribute one read asks for, the broker's default
 /// `ANTARES_TEMPORAL_INSTANCE_LIMIT`.
 const INSTANCES: usize = 1_000;
@@ -85,7 +89,7 @@ pub(crate) async fn collection(
 ) -> Result<Response, ODataErrorResponse> {
     let version = ctx.version;
     if path.last() == Some(&Segment::Ref) {
-        return Err(not_implemented(version));
+        return Err(not_implemented("$ref of a history set", version));
     }
     let plan = plan(set, options, version)?;
     let picked = picked(set, options, version)?;
@@ -172,7 +176,7 @@ pub(crate) async fn entity(
         ..QueryOptions::default()
     };
     if *options != bare {
-        return Err(not_implemented(version));
+        return Err(not_implemented(ONE_ROW, version));
     }
     let plan = plan(set, &bare, version)?;
     let picked = picked(set, options, version)?;
@@ -230,7 +234,7 @@ fn plan<'s>(
         options.compute.is_some(),
     ];
     if unserved.contains(&true) {
-        return Err(not_implemented(version));
+        return Err(not_implemented(UNSERVED, version));
     }
     if !options.custom.is_empty() {
         return Err(ODataErrorResponse::new(
@@ -241,10 +245,12 @@ fn plan<'s>(
         .with_version(version));
     }
     let mut filter = match &options.filter {
-        Some(f) => residual_whole(f, set, &options.aliases).map_err(|r| refusal(r, version))?,
+        Some(f) => {
+            residual_whole(f, set, &options.aliases).map_err(|r| refusal(r, "$filter", version))?
+        }
         None => Translated::default(),
     };
-    let program = program(&filter, now()).map_err(|r| refusal(r, version))?;
+    let program = program(&filter, now()).map_err(|r| refusal(r, "$filter", version))?;
     let terms = set
         .members
         .iter()
@@ -300,7 +306,8 @@ fn picked(
     options: &QueryOptions,
     version: ODataVersion,
 ) -> Result<Option<Vec<String>>, ODataErrorResponse> {
-    let names = selected(set, options.select.as_ref()).map_err(|()| not_implemented(version))?;
+    let names =
+        selected(set, options.select.as_ref()).map_err(|()| not_implemented(SELECT, version))?;
     Ok(names.map(|names| {
         let asked = names
             .into_iter()
@@ -350,7 +357,7 @@ fn sort_keys<'s>(
             ("id", _) => By::Id,
             ("observedAt", _) => By::Observed,
             (_, Some((_, m, term))) => By::Member(m, term.clone()),
-            (_, None) => return Err(refusal(Refused::Bad, version)),
+            (_, None) => return Err(refusal(Refused::Bad, "$orderby", version)),
         };
         keys.push((by, item.descending));
     }
@@ -624,7 +631,7 @@ fn rows(plan: &Plan<'_>, e: &Value, version: ODataVersion) -> Result<Vec<Row>, O
             None => true,
             Some(p) => {
                 p.eval(&doc)
-                    .map_err(|_| refusal(Refused::TooComplex, version))?
+                    .map_err(|_| refusal(Refused::TooComplex, "$filter", version))?
                     == Truth::True
             }
         };

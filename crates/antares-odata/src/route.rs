@@ -140,7 +140,10 @@ async fn history(
         [Segment::EntitySet(name), Segment::Key(key)] => {
             crate::history::entity(reads, caller, ctx, (name, set), key, options).await
         }
-        _ => Err(not_implemented(ctx.version)),
+        _ => Err(not_implemented(
+            "this path below a history set",
+            ctx.version,
+        )),
     }
 }
 
