@@ -165,8 +165,6 @@ pub(crate) async fn run(
     })
 }
 
-/// The body of a write: its media type checked (415), its size bounded (413), its JSON read
-/// (400). A merge takes `application/merge-patch+json` (W5), the others `GeoJSON` or JSON.
 /// The data model's refusal in a 400 (T-5912): it names the attribute and
 /// the rule, never the value or anything the view hides, so it is passed
 /// on as it is and a client fixes the same field whatever surface it wrote
@@ -180,6 +178,8 @@ async fn model_refusal(view: &ViewOps, answer: Response) -> Option<String> {
         .then(|| detail.to_owned())
 }
 
+/// The body of a write: its media type checked (415), its size bounded (413), its JSON read
+/// (400). A merge takes `application/merge-patch+json` (W5), the others `GeoJSON` or JSON.
 async fn read(headers: &HeaderMap, body: Body, merge: bool) -> Result<Value, Problem> {
     let media = headers
         .get(CONTENT_TYPE)
