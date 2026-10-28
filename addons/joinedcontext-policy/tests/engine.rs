@@ -1549,7 +1549,7 @@ async fn a_read_only_caller_writes_nothing_whatever_it_is_granted() -> Res {
     }
     let (code, car) = send(&st, "GET", &at, &read_only, None).await?;
     assert_eq!(code, StatusCode::OK, "{car}");
-    assert_eq!(car["speed"]["value"], json!(1), "{car}");
+    assert_eq!(car.pointer("/speed/value"), Some(&json!(1)), "{car}");
     let (code, _) = send(
         &st,
         "GET",

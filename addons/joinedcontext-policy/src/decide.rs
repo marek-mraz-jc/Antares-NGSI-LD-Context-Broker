@@ -713,7 +713,7 @@ mod tests {
     #[test]
     fn a_read_only_caller_is_refused_every_write_whatever_it_is_granted() -> Result<(), String> {
         let t = compile(&json!({ "policies": [{"id": "all",
-            "assignee": {"kind": "role", "id": "r"}, "operations": CLAUSES}] }))?;
+            "assignee": {"kind": "role", "id": "r"}, "operations": CLAUSES.to_vec()}] }))?;
         let full = caller();
         let read_only = Caller::Platform(Platform {
             roles: ["r".to_owned()].into(),
@@ -736,10 +736,10 @@ mod tests {
                 assert_eq!(asked, decide(Some(&t), &full, &op, Utc::now()), "{clause}");
             }
         }
-        let reads: Vec<&str> = CLAUSES.into_iter().filter(|c| reads(c)).collect();
+        let read: Vec<&str> = CLAUSES.into_iter().filter(|c| reads(c)).collect();
         assert_eq!(
             refused.len(),
-            CLAUSES.len().saturating_sub(reads.len()),
+            CLAUSES.len().saturating_sub(read.len()),
             "{refused:?}"
         );
         assert!(refused.iter().all(|c| !reads(c)), "{refused:?}");
