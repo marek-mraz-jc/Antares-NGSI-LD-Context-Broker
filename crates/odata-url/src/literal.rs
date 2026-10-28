@@ -176,7 +176,7 @@ pub(crate) fn is_base64url(text: &str) -> bool {
     data.bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         && data.len() % 4 != 1
-        && (padding == 0 || (padding <= 2 && text.len() % 4 == 0))
+        && (padding == 0 || (padding <= 2 && text.len().is_multiple_of(4)))
 }
 
 /// `qualifiedEnumTypeName SQUOTE`: a dotted name directly followed by a quote.
@@ -820,6 +820,7 @@ mod tests {
             ("binary'T0RhdGE'", Literal::Binary("T0RhdGE".into())),
             ("binary'dGVzdA=='", Literal::Binary("dGVzdA==".into())),
             ("binary''", Literal::Binary(String::new())),
+            ("binary'-_8'", Literal::Binary("-_8".into())),
             ("1.5f", Literal::Decimal("1.5".into())),
             ("0.0F", Literal::Decimal("0.0".into())),
             ("1.5e2f", Literal::Decimal("1.5e2".into())),
@@ -839,6 +840,8 @@ mod tests {
             "binary'A'",
             "binary'AB='",
             "binary'A==='",
+            "binary'AAAA==='",
+            "duration'P1D",
         ] {
             assert!(
                 matches!(
@@ -847,6 +850,10 @@ mod tests {
                 ),
                 "{bad}"
             );
+        }
+        // each writes back the text it was read from
+        for text in ["duration'-P1D'", "binary'dGVzdA'"] {
+            assert_eq!(ok(text).to_string(), text);
         }
         // `f` that starts a name is no suffix, and INF/NaN take none
         let mut c = Cursor::new("1foo");

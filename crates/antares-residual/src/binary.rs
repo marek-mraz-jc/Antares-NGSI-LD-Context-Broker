@@ -57,16 +57,12 @@ pub fn base64url(bytes: &[u8]) -> String {
         );
     };
     for chunk in bytes.chunks(3) {
-        let (b0, b1, b2) = match *chunk {
-            [a, b, c] => (a, Some(b), Some(c)),
-            [a, b] => (a, Some(b), None),
-            [a] => (a, None, None),
-            _ => continue,
-        };
+        let [b0, b1, b2] = [0, 1, 2].map(|i| chunk.get(i).copied());
+        let (b0, low) = (b0.unwrap_or_default(), b1.unwrap_or_default());
         push(b0 >> 2);
-        push((b0 << 4) | (b1.unwrap_or(0) >> 4));
-        if let Some(b1) = b1 {
-            push((b1 << 2) | (b2.unwrap_or(0) >> 6));
+        push((b0 << 4) | (low >> 4));
+        if b1.is_some() {
+            push((low << 2) | (b2.unwrap_or_default() >> 6));
         }
         if let Some(b2) = b2 {
             push(b2);

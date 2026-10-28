@@ -814,10 +814,36 @@ fn durations_bytes_and_times_stored_as_text_compare_as_values() {
     let is_null = |e: Expr| Expr::IsNull(Box::new(e));
     assert_eq!(on(&is_null(narrowed(0, 255)), &stored), Truth::True);
     assert_eq!(on(&is_null(narrowed(-32768, 32767)), &stored), Truth::False);
+    assert_eq!(on(&is_null(narrowed(400, 500)), &stored), Truth::True);
+    // a duration or bytes compare with nothing but text that spells one
+    let pm10 =
+        json!({"id": "urn:ngsi-ld:P:2", "type": "P", "pm10": {"type": "Property", "value": 12}});
+    assert_eq!(on(&cmp(Cmp::Eq, "pm10", d("P1D")), &pm10), Truth::Unknown);
     assert_eq!(
-        Duration::parse("PT1.5S").map(|d| d.to_string()),
-        Some("PT1.5S".into())
+        on(&cmp(Cmp::Eq, "pm10", Lit::Binary(vec![12])), &pm10),
+        Truth::Unknown
     );
+    // and read back as their text
+    for (lit, text) in [
+        (d("P1DT2H30M"), "P1DT2H30M"),
+        (Lit::Binary(b"test".to_vec()), "dGVzdA"),
+    ] {
+        let value = compile(&Expr::Lit(lit), now()).and_then(|p| p.value(&pm10));
+        assert_eq!(value, Ok(Some(json!(text))));
+    }
+    for text in [
+        "PT1.5S",
+        "P1DT2H30M",
+        "PT2H",
+        "PT30M",
+        "PT45S",
+        "P2DT0.000001S",
+    ] {
+        assert_eq!(
+            Duration::parse(text).map(|d| d.to_string()),
+            Some(text.into())
+        );
+    }
     assert_eq!(
         Duration::parse("-P1D").map(|d| d.to_string()),
         Some("-P1D".into())

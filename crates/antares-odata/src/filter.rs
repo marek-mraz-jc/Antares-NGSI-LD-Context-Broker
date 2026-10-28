@@ -1577,6 +1577,11 @@ mod tests {
                     "span".into(),
                     member("https://e.org/span", value("Edm.Duration", false)),
                 ),
+                // a type this surface does not check
+                (
+                    "clip".into(),
+                    member("https://e.org/clip", value("Edm.Stream", false)),
+                ),
                 (
                     "label".into(),
                     member("https://e.org/label", Shape::Language),
@@ -1992,6 +1997,9 @@ mod tests {
             cmp(m("name"), CompareOp::Ne, m("name")),
             // two durations compare as durations (T-5905)
             cmp(m("span"), CompareOp::Lt, m("span")),
+            // a type this surface does not check compares with any
+            cmp(m("clip"), CompareOp::Eq, m("name")),
+            cmp(m("name"), CompareOp::Eq, m("clip")),
             cmp(
                 call_of(Method::Year, vec![lit(Literal::Date("2026-01-02".into()))]),
                 CompareOp::Eq,
@@ -2125,6 +2133,9 @@ mod tests {
                 CompareOp::Eq,
                 int(1),
             ),
+            call_of(Method::Round, vec![m("clip")]),
+            // a value of a type this surface does not check as a predicate
+            Expr::Not(Box::new(m("clip"))),
             // a lambda over a Relationship's object
             Expr::Any {
                 collection: MemberPath {
@@ -2806,6 +2817,11 @@ mod tests {
         ] {
             assert_eq!(q(&e).as_deref(), Ok(want), "{e:?}");
         }
+        // a type this surface does not check takes any literal
+        assert_eq!(
+            q(&cmp(m("clip"), CompareOp::Eq, lit(Literal::Int(1)))).as_deref(),
+            Ok("(t0==1)")
+        );
         // a duration takes a duration literal, which the residual compares (T-5905)
         assert_eq!(
             q(&cmp(m("span"), CompareOp::Eq, lit(Literal::Int(1)))),
@@ -2905,13 +2921,8 @@ mod tests {
         );
     }
 
-    /// T-5905: each Edm type NGSI-LD stores as text or as a JSON number is compared as its
-    /// value in the residual: its literal is read, a literal past its range or of another type
-    /// is 400 before any read, and the filter keeps the Entities whose value holds it.
-    #[test]
-    fn every_edm_type_ngsi_ld_carries_is_filtered_by_its_value() {
-        use residual::Truth::{self, False, True};
-        use serde_json::{json, Value as J};
+    /// The test set with a member of each Edm type T-5905 serves.
+    fn typed_set() -> Set {
         let mut typed = set();
         for (name, edm) in [
             ("weight", "Edm.Single"),
@@ -2937,6 +2948,73 @@ mod tests {
                 },
             );
         }
+        typed
+    }
+
+    /// T-5905: a literal past its type's range or of another type is 400 before any read, and
+    /// the literals read as their residual values.
+    #[test]
+    fn an_edm_literal_past_its_range_or_type_is_bad() {
+        let typed = typed_set();
+        let c = |name: &str, op, l: Literal| cmp(m(name), op, lit(l));
+        let dec = |t: &str| Literal::Decimal(t.into());
+        // past the type's range, or of another type: 400 before any read
+        for e in [
+            c("weight", CompareOp::Eq, dec("3.5e38")),
+            c("rating", CompareOp::Eq, Literal::Int(256)),
+            c("qty", CompareOp::Gt, Literal::Int(32768)),
+            c("ship", CompareOp::Eq, Literal::String("P1D".into())),
+            c("ship", CompareOp::Eq, Literal::Int(86400)),
+            c("data", CompareOp::Eq, Literal::String("dGVzdA==".into())),
+            c("opens", CompareOp::Eq, Literal::Duration("PT1H".into())),
+        ] {
+            assert_eq!(
+                translate(&e, &typed, &BTreeMap::new(), &[]).map(|_| ()),
+                Err(Refused::Bad),
+                "{e:?}"
+            );
+        }
+        // an integer is a Single, and the literals read as their residual values
+        assert!(translate(
+            &c("weight", CompareOp::Gt, Literal::Int(1)),
+            &typed,
+            &BTreeMap::new(),
+            &[]
+        )
+        .is_ok());
+        assert_eq!(
+            literal_edm(&Literal::Duration("P1D".into())),
+            Some("Edm.Duration")
+        );
+        assert_eq!(
+            literal_edm(&Literal::Binary("AQID".into())),
+            Some("Edm.Binary")
+        );
+        assert!(matches!(residual_lit(&dec("-INF")), Ok(Lit::Num(n)) if n == f64::NEG_INFINITY));
+        assert!(matches!(residual_lit(&dec("NaN")), Ok(Lit::Num(n)) if n.is_nan()));
+        assert_eq!(residual_lit(&dec("1e999")), Err(Refused::Bad));
+        assert_eq!(value(&dec("1e999")), Err(Refused::Bad));
+        // a Single within its range is pushed as a q number
+        assert_eq!(
+            translate(
+                &c("weight", CompareOp::Gt, dec("1.5e2")),
+                &typed,
+                &BTreeMap::new(),
+                &[]
+            )
+            .map(|t| t.q),
+            Ok(Some("(t0>150.0)".into()))
+        );
+    }
+
+    /// T-5905: each Edm type NGSI-LD stores as text or as a JSON number is compared as its
+    /// value in the residual: its literal is read, a literal past its range or of another type
+    /// is 400 before any read, and the filter keeps the Entities whose value holds it.
+    #[test]
+    fn every_edm_type_ngsi_ld_carries_is_filtered_by_its_value() {
+        use residual::Truth::{self, False, True};
+        use serde_json::{json, Value as J};
+        let typed = typed_set();
         let now = DateTime::parse("2026-10-28T12:00:00Z");
         let on = |e: &Expr, stored: J| -> Result<Truth, Refused> {
             let t = translate(e, &typed, &BTreeMap::new(), &[])?;
@@ -2949,8 +3027,8 @@ mod tests {
         let c = |name: &str, op, l: Literal| cmp(m(name), op, lit(l));
         let dec = |t: &str| Literal::Decimal(t.into());
         for (e, stored, want) in [
-            (c("weight", CompareOp::Ne, dec("INF")), json!(3.14), True),
-            (c("weight", CompareOp::Lt, dec("INF")), json!(3.14), True),
+            (c("weight", CompareOp::Ne, dec("INF")), json!(3.5), True),
+            (c("weight", CompareOp::Lt, dec("INF")), json!(3.5), True),
             (c("price", CompareOp::Gt, dec("-INF")), json!(0.0), True),
             (c("price", CompareOp::Eq, dec("NaN")), json!(15.5), False),
             (
@@ -3013,33 +3091,6 @@ mod tests {
         ] {
             assert_eq!(on(&e, stored), Ok(want), "{e:?}");
         }
-        // past the type's range, or of another type: 400 before any read
-        for e in [
-            c("weight", CompareOp::Eq, dec("3.5e38")),
-            c("rating", CompareOp::Eq, Literal::Int(256)),
-            c("qty", CompareOp::Gt, Literal::Int(32768)),
-            c("ship", CompareOp::Eq, Literal::String("P1D".into())),
-            c("ship", CompareOp::Eq, Literal::Int(86400)),
-            c("data", CompareOp::Eq, Literal::String("dGVzdA==".into())),
-            c("opens", CompareOp::Eq, Literal::Duration("PT1H".into())),
-        ] {
-            assert_eq!(
-                translate(&e, &typed, &BTreeMap::new(), &[]).map(|_| ()),
-                Err(Refused::Bad),
-                "{e:?}"
-            );
-        }
-        // a Single within its range is pushed as a q number
-        assert_eq!(
-            translate(
-                &c("weight", CompareOp::Gt, dec("1.5e2")),
-                &typed,
-                &BTreeMap::new(),
-                &[]
-            )
-            .map(|t| t.q),
-            Ok(Some("(t0>150.0)".into()))
-        );
     }
 
     /// `$search` folds to a constant where no String property can hold a term, and reads only

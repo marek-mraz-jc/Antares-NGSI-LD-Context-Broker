@@ -2187,6 +2187,43 @@ mod tests {
             (Value::Null, None),
             "absent, no note"
         );
+        // T-5905: Edm.Binary as unpadded base64url, Edm.TimeOfDay without NGSI-LD's `Z`
+        let typed = |edm, collection| Shape::Value { edm, collection };
+        for (shape, stored, want) in [
+            (
+                typed("Edm.Binary", false),
+                json!("dGVzdA=="),
+                json!("dGVzdA"),
+            ),
+            (
+                typed("Edm.Binary", true),
+                json!(["+/8=", ""]),
+                json!(["-_8", ""]),
+            ),
+            (
+                typed("Edm.TimeOfDay", false),
+                json!("09:30:00Z"),
+                json!("09:30:00"),
+            ),
+            (
+                typed("Edm.TimeOfDay", false),
+                json!("09:30:00"),
+                json!("09:30:00"),
+            ),
+            (typed("Edm.Binary", false), json!(7), json!(7)),
+        ] {
+            assert_eq!(
+                served(&shape, Some(&json!({"value": stored}))),
+                (want, None)
+            );
+        }
+        assert_eq!(
+            served(
+                &typed("Edm.Binary", false),
+                Some(&json!({"value": "no base64!"}))
+            ),
+            (Value::Null, Some("the stored value is no base64 text"))
+        );
     }
 
     #[test]
