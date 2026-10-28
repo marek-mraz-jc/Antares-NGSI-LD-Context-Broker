@@ -644,12 +644,16 @@ const MAX_USAGE_ENTRIES: usize = 4096;
 /// disappears.
 const MAX_MERGED_KEY_BYTES: usize = 8 * 1024;
 
-/// Byte budget of the fetched-document cache. Entry count alone is not a
-/// memory bound when one entry may be MAX_CONTEXT_BYTES.
-const MAX_FETCHED_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+/// Byte budget of the fetched-document cache by default. Entry count alone
+/// is not a memory bound when one entry may be MAX_CONTEXT_BYTES. 8 MiB is
+/// its share of the broker's default 200 MiB memory budget (T-5895).
+pub const DEFAULT_FETCHED_CACHE_BYTES: u64 = 8 * 1024 * 1024;
+
+static FETCHED_CACHE_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(DEFAULT_FETCHED_CACHE_BYTES);
 
 /// Entry ceiling, charged through the byte budget: every entry costs at
-/// least MAX_FETCHED_CACHE_BYTES/MAX_FETCHED_ENTRIES of it, so a flood of
+/// least DEFAULT_FETCHED_CACHE_BYTES/MAX_FETCHED_ENTRIES of it, so a flood of
 /// tiny documents cannot turn a byte budget into an unbounded map.
 const MAX_FETCHED_ENTRIES: u64 = 256;
 
@@ -660,8 +664,61 @@ const MAX_FETCHED_ENTRIES: u64 = 256;
 /// dev held 45 min after each start (T-5894). 64 MiB keeps the 184-term core
 /// context merged with a model context of a few thousand terms warm for
 /// every entry (~0.25 MiB each); a larger context is rebuilt from the warm
-/// fetched-document cache on a miss.
-const MAX_MERGED_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+/// fetched-document cache on a miss. 44 MiB is its share of the broker's
+/// default 200 MiB memory budget (T-5895): ~170 such entries.
+pub const DEFAULT_MERGED_CACHE_BYTES: u64 = 44 * 1024 * 1024;
+
+static MERGED_CACHE_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(DEFAULT_MERGED_CACHE_BYTES);
+
+/// Hits and misses of the @context caches of every [`Loader`] of the
+/// process (T-5895), so a budget that is too small shows as a falling hit
+/// ratio: `[hits, misses]` per cache. A merge too large to cache is neither.
+#[derive(Debug, Default)]
+pub struct CacheStats {
+    /// The merged-context cache.
+    pub merged: [std::sync::atomic::AtomicU64; 2],
+    /// The fetched-document cache (pinned documents are never looked up).
+    pub fetched: [std::sync::atomic::AtomicU64; 2],
+}
+
+impl CacheStats {
+    fn count(&self, cache: &[std::sync::atomic::AtomicU64; 2], hit: bool) {
+        cache[usize::from(!hit)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `{"merged": {"hits", "misses"}, "fetched": {...}}` as counted so far.
+    #[must_use]
+    pub fn snapshot(&self) -> Value {
+        let pair = |c: &[std::sync::atomic::AtomicU64; 2]| {
+            let [h, m] = c
+                .each_ref()
+                .map(|a| a.load(std::sync::atomic::Ordering::Relaxed));
+            serde_json::json!({"hits": h, "misses": m})
+        };
+        serde_json::json!({"merged": pair(&self.merged), "fetched": pair(&self.fetched)})
+    }
+}
+
+/// The process's @context cache counters.
+pub static CACHE_STATS: CacheStats = CacheStats {
+    merged: [
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ],
+    fetched: [
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ],
+};
+
+/// Sets the byte budgets of the merged-context and fetched-document caches
+/// of every [`Loader`] built after the call (T-5895): the broker sets its
+/// shares of `ANTARES_MEMORY_BUDGET` before it builds its loader.
+pub fn set_cache_bytes(merged: u64, fetched: u64) {
+    MERGED_CACHE_BYTES.store(merged, std::sync::atomic::Ordering::Relaxed);
+    FETCHED_CACHE_BYTES.store(fetched, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Entry ceiling of the merged-context cache, charged through the byte
 /// budget exactly as the fetched cache charges its byte budget.
@@ -671,9 +728,13 @@ const MAX_MERGED_ENTRIES: u64 = 256;
 /// than by entries. The same budget on wasm32: the minicache takes moka's
 /// weigher (T-3698).
 fn merged_cache() -> BoundedCache<String, Arc<Context>> {
-    let floor = (MAX_MERGED_CACHE_BYTES / MAX_MERGED_ENTRIES) as u32;
+    merged_cache_of(MERGED_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn merged_cache_of(budget: u64) -> BoundedCache<String, Arc<Context>> {
+    let floor = (budget / MAX_MERGED_ENTRIES) as u32;
     BoundedCache::builder()
-        .max_capacity(MAX_MERGED_CACHE_BYTES)
+        .max_capacity(budget)
         .weigher(move |key: &String, ctx: &Arc<Context>| {
             u32::try_from(ctx.heap_bytes().saturating_add(key.len()))
                 .unwrap_or(u32::MAX)
@@ -688,9 +749,10 @@ fn merged_cache() -> BoundedCache<String, Arc<Context>> {
 /// does.
 fn fetched_cache() -> BoundedCache<String, FetchedDoc> {
     // what one entry costs of the budget at minimum
-    let floor = (MAX_FETCHED_CACHE_BYTES / MAX_FETCHED_ENTRIES) as u32;
+    let budget = FETCHED_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    let floor = (budget / MAX_FETCHED_ENTRIES) as u32;
     BoundedCache::builder()
-        .max_capacity(MAX_FETCHED_CACHE_BYTES)
+        .max_capacity(budget)
         .weigher(move |_url: &String, doc: &FetchedDoc| {
             u32::try_from(doc.value.to_string().len())
                 .unwrap_or(u32::MAX)
@@ -1087,11 +1149,14 @@ impl Loader {
         // urls already counted on the merged-hit path — the fallthrough
         // rebuild below must not bump them a second time.
         let mut counted: Vec<String> = Vec::new();
-        if let Some(hit) = self
+        let hit = self
             .merged
             .get(&key)
-            .filter(|_| self.merged_hit_is_usable(&key, tenant))
-        {
+            .filter(|_| self.merged_hit_is_usable(&key, tenant));
+        if key.len() <= MAX_MERGED_KEY_BYTES {
+            CACHE_STATS.count(&CACHE_STATS.merged, hit.is_some());
+        }
+        if let Some(hit) = hit {
             if count {
                 // cache hit: bump every URL this context resolution involves.
                 // A bump that finds the shared row GONE means another
@@ -1287,7 +1352,14 @@ impl Loader {
         }
         let err = |m: String| NgsiError::LdContextNotAvailable(m);
         let mut stale_value: Option<Arc<Value>> = None;
-        if let Some(hit) = self.fetched.get(url) {
+        let found = self.fetched.get(url);
+        CACHE_STATS.count(
+            &CACHE_STATS.fetched,
+            found
+                .as_ref()
+                .is_some_and(|h| h.serves(tenant) && !h.is_stale()),
+        );
+        if let Some(hit) = found {
             if !hit.serves(tenant) {
                 // 5.5.10 + 5.13.1: this URL names an @context another Tenant
                 // stored locally, so for this Tenant it does not exist — and
@@ -2434,7 +2506,7 @@ mod tests {
         }
         let entries = loader.cache_stats()["fetched"].as_u64().expect("count");
         assert!(
-            entries <= MAX_FETCHED_CACHE_BYTES / mib as u64,
+            entries <= DEFAULT_FETCHED_CACHE_BYTES / mib as u64,
             "byte budget breached: {entries} entries of 1 MiB"
         );
     }
@@ -2598,7 +2670,7 @@ mod tests {
         // tiny contexts cannot turn the byte budget into an unbounded map
         cache.insert("small".into(), big(1));
         cache.run_pending_tasks();
-        let floor = MAX_MERGED_CACHE_BYTES / MAX_MERGED_ENTRIES;
+        let floor = DEFAULT_MERGED_CACHE_BYTES / MAX_MERGED_ENTRIES;
         assert_eq!(
             cache.weighted_size(),
             floor,
@@ -2618,14 +2690,44 @@ mod tests {
         cache.run_pending_tasks();
         let held: u64 = cache.iter().map(|(_, c)| c.heap_bytes() as u64).sum();
         assert!(
-            held <= MAX_MERGED_CACHE_BYTES,
-            "the cache holds {held} bytes of contexts, budget {MAX_MERGED_CACHE_BYTES}"
+            held <= DEFAULT_MERGED_CACHE_BYTES,
+            "the cache holds {held} bytes of contexts, budget {DEFAULT_MERGED_CACHE_BYTES}"
         );
         assert!(
-            cache.weighted_size() <= MAX_MERGED_CACHE_BYTES,
+            cache.weighted_size() <= DEFAULT_MERGED_CACHE_BYTES,
             "weighted size {} passed the budget",
             cache.weighted_size()
         );
+    }
+
+    /// The share of `ANTARES_MEMORY_BUDGET` the broker sets (T-5895) is the
+    /// bound a cache built from it keeps, not the default.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_set_share_bounds_the_merged_cache() {
+        let mut m = serde_json::Map::new();
+        for i in 0..2_000 {
+            m.insert(
+                format!("t{i}"),
+                Value::String(format!("https://example.org/v/{i}")),
+            );
+        }
+        let mut c = Context::default();
+        c.merge_object(&m).expect("merge");
+        c.freeze();
+        let one = Arc::new(c);
+        let budget = 4 * 1024 * 1024;
+        let cache = merged_cache_of(budget);
+        for i in 0..32 {
+            cache.insert(format!("k{i}"), Arc::clone(&one));
+        }
+        cache.run_pending_tasks();
+        assert!(
+            cache.weighted_size() <= budget,
+            "weighted size {} passed the set share {budget}",
+            cache.weighted_size()
+        );
+        assert!(cache.entry_count() > 0, "the share still holds entries");
     }
 
     /// 6to4 (IETF RFC 3056) is the fourth spelling that carries an IPv4

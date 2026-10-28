@@ -300,9 +300,14 @@ struct Entry {
     weight: usize,
 }
 
-/// The bytes of rendered schemas one pod keeps (T-4354), beside the count
-/// bound: a view of a 1 MiB schema renders several MiB of documents.
-pub(crate) const MAX_BYTES: usize = 64 << 20;
+/// The bytes of rendered schemas one pod keeps by default (T-4354), beside
+/// the count bound: a view of a 1 MiB schema renders a few MiB of documents.
+/// 8 MiB is this cache's share of the broker's default 200 MiB memory budget
+/// (T-5895); [`crate::set_cache_bytes`] sets another.
+pub(crate) const MAX_BYTES: usize = 8 << 20;
+
+pub(crate) static CACHE_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(MAX_BYTES);
 
 /// The rendered schemas of this pod, keyed by view id, the schema's bytes
 /// and the visible set (LK2: a visible set is part of the key, so no
@@ -373,7 +378,9 @@ impl Cache {
         *held = held.saturating_add(weight);
         // The oldest go first; a rendering past the whole budget alone would go too, answered
         // and not kept (a 1 MiB schema renders a few MiB, so none does).
-        while entries.len() > crate::CACHE_ENTRIES || *held > MAX_BYTES {
+        while entries.len() > crate::CACHE_ENTRIES
+            || *held > CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+        {
             *held = held.saturating_sub(entries.pop_front().map_or(0, |old| old.weight));
         }
         Some(rendered)

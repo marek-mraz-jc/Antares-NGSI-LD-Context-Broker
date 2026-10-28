@@ -87,9 +87,9 @@ pub use antares_model::{EntityId, NgsiError, TenantId};
 /// WebSocket message never passes the HTTP bounds layer).
 pub mod bounds {
     pub use antares_api::bounds::{
-        json_depth, temporal_default_instances, temporal_instance_limit, ANSWER_TOO_LARGE,
-        DEFAULT_LIMIT, MAX_ANSWER_BYTES, MAX_BATCH_ITEMS, MAX_BODY_BYTES, MAX_JSON_DEPTH,
-        MAX_LIMIT,
+        json_depth, temporal_default_instances, temporal_instance_limit, HeldAnswer,
+        ANSWER_POOL_RETRY_SECONDS, ANSWER_TOO_LARGE, DEFAULT_LIMIT, MAX_ANSWER_BYTES,
+        MAX_BATCH_ITEMS, MAX_BODY_BYTES, MAX_JSON_DEPTH, MAX_LIMIT, MEMORY_OVERLOADED,
     };
 }
 
@@ -398,12 +398,21 @@ impl Ops {
     /// ([`bounds::MAX_ANSWER_BYTES`]): the page size bounds the Entities, not the
     /// bytes, and every concurrent request holds its buffer.
     ///
+    /// The answer holds its share of the broker's buffered-answer pool until
+    /// it drops (T-5895).
+    ///
     /// # Errors
-    /// [`Refusal::Limit`] with [`bounds::ANSWER_TOO_LARGE`] past the bound.
-    pub async fn read_answer(&self, body: Body) -> Result<axum::body::Bytes, Refusal> {
-        axum::body::to_bytes(body, self.state.max_answer_bytes)
-            .await
-            .map_err(|_| Refusal::Limit(bounds::ANSWER_TOO_LARGE))
+    /// [`Refusal::Limit`] with [`bounds::ANSWER_TOO_LARGE`] past the bound,
+    /// [`Refusal::Overloaded`] while the pool has no room.
+    pub async fn read_answer(&self, body: Body) -> Result<bounds::HeldAnswer, Refusal> {
+        self.state.read_answer(body).await.map_err(|r| match r {
+            antares_api::bounds::AnswerRefusal::OverBudget => Refusal::Overloaded {
+                retry_after: Some(HeaderValue::from(
+                    antares_api::bounds::ANSWER_POOL_RETRY_SECONDS,
+                )),
+            },
+            _ => Refusal::Limit(bounds::ANSWER_TOO_LARGE),
+        })
     }
 
     /// The operations of the loaded view `id`, or `None` when no view of
@@ -612,7 +621,7 @@ impl ViewOps {
     ///
     /// # Errors
     /// [`Refusal::Limit`] past the bound.
-    pub async fn read_answer(&self, body: Body) -> Result<axum::body::Bytes, Refusal> {
+    pub async fn read_answer(&self, body: Body) -> Result<bounds::HeldAnswer, Refusal> {
         self.inner.read_answer(body).await
     }
 

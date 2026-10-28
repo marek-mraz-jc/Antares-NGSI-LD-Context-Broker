@@ -113,6 +113,10 @@ impl From<NgsiError> for ApiError {
             if d == antares_model::error::DB_OVERLOADED {
                 return Self::Overloaded(RETRY_AFTER_SECONDS);
             }
+            // T-5895: the buffered-answer pool frees as answers finish
+            if d == antares_model::error::MEMORY_OVERLOADED {
+                return Self::Overloaded(crate::bounds::ANSWER_POOL_RETRY_SECONDS);
+            }
         }
         Self::Ngsi(e)
     }

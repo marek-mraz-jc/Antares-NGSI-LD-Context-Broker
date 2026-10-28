@@ -191,14 +191,21 @@ pub async fn purge_tenant(st: &AppState, tenant: &TenantId) -> Result<(), NgsiEr
 /// read could otherwise grow the store without bound by varying it.
 const MAX_IMPLICIT_CONTEXTS: usize = 1_000;
 
+/// What a stored @context costs of [`AppState::implicit_context_bytes`] per
+/// byte of its JSON text: the memory store holds it as a `serde_json::Value`,
+/// measured at ~4.3x the text (a 2 000-term @context, 92 KB of text, held
+/// ~390 KB; T-5895). The count cap alone let 1 000 of them hold ~390 MB.
+const IMPLICIT_HEAP_PER_TEXT_BYTE: u64 = 4;
+
 /// 6.3.6: an "application/json" response "shall include a Link to the
 /// associated JSON-LD @context", and a Link carries a URL. An inline @context
 /// (an object, or an array of more than one entry) has none, so the broker
 /// hosts it as an ImplicitlyCreated @context (TS 104 175 13.1) and answers
 /// with a copy of `ctx` whose source is that URL. The local id is
 /// content-addressed per Tenant: the same inline @context, request after
-/// request, is one row behind one URL. Past [`MAX_IMPLICIT_CONTEXTS`] the
-/// response keeps the Core @context Link it had before.
+/// request, is one row behind one URL. Past [`MAX_IMPLICIT_CONTEXTS`], or
+/// past the Tenant's share of the memory budget in bytes, the response keeps
+/// the Core @context Link it had before.
 pub(crate) async fn linkable(
     st: &AppState,
     tenant: &TenantId,
@@ -228,17 +235,21 @@ pub(crate) async fn linkable(
         }
         Some(_) => None,
         None => {
-            let held = st
-                .store
-                .context_list_meta(Some(tenant))
-                .await?
-                .iter()
-                .filter(|r| {
-                    r.get("kind").and_then(Value::as_str) == Some("ImplicitlyCreated")
-                        && row_visible(r, tenant)
-                })
-                .count();
-            if held >= MAX_IMPLICIT_CONTEXTS {
+            let rows = st.store.context_list_meta(Some(tenant)).await?;
+            let implicit = rows.iter().filter(|r| {
+                r.get("kind").and_then(Value::as_str) == Some("ImplicitlyCreated")
+                    && row_visible(r, tenant)
+            });
+            let (held, held_bytes) = implicit.fold((0usize, 0u64), |(n, b), r| {
+                let bytes = r.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+                (n.saturating_add(1), b.saturating_add(bytes))
+            });
+            let charge = u64::try_from(body.len()).unwrap_or(u64::MAX);
+            let over_bytes = held_bytes
+                .saturating_add(charge)
+                .saturating_mul(IMPLICIT_HEAP_PER_TEXT_BYTE)
+                > st.implicit_context_bytes;
+            if held >= MAX_IMPLICIT_CONTEXTS || over_bytes {
                 tracing::warn!(
                     tenant = tenant.as_str(),
                     "ImplicitlyCreated @context cap reached; Link names the Core @context"
@@ -256,6 +267,8 @@ pub(crate) async fn linkable(
                             "kind": "ImplicitlyCreated",
                             "createdAt": now_iso(),
                             "owner": tenant.as_str(),
+                            // its charge against the Tenant's byte cap
+                            "bytes": charge,
                             "body": {"@context": ctx.source.clone()},
                         }),
                     )
@@ -723,6 +736,56 @@ pub async fn delete_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T-5895: a read with an inline @context stores one ImplicitlyCreated
+    /// row per distinct @context, and the count cap alone let 1 000 of them
+    /// of 2 000 terms hold ~390 MB in the memory store. Distinct large
+    /// @contexts are hosted until the Tenant's byte share is spent; the rest
+    /// keep the Core Link, and what is stored stays inside the share.
+    #[tokio::test]
+    async fn implicit_contexts_stop_at_the_tenant_byte_share() {
+        let mut st = AppState::new("antares-ctx-implicit-bytes".into());
+        st.implicit_context_bytes = 4 << 20;
+        let tenant = TenantId::new("bytes").expect("tenant");
+        let mut linked = 0;
+        for k in 0..64 {
+            let mut terms = serde_json::Map::new();
+            for t in 0..2_000 {
+                terms.insert(
+                    format!("t{k}_{t}"),
+                    json!(format!("https://example.org/c{k}/t{t}")),
+                );
+            }
+            let mut ctx = Context::default();
+            ctx.source = Value::Object(terms);
+            let ctx = Arc::new(ctx);
+            let out = linkable(&st, &tenant, &HeaderMap::new(), &ctx, Accept::Json)
+                .await
+                .expect("linkable");
+            if out.source.is_string() {
+                linked += 1;
+            }
+        }
+        let rows = st
+            .store
+            .context_list_meta(Some(&tenant))
+            .await
+            .expect("list");
+        let charged: u64 = rows
+            .iter()
+            .filter_map(|r| r.get("bytes").and_then(Value::as_u64))
+            .sum();
+        assert_eq!(rows.len(), linked, "one row per hosted @context");
+        assert!(
+            linked > 0,
+            "a share of 4 MiB hosts some 2 000-term @contexts"
+        );
+        assert!(linked < 64, "all 64 were hosted: {charged} bytes of text");
+        assert!(
+            charged.saturating_mul(IMPLICIT_HEAP_PER_TEXT_BYTE) <= st.implicit_context_bytes,
+            "{charged} bytes of text charged over the share"
+        );
+    }
 
     fn forged_host() -> HeaderMap {
         let mut h = HeaderMap::new();

@@ -250,6 +250,16 @@ fn describe() {
         Unit::Bytes,
         "jemalloc resident bytes (RSS ~ live x1.2 is the section-2.1 target)"
     );
+    describe_counter!(
+        "antares_context_cache_lookups_total",
+        Unit::Count,
+        "@context cache lookups by cache (merged, fetched) and result (hit, miss)"
+    );
+    describe_gauge!(
+        "antares_answer_pool_held_bytes",
+        Unit::Bytes,
+        "bytes the buffered in-process answers hold of the memory budget's pool"
+    );
     describe_gauge!(
         "antares_commit_queue_depth",
         Unit::Count,
@@ -298,6 +308,16 @@ pub fn spawn_sampler(state: antares_api::AppState) {
                     metrics::gauge!("antares_memory_resident_bytes").set(r as f64);
                 }
             }
+            // T-5895: the hit ratio of each @context cache under its share
+            let stats = &antares_jsonld::CACHE_STATS;
+            for (cache, pair) in [("merged", &stats.merged), ("fetched", &stats.fetched)] {
+                for (result, n) in [("hit", &pair[0]), ("miss", &pair[1])] {
+                    metrics::counter!("antares_context_cache_lookups_total",
+                        "cache" => cache, "result" => result)
+                    .absolute(n.load(std::sync::atomic::Ordering::Relaxed));
+                }
+            }
+            metrics::gauge!("antares_answer_pool_held_bytes").set(state.answer_pool.held() as f64);
             if let Some((depth, _peak)) = state.store.commit_queue() {
                 metrics::gauge!("antares_commit_queue_depth").set(depth as f64);
             }
