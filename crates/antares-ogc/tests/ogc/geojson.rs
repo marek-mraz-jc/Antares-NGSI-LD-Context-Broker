@@ -3,7 +3,7 @@
 
 use crate::common::{fixture, get, href};
 use axum::http::StatusCode;
-use serde_json::json;
+use serde_json::{json, Value};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn feature_collection_and_feature_shape() -> Result<(), String> {
@@ -66,9 +66,24 @@ async fn feature_collection_and_feature_shape() -> Result<(), String> {
             "links",
             "numberMatched",
             "numberReturned",
+            "timeStamp",
             "type"
         ],
-        "C17: no timeStamp"
+        "C17: timeStamp is the response time"
+    );
+    let stamp = page
+        .body
+        .get("timeStamp")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        antares_ops::residual::DateTime::parse(stamp).is_some(),
+        "C17: an RFC 3339 instant, got {stamp:?}"
+    );
+    assert_eq!(
+        stamp.len(),
+        "2026-10-28T11:00:00Z".len(),
+        "C17: whole seconds, {stamp}"
     );
     assert_eq!(page.body.get("type"), Some(&json!("FeatureCollection")));
     Ok(())

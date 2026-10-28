@@ -23,6 +23,7 @@
 mod api;
 mod crs;
 mod export;
+mod extent;
 mod features;
 mod filter;
 mod history;
@@ -303,9 +304,9 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
         (["collections"], _) if asked.file.is_some() => {
             at.bundle(&pairs, asked.file.unwrap_or_default()).await
         }
-        (["collections"], true) => document(JSON, &at.collections()),
+        (["collections"], true) => document(JSON, &at.collections().await),
         (["collections", c], true) => match collections.get(*c) {
-            Some(c) => document(JSON, &at.collection(c)),
+            Some(c) => document(JSON, &at.collection(c).await),
             None => not_found(),
         },
         (["functions"], true) => document(JSON, &json!({"functions": []})),
@@ -753,13 +754,11 @@ impl Here<'_> {
         })
     }
 
-    /// C5: every collection, with its links.
-    fn collections(&self) -> Value {
-        let all: Vec<Value> = self
-            .collections
-            .values()
-            .map(|c| self.collection(c))
-            .collect();
+    /// C5: every collection, with its links; their extents are read side by side.
+    async fn collections(&self) -> Value {
+        let all: Vec<Value> =
+            futures_util::future::join_all(self.collections.values().map(|c| self.collection(c)))
+                .await;
         json!({
             "links": [link("self", JSON, &format!("{}/collections", self.base))],
             "crs": [crs::CRS84, crs::CRS84H],
@@ -767,8 +766,8 @@ impl Here<'_> {
         })
     }
 
-    /// C7: one collection; no `extent` (M8).
-    fn collection(&self, c: &Collection) -> Value {
+    /// C7: one collection, with the `extent` of what the caller reads (C6, M8).
+    async fn collection(&self, c: &Collection) -> Value {
         let at = format!("{}/collections/{}", self.base, c.id);
         let mut links = vec![
             link("self", JSON, &at),
@@ -789,6 +788,10 @@ impl Here<'_> {
                 }))),
             ),
             ("description", c.description.as_deref().map(Value::from)),
+            (
+                "extent",
+                extent::of(self.view, self.id, self.caller, c).await,
+            ),
             ("itemType", Some(Value::from("feature"))),
             ("crs", Some(json!([crs::CRS84, crs::CRS84H]))),
             ("storageCrs", Some(Value::from(crs::CRS84))),
@@ -851,6 +854,12 @@ impl Here<'_> {
         let mut body = json!({
             "type": "FeatureCollection",
             "features": page.features,
+            // C17: when the answer was made, a response time and no Entity time; whole
+            // seconds, so a HEAD states the length of the GET.
+            "timeStamp": items::now().and_then(|t| {
+                let seconds = t.unix_micros().checked_div(1_000_000)?;
+                antares_ops::residual::DateTime::from_unix_micros(seconds.checked_mul(1_000_000)?)
+            }).as_ref().map(ToString::to_string),
             "numberReturned": returned,
             "links": links,
         });

@@ -443,6 +443,8 @@ async fn part4(f: &Fixture, c: &Column) -> Result<(), String> {
     ensure(created.status == StatusCode::CREATED, || {
         format!("POST {} {}", created.status, created.body)
     })?;
+    // T-5909: each write is read back as the NGSI-LD Entity the Tenant stores.
+    stored(f, 1, [17.0, 48.0]).await?;
     let one = format!("{items}/urn:ngsi-ld:Car:matrix");
     let patch = send(
         &f.app,
@@ -455,10 +457,15 @@ async fn part4(f: &Fixture, c: &Column) -> Result<(), String> {
     ensure(patch.status == StatusCode::NO_CONTENT, || {
         format!("PATCH {}", patch.status)
     })?;
-    let put = send(&f.app, "PUT", &one, &body, &geo).await;
+    stored(f, 2, [17.0, 48.0]).await?;
+    let replaced = json!({"type": "Feature", "id": "urn:ngsi-ld:Car:matrix",
+        "geometry": {"type": "Point", "coordinates": [19.5, 49.25]}, "properties": {"speed": 3}})
+    .to_string();
+    let put = send(&f.app, "PUT", &one, &replaced, &geo).await;
     ensure(put.status == StatusCode::NO_CONTENT, || {
         format!("PUT {} {}", put.status, put.body)
     })?;
+    stored(f, 3, [19.5, 49.25]).await?;
     let delete = send(&f.app, "DELETE", &one, "", &[]).await;
     ensure(delete.status == StatusCode::NO_CONTENT, || {
         format!("DELETE {}", delete.status)
@@ -466,7 +473,35 @@ async fn part4(f: &Fixture, c: &Column) -> Result<(), String> {
     let gone = get(&f.app, &one).await;
     ensure(gone.status == StatusCode::NOT_FOUND, || {
         format!("after DELETE {}", gone.status)
+    })?;
+    let entity = ngsi_ld(f).await;
+    ensure(entity.status == StatusCode::NOT_FOUND, || {
+        format!("NGSI-LD after DELETE {} {}", entity.status, entity.body)
     })
+}
+
+/// The Feature the Part 4 cell wrote, read through NGSI-LD in the Tenant.
+async fn ngsi_ld(f: &Fixture) -> crate::common::Answer {
+    let at = "/ngsi-ld/v1/entities/urn:ngsi-ld:Car:matrix";
+    send(&f.app, "GET", at, "", &[("NGSILD-Tenant", "city")]).await
+}
+
+/// The stored Entity holds `speed` and a `location` Point at `at`, and nothing the write
+/// did not name.
+async fn stored(f: &Fixture, speed: i64, at: [f64; 2]) -> Result<(), String> {
+    let a = ngsi_ld(f).await;
+    let b = &a.body;
+    let point = json!({"type": "Point", "coordinates": at});
+    ensure(
+        a.status == StatusCode::OK
+            && b.pointer("/type") == Some(&json!("Car"))
+            && b.pointer("/speed/type") == Some(&json!("Property"))
+            && b.pointer("/speed/value") == Some(&json!(speed))
+            && b.pointer("/speed/unitCode").is_none()
+            && b.pointer("/location/type") == Some(&json!("GeoProperty"))
+            && b.pointer("/location/value") == Some(&point),
+        || format!("NGSI-LD read back (speed {speed}): {} {b}", a.status),
+    )
 }
 
 async fn part5(f: &Fixture, c: &Column) -> Result<(), String> {

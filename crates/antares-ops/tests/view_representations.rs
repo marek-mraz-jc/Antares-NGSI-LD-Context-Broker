@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! What a surface reads of the request and the view for a domain standard (T-4901): the view's
 //! own `representations` member by surface name, and whether the request carries the broker's
-//! admin bearer token (false on a broker that has none).
+//! admin bearer token (false on a broker that has none), and the view compilation it reads
+//! through (T-5909).
 
 use antares_ops::test_kit::{AdminAuth, TestBroker};
 use antares_ops::{Ops, Surface};
@@ -12,12 +13,18 @@ use axum::routing::get;
 use axum::Router;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use std::sync::{Mutex, PoisonError, Weak};
 use tower::ServiceExt;
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
-/// `/x/probe/{view}` answers `[admin?, the view's ical representation]`.
+/// `/x/probe/{view}` answers `[admin?, the view's ical representation]`; `/x/probe/gen/{view}`
+/// whether the view's compilation is the one the previous call kept.
 struct Probe;
+
+type Generation = Weak<dyn std::any::Any + Send + Sync>;
+
+static KEPT: Mutex<Option<Generation>> = Mutex::new(None);
 
 impl Surface for Probe {
     fn name(&self) -> &'static str {
@@ -30,16 +37,28 @@ impl Surface for Probe {
         Value::Null
     }
     fn router(&self, ops: Ops) -> Router {
-        Router::new().route(
-            "/{view}",
-            get(move |Path(id): Path<String>, req: Request| async move {
-                let admin = ops.admits_admin(req.headers());
-                let ical = ops
-                    .view(&id)
-                    .and_then(|v| v.representation("ical").cloned());
-                axum::Json(json!([admin, ical]))
-            }),
-        )
+        let gen_ops = ops.clone();
+        Router::new()
+            .route(
+                "/{view}",
+                get(move |Path(id): Path<String>, req: Request| async move {
+                    let admin = ops.admits_admin(req.headers());
+                    let ical = ops
+                        .view(&id)
+                        .and_then(|v| v.representation("ical").cloned());
+                    axum::Json(json!([admin, ical]))
+                }),
+            )
+            .route(
+                "/gen/{view}",
+                get(move |Path(id): Path<String>| async move {
+                    let now = gen_ops.view(&id).map(|v| v.generation());
+                    let mut kept = KEPT.lock().unwrap_or_else(PoisonError::into_inner);
+                    let same = kept.as_ref().zip(now.as_ref()).map(|(a, b)| a.ptr_eq(b));
+                    *kept = now;
+                    axum::Json(json!(same))
+                }),
+            )
     }
 }
 
@@ -129,5 +148,22 @@ async fn a_broker_without_an_admin_token_admits_nobody_to_a_surfaces_internal_ro
     assert_eq!(status, StatusCode::CREATED);
     let (_, seen) = send(&app, "GET", "/x/probe/plain", "", Some(TOKEN)).await;
     assert_eq!(seen, json!([false, null]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_view_compilation_is_the_same_until_the_view_changes() -> Result<(), String> {
+    let broker = TestBroker::new().await?;
+    let app = broker.serve(Probe)?;
+    let (status, _) = send(&app, "PUT", "/q/views/gen", &view("gen", None), None).await;
+    assert_eq!(status, StatusCode::CREATED);
+    send(&app, "GET", "/x/probe/gen/gen", "", None).await;
+    let (_, same) = send(&app, "GET", "/x/probe/gen/gen", "", None).await;
+    assert_eq!(same, json!(true), "two reads of one compilation");
+    let changed = view("gen", Some(json!({"ical": []})));
+    let (status, _) = send(&app, "PUT", "/q/views/gen", &changed, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, same) = send(&app, "GET", "/x/probe/gen/gen", "", None).await;
+    assert_eq!(same, json!(false), "a changed view is a new compilation");
     Ok(())
 }

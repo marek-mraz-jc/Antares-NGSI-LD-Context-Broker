@@ -64,7 +64,7 @@ The job pins the 1.8 release; 1.9 is a release candidate. Watch: when ETS 1.9 or
 ## 3. The baseline and the regression gate
 
 `ci/ogc-compliance/<view>.json` records every test method of the view's run
-that is no TestNG configuration method (71 for view `all` today). Each test is keyed
+that is no TestNG configuration method (188 for view `all` since T-5909). Each test is keyed
 `Core :: FeaturesLimit.validateFeaturesWithLimitResponse_NumberMatched`
 (class, test class, method), with `#2`, `#3` added when a data provider runs a
 method again, and status `PASS`, `FAIL` or `SKIP`. `baseline.py check` fails
@@ -88,7 +88,7 @@ The baseline was written from surfaces-conformance run 38141481939 on
 | Coordinate Reference Systems by Reference | 24 | 0 | 1 | 100.0 % |
 | **All** | 67 | 0 | 4 | 100.0 % |
 
-The first run (38141079096 on `e2753b4`) failed two Core tests, both fixed
+Section 7 has today's counts per view (T-5909). The first run (38141079096 on `e2753b4`) failed two Core tests, both fixed
 on this branch:
 
 - `FeaturesLimit.validateFeaturesWithLimitResponse_NumberMatched` follows a
@@ -102,10 +102,20 @@ on this branch:
 
 ## 5. The skipped tests
 
-| Test | Why it skips |
-|---|---|
-| `Features.validateFeaturesResponse_TimeStamp`, `FeaturesLimit.validateFeaturesWithLimitResponse_TimeStamp` (twice) | the endpoint sends no `timeStamp`, by design: the member is optional and a response time is no Entity time (mapping row C17) |
-| `BBoxCrsParameterInvalid.verifyBboxCrsParameterInvalid` | the collection states no spatial `extent`, which the test needs to build its request: the extent would take a scan of the Tenant's Entities on every collection read |
+Since T-5909 every `FeatureCollection` carries `timeStamp` (mapping row C17)
+and every collection with a geometry states the spatial `extent` of what the
+caller reads (C6, M8), so the `TimeStamp` tests and the bbox tests run. The
+ETS adds five fixed boxes to each collection with an extent (the prime
+meridian, the equator, the 180° meridian and both poles); the `ogc` seed holds
+one `AirQualityObserved` Entity in each (`urn:ngsi-ld:AirQualityObserved:ets-*`),
+so those queries return Features and are judged. What still skips:
+
+| Test | View | Why it skips |
+|---|---|---|
+| `BBoxCrsParameterInvalid.verifyBboxCrsParameterInvalid` | `ogc-star`, `ogc-cube` | collection `Reading` has no geometry, so it has no spatial extent to build the request from |
+| `BBoxCrsParameterInvalid.verifyBboxCrsParameterInvalid` | `all`, `ogc-history` | a `{type}-history` collection states no extent: it would take a read of every instance |
+| `Features.validateFeaturesResponse_NumberMatched`, `FeaturesLimit.validateFeaturesWithLimitResponse_NumberMatched` (twice) | `all`, `ogc-history` | a `{type}-history` page sends no `numberMatched` (T-5100, [the endpoint](ogc.md)) |
+| `FeaturesBBox.validateFeaturesWithBoundingBoxResponse` (five boxes) | `all` | the `conformance` Tenant, which other suites count, holds no Entity inside the five fixed boxes |
 
 ## 6. The gate goes red
 
@@ -119,18 +129,21 @@ schema again, went red on `Core :: FeaturesBBox.boundingBoxParameterDefinition`.
 The platform puts six kinds of Endpoint in front of this surface. Each is a
 view, and each runs the ETS on its own (`ci/views/ogc`, `ogc` Tenant;
 `all` is the conformance Tenant's star view). The table counts passed,
-failed and skipped tests, from local runs of the pinned image on
-`agent/worker-7/T-3831` (2026-10-12):
+failed and skipped tests, from a local run of the pinned image on
+`agent/worker-t5909/T-5909` (2026-10-28), written to the baselines with
+`baseline.py write`. Before T-5909 every view kept the three `TimeStamp` and the
+`BBoxCrsParameterInvalid` skips, and the bbox tests did not run:
 
 | view | Endpoint kind | Core | CRS by Reference |
 |---|---|---|---|
-| `all` | star, conformance Tenant | 43 / 0 / 3 | 24 / 0 / 1 |
-| `ogc-public` | public: a type list, reads only | 43 / 0 / 3 | 24 / 0 / 1 |
-| `ogc-internal` | internal: the same with the Part 4 writes | 43 / 0 / 3 | 24 / 0 / 1 |
-| `ogc-filtered` | filtered by the view's `q` (`NO2>25`) | 43 / 0 / 3 | 24 / 0 / 1 |
-| `ogc-star` | star (ADR-0023 rule 12): both classes | 75 / 0 / 6 | 43 / 2 / 2 |
-| `ogc-projection` | projection: `temperature` and `location` | 43 / 0 / 3 | 24 / 0 / 1 |
-| `ogc-cube` | data cube observations: `Reading`, no geometry | 43 / 0 / 3 | 22 / 2 / 1 |
+| `all` | star, conformance Tenant | 127 / 0 / 8 | 52 / 0 / 1 |
+| `ogc-public` | public: a type list, reads only | 100 / 0 / 0 | 31 / 0 / 0 |
+| `ogc-internal` | internal: the same with the Part 4 writes | 100 / 0 / 0 | 31 / 0 / 0 |
+| `ogc-filtered` | filtered by the view's `q` (`NO2>25`) | 100 / 0 / 0 | 31 / 0 / 0 |
+| `ogc-star` | star (ADR-0023 rule 12): both classes | 135 / 0 / 0 | 50 / 2 / 1 |
+| `ogc-projection` | projection: `temperature` and `location` | 100 / 0 / 0 | 31 / 0 / 0 |
+| `ogc-cube` | data cube observations: `Reading`, no geometry | 46 / 0 / 0 | 22 / 2 / 1 |
+| `ogc-history` | `{type}-history` collections (T-5100) | 132 / 0 / 3 | 52 / 0 / 1 |
 
 The two failures of `ogc-star` and `ogc-cube` are the same ETS defect, kept as
 known failures in their baselines:
@@ -138,12 +151,21 @@ known failures in their baselines:
 (twice) throws a `NullPointerException` on a `Reading` Feature, whose
 `"geometry": null` RFC 7946 section 3.2 allows. The endpoint answers 200 with
 `Content-Crs` as the requirement asks; the test reads coordinates that a
-Feature without a geometry does not have.
+Feature without a geometry does not have. In the 1.8 source and on `master`,
+`JsonUtils.parseFeatureGeometry` returns `null` for `"geometry": null` and
+`verifyFeatureCrsParameterTransformWithoutCrsParameter` calls
+`GeometryTransformer.transform(null)` and `equalsExact` on it; the same test
+also drops the result of `equalsExact`. An upstream fix (T-5909) is not yet
+proposed to opengeospatial/ets-ogcapi-features10; until a release ships it,
+the two runs stay known failures.
 
 No ETS exists for Parts 3, 4 and 5 (section 2). The matrix test
 `crates/antares-ogc/tests/ogc/matrix.rs` runs every Part on the same six
 kinds, one cell per Part and kind. A cell holds, or the write cell of a view
-without writes asserts its 405 with `Allow`. In every column no feature,
+without writes asserts its 405 with `Allow`. The write cell of `internal`
+reads the Entity back through NGSI-LD in the Tenant after each of `POST`,
+`PATCH` and `PUT` (the value, no `unitCode` the write did not send, the
+`location` Point) and finds it gone after `DELETE` (T-5909). In every column no feature,
 queryable or schema shows an attribute the view hides, and a filter on one
 is the same 400 as an unknown name.
 
