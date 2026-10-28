@@ -71,7 +71,11 @@ another mode (T-5056).
 
 `timerel` is `before`, `after` or `between` around `timeAt` (and
 `endTimeAt` for `between`), applied to `timeproperty` (`observedAt` by
-default; `createdAt`, `modifiedAt`, `deletedAt`). Clause 4.11 fixes the
+default; `createdAt`, `modifiedAt`, `deletedAt`, `expiresAt`, the 4.8 set of
+TS 104 175 5.2.4 NOTE 2). A window over `expiresAt` keeps the instances whose
+expiry falls in it; an instance already past its `expiresAt` is invalid
+(5.2.4) and absent from every read, before the maintenance reap deletes it.
+Clause 4.11 fixes the
 bounds: `after` includes the `timeAt` instant, `before` excludes it, and
 `between` includes `timeAt` and excludes `endTimeAt`. `attrs` restricts the
 attributes.
