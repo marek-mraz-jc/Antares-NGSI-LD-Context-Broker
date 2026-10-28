@@ -109,8 +109,10 @@ env:
   # pin/antares-surfaces, same change as conformance main 494cd93), and the
   # describe_type parity case (T-4537, T-4559; conformance main 2594d95)
   # conformance main d581c6d since T-4879: tests/ws/test_rfc6455.py (RFC 6455
-  # close handshake and protocol-error codes) joins ws-conformance
-  CONFORMANCE_REF: 184b8d8fec7f2f8f9f615eab192a72cab30462d9
+  # close handshake and protocol-error codes) joins ws-conformance;
+  # conformance main 4ab75bd since T-5905: the duration/binary literals move
+  # from REJECTED (501) to MISMATCHED (400) in tests/odata/test_parity.py
+  CONFORMANCE_REF: 4ab75bdae432ebc1ca67ad17d6b9dc8ac2a46d90
   NIGHTLY: ${{ github.event_name != 'pull_request' && !inputs.fast }}
 
 jobs:
