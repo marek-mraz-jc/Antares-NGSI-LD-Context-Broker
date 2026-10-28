@@ -262,6 +262,26 @@ mod tests {
     }
 
     #[test]
+    fn released_handles_are_freed_with_or_without_a_runtime() {
+        let held = Arc::new(());
+        release(vec![held.clone()]);
+        assert_eq!(
+            Arc::strong_count(&held),
+            1,
+            "freed at once outside a runtime"
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime");
+        rt.block_on(async {
+            release(Vec::<Arc<()>>::new());
+            release(vec![held.clone()]);
+        });
+        drop(rt);
+        assert_eq!(Arc::strong_count(&held), 1, "freed on the blocking pool");
+    }
+
+    #[test]
     fn the_idle_bound_defaults_to_an_hour_and_refuses_a_bad_value() {
         assert_eq!(parse_idle(None), Ok(DEFAULT_IDLE));
         assert_eq!(parse_idle(Some("30m")), Ok(Duration::from_mins(30)));
