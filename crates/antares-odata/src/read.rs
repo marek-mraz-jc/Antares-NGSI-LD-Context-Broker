@@ -1261,7 +1261,7 @@ pub(crate) async fn run_request(
         // A query answers 404 for a Tenant that holds nothing yet (5.5.10);
         // its EntitySet is empty.
         return match op {
-            OperationId::QueryEntities => Ok((Vec::new(), 0)),
+            OperationId::QueryEntities | OperationId::TemporalQuery => Ok((Vec::new(), 0)),
             _ => Err(not_found(version)),
         };
     }
@@ -2107,6 +2107,7 @@ mod tests {
             namespace: "n".into(),
             sets: BTreeMap::new(),
             schema_version: "0.m1".into(),
+            histories: std::collections::BTreeMap::new(),
         };
         let item = |path: &[&str]| QueryOptions {
             expand: Some(vec![odata_url::ExpandItem {
@@ -2316,6 +2317,7 @@ mod tests {
             namespace: "v".into(),
             sets: BTreeMap::from([("T".into(), set())]),
             schema_version: "0.m1".into(),
+            histories: std::collections::BTreeMap::new(),
         };
         let both = json!({"type": ["https://e.org/T", "https://e.org/Hidden"]});
         assert_eq!(visible_types(&edm, &both), vec!["T".to_owned()]);

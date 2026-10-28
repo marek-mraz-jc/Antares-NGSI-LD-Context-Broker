@@ -67,6 +67,11 @@ pub(crate) async fn serve(
     let (ODataUri::Resource { path, options }, None) = (&request.uri, refused) else {
         return not_implemented(refused.unwrap_or("this resource"), version).into_response();
     };
+    if let Some(set) = history_set(reads, path) {
+        return history(reads, caller, &ctx, set, path, options, headers)
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+    }
     let answer = match path.as_slice() {
         [_, Segment::Ref] | [_, _, Segment::Ref] if shaped(options) => Err(no_properties(version)),
         [Segment::EntitySet(set)] | [Segment::EntitySet(set), Segment::Ref]
@@ -108,6 +113,37 @@ pub(crate) async fn serve(
     answer.unwrap_or_else(IntoResponse::into_response)
 }
 
+/// The history set the path starts at (T-5908): a path starts at an EntitySet, written as its
+/// name.
+fn history_set<'r>(reads: &'r Reads, path: &[Segment]) -> Option<&'r crate::edm::Set> {
+    reads.edm.histories.get(&path.first()?.to_string())
+}
+
+/// A read of a history set (T-5908): the set, its `$count`, one row by key.
+async fn history(
+    reads: &Reads,
+    caller: &Caller,
+    ctx: &Ctx<'_>,
+    set: &crate::edm::Set,
+    path: &[Segment],
+    options: &QueryOptions,
+    headers: &HeaderMap,
+) -> Result<Response, ODataErrorResponse> {
+    match path {
+        [Segment::EntitySet(name)] | [Segment::EntitySet(name), Segment::Ref] => {
+            crate::history::collection(reads, caller, ctx, (name, set), path, options, headers)
+                .await
+        }
+        [_, Segment::Count] => {
+            crate::history::count(reads, caller, set, options, ctx.version).await
+        }
+        [Segment::EntitySet(name), Segment::Key(key)] => {
+            crate::history::entity(reads, caller, ctx, (name, set), key, options).await
+        }
+        _ => Err(not_implemented(ctx.version)),
+    }
+}
+
 /// A request that is not a `GET`: the write its method and path stand for.
 async fn write(
     reads: &Reads,
@@ -121,6 +157,10 @@ async fn write(
     let ODataUri::Resource { path, options } = &request.uri else {
         return written(method, &request.uri, version);
     };
+    // A history is read only, whatever the view offers (T-5908).
+    if history_set(reads, path).is_some() {
+        return refused(StatusCode::METHOD_NOT_ALLOWED, version).into_response();
+    }
     let form = match (method, path.as_slice()) {
         (&Method::POST, [Segment::EntitySet(set)]) => Form::Create(set),
         (&Method::PATCH, [Segment::EntitySet(set), Segment::Key(key)]) => {
