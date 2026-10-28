@@ -191,7 +191,7 @@ pub async fn purge_tenant(st: &AppState, tenant: &TenantId) -> Result<(), NgsiEr
 /// read could otherwise grow the store without bound by varying it.
 const MAX_IMPLICIT_CONTEXTS: usize = 1_000;
 
-/// What a stored @context costs of [`AppState::implicit_context_bytes`] per
+/// What a stored @context costs of `AppState::implicit_context_bytes` per
 /// byte of its JSON text: the memory store holds it as a `serde_json::Value`,
 /// measured at ~4.3x the text (a 2 000-term @context, 92 KB of text, held
 /// ~390 KB; T-5895). The count cap alone let 1 000 of them hold ~390 MB.

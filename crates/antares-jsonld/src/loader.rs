@@ -681,13 +681,6 @@ pub struct HitCount {
 }
 
 impl HitCount {
-    const fn new() -> Self {
-        Self {
-            hits: std::sync::atomic::AtomicU64::new(0),
-            misses: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-
     fn count(&self, hit: bool) {
         let n = if hit { &self.hits } else { &self.misses };
         n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -720,8 +713,14 @@ impl CacheStats {
 
 /// The process's @context cache counters.
 pub static CACHE_STATS: CacheStats = CacheStats {
-    merged: HitCount::new(),
-    fetched: HitCount::new(),
+    merged: HitCount {
+        hits: std::sync::atomic::AtomicU64::new(0),
+        misses: std::sync::atomic::AtomicU64::new(0),
+    },
+    fetched: HitCount {
+        hits: std::sync::atomic::AtomicU64::new(0),
+        misses: std::sync::atomic::AtomicU64::new(0),
+    },
 };
 
 /// Sets the byte budgets of the merged-context and fetched-document caches
