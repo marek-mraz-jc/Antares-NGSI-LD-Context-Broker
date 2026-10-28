@@ -140,7 +140,7 @@ async fn read_whole(ops: Ops, id: String, caller: Caller) -> Response {
     };
     let req = OpsRequest::new(Method::GET, "/ngsi-ld/v1/entities?type=Car");
     let read = match view.run(OperationId::QueryEntities, &caller, req).await {
-        Ok(answer) => view.read_answer(answer.into_body()).await,
+        Ok(answer) => view.read_answer(answer.into_body(), "test").await,
         Err(refusal) => Err(refusal),
     };
     match read {

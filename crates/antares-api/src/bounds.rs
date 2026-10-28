@@ -12,6 +12,11 @@ use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use std::sync::atomic::{AtomicU64, Ordering};
+// Clock rule: std Instant panics on wasm32 (T-4937).
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant as Clock;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant as Clock;
 
 /// Hard caps (v1: compile-time constants — a config file is a later knob;
 /// every value is spec-shaped on rejection).
@@ -44,6 +49,13 @@ pub use antares_model::error::MEMORY_OVERLOADED;
 /// `Retry-After` of a 503 for [`MEMORY_OVERLOADED`]: the pool frees as the
 /// concurrent buffered answers finish, which takes well under a second.
 pub const ANSWER_POOL_RETRY_SECONDS: u64 = 1;
+/// How long a buffered read waits for room in a full [`AnswerPool`] before
+/// it is refused with [`MEMORY_OVERLOADED`] (T-5898). The answers ahead of it
+/// free their share as soon as they are written out, well under a second
+/// each, so a brief burst of large reads queues instead of failing; a client
+/// still sees a 503 long before its own timeout. One deadline covers the
+/// whole read, however many frames wait.
+pub const ANSWER_POOL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The process-wide memory budget (`ANTARES_MEMORY_BUDGET`, T-5895) and its
 /// split over every long-lived cache and the buffered-answer pool. Each share
@@ -193,22 +205,42 @@ impl MemoryBudget {
 /// The bytes every in-process answer a handler buffers holds together
 /// (T-5895): [`MAX_ANSWER_BYTES`] bounds one answer, this bounds N of them,
 /// so concurrency cannot multiply the per-request cap past the memory budget.
-/// A read the pool has no room for is refused with [`MEMORY_OVERLOADED`]
-/// (503 + `Retry-After`), never cut short.
+/// A read the pool has no room for waits up to [`ANSWER_POOL_WAIT`], then
+/// is refused with [`MEMORY_OVERLOADED`] (503 + `Retry-After`), never cut
+/// short.
 #[derive(Debug)]
 pub struct AnswerPool {
     cap: usize,
     held: std::sync::atomic::AtomicUsize,
+    /// The most `held` reached since [`AnswerPool::take_peak`] last read it.
+    peak: std::sync::atomic::AtomicUsize,
+    /// Wakes the reads waiting for room whenever an answer gives its share back.
+    freed: tokio::sync::Notify,
+    wait: std::time::Duration,
 }
 
 impl AnswerPool {
-    /// A pool of `cap` bytes.
+    /// A pool of `cap` bytes whose reads wait up to [`ANSWER_POOL_WAIT`].
     #[must_use]
     pub fn new(cap: usize) -> std::sync::Arc<Self> {
+        Self::with_wait(cap, ANSWER_POOL_WAIT)
+    }
+    /// A pool of `cap` bytes whose reads wait up to `wait` for room.
+    #[must_use]
+    pub fn with_wait(cap: usize, wait: std::time::Duration) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             cap,
             held: std::sync::atomic::AtomicUsize::new(0),
+            peak: std::sync::atomic::AtomicUsize::new(0),
+            freed: tokio::sync::Notify::new(),
+            wait,
         })
+    }
+    /// The most bytes held at once since the last call, then starts over
+    /// from what is held now: the metric sampler reads the peak between two
+    /// samples, which a gauge of `held` alone misses.
+    pub fn take_peak(&self) -> usize {
+        self.peak.swap(self.held(), Ordering::AcqRel)
     }
     /// The bytes the pool holds at most.
     #[must_use]
@@ -221,11 +253,44 @@ impl AnswerPool {
         self.held.load(Ordering::Acquire)
     }
     fn take(&self, n: usize) -> bool {
-        self.held
+        match self
+            .held
             .try_update(Ordering::AcqRel, Ordering::Acquire, |h| {
                 h.checked_add(n).filter(|t| *t <= self.cap)
-            })
-            .is_ok()
+            }) {
+            Ok(before) => {
+                self.peak
+                    .fetch_max(before.saturating_add(n), Ordering::AcqRel);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+    /// [`AnswerPool::take`], waiting until `until` for an answer to give
+    /// room back; a read that already holds `own` and would not fit even an
+    /// otherwise empty pool is refused at once. The wasm build has no tokio
+    /// timer: there a read takes room only when it is free now.
+    async fn take_until(&self, n: usize, own: usize, until: Clock) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        loop {
+            // registered before the try, so a share freed in between wakes it
+            let freed = self.freed.notified();
+            tokio::pin!(freed);
+            freed.as_mut().enable();
+            if self.take(n) {
+                return true;
+            }
+            let left = until.saturating_duration_since(Clock::now());
+            if own.saturating_add(n) > self.cap || tokio::time::timeout(left, freed).await.is_err()
+            {
+                return self.take(n);
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (own, until);
+            self.take(n)
+        }
     }
 }
 
@@ -268,7 +333,10 @@ struct Charge {
 
 impl Drop for Charge {
     fn drop(&mut self) {
-        self.pool.held.fetch_sub(self.bytes, Ordering::AcqRel);
+        if self.bytes > 0 {
+            self.pool.held.fetch_sub(self.bytes, Ordering::AcqRel);
+            self.pool.freed.notify_waiters();
+        }
     }
 }
 
@@ -278,7 +346,7 @@ pub enum AnswerRefusal {
     /// This answer alone is over the per-request bound
     /// ([`ANSWER_TOO_LARGE`]).
     TooLarge,
-    /// The pool has no room now ([`MEMORY_OVERLOADED`]).
+    /// The pool has no room within its wait ([`MEMORY_OVERLOADED`]).
     OverBudget,
     /// The inner body failed while it was read.
     Body,
@@ -303,17 +371,47 @@ impl From<AnswerRefusal> for crate::negotiate::ApiError {
 }
 
 /// Reads `body` whole, at most `max` bytes, charging every frame to `pool`
-/// as it arrives: a refusal releases what the read held.
+/// as it arrives; a frame the pool has no room for waits for it up to the
+/// pool's wait, counted from the start of the read (T-5898). A refusal
+/// releases what the read held. `surface` labels the metrics: the size of
+/// each answer read whole (`antares_answer_bytes`), the time spent waiting
+/// for room and each refusal for a full pool.
 ///
 /// # Errors
-/// [`AnswerRefusal`] when the answer is over `max`, the pool has no room or
-/// the body fails.
+/// [`AnswerRefusal`] when the answer is over `max`, the pool had no room
+/// within its wait or the body fails.
 pub async fn read_answer(
     pool: &std::sync::Arc<AnswerPool>,
     body: Body,
     max: usize,
+    surface: &'static str,
+) -> Result<HeldAnswer, AnswerRefusal> {
+    let started = Clock::now();
+    let read = read_charged(pool, body, max, started).await;
+    match &read {
+        Ok(answer) => {
+            metrics::histogram!("antares_answer_bytes", "surface" => surface)
+                .record(answer.len() as f64);
+        }
+        Err(AnswerRefusal::OverBudget) => {
+            metrics::counter!("antares_answer_pool_refusals_total", "surface" => surface)
+                .increment(1);
+        }
+        Err(_) => {}
+    }
+    metrics::histogram!("antares_answer_pool_wait_seconds", "surface" => surface)
+        .record(started.elapsed().as_secs_f64());
+    read
+}
+
+async fn read_charged(
+    pool: &std::sync::Arc<AnswerPool>,
+    body: Body,
+    max: usize,
+    started: Clock,
 ) -> Result<HeldAnswer, AnswerRefusal> {
     use futures_util::StreamExt;
+    let until = started.checked_add(pool.wait).unwrap_or(started);
     let mut charge = Charge {
         pool: std::sync::Arc::clone(pool),
         bytes: 0,
@@ -326,7 +424,7 @@ pub async fn read_answer(
         if total > max {
             return Err(AnswerRefusal::TooLarge);
         }
-        if !pool.take(frame.len()) {
+        if !pool.take_until(frame.len(), charge.bytes, until).await {
             return Err(AnswerRefusal::OverBudget);
         }
         charge.bytes = charge.bytes.saturating_add(frame.len());
@@ -970,27 +1068,89 @@ mod tests {
     /// refused whole, and a dropped answer gives its bytes back.
     #[tokio::test]
     async fn the_answer_pool_refuses_past_its_cap_and_frees_on_drop() {
-        let pool = AnswerPool::new(1000);
-        let first = read_answer(&pool, body_of(600), 800).await.expect("fits");
+        let pool = AnswerPool::with_wait(1000, std::time::Duration::ZERO);
+        let first = read_answer(&pool, body_of(600), 800, "test")
+            .await
+            .expect("fits");
         assert_eq!(first.len(), 600);
         assert_eq!(pool.held(), 600);
         assert_eq!(
-            read_answer(&pool, body_of(600), 800).await.err(),
+            read_answer(&pool, body_of(600), 800, "test").await.err(),
             Some(AnswerRefusal::OverBudget)
         );
         assert_eq!(pool.held(), 600, "a refused read holds nothing");
         assert_eq!(
-            read_answer(&pool, body_of(900), 800).await.err(),
+            read_answer(&pool, body_of(900), 800, "test").await.err(),
             Some(AnswerRefusal::TooLarge),
             "one answer stays under the per-answer bound"
         );
         drop(first);
         assert_eq!(pool.held(), 0);
-        let again = read_answer(&pool, body_of(600), 800)
+        let again = read_answer(&pool, body_of(600), 800, "test")
             .await
             .expect("room again");
         assert_eq!(again.into_bytes().len(), 600);
         assert_eq!(pool.held(), 0, "a body handed on leaves the pool");
+        assert_eq!(pool.take_peak(), 600, "the peak between two samples");
+        assert_eq!(pool.take_peak(), 0, "starts over from what is held");
+    }
+
+    /// A read the full pool has no room for waits, and gets its room when an
+    /// answer ahead of it is written out before the wait ends (T-5898).
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_waits_for_room_and_gets_it_before_the_wait_ends() {
+        let pool = AnswerPool::with_wait(1000, std::time::Duration::from_secs(2));
+        let first = read_answer(&pool, body_of(600), 800, "test")
+            .await
+            .expect("fits");
+        let started = tokio::time::Instant::now();
+        let waiting = tokio::spawn({
+            let pool = std::sync::Arc::clone(&pool);
+            async move { read_answer(&pool, body_of(600), 800, "test").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(!waiting.is_finished(), "it waits while the pool is full");
+        drop(first);
+        let second = waiting.await.expect("joined").expect("room freed in time");
+        assert_eq!(second.len(), 600);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(pool.held(), 600);
+    }
+
+    /// Past the wait the read is refused whole and holds nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_reader_is_refused_when_no_room_frees_within_the_wait() {
+        let pool = AnswerPool::with_wait(1000, std::time::Duration::from_secs(2));
+        let _first = read_answer(&pool, body_of(600), 800, "test")
+            .await
+            .expect("fits");
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            read_answer(&pool, body_of(600), 800, "test").await.err(),
+            Some(AnswerRefusal::OverBudget)
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+        assert_eq!(pool.held(), 600, "a refused read holds nothing");
+    }
+
+    /// A read that would not fit even an empty pool beside what it already
+    /// holds is refused at once: no wait can make room for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_too_big_for_the_whole_pool_does_not_wait() {
+        let pool = AnswerPool::with_wait(1000, std::time::Duration::from_secs(2));
+        let frames = futures_util::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; 600])),
+            Ok(Bytes::from(vec![b'x'; 600])),
+        ]);
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            read_answer(&pool, Body::from_stream(frames), 4000, "test")
+                .await
+                .err(),
+            Some(AnswerRefusal::OverBudget)
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+        assert_eq!(pool.held(), 0, "a refused read holds nothing");
     }
 
     /// The API answers a full pool 503 with Retry-After, never a body cut

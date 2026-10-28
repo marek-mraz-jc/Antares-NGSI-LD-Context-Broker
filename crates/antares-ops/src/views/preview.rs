@@ -104,7 +104,7 @@ async fn preview(
         .and_then(|v: &HeaderValue| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or_default();
-    let bytes = match r.state.read_answer(answer.into_body()).await {
+    let bytes = match r.state.read_answer(answer.into_body(), "views").await {
         Ok(bytes) => bytes,
         Err(antares_api::bounds::AnswerRefusal::OverBudget) => {
             return Ok(antares_api::negotiate::ApiError::from(

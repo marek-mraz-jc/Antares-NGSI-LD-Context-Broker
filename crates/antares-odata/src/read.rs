@@ -1278,7 +1278,7 @@ pub(crate) async fn run_request(
         .unwrap_or(0);
     let bytes = reads
         .view
-        .read_answer(answer.into_body())
+        .read_answer(answer.into_body(), "odata")
         .await
         .map_err(|refusal| refused(refusal.status(), version))?;
     let docs = serde_json::from_slice::<Value>(&bytes)

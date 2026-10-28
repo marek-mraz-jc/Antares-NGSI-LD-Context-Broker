@@ -406,15 +406,22 @@ impl Ops {
     /// # Errors
     /// [`Refusal::Limit`] with [`bounds::ANSWER_TOO_LARGE`] past the bound,
     /// [`Refusal::Overloaded`] while the pool has no room.
-    pub async fn read_answer(&self, body: Body) -> Result<bounds::HeldAnswer, Refusal> {
-        self.state.read_answer(body).await.map_err(|r| match r {
-            antares_api::bounds::AnswerRefusal::OverBudget => Refusal::Overloaded {
-                retry_after: Some(HeaderValue::from(
-                    antares_api::bounds::ANSWER_POOL_RETRY_SECONDS,
-                )),
-            },
-            _ => Refusal::Limit(bounds::ANSWER_TOO_LARGE),
-        })
+    pub async fn read_answer(
+        &self,
+        body: Body,
+        surface: &'static str,
+    ) -> Result<bounds::HeldAnswer, Refusal> {
+        self.state
+            .read_answer(body, surface)
+            .await
+            .map_err(|r| match r {
+                antares_api::bounds::AnswerRefusal::OverBudget => Refusal::Overloaded {
+                    retry_after: Some(HeaderValue::from(
+                        antares_api::bounds::ANSWER_POOL_RETRY_SECONDS,
+                    )),
+                },
+                _ => Refusal::Limit(bounds::ANSWER_TOO_LARGE),
+            })
     }
 
     /// The operations of the loaded view `id`, or `None` when no view of
@@ -633,8 +640,12 @@ impl ViewOps {
     ///
     /// # Errors
     /// [`Refusal::Limit`] past the bound.
-    pub async fn read_answer(&self, body: Body) -> Result<bounds::HeldAnswer, Refusal> {
-        self.inner.read_answer(body).await
+    pub async fn read_answer(
+        &self,
+        body: Body,
+        surface: &'static str,
+    ) -> Result<bounds::HeldAnswer, Refusal> {
+        self.inner.read_answer(body, surface).await
     }
 
     /// Whether the view allows `op`.
