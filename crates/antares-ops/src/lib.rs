@@ -44,6 +44,7 @@ mod operation;
 pub mod outputs;
 pub mod percent;
 mod scan;
+pub mod view_cache;
 pub mod views;
 
 /// The one `GeoJSON` geometry rule of the broker (T-5208): the default instance, valid, RFC 7946
@@ -123,9 +124,10 @@ const LOGGED_DETAIL_BYTES: usize = 4096;
 #[derive(Clone)]
 pub struct Ops {
     state: AppState,
-    /// The narrowed handle of each view served so far, so a request does
-    /// not build the narrowed state and its in-process router anew.
-    views: Arc<Mutex<BTreeMap<String, ViewOps>>>,
+    /// The narrowed handle of each view served lately, so a request does
+    /// not build the narrowed state and its in-process router anew; an
+    /// idle one is dropped ([`view_cache`]).
+    views: Arc<Mutex<view_cache::ViewCache<ViewOps>>>,
     /// The surface these operations are run for, named on each one's log
     /// line (threat G10); `None` for the broker's own in-process forwards.
     surface: Option<Arc<str>>,
@@ -453,27 +455,37 @@ impl Ops {
             None => None,
             Some(a) => Some(a.0.clone().downcast::<mapping::Mapping>().ok()?),
         };
-        let mut cache = self.views.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(hit) = cache.get(id).filter(|c| Arc::ptr_eq(&c.view, view)) {
-            return Some(hit.clone());
-        }
-        let made = ViewOps {
-            inner: Self::new(self.state.with_view(view.clone()), self.surface.clone()),
-            view: view.clone(),
-            tenant,
-            operations: operations
-                .iter()
-                .filter_map(|o| OperationId::from_id(o))
-                .collect(),
-            mapping,
-            names: Arc::new(names::of_view(context.as_deref())?),
-            representations: representations.clone(),
+        let build = || {
+            Some(ViewOps {
+                inner: Self::new(self.state.with_view(view.clone()), self.surface.clone()),
+                view: view.clone(),
+                tenant,
+                operations: operations
+                    .iter()
+                    .filter_map(|o| OperationId::from_id(o))
+                    .collect(),
+                mapping,
+                names: Arc::new(names::of_view(context.as_deref())?),
+                representations: representations.clone(),
+            })
         };
         // Only views loaded now stay cached: a removed one goes with the
-        // first view served after its removal.
-        cache.retain(|k, _| table.contains_key(k));
-        cache.insert(id.to_owned(), made.clone());
-        Some(made)
+        // next sweep. A changed view is a new `CompiledView`, so a handle
+        // of the old one is never served again.
+        let (made, gone) = self
+            .views
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_build(
+                id,
+                |held| Arc::ptr_eq(&held.view, view),
+                |k| table.contains_key(k),
+                std::time::Instant::now(),
+                view_cache::idle(),
+                build,
+            );
+        view_cache::release(gone);
+        made
     }
 
     /// Run `op` as the caller of the outer request.

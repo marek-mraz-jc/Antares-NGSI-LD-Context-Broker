@@ -60,7 +60,12 @@ pub const HISTORY_DEFAULT_ENV: &str = "ANTARES_RETENTION_HISTORY_DEFAULT";
 
 /// Every variable the view table reads. The broker accepts these as config
 /// keys from here, so a new one is added in this crate alone (T-3766).
-pub const ENV_KEYS: &[&str] = &[RELOAD_ENV, SCHEMA_MAX_ENV, HISTORY_DEFAULT_ENV];
+pub const ENV_KEYS: &[&str] = &[
+    RELOAD_ENV,
+    SCHEMA_MAX_ENV,
+    HISTORY_DEFAULT_ENV,
+    crate::view_cache::VIEW_IDLE_ENV,
+];
 
 /// The largest view document `/q/views` accepts, in bytes.
 pub const MAX_VIEW_BYTES: usize = 64 * 1024;
@@ -767,6 +772,7 @@ fn platform_history(raw: Option<String>) -> Result<Option<std::time::Duration>, 
 /// # Errors
 /// The store's, or routes set already.
 pub async fn install(state: &AppState) -> Result<Reload, String> {
+    crate::view_cache::configure()?;
     install_with(
         state,
         platform_history(std::env::var(HISTORY_DEFAULT_ENV).ok())?,
