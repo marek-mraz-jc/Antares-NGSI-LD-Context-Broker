@@ -1,8 +1,8 @@
 {
  "counts": {
   "FAIL": 2,
-  "PASS": 65,
-  "SKIP": 4
+  "PASS": 68,
+  "SKIP": 1
  },
  "results": {
   "Coordinate Reference Systems by Reference :: BBoxCrsParameterInvalid.verifyBboxCrsParameterInvalid": "SKIP",
@@ -48,7 +48,7 @@
   "Core :: Features.validateFeaturesResponse_Links": "PASS",
   "Core :: Features.validateFeaturesResponse_NumberMatched": "PASS",
   "Core :: Features.validateFeaturesResponse_NumberReturned": "PASS",
-  "Core :: Features.validateFeaturesResponse_TimeStamp": "SKIP",
+  "Core :: Features.validateFeaturesResponse_TimeStamp": "PASS",
   "Core :: Features.validateFeaturesResponse_TypeProperty": "PASS",
   "Core :: FeaturesBBox.boundingBoxParameterDefinition": "PASS",
   "Core :: FeaturesErrorConditions.validateFeaturesOperation_QueryParamInvalid": "PASS",
@@ -68,8 +68,8 @@
   "Core :: FeaturesLimit.validateFeaturesWithLimitResponse_Links #2": "PASS",
   "Core :: FeaturesLimit.validateFeaturesWithLimitResponse_NumberMatched": "PASS",
   "Core :: FeaturesLimit.validateFeaturesWithLimitResponse_NumberMatched #2": "PASS",
-  "Core :: FeaturesLimit.validateFeaturesWithLimitResponse_TimeStamp": "SKIP",
-  "Core :: FeaturesLimit.validateFeaturesWithLimitResponse_TimeStamp #2": "SKIP",
+  "Core :: FeaturesLimit.validateFeaturesWithLimitResponse_TimeStamp": "PASS",
+  "Core :: FeaturesLimit.validateFeaturesWithLimitResponse_TimeStamp #2": "PASS",
   "Core :: FeaturesLimit.validateFeaturesWithLimitResponse_TypeProperty": "PASS",
   "Core :: FeaturesLimit.validateFeaturesWithLimitResponse_TypeProperty #2": "PASS",
   "Core :: FeaturesTime.timeParameterDefinition": "PASS",
