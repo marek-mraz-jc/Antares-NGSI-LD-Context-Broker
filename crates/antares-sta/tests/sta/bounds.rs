@@ -90,8 +90,16 @@ async fn query_options_are_bounded_and_a_refusal_names_the_option() -> Result<()
         at(&has.body, "/error/message"),
         "$filter: has is not supported"
     );
-    let series = sta(&f.app, "/Datastreams('urn:ngsi-ld:Car:1%2Fspeed')/Observations?$filter=a eq 1 or phenomenonTime gt 2026-01-01T00:00:00Z").await;
-    assert_eq!(series.status, StatusCode::BAD_REQUEST);
+    // T-5918: what no time window says is judged over the Datastream's Observations.
+    let series = sta(&f.app, "/Datastreams('urn:ngsi-ld:Car:1%2Fspeed')/Observations?$filter=result eq -1 or phenomenonTime gt 2026-01-01T00:00:00Z").await;
+    assert_eq!(series.status, StatusCode::OK, "{}", series.body);
+    let times = at(&series.body, "/value")
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(times
+        .iter()
+        .all(|o| o.get("phenomenonTime").and_then(Value::as_str) > Some("2026-01-01T00:00:00Z")));
     Ok(())
 }
 
@@ -119,7 +127,13 @@ async fn a_filter_the_view_cannot_read_is_its_400() -> Result<(), String> {
         )
     );
     let b = sta(&f.app, "/Datastreams('urn:ngsi-ld:Car:1%2Fspeed')/Observations?$filter=phenomenonTime gt yesterday").await;
-    assert_eq!(b.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        (b.status, at(&b.body, "/error/message")),
+        (
+            StatusCode::BAD_REQUEST,
+            json!("$filter: yesterday is no property of these resources; quote a text")
+        )
+    );
     Ok(())
 }
 
