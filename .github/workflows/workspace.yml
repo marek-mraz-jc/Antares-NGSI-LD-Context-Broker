@@ -57,7 +57,10 @@ jobs:
         # host ports must stay below 32768: the ephemeral range (32768-60999)
         # collides with random outbound source ports -> "address already in use"
         ports: ["15432:5432"]
+        # docker's 64 MB /dev/shm: 16's parallel VACUUM failed 53100 "could
+        # not resize shared memory segment" in pg_explain (run 40821321485)
         options: >-
+          --shm-size=1g
           --health-cmd "pg_isready -U antares"
           --health-interval 5s --health-timeout 3s --health-retries 20
       # The store integration tests run against BOTH temporal modes —
@@ -70,6 +73,7 @@ jobs:
           POSTGRES_DB: antares
         ports: ["15433:5432"]
         options: >-
+          --shm-size=1g
           --health-cmd "pg_isready -U antares"
           --health-interval 5s --health-timeout 3s --health-retries 20
     steps:
