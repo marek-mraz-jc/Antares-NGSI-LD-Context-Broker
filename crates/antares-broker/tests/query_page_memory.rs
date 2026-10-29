@@ -74,12 +74,32 @@ async fn a_1000_entity_page_is_held_as_written_until_it_is_read() {
     assert_eq!(docs.len(), PAGE);
     drop(docs);
 
+    // a plain list, and an ordered one (sorted on trimmed documents, its
+    // page read whole by id)
+    for query in ["", "&orderBy=level"] {
+        let (held, answer) = read(&app, query).await;
+        // ~0.5 MB written against ~4.7 MB of trees: a quarter leaves room
+        // for a wider shape
+        assert!(
+            held < as_values / 4,
+            "{query}: the answer holds {held} bytes before it is read; the page as values is {as_values}"
+        );
+        // the same answer as the documents' path: `join` holds the page as
+        // `Value`s, and these Entities link to nothing it would add
+        let (_, joined) = read(&app, &format!("{query}&join=flat&joinLevel=1")).await;
+        assert_eq!(answer, joined, "{query}");
+    }
+}
+
+/// One page of the Load Entities with `query` appended: the bytes the
+/// answer held before its body was read, and the body.
+async fn read(app: &axum::Router, query: &str) -> (u64, axum::body::Bytes) {
     let before = live();
     let answer = app
         .clone()
         .oneshot(
             Request::get(format!(
-                "/ngsi-ld/v1/entities?type=Load&limit={PAGE}&count=true"
+                "/ngsi-ld/v1/entities?type=Load&limit={PAGE}&count=true{query}"
             ))
             .header("Accept", "application/json")
             .body(Body::empty())
@@ -93,32 +113,11 @@ async fn a_1000_entity_page_is_held_as_written_until_it_is_read() {
             .headers()
             .get("NGSILD-Results-Count")
             .and_then(|v| v.to_str().ok()),
-        Some("1000")
+        Some("1000"),
+        "{query}"
     );
-    // ~0.5 MB written against ~4.7 MB of trees: a quarter leaves room for
-    // a wider shape
-    assert!(
-        held < as_values / 4,
-        "the answer holds {held} bytes before it is written; the page as values is {as_values}"
-    );
-    // the same answer as the documents' path: `join` holds the page as
-    // `Value`s, and these Entities link to nothing it would add
-    let text = axum::body::to_bytes(answer.into_body(), usize::MAX)
+    let body = axum::body::to_bytes(answer.into_body(), usize::MAX)
         .await
         .expect("body");
-    let joined = app
-        .oneshot(
-            Request::get(format!(
-                "/ngsi-ld/v1/entities?type=Load&limit={PAGE}&count=true&join=flat&joinLevel=1"
-            ))
-            .header("Accept", "application/json")
-            .body(Body::empty())
-            .expect("request"),
-        )
-        .await
-        .expect("query");
-    let joined = axum::body::to_bytes(joined.into_body(), usize::MAX)
-        .await
-        .expect("body");
-    assert_eq!(text, joined);
+    (held, body)
 }

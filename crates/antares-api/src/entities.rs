@@ -932,12 +932,14 @@ async fn query_entities_inner(
     // T-6055: a plain list writes each Entity as it is admitted and holds the
     // page as its answer (~0.25 KB an Entity), where the stored `Value` tree
     // takes ~5 KB
-    let as_frames = join.is_none() && accept != Accept::GeoJson && order_keys.is_none();
+    // an ordered read sorts trimmed documents and writes its page as read
+    // whole by id ([`whole_page_written`])
+    let as_frames = join.is_none() && accept != Accept::GeoJson;
     let ld_ctx = crate::negotiate::list_context(&ctx, accept);
     let write = |doc: &Value| {
         shape(doc).map(|shaped| crate::negotiate::list_frame(shaped, ld_ctx.as_ref()))
     };
-    let mut filtered = match as_frames && fed.is_empty() {
+    let mut filtered = match as_frames && order_keys.is_none() && fed.is_empty() {
         true => {
             filter_entities_written(st, &tenant, params, &ctx, pushdown, Some(&repr), &write)
                 .await?
@@ -985,11 +987,16 @@ async fn query_entities_inner(
     let (page, count_hdr, links) = match filtered.written.is_empty() {
         true => {
             let (page, count, links) = cut.page(st, params, matches)?;
-            let page = match trimmed {
-                true => whole_page(st, &tenant, params, &ctx, &repr, page).await?,
-                false => page,
+            let page = match (trimmed, as_frames) {
+                (true, true) => Page::Written(
+                    whole_page_written(st, &tenant, params, &ctx, &repr, page, &write).await?,
+                ),
+                (true, false) => {
+                    Page::Docs(whole_page(st, &tenant, params, &ctx, &repr, page).await?)
+                }
+                (false, _) => Page::Docs(page),
             };
-            (Page::Docs(page), count, links)
+            (page, count, links)
         }
         false => {
             let (page, count, links) = cut.page(st, params, filtered.written)?;
@@ -1377,6 +1384,54 @@ async fn whole_page(
         .filter_map(|d| Some((d.get("id")?.as_str()?.to_owned(), d)))
         .collect();
     Ok(ids.iter().filter_map(|id| found.remove(*id)).collect())
+}
+
+/// [`whole_page`] with each Entity written as it is read
+/// ([`filter_entities_written`]), in the order of the trimmed `page`.
+async fn whole_page_written(
+    st: &AppState,
+    tenant: &TenantId,
+    params: &HashMap<String, String>,
+    ctx: &antares_jsonld::Context,
+    repr: &crate::repr::Repr,
+    page: Vec<Value>,
+    write: Write<'_>,
+) -> ApiResult<Vec<Written>> {
+    let ids: Vec<String> = page
+        .iter()
+        .filter_map(|d| Some(d.get("id")?.as_str()?.to_owned()))
+        .collect();
+    drop(page);
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut by_id = params.clone();
+    by_id.insert("id".to_owned(), ids.join(","));
+    let whole = filter_entities_written(
+        st,
+        tenant,
+        &by_id,
+        ctx,
+        Pushdown::default(),
+        Some(repr),
+        write,
+    )
+    .await?;
+    // a read of documents (a walk in store pages) is written here
+    let docs = whole.docs.iter().filter_map(|d| {
+        let id = d.get("id")?.as_str()?.to_owned();
+        Some(Written {
+            id,
+            frame: write(d),
+        })
+    });
+    let mut found: HashMap<String, Written> = whole
+        .written
+        .into_iter()
+        .chain(docs)
+        .map(|w| (w.id.clone(), w))
+        .collect();
+    Ok(ids.iter().filter_map(|id| found.remove(id)).collect())
 }
 
 /// Whether the store may be asked to cut the page (ORDER BY id +
