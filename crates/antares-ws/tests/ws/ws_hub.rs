@@ -7,7 +7,9 @@
 
 use crate::common::{broker, broker_alone, cars, connect, outbound, rendered, status, text, until};
 use antares_ops::{NotificationSink, Surface};
-use antares_ws::{Answer, Forwarded, Hub, Limits, Relay, Sink, ViewWs, Ws, ENDPOINT_PREFIX};
+use antares_ws::{
+    Answer, Forwarded, Hub, Limits, Relay, Sink, StaMqtt, ViewWs, Ws, ENDPOINT_PREFIX,
+};
 use serde_json::{json, Value};
 use std::future::Future;
 use std::pin::Pin;
@@ -109,6 +111,11 @@ fn ws_both_surfaces_report_their_limits() {
             ViewWs::process().version_info(),
             ViewWs::process().needs_view(),
         ),
+        (
+            StaMqtt::process().name(),
+            StaMqtt::process().version_info(),
+            StaMqtt::process().needs_view(),
+        ),
     ] {
         assert_eq!(
             info.pointer("/limits/queue"),
@@ -117,7 +124,7 @@ fn ws_both_surfaces_report_their_limits() {
         );
         assert_eq!(info.pointer("/connections"), Some(&json!(0)), "{name}");
         assert_eq!(info.pointer("/queued"), Some(&json!(0)), "{name}");
-        assert_eq!(needs_view, name == "ws-views");
+        assert_eq!(needs_view, name != "ws");
     }
     assert_eq!(Ws::process().prefix(), "/x/ws");
 }

@@ -18,6 +18,7 @@ surface hides, and which CI job proves each surface's conformance.
 | OData | `odata` (adds `views`) | `odata` | `/x/views/{view}/odata/v4` | [OData endpoint of a view](odata.md) |
 | OGC API - Features | `ogc` (adds `views`) | `ogc` | `/x/views/{view}/ogc/features` | [OGC API - Features endpoint of a view](ogc.md) |
 | SensorThings API | `sta` (adds `views`) | `sta` | `/x/views/{view}/sta/v1.1` | [SensorThings API endpoint of a view](sta.md) |
+| SensorThings MQTT | `sta` and `ws` | `sta-mqtt` | `/x/views/{view}/sta/mqtt` | [SensorThings API endpoint of a view](sta.md#5-mqtt-subscriptions) |
 | iCalendar | `ical` (adds `views`) | `ical` | `/x/views/{view}/ical/v1/events.ics` | [iCalendar feed of a view](ical.md) |
 | GeoJSON of a view | `geojson` (adds `views`) | `geojson` | `/x/views/{view}/geojson/v1/{type}` | [GeoJSON of a view](geojson.md) |
 | Feeds of a view | `feed` (adds `views`) | `feed` | `/x/views/{view}/feed/v1/{name}/{atom.xml\|rss.xml\|feed.json}` | [Feeds of a view](feed.md) |

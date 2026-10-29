@@ -777,6 +777,22 @@ impl ViewOps {
         (!matching.is_empty()).then(|| format!("type={}", matching.join(",")))
     }
 
+    /// The Entity types a Subscription through the view names to watch everything it shows:
+    /// the shown types, or for a view of every type the Tenant's stored types. Empty when the
+    /// store keeps no type list or holds no Entity yet.
+    pub async fn watched_types(&self) -> Vec<String> {
+        if !self.shows_every_name() {
+            return self.shown_names().0;
+        }
+        self.inner
+            .state
+            .stored_type_names(&self.tenant)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+
     /// Whether the view shows every type and Attribute (ADR-0023 rule 12):
     /// [`Self::shown_names`] and [`Self::shown_by_type`] are then empty and a
     /// surface offers a name by its syntax alone.
@@ -1197,6 +1213,36 @@ impl Ops {
                 answer.status().as_u16()
             ))
         }
+    }
+}
+
+impl Ops {
+    /// GET `path_and_query` through this broker's own router as `caller` sent it over HTTP: the
+    /// answer a surface re-reads for a push channel, so a pushed message is the HTTP read byte
+    /// for byte (the `SensorThings` MQTT extension, T-5911). The status and the body up to `max`
+    /// bytes; an empty body past `max`.
+    pub async fn get_as(
+        &self,
+        caller: &Caller,
+        path_and_query: &str,
+        max: usize,
+    ) -> (u16, axum::body::Bytes) {
+        let mut req = axum::http::Request::builder()
+            .method(Method::GET)
+            .uri(path_and_query);
+        // the links an answer writes start from the Host the caller reached, as over HTTP
+        if let Some(host) = caller.0.get(axum::http::header::HOST) {
+            req = req.header(axum::http::header::HOST, host);
+        }
+        let Ok(req) = req.body(Body::empty()) else {
+            return (400, axum::body::Bytes::new());
+        };
+        let answer = self.state.call_on_task(None, caller.0.clone(), req).await;
+        let status = answer.status().as_u16();
+        let body = axum::body::to_bytes(answer.into_body(), max)
+            .await
+            .unwrap_or_default();
+        (status, body)
     }
 }
 

@@ -12,4 +12,5 @@ mod ws_protocol;
 mod ws_queue;
 mod ws_resume;
 mod ws_seams;
+mod ws_sta_mqtt;
 mod ws_views;

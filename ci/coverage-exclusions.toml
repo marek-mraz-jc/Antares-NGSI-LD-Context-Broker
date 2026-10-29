@@ -727,6 +727,30 @@ branches = 0
 reason = "an Entity of a type the output does not list: since F-ANT5-010 every read pushes the output's types, so only the `local=true` fallback of a store without a type list returns one; the built-in store under test_kit keeps that list"
 
 [[exclusion]]
+crate = "antares-ws"
+file = "src/sta_mqtt.rs"
+function = "Session::publish"
+lines = 1
+branches = 1
+reason = "a socket that breaks or stops reading in the middle of a PUBLISH: tungstenite's write fails only on a peer the kernel has already dropped, which no client in a test can time between two messages"
+
+[[exclusion]]
+crate = "antares-ws"
+file = "src/sta_mqtt.rs"
+function = "Session::watch"
+lines = 1
+branches = 2
+reason = "the view removed between the tick that checks it and a SUBSCRIBE in the same second, and a view showing more than 64 types (MAX_TYPES); both refuse the topic as an unreadable one does"
+
+[[exclusion]]
+crate = "antares-ws"
+file = "src/sta_mqtt.rs"
+function = "Session::drain"
+lines = 2
+branches = 2
+reason = "the queue overflowing while the session drains it at once (an MQTT connection is never detached, so the queue only overflows under a burst faster than in-process reads), and a PUBLISH failing inside it (Session::publish)"
+
+[[exclusion]]
 crate = "antares-odata"
 file = "src/history.rs"
 function = "antares_odata::history::rows"

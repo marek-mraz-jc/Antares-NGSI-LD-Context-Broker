@@ -160,7 +160,7 @@ fn leased(wish: Option<&str>, lease: std::time::Duration) -> String {
 
 /// Renew the lease of every Subscription `conn` made (rule 7a); one deleted
 /// meanwhile (over HTTP, or by the sweep) is forgotten.
-async fn renew(conn: &Conn, lease: std::time::Duration) {
+pub(crate) async fn renew(conn: &Conn, lease: std::time::Duration) {
     for sub in conn.subscriptions() {
         let mut fragment = Map::new();
         let until = leased(conn.wish(&sub).as_deref(), lease);
@@ -178,7 +178,7 @@ async fn renew(conn: &Conn, lease: std::time::Duration) {
 /// `x-subscribe`: Create Subscription (10.5.2) with this connection as the
 /// endpoint; a body naming another endpoint is refused (W6), past
 /// `max_subscriptions` too (W9).
-async fn subscribe(
+pub(crate) async fn subscribe(
     conn: &Conn,
     limits: &Limits,
     mut body: Map<String, Value>,
@@ -331,7 +331,7 @@ struct Session {
 /// `per_sec` a second. It runs before a message is parsed, so a flood of
 /// `x-subscribe`, `x-update` or Pings costs one comparison a frame.
 #[derive(Debug)]
-struct Rate {
+pub(crate) struct Rate {
     tokens: f64,
     at: Instant,
     per_sec: f64,
@@ -339,7 +339,7 @@ struct Rate {
 }
 
 impl Rate {
-    fn new(limits: &Limits, now: Instant) -> Self {
+    pub(crate) fn new(limits: &Limits, now: Instant) -> Self {
         let burst = f64::from(limits.message_burst);
         Self {
             tokens: burst,
@@ -350,7 +350,7 @@ impl Rate {
     }
 
     /// Whether one more frame at `now` stays within the bound.
-    fn take(&mut self, now: Instant) -> bool {
+    pub(crate) fn take(&mut self, now: Instant) -> bool {
         let earned = now.duration_since(self.at).as_secs_f64() * self.per_sec;
         self.tokens = (self.tokens + earned).min(self.burst);
         self.at = now;
