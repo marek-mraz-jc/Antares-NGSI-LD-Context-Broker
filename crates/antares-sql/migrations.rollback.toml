@@ -120,3 +120,7 @@ note = "a new index on entities (tenant_id, id COLLATE \"C\"); an older release 
 [0028]
 rollback = "compatible"
 note = "offset_until is not kept by an older release: after a roll-forward, lastN of an attribute given a non-UTC observedAt during the rollback may read its newest rows only, ranked by instant"
+
+[0029]
+rollback = "compatible"
+note = "an older release never reads bare and does not clear it on a write: after a roll-forward, an Entity marked bare that gained history during the rollback stays out of temporal query pages until its next write or the sweep's next pass over it"

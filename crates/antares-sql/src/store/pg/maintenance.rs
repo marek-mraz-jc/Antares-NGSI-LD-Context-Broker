@@ -252,6 +252,14 @@ pub async fn temporal_maintenance(
             Err(e) => done.push(format!("history index build deferred ({e})")),
         }
     }
+    match mark_bare(pool, BARE_BUDGET).await {
+        Ok(BareSweep { marked: 0, .. }) => {}
+        Ok(b) => done.push(format!(
+            "bare: {} of {} Entities checked changed",
+            b.marked, b.checked
+        )),
+        Err(e) => done.push(format!("bare sweep skipped ({e})")),
+    }
     // 4.22 garbage collection, on both backends: reads already refuse expired
     // entities and instances, so these reaps only bound storage — the clause
     // itself sanctions deletion lagging expiresAt.
@@ -860,6 +868,111 @@ async fn entity_chunk(
         .await?;
     tx.commit().await?;
     Ok(ids)
+}
+
+/// How long one maintenance pass spends on [`mark_bare`]: the sweep resumes
+/// where the last pass stopped, so a large store is covered over passes.
+pub const BARE_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+/// The Entities one [`mark_bare`] transaction locks and checks.
+const BARE_BATCH: i64 = 500;
+/// Where [`mark_bare`] resumes: the Tenant and the last id it checked.
+static BARE_CURSOR: std::sync::Mutex<(String, String)> =
+    std::sync::Mutex::new((String::new(), String::new()));
+
+/// What one [`mark_bare`] call did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BareSweep {
+    /// Entities checked.
+    pub checked: u64,
+    /// Entities whose `bare` changed.
+    pub marked: u64,
+    /// The walk reached the last Tenant's last Entity and starts over next time.
+    pub wrapped: bool,
+}
+
+/// Sets `temporal_entities.bare` (migration 0029, T-5835) from what the
+/// history holds, Tenant by Tenant in id order, for at most `budget`. Each
+/// batch locks its rows `FOR UPDATE SKIP LOCKED` first and reads the history
+/// in the next statement, whose snapshot is younger than the lock: a write
+/// that committed rows before the lock is seen, and one still open holds the
+/// row `FOR SHARE` (`insert_rows`), so it is skipped or, once the sweep
+/// commits, clears the mark itself. An Entity whose rows retention dropped
+/// becomes bare on the next pass.
+pub async fn mark_bare(
+    pool: &PgPool,
+    budget: std::time::Duration,
+) -> Result<BareSweep, sqlx::Error> {
+    let started = std::time::Instant::now();
+    let (from, mut after) = BARE_CURSOR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let tenants: Vec<String> = sqlx::query_scalar(
+        "SELECT tenant_id FROM tenants WHERE tenant_id >= $1 ORDER BY tenant_id",
+    )
+    .bind(&from)
+    .fetch_all(pool)
+    .await?;
+    let mut out = BareSweep::default();
+    for tenant in tenants {
+        if tenant != from {
+            after.clear();
+        }
+        loop {
+            if started.elapsed() >= budget {
+                *BARE_CURSOR
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = (tenant, after);
+                return Ok(out);
+            }
+            let mut tx = pool.begin().await?;
+            sqlx::query(crate::SET_TENANT_SQL)
+                .bind(&tenant)
+                .execute(&mut *tx)
+                .await?;
+            let ids: Vec<String> = sqlx::query_scalar(
+                "SELECT id FROM temporal_entities WHERE tenant_id = $1 AND id > $2
+                 ORDER BY id LIMIT $3 FOR UPDATE SKIP LOCKED",
+            )
+            .bind(&tenant)
+            .bind(&after)
+            .bind(BARE_BATCH)
+            .fetch_all(&mut *tx)
+            .await?;
+            let Some(last) = ids.last().cloned() else {
+                tx.commit().await?;
+                break;
+            };
+            let marked = sqlx::query(
+                "UPDATE temporal_entities m SET bare = c.bare
+                 FROM (SELECT e.id, NOT (
+                         EXISTS (SELECT 1 FROM attr_instances ai
+                                 WHERE ai.tenant_id = e.tenant_id AND ai.entity_id = e.id)
+                         OR EXISTS (SELECT 1 FROM attr_rows r
+                                    WHERE r.tenant_id = e.tenant_id
+                                      AND r.entity_no = iri_no(e.tenant_id, e.id))) AS bare
+                       FROM temporal_entities e
+                       WHERE e.tenant_id = $1 AND e.id = ANY($2)) c
+                 WHERE m.tenant_id = $1 AND m.id = c.id AND m.bare <> c.bare",
+            )
+            .bind(&tenant)
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            tx.commit().await?;
+            out.checked = out
+                .checked
+                .saturating_add(u64::try_from(ids.len()).unwrap_or(u64::MAX));
+            out.marked = out.marked.saturating_add(marked);
+            after = last;
+        }
+    }
+    *BARE_CURSOR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Default::default();
+    out.wrapped = true;
+    Ok(out)
 }
 
 /// The Entities of every Tenant that carry their own history retention

@@ -334,7 +334,9 @@ fn history(tenant: &str, entity: &str) -> String {
 /// text predicate then refused: ~115 rows an Entity on the helsinki-bikes
 /// history, past the 30 s statement timeout for 577 Entities (T-5616).
 /// `attrs`, the bind of the Attribute IRIs a policy shows, keeps the probe to
-/// their rows.
+/// their rows. A `bare` Entity (migration 0029) holds no row and is not probed:
+/// each probe reads every weekly partition of its parent, and a type of
+/// 19 782 Entities without history passed the 30 s statement timeout (T-5835).
 pub fn has_history(preds: &str, dir: &str, attrs: Option<usize>) -> String {
     let (x, r) = attrs.map_or_else(Default::default, |n| {
         (
@@ -346,7 +348,7 @@ pub fn has_history(preds: &str, dir: &str, attrs: Option<usize>) -> String {
         )
     });
     format!(
-        "((SELECT true FROM attr_instances ai \
+        "NOT m.bare AND ((SELECT true FROM attr_instances ai \
            WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id{x}{preds} \
            ORDER BY ai.attr_id {dir}, ai.observed_at {dir} LIMIT 1) IS NOT NULL \
          OR (SELECT true FROM attr_rows ai \
@@ -529,6 +531,23 @@ async fn insert_rows(
     let rows = if dedup { unseen(rows) } else { rows };
     if rows.is_empty() {
         return Ok(());
+    }
+    // The row stays locked until this write commits, so the bare sweep skips
+    // it, or this waits for the sweep to commit and then sees its mark
+    // (migration 0029). Every caller writes the Entity's temporal row first.
+    let bare: Option<bool> = sqlx::query_scalar(
+        "SELECT bare FROM temporal_entities WHERE tenant_id = $1 AND id = $2 FOR SHARE",
+    )
+    .bind(tenant.as_str())
+    .bind(entity_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if bare == Some(true) {
+        sqlx::query("UPDATE temporal_entities SET bare = false WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_str())
+            .bind(entity_id)
+            .execute(&mut *tx)
+            .await?;
     }
     // The Attributes given an instance in a dataset (migration 0009): lastN
     // keeps every row of these, so the read needs to know them.
@@ -2407,6 +2426,7 @@ mod tests {
             "{sql}"
         );
         assert_eq!(sql.matches(" AND ai.x").count(), 2, "{sql}");
+        assert!(sql.starts_with("NOT m.bare AND ("), "{sql}");
         assert!(!sql.contains("EXISTS"), "{sql}");
         assert!(!sql.contains("ANY("), "{sql}");
     }

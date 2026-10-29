@@ -366,3 +366,138 @@ async fn no_migration_builds_a_partial_index_over_history() {
         "partial indexes on attr_instances: {partial:?}"
     );
 }
+
+/// T-5835: an Entity with no history row is marked `bare` by the sweep and
+/// the page qualification skips it without a probe (19 782 history-less
+/// KeyPerformanceIndicators passed the 30 s statement timeout, each probe
+/// reading every weekly partition); an instance written later clears the mark
+/// and the Entity is on the page again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bare_entity_is_skipped_by_the_page_until_it_gains_history() {
+    use antares_sql::store::pg::maintenance::mark_bare;
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let mut s = PgTemporalStore::new(pool.clone());
+    s.temporal_only = true;
+    let t = TenantId::new("pgbare").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let kept = "urn:ngsi-ld:Kpi:bare-kept";
+    let bare: Vec<String> = (0..3)
+        .map(|n| format!("urn:ngsi-ld:Kpi:bare-{n}"))
+        .collect();
+    let _ = s.delete(&t, kept).await;
+    for id in &bare {
+        let _ = s.delete(&t, id).await;
+    }
+    let shell = |id: &str| {
+        json!({"id": id, "type": "Kpi",
+               "createdAt": "2026-01-01T00:00:00Z", "modifiedAt": "2026-01-01T00:00:00Z"})
+    };
+    let mut doc = shell(kept);
+    doc[SPEED] = json!([inst(1, "2026-01-09T00:00:00Z", None)]);
+    assert!(s.create(&t, kept, &doc).await.expect("create"));
+    for id in &bare {
+        assert!(s.create(&t, id, &shell(id)).await.expect("create"));
+    }
+    // a pass from wherever another call left the cursor, then a whole one
+    for _ in 0..2 {
+        while !mark_bare(&pool, std::time::Duration::from_secs(60))
+            .await
+            .expect("sweep")
+            .wrapped
+        {}
+    }
+    let marks = || async {
+        let mut tx = pool.begin().await.expect("tx");
+        sqlx::query(antares_sql::SET_TENANT_SQL)
+            .bind(t.as_str())
+            .execute(&mut *tx)
+            .await
+            .expect("tenant");
+        let rows: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT id, bare FROM temporal_entities WHERE tenant_id = $1 ORDER BY id",
+        )
+        .bind(t.as_str())
+        .fetch_all(&mut *tx)
+        .await
+        .expect("marks");
+        rows
+    };
+    let mut want: Vec<(String, bool)> = bare.iter().map(|id| (id.clone(), true)).collect();
+    want.push((kept.to_owned(), false));
+    want.sort();
+    assert_eq!(marks().await, want);
+
+    // the qualification probes the one Entity that is not bare
+    let qual = pg::temporal::has_history("", "DESC", None);
+    let mut tx = pool.begin().await.expect("tx");
+    sqlx::query(antares_sql::SET_TENANT_SQL)
+        .bind(t.as_str())
+        .execute(&mut *tx)
+        .await
+        .expect("tenant");
+    let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, FORMAT TEXT) \
+         SELECT count(*) FROM temporal_entities m WHERE m.tenant_id = 'pgbare' AND {qual}"
+    )))
+    .fetch_all(&mut *tx)
+    .await
+    .expect("explain");
+    tx.rollback().await.expect("rollback");
+    let plan = plan.join("\n");
+    let probes: Vec<&str> = plan
+        .lines()
+        .filter(|l| l.contains("Limit (actual rows="))
+        .collect();
+    assert!(!probes.is_empty(), "{plan}");
+    assert!(
+        probes.iter().all(|l| l.contains("loops=1)")),
+        "each probe runs for the one Entity with history only — plan:\n{plan}"
+    );
+
+    let types = ["Kpi".to_owned()];
+    let expand = |t: &str| t.to_owned();
+    let page = |types| TemporalFilter {
+        types: Some(types),
+        range: Some(InstanceRange {
+            timerel: "after",
+            time_at: "2026-01-05T00:00:00Z",
+            end_time_at: None,
+            timeproperty: "observedAt",
+        }),
+        page: Some(antares_store::filter::Page {
+            offset: 0,
+            limit: 10,
+            count: true,
+        }),
+        expand: &expand,
+        ..TemporalFilter::default()
+    };
+    let ids = |out: &antares_store::filter::TemporalOutcome| -> Vec<String> {
+        out.rows
+            .iter()
+            .filter_map(|r| r["id"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let out = s.query(&t, &page(&types)).await.expect("query");
+    assert_eq!(ids(&out), vec![kept.to_owned()]);
+
+    // a bare Entity that gains history is on the page again
+    let first = &bare[0];
+    s.append(
+        &t,
+        first,
+        &shell(first),
+        &json!({SPEED: [inst(2, "2026-01-09T00:00:00Z", None)]}),
+    )
+    .await
+    .expect("append");
+    let out = s.query(&t, &page(&types)).await.expect("query");
+    assert_eq!(ids(&out), vec![first.clone(), kept.to_owned()]);
+    assert_eq!(out.total, Some(2));
+    assert!(marks().await.contains(&(first.clone(), false)));
+
+    for id in bare.iter().map(String::as_str).chain([kept]) {
+        assert!(s.delete(&t, id).await.expect("delete"));
+    }
+}
