@@ -334,7 +334,7 @@ fn history(tenant: &str, entity: &str) -> String {
 /// text predicate then refused: ~115 rows an Entity on the helsinki-bikes
 /// history, past the 30 s statement timeout for 577 Entities (T-5616).
 /// `attrs`, the bind of the Attribute IRIs a policy shows, keeps the probe to
-/// their rows. A `bare` Entity (migration 0029) holds no row and is not probed:
+/// their rows. A `bare` Entity (migration 0030) holds no row and is not probed:
 /// each probe reads every weekly partition of its parent, and a type of
 /// 19 782 Entities without history passed the 30 s statement timeout (T-5835).
 pub fn has_history(preds: &str, dir: &str, attrs: Option<usize>) -> String {
@@ -534,7 +534,7 @@ async fn insert_rows(
     }
     // The row stays locked until this write commits, so the bare sweep skips
     // it, or this waits for the sweep to commit and then sees its mark
-    // (migration 0029). Every caller writes the Entity's temporal row first.
+    // (migration 0030). Every caller writes the Entity's temporal row first.
     let bare: Option<bool> = sqlx::query_scalar(
         "SELECT bare FROM temporal_entities WHERE tenant_id = $1 AND id = $2 FOR SHARE",
     )

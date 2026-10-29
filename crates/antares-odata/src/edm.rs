@@ -1153,7 +1153,7 @@ fn container_capabilities() -> Vec<Annotation> {
         Annotation::new(
             "Capabilities.FilterFunctions",
             Expr::Collection(
-                crate::filter::filter_functions()
+                crate::functions::filter_functions()
                     .into_iter()
                     .map(|f| Expr::String(f.into()))
                     .collect(),

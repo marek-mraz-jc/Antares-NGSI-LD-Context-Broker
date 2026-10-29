@@ -890,7 +890,7 @@ pub struct BareSweep {
     pub wrapped: bool,
 }
 
-/// Sets `temporal_entities.bare` (migration 0029, T-5835) from what the
+/// Sets `temporal_entities.bare` (migration 0030, T-5835) from what the
 /// history holds, Tenant by Tenant in id order, for at most `budget`. Each
 /// batch locks its rows `FOR UPDATE SKIP LOCKED` first and reads the history
 /// in the next statement, whose snapshot is younger than the lock: a write
