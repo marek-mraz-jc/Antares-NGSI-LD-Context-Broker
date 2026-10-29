@@ -412,41 +412,47 @@ async fn frames(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_page_past_one_store_read_streams_and_equals_the_page_read_whole() -> Result<(), String> {
     let whole = fixture().await?;
-    let streamed = fixture_with(TestBroker::with_max_limit(1).await?).await?;
     let mut streams = 0;
-    for query in queries() {
-        for limit in ["limit=1", "limit=3", "limit=1000"] {
-            let uri = with(&query, limit);
-            let mut expected = get(&whole.app, &uri).await.body;
-            let (status, sized, parts, broken) = frames(&streamed.app, "GET", &uri).await;
-            assert_eq!((status, broken), (StatusCode::OK, false), "{uri}");
-            let mut got: Value =
-                serde_json::from_str(&parts.concat()).map_err(|e| format!("{uri}: {e}"))?;
-            if parts.len() > 1 {
-                streams += 1;
-                assert!(!sized, "{uri}: a streamed page states no length");
-                for part in &parts {
-                    assert!(
-                        part.matches("\"type\":\"Feature\"").count() <= 1,
-                        "{uri}: {part}"
-                    );
+    // One Entity per store read, and two, where Cars 2 and 4 fill a residual's read at the end
+    // of the store's answer.
+    for max_limit in [1, 2] {
+        let streamed = fixture_with(TestBroker::with_max_limit(max_limit).await?).await?;
+        let south = format!("bbox=-180,-10,180,10&{WORLD}");
+        for query in queries().into_iter().chain([south]) {
+            for limit in ["limit=1", "limit=3", "limit=1000"] {
+                let uri = with(&query, limit);
+                let mut expected = get(&whole.app, &uri).await.body;
+                let (status, sized, parts, broken) = frames(&streamed.app, "GET", &uri).await;
+                assert_eq!((status, broken), (StatusCode::OK, false), "{uri}");
+                let mut got: Value =
+                    serde_json::from_str(&parts.concat()).map_err(|e| format!("{uri}: {e}"))?;
+                if parts.len() > 1 {
+                    streams += 1;
+                    assert!(!sized, "{uri}: a streamed page states no length");
+                    for part in &parts {
+                        assert!(
+                            part.matches("\"type\":\"Feature\"").count() <= max_limit,
+                            "{uri}: {part}"
+                        );
+                    }
                 }
+                // `links` aside: a store read of one Entity cannot tell its answer ended, so
+                // `next` may name an empty page; the pages followed hold the same Features.
+                for body in [&mut expected, &mut got] {
+                    body.as_object_mut()
+                        .map(|m| (m.remove("timeStamp"), m.remove("links")));
+                }
+                assert_eq!(got, expected, "{uri}");
+                assert_eq!(
+                    pages(&streamed, &uri).await?.0,
+                    pages(&whole, &uri).await?.0,
+                    "{uri}"
+                );
             }
-            // `links` aside: a store read of one Entity cannot tell its answer ended, so
-            // `next` may name an empty page; the pages followed hold the same Features.
-            for body in [&mut expected, &mut got] {
-                body.as_object_mut()
-                    .map(|m| (m.remove("timeStamp"), m.remove("links")));
-            }
-            assert_eq!(got, expected, "{uri}");
-            assert_eq!(
-                pages(&streamed, &uri).await?.0,
-                pages(&whole, &uri).await?.0,
-                "{uri}"
-            );
         }
     }
     assert!(streams > 0, "some page went out in frames");
+    let streamed = fixture_with(TestBroker::with_max_limit(1).await?).await?;
     let (status, sized, parts, _) = frames(&streamed.app, "HEAD", &with("", "limit=1000")).await;
     assert_eq!(
         (status, sized, parts.concat()),
