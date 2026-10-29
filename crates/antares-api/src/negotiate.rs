@@ -828,24 +828,58 @@ where
             tenant,
         );
     }
-    let ld_ctx = (accept == Accept::LdJson).then(|| served_context(ctx));
+    let ld_ctx = list_context(ctx, accept);
+    let frames = docs
+        .into_iter()
+        .map(move |doc| list_frame(doc, ld_ctx.as_ref()));
+    respond_frames(status, frames, ctx, accept, tenant)
+}
+
+/// The `@context` each Entity of a streamed list carries: the served one
+/// under JSON-LD, none under plain JSON (a Link header names it).
+pub(crate) fn list_context(ctx: &Context, accept: Accept) -> Option<Value> {
+    (accept == Accept::LdJson).then(|| served_context(ctx))
+}
+
+/// One Entity of a streamed list as written ([`respond_frames`]), with
+/// `ld_ctx` ([`list_context`]) as its `@context`.
+pub(crate) fn list_frame(doc: Value, ld_ctx: Option<&Value>) -> axum::body::Bytes {
+    let doc = match (ld_ctx, doc) {
+        (Some(ctx_val), Value::Object(mut o)) => {
+            o.insert("@context".into(), ctx_val.clone());
+            Value::Object(o)
+        }
+        (_, other) => other,
+    };
+    let mut buf = Vec::new();
+    // serializing a Value into a Vec cannot fail
+    let _ = serde_json::to_writer(&mut buf, &SpecOrder(&doc));
+    axum::body::Bytes::from(buf)
+}
+
+/// [`respond_list`] over Entities already written ([`list_frame`]): the
+/// array streams one frame at a time. Json and LdJson only.
+pub(crate) fn respond_frames<F>(
+    status: StatusCode,
+    frames: F,
+    ctx: &Context,
+    accept: Accept,
+    tenant: &TenantId,
+) -> Response
+where
+    F: IntoIterator<Item = axum::body::Bytes>,
+    F::IntoIter: Send + 'static,
+{
     let content_type = match accept {
         Accept::LdJson => "application/ld+json",
         _ => "application/json",
     };
     let chunks = std::iter::once(axum::body::Bytes::from_static(b"["))
-        .chain(docs.into_iter().enumerate().map(move |(i, doc)| {
-            let doc = match (&ld_ctx, doc) {
-                (Some(ctx_val), Value::Object(mut o)) => {
-                    o.insert("@context".into(), ctx_val.clone());
-                    Value::Object(o)
-                }
-                (_, other) => other,
-            };
-            let mut buf = if i == 0 { Vec::new() } else { vec![b','] };
-            // serializing a Value into a Vec cannot fail
-            let _ = serde_json::to_writer(&mut buf, &SpecOrder(&doc));
-            axum::body::Bytes::from(buf)
+        .chain(frames.into_iter().enumerate().flat_map(|(i, frame)| {
+            (i > 0)
+                .then(|| axum::body::Bytes::from_static(b","))
+                .into_iter()
+                .chain(std::iter::once(frame))
         }))
         .chain(std::iter::once(axum::body::Bytes::from_static(b"]")));
     let body = axum::body::Body::from_stream(futures_util::stream::iter(

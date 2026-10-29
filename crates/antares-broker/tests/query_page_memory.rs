@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! T-6055: a Query Entities answer of one 1000-Entity page holds the page as
-//! the stored JSON text (~0.9 KB an Entity) until each Entity is written,
-//! not as `Value` trees (~4.7 KB an Entity). The heavy OData kinds read such
-//! a page per request, 30 at once, and held ~9 MB each.
+//! T-6055: a Query Entities answer of one 1000-Entity page holds each Entity
+//! as written (~0.25 KB) until the body is read, not the page as stored
+//! `Value` trees (~4.7 KB an Entity). The heavy OData kinds read such a page
+//! per request, 30 at once, and held ~9 MB each.
 //!
 //! The heap is read from jemalloc's per-thread counters (the allocator the
 //! broker ships), on a current-thread runtime, so the request's allocations
@@ -43,7 +43,7 @@ fn entity(n: usize) -> serde_json::Value {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn a_1000_entity_page_is_held_as_text_until_it_is_written() {
+async fn a_1000_entity_page_is_held_as_written_until_it_is_read() {
     let st = AppState::new("t6055".into());
     let store = st.store.clone();
     let app = antares_api::router(st);
@@ -95,8 +95,8 @@ async fn a_1000_entity_page_is_held_as_text_until_it_is_written() {
             .and_then(|v| v.to_str().ok()),
         Some("1000")
     );
-    // ~0.9 MB of text against ~4.7 MB of trees: a quarter leaves room for
-    // the shape, headers and links
+    // ~0.5 MB written against ~4.7 MB of trees: a quarter leaves room for
+    // a wider shape
     assert!(
         held < as_values / 4,
         "the answer holds {held} bytes before it is written; the page as values is {as_values}"

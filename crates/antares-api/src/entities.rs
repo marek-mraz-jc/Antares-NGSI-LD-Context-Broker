@@ -918,12 +918,30 @@ async fn query_entities_inner(
         proj: push_proj.then_some(&repr),
         order_keys: order_keys.as_deref(),
     };
-    // T-6055: a plain list holds its page as the stored text, ~1 KB an
-    // Entity where its `Value` tree takes ~5 KB, and shapes each Entity as it
-    // is written
-    let as_text = join.is_none() && accept != Accept::GeoJson && order_keys.is_none();
-    let mut filtered = match as_text && fed.is_empty() {
-        true => filter_entities_text(st, &tenant, params, &ctx, pushdown, Some(&repr)).await?,
+    let shape = {
+        let (repr, ctx) = (repr.clone(), ctx.clone());
+        move |doc: &Value| {
+            let shaped = apply(doc, &repr);
+            // pick projections that match nothing drop the entity entirely
+            if repr.pick.is_some() && shaped.as_object().is_some_and(|o| o.is_empty()) {
+                return None;
+            }
+            Some(compact_for(&repr, &shaped, &ctx))
+        }
+    };
+    // T-6055: a plain list writes each Entity as it is admitted and holds the
+    // page as its answer (~0.25 KB an Entity), where the stored `Value` tree
+    // takes ~5 KB
+    let as_frames = join.is_none() && accept != Accept::GeoJson && order_keys.is_none();
+    let ld_ctx = crate::negotiate::list_context(&ctx, accept);
+    let write = |doc: &Value| {
+        shape(doc).map(|shaped| crate::negotiate::list_frame(shaped, ld_ctx.as_ref()))
+    };
+    let mut filtered = match as_frames && fed.is_empty() {
+        true => {
+            filter_entities_written(st, &tenant, params, &ctx, pushdown, Some(&repr), &write)
+                .await?
+        }
         false => {
             filter_entities_paged(st, &tenant, params, &ctx, fed, pushdown, Some(&repr)).await?
         }
@@ -964,7 +982,7 @@ async fn query_entities_inner(
         offset: p_offset,
         limit: p_limit,
     };
-    let (page, count_hdr, links) = match filtered.text.is_empty() {
+    let (page, count_hdr, links) = match filtered.written.is_empty() {
         true => {
             let (page, count, links) = cut.page(st, params, matches)?;
             let page = match trimmed {
@@ -974,8 +992,8 @@ async fn query_entities_inner(
             (Page::Docs(page), count, links)
         }
         false => {
-            let (page, count, links) = cut.page(st, params, filtered.text)?;
-            (Page::Text(page), count, links)
+            let (page, count, links) = cut.page(st, params, filtered.written)?;
+            (Page::Written(page), count, links)
         }
     };
     let links = match keyset {
@@ -990,24 +1008,10 @@ async fn query_entities_inner(
         false => links,
     };
 
-    let shape = {
-        let (repr, ctx) = (repr.clone(), ctx.clone());
-        move |doc: &Value| {
-            let shaped = apply(doc, &repr);
-            // pick projections that match nothing drop the entity entirely
-            if repr.pick.is_some() && shaped.as_object().is_some_and(|o| o.is_empty()) {
-                return None;
-            }
-            Some(compact_for(&repr, &shaped, &ctx))
-        }
-    };
     let mut resp = match page {
-        Page::Text(rows) => {
-            // a row parsed while it was decided parses again here
-            let docs = rows
-                .into_iter()
-                .filter_map(move |r| shape(&serde_json::from_str(r.get()).ok()?));
-            crate::negotiate::respond_list(StatusCode::OK, docs, &ctx, accept, &tenant)
+        Page::Written(rows) => {
+            let frames = rows.into_iter().filter_map(|w| w.frame);
+            crate::negotiate::respond_frames(StatusCode::OK, frames, &ctx, accept, &tenant)
         }
         Page::Docs(page) if join.is_none() && accept != Accept::GeoJson => {
             // T-6049: each Entity is shaped as it is written, and the page holds no shaped
@@ -1102,11 +1106,11 @@ async fn query_entities_inner(
     Ok(resp)
 }
 
-/// A Query Entities page: documents, or the stored text of each
-/// ([`filter_entities_text`]).
+/// A Query Entities page: documents, or each Entity as written
+/// ([`filter_entities_written`]).
 enum Page {
     Docs(Vec<Value>),
-    Text(Vec<Box<serde_json::value::RawValue>>),
+    Written(Vec<Written>),
 }
 
 impl Page {
@@ -1114,10 +1118,7 @@ impl Page {
     fn last_id(&self) -> Option<String> {
         let last = match self {
             Page::Docs(p) => p.last()?.get("id")?.as_str()?.to_owned(),
-            Page::Text(p) => {
-                let doc: Value = serde_json::from_str(p.last()?.get()).ok()?;
-                doc.get("id")?.as_str()?.to_owned()
-            }
+            Page::Written(p) => p.last()?.id.clone(),
         };
         Some(last)
     }
@@ -1214,10 +1215,21 @@ pub struct Filtered {
     /// [`Pushdown::order_keys`] of each document: enough to order and page
     /// it, and the page is then read whole by id (T-4919).
     pub trimmed: bool,
-    /// The matches as their stored JSON text, in place of `docs`, from
-    /// [`filter_entities_text`].
-    pub text: Vec<Box<serde_json::value::RawValue>>,
+    /// The matches as written, in place of `docs`, from
+    /// [`filter_entities_written`].
+    pub(crate) written: Vec<Written>,
 }
+
+/// A match [`filter_entities_written`] wrote as it admitted it.
+pub(crate) struct Written {
+    pub(crate) id: String,
+    /// `None`: the Entity shapes to nothing and is left out of the answer,
+    /// though it still counts in the page.
+    pub(crate) frame: Option<axum::body::Bytes>,
+}
+
+/// What [`filter_entities_written`] writes each admitted Entity with.
+pub(crate) type Write<'a> = &'a (dyn Fn(&Value) -> Option<axum::body::Bytes> + Sync);
 
 /// Whether the store may be asked to project members away. Only when its
 /// answer is the final answer: 5.7.2.4 applies the query, geoquery, Scope
@@ -1508,27 +1520,29 @@ pub async fn filter_entities_paged(
     filter_rows(st, tenant, params, ctx, Rows::Docs(fed), push, narrow).await
 }
 
-/// [`filter_entities_paged`] with the matches kept as their stored JSON text
-/// (`Filtered::text`) wherever the store answers in one read: each row is
-/// parsed only while it is decided, so the page is held as ~1 KB of text per
-/// Entity instead of a ~5 KB `Value` tree (T-6055). A walk in store pages,
-/// federated candidates or a sorted read keep `docs`.
-pub(crate) async fn filter_entities_text(
+/// [`filter_entities_paged`] with each match written by `write` as it is
+/// admitted (`Filtered::written`) wherever the store answers in one read:
+/// the store hands its rows over as JSON text, each is parsed while it is
+/// decided and written at once, so the page is held as its answer instead of
+/// ~5 KB `Value` trees an Entity (T-6055). A walk in store pages keeps
+/// `docs`.
+pub(crate) async fn filter_entities_written(
     st: &AppState,
     tenant: &TenantId,
     params: &HashMap<String, String>,
     ctx: &antares_jsonld::Context,
     push: Pushdown<'_>,
     narrow: Option<&crate::repr::Repr>,
+    write: Write<'_>,
 ) -> ApiResult<Filtered> {
-    filter_rows(st, tenant, params, ctx, Rows::Text, push, narrow).await
+    filter_rows(st, tenant, params, ctx, Rows::Written(write), push, narrow).await
 }
 
 /// How [`filter_rows`] holds its matches: documents, beside the federated
-/// candidates merged into them, or the local rows' stored text.
-enum Rows {
+/// candidates merged into them, or the local rows as written.
+enum Rows<'a> {
     Docs(Vec<(bool, Value)>),
-    Text,
+    Written(Write<'a>),
 }
 
 async fn filter_rows(
@@ -1536,13 +1550,13 @@ async fn filter_rows(
     tenant: &TenantId,
     params: &HashMap<String, String>,
     ctx: &antares_jsonld::Context,
-    source: Rows,
+    source: Rows<'_>,
     push: Pushdown<'_>,
     narrow: Option<&crate::repr::Repr>,
 ) -> ApiResult<Filtered> {
-    let (fed, text) = match source {
-        Rows::Docs(fed) => (fed, false),
-        Rows::Text => (Vec::new(), true),
+    let (fed, write) = match source {
+        Rows::Docs(fed) => (fed, None),
+        Rows::Written(write) => (Vec::new(), Some(write)),
     };
     let Pushdown {
         page,
@@ -1792,7 +1806,7 @@ async fn filter_rows(
     let id_set: Option<std::collections::HashSet<&str>> =
         ids.as_ref().map(|v| v.iter().copied().collect());
     let mut out = Vec::new();
-    let mut out_text = Vec::new();
+    let mut out_written = Vec::new();
     let (mut paged, mut total): (bool, Option<usize>);
     let mut trimmed: bool;
     let mut rows = 0usize;
@@ -1871,7 +1885,7 @@ async fn filter_rows(
         // what it cannot decide
         let (outcome, texts) = match enough.or(counting.map(|_| 0)) {
             Some(_) => (st.store.query_candidates(tenant, &f).await?, Vec::new()),
-            None if text => {
+            None if write.is_some() => {
                 let o = st.store.query_entities_text(tenant, &f).await?;
                 let outcome = antares_store::filter::QueryOutcome {
                     rows: Vec::new(),
@@ -1896,17 +1910,17 @@ async fn filter_rows(
             .last()
             .and_then(|d| d.get("id")?.as_str())
             .map(str::to_owned);
-        // a row held as text is parsed only while it is decided
+        // a row the store hands over as text is parsed once, to be decided and written
         let all = crate::federation::merge_candidates(outcome.rows, fed)
             .into_iter()
             .map(|d| Ok::<_, serde_json::Error>((d, None)))
             .chain(
                 texts
                     .into_iter()
-                    .map(|r| serde_json::from_str::<Value>(r.get()).map(|d| (d, Some(r)))),
+                    .map(|r| serde_json::from_str::<Value>(r.get()).map(|d| (d, write))),
             );
         for item in all {
-            let (doc, raw) = item.map_err(|e| NgsiError::InternalError(e.to_string()))?;
+            let (doc, write) = item.map_err(|e| NgsiError::InternalError(e.to_string()))?;
             let id = doc.get("id").and_then(Value::as_str).unwrap_or("");
             if let Some(ids) = &id_set {
                 if !decided && !ids.contains(id) {
@@ -2014,8 +2028,11 @@ async fn filter_rows(
                 }
                 continue;
             }
-            match raw {
-                Some(raw) => out_text.push(raw),
+            match write {
+                Some(write) => out_written.push(Written {
+                    id: id.to_owned(),
+                    frame: write(&doc),
+                }),
                 None => out.push(doc),
             }
         }
@@ -2048,7 +2065,7 @@ async fn filter_rows(
             paged: true,
             rows,
             trimmed,
-            text: Vec::new(),
+            written: Vec::new(),
         });
     }
     if counting.is_some() {
@@ -2059,7 +2076,7 @@ async fn filter_rows(
             total: Some(matched),
             rows,
             trimmed,
-            text: Vec::new(),
+            written: Vec::new(),
         });
     }
     Ok(Filtered {
@@ -2068,7 +2085,7 @@ async fn filter_rows(
         total,
         rows,
         trimmed,
-        text: out_text,
+        written: out_written,
     })
 }
 
