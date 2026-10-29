@@ -1216,6 +1216,7 @@ antares-broker v0.3.0
 │   │   │       └── regex-syntax feature "default" (*)
 │   │   ├── async-trait feature "default" (*)
 │   │   ├── ngsild-ql feature "default" (*)
+│   │   ├── regex feature "default" (*)
 │   │   ├── metrics feature "default"
 │   │   │   └── metrics v0.24.6
 │   │   │       └── rapidhash v4.5.1
