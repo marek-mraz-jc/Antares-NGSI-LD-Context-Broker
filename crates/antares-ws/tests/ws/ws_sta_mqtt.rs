@@ -336,6 +336,13 @@ async fn sta_mqtt_refuses_what_is_no_reading_client() -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     assert_eq!(next(&mut ws, WAIT).await?, None, "a text frame");
+    // answer the closing handshake and read on until the server drops the stream, so its close()
+    // returns before the next connection: a client that stops at the Close frame leaves it waiting
+    while tokio::time::timeout(WAIT, ws.next())
+        .await
+        .map_err(|_| "the server kept the socket after its Close".to_string())?
+        .is_some()
+    {}
 
     // a view of every type over a Tenant that holds nothing has no type to watch
     let doc = json!({"id": "m7", "tenant": "void", "selector": ["*"],
