@@ -1689,6 +1689,25 @@ impl PgTemporalStore {
                 "(m.types[1] = ANY(${n}) OR (cardinality(m.types) > 1 AND m.types && ${n}))"
             ));
         }
+        // a policy's idPatterns, as the entity query takes them (T-5826,
+        // T-6052): every one written or none, so the rows stay a superset
+        if let Some(res) = f.id_patterns.and_then(|ps| {
+            ps.iter()
+                .map(|p| antares_store::filter::id_pattern_sql(p))
+                .collect::<Option<Vec<_>>>()
+        }) {
+            let any: Vec<String> = res
+                .into_iter()
+                .map(|re| {
+                    binds.push(B::Text(re));
+                    format!("regexp_like(m.id COLLATE \"C\", ${})", binds.len())
+                })
+                .collect();
+            wheres.push(match any.as_slice() {
+                [] => "false".to_owned(),
+                _ => format!("({})", any.join(" OR ")),
+            });
+        }
         if let Some(attrs) = f.attrs {
             binds.push(B::Arr(super::storable(attrs)));
             wheres.push(format!(

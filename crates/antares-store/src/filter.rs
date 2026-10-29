@@ -137,6 +137,11 @@ pub struct TemporalFilter<'a> {
     pub ids: Option<&'a [&'a str]>,
     /// flat OR list of expanded type IRIs (temporal query has no AND groups)
     pub types: Option<&'a [String]>,
+    /// The id matches one of these `idPattern`s, each read whole as a policy
+    /// rule reads it: a policy's narrowing the caller hands over only when
+    /// [`id_pattern_sql`] writes every one (T-6052). A store that cannot apply
+    /// them returns a superset, as for `ids`, and the caller's rules decide.
+    pub id_patterns: Option<&'a [String]>,
     /// `attrs=`: the entity must carry at least one, expanded IRIs
     pub attrs: Option<&'a [String]>,
     /// the 4.11 window; `None` = no instance pruning
@@ -214,6 +219,7 @@ impl Default for TemporalFilter<'_> {
         Self {
             ids: None,
             types: None,
+            id_patterns: None,
             attrs: None,
             range: None,
             last_n: None,

@@ -780,6 +780,12 @@ async fn fetch_temporal(
     let tf = antares_store::filter::TemporalFilter {
         ids: qry.ids.as_deref(),
         types: qry.types.as_deref(),
+        // the rules admit only ids these match: the store skips the rest
+        // instead of walking the type into its 10 000-row ceiling (T-6052)
+        id_patterns: qry
+            .types_rule
+            .as_deref()
+            .and_then(|r| crate::policy::shared_id_patterns(&r.rules)),
         attrs: qry.entity_attr_filter.as_deref(),
         // a condition rebuilds each instance's state from the whole
         // history; rules without one read only the window (T-4246)
