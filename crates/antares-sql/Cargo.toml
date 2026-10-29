@@ -17,7 +17,7 @@ antares-model = { workspace = true }
 antares-store = { workspace = true }
 antares-ql = { workspace = true }
 chrono = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 redb = { workspace = true }
 sqlx = { workspace = true, optional = true }
 # T-5243: the attr_rows key of a client's own instanceId (v5)

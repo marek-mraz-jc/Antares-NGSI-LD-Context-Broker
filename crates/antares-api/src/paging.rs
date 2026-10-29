@@ -28,24 +28,24 @@ pub fn attach_warnings(resp: &mut Response, warnings: &[String]) {
 /// pointer carrying every parameter needed to fetch the page, prev on every
 /// iteration but the first, and only prev on the last. Shared by every
 /// paginated list operation (5.7.2, 5.7.4, 5.8.4, 5.10.2, 5.11.5).
-pub fn paginate(
+pub fn paginate<T>(
     st: &AppState,
     params: &HashMap<String, String>,
-    matches: Vec<Value>,
+    matches: Vec<T>,
     path: &str,
-) -> ApiResult<(Vec<Value>, Option<usize>, Vec<String>)> {
+) -> ApiResult<(Vec<T>, Option<usize>, Vec<String>)> {
     paginate_impl(st, params, matches, path, Accept::Json, None, false)
 }
 
 /// The store already applied ORDER BY id + LIMIT/OFFSET and counted the
 /// match set — `matches` IS the page; only count/links remain.
-pub fn paginate_pre(
+pub fn paginate_pre<T>(
     st: &AppState,
     params: &HashMap<String, String>,
-    page: Vec<Value>,
+    page: Vec<T>,
     path: &str,
     total: usize,
-) -> ApiResult<(Vec<Value>, Option<usize>, Vec<String>)> {
+) -> ApiResult<(Vec<T>, Option<usize>, Vec<String>)> {
     paginate_impl(st, params, page, path, Accept::Json, Some(total), false)
 }
 
@@ -282,18 +282,18 @@ pub(crate) fn link_media_type(accept: Accept) -> &'static str {
     }
 }
 
-fn paginate_impl(
+fn paginate_impl<T>(
     st: &AppState,
     params: &HashMap<String, String>,
-    matches: Vec<Value>,
+    matches: Vec<T>,
     path: &str,
     accept: Accept,
     pre: Option<usize>,
     csource_style: bool,
-) -> ApiResult<(Vec<Value>, Option<usize>, Vec<String>)> {
+) -> ApiResult<(Vec<T>, Option<usize>, Vec<String>)> {
     let (offset, limit, count) = page_params(st, params)?;
     let total = pre.unwrap_or(matches.len());
-    let page: Vec<Value> = match pre {
+    let page: Vec<T> = match pre {
         Some(_) => matches, // already exactly the page (store pushdown)
         None => matches.into_iter().skip(offset).take(limit).collect(),
     };

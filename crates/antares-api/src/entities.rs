@@ -918,8 +918,16 @@ async fn query_entities_inner(
         proj: push_proj.then_some(&repr),
         order_keys: order_keys.as_deref(),
     };
-    let mut filtered =
-        filter_entities_paged(st, &tenant, params, &ctx, fed, pushdown, Some(&repr)).await?;
+    // T-6055: a plain list holds its page as the stored text, ~1 KB an
+    // Entity where its `Value` tree takes ~5 KB, and shapes each Entity as it
+    // is written
+    let as_text = join.is_none() && accept != Accept::GeoJson && order_keys.is_none();
+    let mut filtered = match as_text && fed.is_empty() {
+        true => filter_entities_text(st, &tenant, params, &ctx, pushdown, Some(&repr)).await?,
+        false => {
+            filter_entities_paged(st, &tenant, params, &ctx, fed, pushdown, Some(&repr)).await?
+        }
+    };
     // the page is read back by `id`, a comma-separated list
     let listable = |d: &Value| {
         d.get("id")
@@ -949,24 +957,26 @@ async fn query_entities_inner(
         })?;
     }
     let keyset = push_page && crate::paging::keyset_allowed(params);
-    let (page, count_hdr, links) = if keyset && params.contains_key(crate::paging::CURSOR) {
-        // the rows start after the cursor's id, at the client's offset
-        let total = match filtered.paged {
-            true => filtered.total.unwrap_or(matches.len()),
-            false => matches.len(),
-        };
-        matches.truncate(p_limit);
-        let total = p_offset.saturating_add(total);
-        paginate_pre(st, params, matches, "/ngsi-ld/v1/entities", total)?
-    } else if filtered.paged {
-        let total = filtered.total.unwrap_or(matches.len());
-        paginate_pre(st, params, matches, "/ngsi-ld/v1/entities", total)?
-    } else {
-        paginate(st, params, matches, "/ngsi-ld/v1/entities")?
+    let cut = PageCut {
+        keyset: keyset && params.contains_key(crate::paging::CURSOR),
+        paged: filtered.paged,
+        total: filtered.total,
+        offset: p_offset,
+        limit: p_limit,
     };
-    let page = match trimmed {
-        true => whole_page(st, &tenant, params, &ctx, &repr, page).await?,
-        false => page,
+    let (page, count_hdr, links) = match filtered.text.is_empty() {
+        true => {
+            let (page, count, links) = cut.page(st, params, matches)?;
+            let page = match trimmed {
+                true => whole_page(st, &tenant, params, &ctx, &repr, page).await?,
+                false => page,
+            };
+            (Page::Docs(page), count, links)
+        }
+        false => {
+            let (page, count, links) = cut.page(st, params, filtered.text)?;
+            (Page::Text(page), count, links)
+        }
     };
     let links = match keyset {
         true => crate::paging::with_next_cursor(
@@ -974,9 +984,7 @@ async fn query_entities_inner(
             &crate::paging::view_of(st),
             tenant.as_str(),
             params,
-            page.last()
-                .and_then(|d| d.get("id"))
-                .and_then(Value::as_str),
+            page.last_id().as_deref(),
             p_offset.saturating_add(p_limit),
         ),
         false => links,
@@ -993,78 +1001,88 @@ async fn query_entities_inner(
             Some(compact_for(&repr, &shaped, &ctx))
         }
     };
-    let mut resp = if join.is_none() && accept != Accept::GeoJson {
-        // T-6049: each Entity is shaped as it is written, and the page holds no shaped
-        // copy of itself beside the read one
-        let docs = page.into_iter().filter_map(move |doc| shape(&doc));
-        crate::negotiate::respond_list(StatusCode::OK, docs, &ctx, accept, &tenant)
-    } else {
-        let mut payload: Vec<Value> = page.iter().filter_map(&shape).collect();
-        if let Some((mode, level)) = &join {
-            let mut complete = true;
-            let held = contained_by(params);
-            // 4.5.23.1 bounds the WIDTH of the retrieval per request, so one
-            // allowance is spent across the whole page: minting a fresh budget per
-            // payload Entity multiplied it by the page size, and a page of
-            // max_limit densely linked Entities bought MAX_JOIN_LOOKUPS lookups
-            // each.
-            let mut budget = MAX_JOIN_LOOKUPS;
-            match mode.as_str() {
-                "inline" => {
-                    for p in &mut payload {
-                        complete &= inline_join_beyond(
-                            st,
-                            &tenant,
-                            &ctx,
-                            &repr,
-                            p,
-                            *level,
-                            &held,
-                            &mut budget,
-                            crate::federation::active(params).then_some(headers),
-                        )
-                        .await;
-                    }
-                }
-                "flat" => {
-                    let mut linked = std::collections::BTreeMap::new();
-                    for doc in &page {
-                        complete &= collect_flat_beyond(
-                            st,
-                            &tenant,
-                            &ctx,
-                            &repr,
-                            doc,
-                            *level,
-                            &mut linked,
-                            &held,
-                            &mut budget,
-                        )
-                        .await;
-                    }
-                    let page_ids: Vec<&str> =
-                        page.iter().filter_map(|d| d["id"].as_str()).collect();
-                    for (id, (ldoc, lrepr)) in linked {
-                        if !page_ids.contains(&id.as_str()) {
-                            payload.push(compact_for(&lrepr, &apply(&ldoc, &lrepr), &ctx));
+    let mut resp = match page {
+        Page::Text(rows) => {
+            // a row parsed while it was decided parses again here
+            let docs = rows
+                .into_iter()
+                .filter_map(move |r| shape(&serde_json::from_str(r.get()).ok()?));
+            crate::negotiate::respond_list(StatusCode::OK, docs, &ctx, accept, &tenant)
+        }
+        Page::Docs(page) if join.is_none() && accept != Accept::GeoJson => {
+            // T-6049: each Entity is shaped as it is written, and the page holds no shaped
+            // copy of itself beside the read one
+            let docs = page.into_iter().filter_map(move |doc| shape(&doc));
+            crate::negotiate::respond_list(StatusCode::OK, docs, &ctx, accept, &tenant)
+        }
+        Page::Docs(page) => {
+            let mut payload: Vec<Value> = page.iter().filter_map(&shape).collect();
+            if let Some((mode, level)) = &join {
+                let mut complete = true;
+                let held = contained_by(params);
+                // 4.5.23.1 bounds the WIDTH of the retrieval per request, so one
+                // allowance is spent across the whole page: minting a fresh budget per
+                // payload Entity multiplied it by the page size, and a page of
+                // max_limit densely linked Entities bought MAX_JOIN_LOOKUPS lookups
+                // each.
+                let mut budget = MAX_JOIN_LOOKUPS;
+                match mode.as_str() {
+                    "inline" => {
+                        for p in &mut payload {
+                            complete &= inline_join_beyond(
+                                st,
+                                &tenant,
+                                &ctx,
+                                &repr,
+                                p,
+                                *level,
+                                &held,
+                                &mut budget,
+                                crate::federation::active(params).then_some(headers),
+                            )
+                            .await;
                         }
                     }
+                    "flat" => {
+                        let mut linked = std::collections::BTreeMap::new();
+                        for doc in &page {
+                            complete &= collect_flat_beyond(
+                                st,
+                                &tenant,
+                                &ctx,
+                                &repr,
+                                doc,
+                                *level,
+                                &mut linked,
+                                &held,
+                                &mut budget,
+                            )
+                            .await;
+                        }
+                        let page_ids: Vec<&str> =
+                            page.iter().filter_map(|d| d["id"].as_str()).collect();
+                        for (id, (ldoc, lrepr)) in linked {
+                            if !page_ids.contains(&id.as_str()) {
+                                payload.push(compact_for(&lrepr, &apply(&ldoc, &lrepr), &ctx));
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
+                if !complete {
+                    warnings.push(crate::federation::warning(
+                        199,
+                        &crate::federation::alias_for(&st.host_alias, &tenant),
+                        "the linked entity retrieval was truncated",
+                    ));
+                }
             }
-            if !complete {
-                warnings.push(crate::federation::warning(
-                    199,
-                    &crate::federation::alias_for(&st.host_alias, &tenant),
-                    "the linked entity retrieval was truncated",
-                ));
+            if accept == Accept::GeoJson {
+                let fc = to_geojson_collection(payload, params.get("geometryProperty"));
+                respond_prefer(StatusCode::OK, fc, &ctx, accept, &tenant, headers)
+            } else {
+                crate::negotiate::respond_list(StatusCode::OK, payload, &ctx, accept, &tenant)
             }
-        }
-        if accept == Accept::GeoJson {
-            let fc = to_geojson_collection(payload, params.get("geometryProperty"));
-            respond_prefer(StatusCode::OK, fc, &ctx, accept, &tenant, headers)
-        } else {
-            crate::negotiate::respond_list(StatusCode::OK, payload, &ctx, accept, &tenant)
         }
     };
     attach_paging(&mut resp, count_hdr, &links);
@@ -1082,6 +1100,63 @@ async fn query_entities_inner(
     }
     filter.mark(&st.host_alias, resp.headers_mut());
     Ok(resp)
+}
+
+/// A Query Entities page: documents, or the stored text of each
+/// ([`filter_entities_text`]).
+enum Page {
+    Docs(Vec<Value>),
+    Text(Vec<Box<serde_json::value::RawValue>>),
+}
+
+impl Page {
+    /// The id of the page's last Entity, which a keyset cursor seeks past.
+    fn last_id(&self) -> Option<String> {
+        let last = match self {
+            Page::Docs(p) => p.last()?.get("id")?.as_str()?.to_owned(),
+            Page::Text(p) => {
+                let doc: Value = serde_json::from_str(p.last()?.get()).ok()?;
+                doc.get("id")?.as_str()?.to_owned()
+            }
+        };
+        Some(last)
+    }
+}
+
+/// How Query Entities cuts its matches to the client's page (6.3.10).
+struct PageCut {
+    /// A keyset cursor: the rows start after its id, at the client's offset.
+    keyset: bool,
+    /// The store paged ([`Filtered::paged`]) and counted (`total`).
+    paged: bool,
+    total: Option<usize>,
+    offset: usize,
+    limit: usize,
+}
+
+impl PageCut {
+    fn page<T>(
+        &self,
+        st: &AppState,
+        params: &HashMap<String, String>,
+        mut matches: Vec<T>,
+    ) -> ApiResult<(Vec<T>, Option<usize>, Vec<String>)> {
+        const PATH: &str = "/ngsi-ld/v1/entities";
+        if self.keyset {
+            let total = match self.paged {
+                true => self.total.unwrap_or(matches.len()),
+                false => matches.len(),
+            };
+            matches.truncate(self.limit);
+            let total = self.offset.saturating_add(total);
+            paginate_pre(st, params, matches, PATH, total)
+        } else if self.paged {
+            let total = self.total.unwrap_or(matches.len());
+            paginate_pre(st, params, matches, PATH, total)
+        } else {
+            paginate(st, params, matches, PATH)
+        }
+    }
 }
 
 /// 5.7.2.4 / 5.7.4.4 / 5.14.4.4 a-e: a query qualifies (is not "too wide")
@@ -1139,6 +1214,9 @@ pub struct Filtered {
     /// [`Pushdown::order_keys`] of each document: enough to order and page
     /// it, and the page is then read whole by id (T-4919).
     pub trimmed: bool,
+    /// The matches as their stored JSON text, in place of `docs`, from
+    /// [`filter_entities_text`].
+    pub text: Vec<Box<serde_json::value::RawValue>>,
 }
 
 /// Whether the store may be asked to project members away. Only when its
@@ -1427,6 +1505,45 @@ pub async fn filter_entities_paged(
     push: Pushdown<'_>,
     narrow: Option<&crate::repr::Repr>,
 ) -> ApiResult<Filtered> {
+    filter_rows(st, tenant, params, ctx, Rows::Docs(fed), push, narrow).await
+}
+
+/// [`filter_entities_paged`] with the matches kept as their stored JSON text
+/// (`Filtered::text`) wherever the store answers in one read: each row is
+/// parsed only while it is decided, so the page is held as ~1 KB of text per
+/// Entity instead of a ~5 KB `Value` tree (T-6055). A walk in store pages,
+/// federated candidates or a sorted read keep `docs`.
+pub(crate) async fn filter_entities_text(
+    st: &AppState,
+    tenant: &TenantId,
+    params: &HashMap<String, String>,
+    ctx: &antares_jsonld::Context,
+    push: Pushdown<'_>,
+    narrow: Option<&crate::repr::Repr>,
+) -> ApiResult<Filtered> {
+    filter_rows(st, tenant, params, ctx, Rows::Text, push, narrow).await
+}
+
+/// How [`filter_rows`] holds its matches: documents, beside the federated
+/// candidates merged into them, or the local rows' stored text.
+enum Rows {
+    Docs(Vec<(bool, Value)>),
+    Text,
+}
+
+async fn filter_rows(
+    st: &AppState,
+    tenant: &TenantId,
+    params: &HashMap<String, String>,
+    ctx: &antares_jsonld::Context,
+    source: Rows,
+    push: Pushdown<'_>,
+    narrow: Option<&crate::repr::Repr>,
+) -> ApiResult<Filtered> {
+    let (fed, text) = match source {
+        Rows::Docs(fed) => (fed, false),
+        Rows::Text => (Vec::new(), true),
+    };
     let Pushdown {
         page,
         proj,
@@ -1675,6 +1792,7 @@ pub async fn filter_entities_paged(
     let id_set: Option<std::collections::HashSet<&str>> =
         ids.as_ref().map(|v| v.iter().copied().collect());
     let mut out = Vec::new();
+    let mut out_text = Vec::new();
     let (mut paged, mut total): (bool, Option<usize>);
     let mut trimmed: bool;
     let mut rows = 0usize;
@@ -1751,9 +1869,19 @@ pub async fn filter_entities_paged(
         };
         // a walk in pages decides each row itself, so the store may page
         // what it cannot decide
-        let outcome = match enough.or(counting.map(|_| 0)) {
-            Some(_) => st.store.query_candidates(tenant, &f).await?,
-            None => st.store.query_entities(tenant, &f).await?,
+        let (outcome, texts) = match enough.or(counting.map(|_| 0)) {
+            Some(_) => (st.store.query_candidates(tenant, &f).await?, Vec::new()),
+            None if text => {
+                let o = st.store.query_entities_text(tenant, &f).await?;
+                let outcome = antares_store::filter::QueryOutcome {
+                    rows: Vec::new(),
+                    decided: o.decided,
+                    paged: o.paged,
+                    total: o.total,
+                };
+                (outcome, o.rows)
+            }
+            None => (st.store.query_entities(tenant, &f).await?, Vec::new()),
         };
         let fed = fed_once.take().unwrap_or_default();
         let store_paged = outcome.paged;
@@ -1761,15 +1889,24 @@ pub async fn filter_entities_paged(
         trimmed = order_keys.is_some() && decided;
         paged = store_paged && fed.is_empty() && enough.is_none();
         total = outcome.total.map(|t| t as usize);
-        let got = outcome.rows.len();
+        let got = outcome.rows.len().saturating_add(texts.len());
         rows = rows.saturating_add(got);
         walk_after = outcome
             .rows
             .last()
             .and_then(|d| d.get("id")?.as_str())
             .map(str::to_owned);
-        let all = crate::federation::merge_candidates(outcome.rows, fed);
-        for doc in all {
+        // a row held as text is parsed only while it is decided
+        let all = crate::federation::merge_candidates(outcome.rows, fed)
+            .into_iter()
+            .map(|d| Ok::<_, serde_json::Error>((d, None)))
+            .chain(
+                texts
+                    .into_iter()
+                    .map(|r| serde_json::from_str::<Value>(r.get()).map(|d| (d, Some(r)))),
+            );
+        for item in all {
+            let (doc, raw) = item.map_err(|e| NgsiError::InternalError(e.to_string()))?;
             let id = doc.get("id").and_then(Value::as_str).unwrap_or("");
             if let Some(ids) = &id_set {
                 if !decided && !ids.contains(id) {
@@ -1877,7 +2014,10 @@ pub async fn filter_entities_paged(
                 }
                 continue;
             }
-            out.push(doc);
+            match raw {
+                Some(raw) => out_text.push(raw),
+                None => out.push(doc),
+            }
         }
         // a store that could not page answered with every row it holds
         if (enough.is_none() && counting.is_none()) || !store_paged || got < read.1 {
@@ -1908,6 +2048,7 @@ pub async fn filter_entities_paged(
             paged: true,
             rows,
             trimmed,
+            text: Vec::new(),
         });
     }
     if counting.is_some() {
@@ -1918,6 +2059,7 @@ pub async fn filter_entities_paged(
             total: Some(matched),
             rows,
             trimmed,
+            text: Vec::new(),
         });
     }
     Ok(Filtered {
@@ -1926,6 +2068,7 @@ pub async fn filter_entities_paged(
         total,
         rows,
         trimmed,
+        text: out_text,
     })
 }
 

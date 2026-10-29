@@ -1137,12 +1137,33 @@ impl PgEntityStore {
         self.query_in(tenant, f, true).await
     }
 
-    async fn query_in(
+    /// `query` with each row as the stored JSON text, never a `Value` tree
+    /// (T-6055).
+    pub async fn query_text(
+        &self,
+        tenant: &TenantId,
+        f: &EntityFilter<'_>,
+    ) -> Result<QueryOutcome<Box<serde_json::value::RawValue>>, sqlx::Error> {
+        let o = self
+            .query_in::<sqlx::types::Json<Box<serde_json::value::RawValue>>>(tenant, f, false)
+            .await?;
+        Ok(QueryOutcome {
+            rows: o.rows.into_iter().map(|j| j.0).collect(),
+            decided: o.decided,
+            paged: o.paged,
+            total: o.total,
+        })
+    }
+
+    async fn query_in<R>(
         &self,
         tenant: &TenantId,
         f: &EntityFilter<'_>,
         candidates: bool,
-    ) -> Result<QueryOutcome, sqlx::Error> {
+    ) -> Result<QueryOutcome<R>, sqlx::Error>
+    where
+        R: for<'r> sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>,
+    {
         let mut binds: Vec<Bind> = vec![Bind::Text(tenant.as_str().to_owned())];
         let mut wheres = vec![
             "tenant_id = $1".to_owned(),
@@ -1386,7 +1407,7 @@ impl PgEntityStore {
         }
         // Stream rows, decode each to its Value and
         // drop the PgRow — the full row set never sits in memory twice.
-        let mut docs: Vec<Value> = Vec::new();
+        let mut docs: Vec<R> = Vec::new();
         let mut total: Option<i64> = None;
         // candidates are no match set to count
         let counted = paged && decided && f.page.as_ref().is_some_and(|p| p.count);
@@ -1394,7 +1415,7 @@ impl PgEntityStore {
             use futures_util::TryStreamExt;
             let mut stream = qy.fetch(&mut *tx);
             while let Some(row) = stream.try_next().await? {
-                docs.push(row.get::<Value, _>(0));
+                docs.push(row.try_get::<R, _>(0)?);
             }
         }
         check_ceiling(paged, docs.len(), ceiling)?;

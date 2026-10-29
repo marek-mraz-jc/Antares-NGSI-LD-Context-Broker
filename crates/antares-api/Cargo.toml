@@ -37,7 +37,7 @@ chrono = { workspace = true }
 icu_collator = { workspace = true }
 icu_locale_core = { workspace = true }
 uuid = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 # the Channel document (feature `channels`)
 serde = { workspace = true, optional = true }
 tracing = { workspace = true }

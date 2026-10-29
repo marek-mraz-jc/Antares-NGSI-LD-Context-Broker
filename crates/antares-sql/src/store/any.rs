@@ -73,6 +73,11 @@ pub(crate) fn now_utc() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+/// A document as its JSON text ([`AnyStore::query_entities_text`]).
+fn raw(doc: &Value) -> Result<Box<serde_json::value::RawValue>, NgsiError> {
+    serde_json::value::to_raw_value(doc).map_err(|e| NgsiError::InternalError(e.to_string()))
+}
+
 #[cfg(feature = "postgres")]
 fn doc_kind(kind: Kind) -> Result<DocKind, NgsiError> {
     match kind {
@@ -853,6 +858,51 @@ impl AnyStore {
         f: &crate::store::filter::EntityFilter<'_>,
     ) -> Result<crate::store::filter::QueryOutcome, NgsiError> {
         self.query_paged(tenant, f, true).await
+    }
+
+    /// `query_entities` with each row as its JSON text (T-6055): the Pg arm
+    /// decodes no `Value` tree, and only a row that names `expiresAt` is
+    /// parsed for 4.22 stripping; the memory arm writes its documents out.
+    pub async fn query_entities_text(
+        &self,
+        tenant: &TenantId,
+        f: &crate::store::filter::EntityFilter<'_>,
+    ) -> Result<crate::store::filter::QueryOutcome<Box<serde_json::value::RawValue>>, NgsiError>
+    {
+        match self {
+            AnyStore::Mem(_) => {
+                let o = self.query_paged(tenant, f, false).await?;
+                Ok(crate::store::filter::QueryOutcome {
+                    rows: o
+                        .rows
+                        .into_iter()
+                        .map(|d| raw(&d))
+                        .collect::<Result<_, _>>()?,
+                    decided: o.decided,
+                    paged: o.paged,
+                    total: o.total,
+                })
+            }
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => {
+                let mut outcome = p.entities.query_text(tenant, f).await.map_err(db)?;
+                let now = now_utc();
+                let mut kept = Vec::with_capacity(outcome.rows.len());
+                for row in outcome.rows {
+                    if !row.get().contains("expiresAt") {
+                        kept.push(row);
+                        continue;
+                    }
+                    let mut doc: Value = serde_json::from_str(row.get())
+                        .map_err(|e| NgsiError::InternalError(e.to_string()))?;
+                    if !crate::store::filter::strip_expired(&mut doc, &now) {
+                        kept.push(raw(&doc)?);
+                    }
+                }
+                outcome.rows = kept;
+                Ok(outcome)
+            }
+        }
     }
 
     async fn query_paged(
@@ -1769,6 +1819,14 @@ impl antares_store::CurrentStateDriver for AnyStore {
         f: &crate::store::filter::EntityFilter<'_>,
     ) -> Result<crate::store::filter::QueryOutcome, NgsiError> {
         AnyStore::query_candidates(self, tenant, f).await
+    }
+    async fn query_entities_text(
+        &self,
+        tenant: &TenantId,
+        f: &crate::store::filter::EntityFilter<'_>,
+    ) -> Result<crate::store::filter::QueryOutcome<Box<serde_json::value::RawValue>>, NgsiError>
+    {
+        AnyStore::query_entities_text(self, tenant, f).await
     }
     async fn entity_type_names(&self, tenant: &TenantId) -> Result<Option<Vec<String>>, NgsiError> {
         AnyStore::entity_type_names(self, tenant).await.map(Some)
