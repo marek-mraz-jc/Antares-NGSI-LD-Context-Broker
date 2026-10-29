@@ -149,6 +149,7 @@ dependencies = [
  "ngsild-model",
  "ngsild-ql",
  "redb",
+ "regex",
  "serde_json",
  "tokio",
  "tracing",

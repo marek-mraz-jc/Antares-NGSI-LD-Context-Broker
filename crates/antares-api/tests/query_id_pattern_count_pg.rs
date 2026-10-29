@@ -6,7 +6,8 @@
 //! the pattern forces (T-5787) is the whole type. The count walked every
 //! Tree in OFFSET pages, judged the regex in Rust, and passed the gateway's
 //! 10 s (or hit TooManyResults past 100 000). The store now decides the
-//! pattern and counts in SQL. The guard counts the Entity rows Postgres
+//! pattern: the page in SQL, the count over the ids in the broker
+//! (T-6066). The guard counts the Entity rows Postgres
 //! returns to the broker, from sqlx's `sqlx::query` events; wall time is
 //! printed, not asserted (T-5661). Own test binary because the subscriber
 //! is process-wide. Skips loudly without `ANTARES_TEST_DATABASE_URL`.
@@ -33,13 +34,17 @@ fn iri(term: &str) -> String {
 }
 
 /// The rows each Entity read returned, summed over the statements sqlx sent
-/// since the last `take`.
+/// since the last `take`, and the counts Postgres decided with a regex.
 #[derive(Clone, Default)]
-struct EntityRows(Arc<Mutex<u64>>);
+struct EntityRows(Arc<Mutex<u64>>, Arc<Mutex<u64>>);
 
 impl EntityRows {
     fn take(&self) -> u64 {
         std::mem::take(&mut *self.0.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn take_regex_counts(&self) -> u64 {
+        std::mem::take(&mut *self.1.lock().unwrap_or_else(|e| e.into_inner()))
     }
 }
 
@@ -73,6 +78,10 @@ impl<S: tracing::Subscriber> Layer<S> for EntityRows {
             if q.sql.contains("SELECT entity AS entity FROM") {
                 let mut n = self.0.lock().unwrap_or_else(|e| e.into_inner());
                 *n = n.saturating_add(q.rows);
+            }
+            if q.sql.contains("count(*)") && q.sql.contains("regexp_like") {
+                let mut n = self.1.lock().unwrap_or_else(|e| e.into_inner());
+                *n = n.saturating_add(1);
             }
         }
     }
@@ -219,6 +228,7 @@ async fn a_views_id_pattern_over_a_whole_type_is_counted_in_the_store() {
         "type=Tree&limit=2&offset=5",
     ] {
         rows.take();
+        rows.take_regex_counts();
         let (code, count, body, took) = get(&st, &tenant, query).await;
         let read = rows.take();
         eprintln!("{query}: {code} in {took:?}, {read} Entity rows read");
@@ -234,6 +244,9 @@ async fn a_views_id_pattern_over_a_whole_type_is_counted_in_the_store() {
         );
         if query.contains("count=true") {
             assert_eq!(count.as_deref(), Some("164000"), "{query}");
+            // T-6066: Postgres's regex took 2.9 s a core over dev's 241 752
+            // Gardens; the broker matches the ids instead
+            assert_eq!(rows.take_regex_counts(), 0, "{query}: a regex count in SQL");
         }
         if query.contains("offset=5") {
             assert_eq!(
