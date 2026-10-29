@@ -1475,6 +1475,66 @@ async fn the_temporal_page_qualification_reads_each_station_newest_first() {
         "the probe fetched {refused} rows the window refused for {STATIONS} stations — plan:\n{plan}"
     );
     assert_eq!(qualified, STATIONS, "every station has rows in the window");
+
+    // Under a view's rule the probe keeps to the shown Attributes: one probe
+    // per Attribute on the full btree prefix. Postgres 16 (dev's CNPG image)
+    // reads `attr_id = ANY(..)` as no ordered index condition and sorted every
+    // row of the station in the widened bound (dev: 5.9 s for 577 stations);
+    // 17 orders it, so the plan text pins the per-Attribute equality.
+    let qual =
+        pg::temporal::has_history(&format!(" AND {} AND {column}", text.sql), "DESC", Some(4));
+    let mut tx = pool.begin().await.expect("tx");
+    for s in [
+        "SET LOCAL plan_cache_mode = force_generic_plan",
+        "SET LOCAL ROLE antares_app",
+        "SELECT set_config('antares.tenant', 'pgexplain-bikes', true)",
+    ] {
+        sqlx::query(s).execute(&mut *tx).await.expect(s);
+    }
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "PREPARE t5616_shown(text, text, text, text[]) AS \
+         SELECT count(*) FROM temporal_entities m WHERE m.tenant_id = $1 AND {qual}"
+    )))
+    .execute(&mut *tx)
+    .await
+    .expect("prepare");
+    let args = format!(
+        "('{T}', 'observedAt', '2004-03-13T12:00:00Z', ARRAY['https://x/name', 'https://x/bikes'])"
+    );
+    let qualified: i64 =
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXECUTE t5616_shown{args}")))
+            .fetch_one(&mut *tx)
+            .await
+            .expect("execute");
+    let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, FORMAT TEXT) EXECUTE t5616_shown{args}"
+    )))
+    .fetch_all(&mut *tx)
+    .await
+    .expect("explain");
+    tx.rollback().await.expect("rollback");
+    let plan = plan.join("\n");
+    let refused: i64 = plan
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("Rows Removed by Filter: "))
+        .filter_map(|n| n.trim().parse::<i64>().ok())
+        .sum();
+    assert!(
+        plan.contains("(attr_id = s.attr)") && !plan.contains("attr_id = ANY"),
+        "the shown-Attribute probe is no equality per Attribute — plan:\n{plan}"
+    );
+    assert!(
+        !plan.contains("->  Sort "),
+        "the shown-Attribute probe sorts the station's rows — plan:\n{plan}"
+    );
+    assert!(
+        refused < STATIONS,
+        "the shown-Attribute probe fetched {refused} rows the window refused for {STATIONS} stations — plan:\n{plan}"
+    );
+    assert_eq!(
+        qualified, STATIONS,
+        "every station has shown rows in the window"
+    );
 }
 
 /// F-ANT1-016: the query geometry's validity probe runs on the query's own
