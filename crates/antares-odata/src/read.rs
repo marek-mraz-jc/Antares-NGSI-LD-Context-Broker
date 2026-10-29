@@ -858,9 +858,8 @@ pub(crate) async fn collection(
         let mut ids = Vec::new();
         for mut doc in docs.each() {
             attach_one(&mut doc, &programs, version)?;
-            if let Some(urn) = doc.get("id").and_then(Value::as_str) {
-                ids.push(format!("{set_name}{}", key_segment(set, urn)));
-            }
+            let urn = doc.get("id").and_then(Value::as_str);
+            ids.extend(urn.map(|urn| format!("{set_name}{}", key_segment(set, urn))));
         }
         let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
         let _ = write_entity_references(ctx, &ids, &page, &mut body);

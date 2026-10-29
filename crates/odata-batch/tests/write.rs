@@ -206,7 +206,7 @@ mod write {
         let mut out = sink();
         let binary = response(None, 200, &[], b"\xff");
         assert!(write_json(&[kept.clone(), binary], &mut out).is_err());
-        assert!(out.out.is_empty());
+        assert_eq!(out.out, Vec::<u8>::new());
         let text = String::from_utf8(json(&[kept, broken]).unwrap()).unwrap();
         assert_eq!(
             text,
