@@ -45,7 +45,11 @@ jobs:
       CARGO_TERM_COLOR: always
     services: &workspace-services
       postgis:
-        image: ghcr.io/baosystems/postgis:17-3.5
+        # The major dev and prod run (CNPG postgis:16-3.6-system-trixie): a
+        # plan fast on 17 sorted every row on 16 (T-5616, T-6021). 16.15 with
+        # PostGIS 3.6.4 on trixie, amd64 only, so no arm job uses it;
+        # dev/preflight.sh starts this same line. strict.yml keeps 17.
+        image: postgis/postgis:16-3.6@sha256:d07ce3f06f657b6516c7511412232e97174d7e9dcf4c9fe520109b682b44a201
         env:
           POSTGRES_USER: antares
           POSTGRES_PASSWORD: antares

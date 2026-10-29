@@ -44,7 +44,10 @@ ETSI badges describe `dev`; `:latest` and the versioned images describe
    there (clippy wall, all-features tests, each new test alone, machete,
    the ledger, module rules, the vanilla gates, the SBOM, the docs gates,
    the coverage gate) on the crates the branch touches, about 5 minutes
-   warm. A new CI-only check lands in `dev/preflight.sh` in the same
+   warm. When `antares-sql`, `-api`, `-broker` or `-ops` is touched and
+   `ANTARES_TEST_DATABASE_URL` is unset, it starts the PostGIS image of
+   `workspace.yml` (PostgreSQL 16, the major dev and prod run) in docker
+   for the pg tests. A new CI-only check lands in `dev/preflight.sh` in the same
    change, with a comment naming its CI step.
 3. Open the pull request into `dev`. `ci` runs on it; a first-time
    contributor's run waits for a maintainer to approve it.
