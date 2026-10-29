@@ -106,7 +106,7 @@ impl Surface for Probe {
                             read,
                         )) => Json(json!({
                             "entities": entities, "next": next, "count": count, "read": read,
-                            "truncated": truncated
+                            "truncated": truncated, "pageSize": view.page_size()
                         }))
                         .into_response(),
                         Ok((Scanned::Answer(answer), _)) => answer,
@@ -666,6 +666,10 @@ async fn a_page_past_max_limit_is_read_in_store_pages() {
     let rig = rig_on(broker).await.expect("rig");
     let (s, b) = rig.scan((pushdown(), None), "size=10&whole=1").await;
     assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(
+        b["pageSize"], 4,
+        "one store read, what a surface streams at a time"
+    );
     assert_eq!(ids(&b), expected(|_| true)[..10]);
     assert_eq!(
         (b["count"].clone(), b["next"].clone()),

@@ -639,35 +639,191 @@ pub(crate) async fn page(
     digest: u64,
     refs: Refs<'_>,
 ) -> Result<Page, Problem> {
-    let terms = Terms::of(c);
-    // One geoQ per request (4.10): the filter's spatial conjunct is pushed only when neither
-    // `bbox` nor an `ngsild.geo*` option holds it.
-    let geo_free = !p.ngsild_geo() && (p.bbox.is_none() || c.geometry.is_none());
-    let lowered = match &p.filter {
-        Some(f) => crate::filter::lower(c, &terms, f, geo_free)?,
-        None => Lowered::default(),
-    };
-    if lowered.ids.as_ref().is_some_and(Vec::is_empty) {
+    let mut cursor = Cursor::new(c, p, digest)?;
+    let mut features = Vec::new();
+    while let Some(more) = cursor.chunk(view, caller, c, refs).await? {
+        features.extend(more);
+    }
+    Ok(Page {
+        features,
+        matched: cursor.matched,
+        next: cursor.next,
+    })
+}
+
+/// [`page`] read one store read at a time (T-6036): each [`Cursor::chunk`] asks the store for
+/// at most [`ViewOps::page_size`] Entities, so a reader that writes each chunk out holds one
+/// upstream page of Features, never the whole page. The store reads are those one [`page`]
+/// makes, and a residual's [`antares_ops::RESIDUAL_SCAN`] budget is the part's, across chunks.
+pub(crate) struct Cursor {
+    terms: Terms,
+    parts: Vec<Part>,
+    order: Vec<String>,
+    attrs: Option<Vec<String>>,
+    /// The part and its upstream offset the page starts at, from its `next` token.
+    start: (usize, usize),
+    limit: usize,
+    digest: u64,
+    /// The part being read and where its read stands, `None` before its first read.
+    part: usize,
+    reading: Option<Reading>,
+    served: usize,
+    /// `numberMatched` of the parts read so far, see [`Page::matched`].
+    pub matched: Option<u64>,
+    /// The `next` token, once a part set it.
+    pub next: Option<String>,
+}
+
+/// Where the read of one part stands.
+struct Reading {
+    residual: Option<residual::Program>,
+    pushdown: Pushdown,
+    /// The upstream offset of the part's next read.
+    pos: usize,
+    first: bool,
+    /// What is left of the part's residual budget.
+    budget: usize,
+    count: Option<usize>,
+}
+
+impl Cursor {
+    /// The parts a page reads and where it starts.
+    pub(crate) fn new(c: &Collection, p: &Params, digest: u64) -> Result<Self, Problem> {
+        let terms = Terms::of(c);
+        // One geoQ per request (4.10): the filter's spatial conjunct is pushed only when
+        // neither `bbox` nor an `ngsild.geo*` option holds it.
+        let geo_free = !p.ngsild_geo() && (p.bbox.is_none() || c.geometry.is_none());
+        let lowered = match &p.filter {
+            Some(f) => crate::filter::lower(c, &terms, f, geo_free)?,
+            None => Lowered::default(),
+        };
         // `id` conjuncts no Entity id meets: nothing to ask the store.
-        return Ok(Page {
-            features: Vec::new(),
+        let (parts, start) = if lowered.ids.as_ref().is_some_and(Vec::is_empty) {
+            (Vec::new(), (0, 0))
+        } else {
+            let parts = targets(c, &terms, p, &lowered);
+            let start = match &p.next {
+                None => (0, 0),
+                Some(t) => read_token(t, digest, parts.len())
+                    .ok_or_else(|| bad("the next token does not belong to this request"))?,
+            };
+            (parts, start)
+        };
+        Ok(Self {
+            order: order(&terms, p),
+            attrs: attrs(c, &terms, p),
+            terms,
+            parts,
+            start,
+            limit: usize::try_from(p.limit).unwrap_or(usize::MAX),
+            digest,
+            part: 0,
+            reading: None,
+            served: 0,
             matched: Some(0),
             next: None,
-        });
+        })
     }
-    let parts = targets(c, &terms, p, &lowered);
-    let (start, offset) = match &p.next {
-        None => (0, 0),
-        Some(t) => read_token(t, digest, parts.len())
-            .ok_or_else(|| bad("the next token does not belong to this request"))?,
-    };
-    let limit = usize::try_from(p.limit).unwrap_or(usize::MAX);
-    let mut out = Page {
-        features: Vec::new(),
-        matched: Some(0),
-        next: None,
-    };
-    for (i, part) in parts.iter().enumerate() {
+
+    /// Whether every part was read.
+    pub(crate) fn done(&self) -> bool {
+        self.part >= self.parts.len()
+    }
+
+    /// The Features of the next store read, `None` once every part was read.
+    pub(crate) async fn chunk(
+        &mut self,
+        view: &ViewOps,
+        caller: &Caller,
+        c: &Collection,
+        refs: Refs<'_>,
+    ) -> Result<Option<Vec<Value>>, Problem> {
+        let i = self.part;
+        let Some(part) = self.parts.get(i) else {
+            return Ok(None);
+        };
+        let mut r = match self.reading.take() {
+            Some(r) => r,
+            None => self.enter(part)?,
+        };
+        let room = if i < self.start.0 {
+            0
+        } else {
+            self.limit.saturating_sub(self.served)
+        };
+        let size = room.min(view.page_size());
+        let page = antares_ops::Page {
+            start: r.pos,
+            size,
+            whole: r.residual.is_none() && r.first,
+        };
+        let (docs, next, count) = match &r.residual {
+            None => scanned(view.scan(caller, &r.pushdown, None, page).await)?,
+            Some(program) => scanned(
+                view.scan_within(caller, &r.pushdown, program, page, &mut r.budget)
+                    .await,
+            )?,
+        };
+        let got = docs.len();
+        self.served = self.served.saturating_add(got);
+        r.first = false;
+        r.count = r.count.or(count);
+        r.pos = next.unwrap_or(r.pos.saturating_add(got));
+        let simple = r.residual.is_some();
+        let features = docs
+            .into_iter()
+            .map(|d| {
+                Value::Object(feature(
+                    c,
+                    &self.terms,
+                    &if simple { simplified(d) } else { d },
+                    refs,
+                ))
+            })
+            .collect();
+        // The part goes on while its reads come back full and the page has room; a residual
+        // read also ends with the store's answer.
+        if got == size && size < room && (!simple || next.is_some()) {
+            self.reading = Some(r);
+            return Ok(Some(features));
+        }
+        let count = match &r.residual {
+            None => r.count,
+            // ponytail: the count reads the residual's answer again, within the budget; a
+            // count kept beside the cursor when one request reads both.
+            Some(program) => {
+                let whole = antares_ops::Page {
+                    start: 0,
+                    size: 0,
+                    whole: true,
+                };
+                match view.scan(caller, &r.pushdown, Some(program), whole).await {
+                    Err(Refusal::TooManyResults { .. }) => None,
+                    answer => scanned(answer)?.2,
+                }
+            }
+        };
+        self.matched = self
+            .matched
+            .zip(count)
+            .map(|(m, n)| m.saturating_add(u64::try_from(n).unwrap_or(u64::MAX)));
+        self.part = i.saturating_add(1);
+        if i < self.start.0 || self.next.is_some() {
+            return Ok(Some(features));
+        }
+        // Without a residual the whole count says whether more remains past this page.
+        let next = match r.residual {
+            Some(_) => next,
+            None => count.filter(|n| r.pos < *n).map(|_| r.pos),
+        };
+        // A part after the one that filled the page answers its whole count and, holding
+        // anything, starts the next page at its offset 0.
+        self.next = next.map(|next| token(i, next, self.digest));
+        Ok(Some(features))
+    }
+
+    /// The first read of `part`: its residual compiled and its pushdown.
+    fn enter(&self, part: &Part) -> Result<Reading, Problem> {
         let residual = match &part.residual {
             None => None,
             Some(expr) => {
@@ -684,64 +840,24 @@ pub(crate) async fn page(
             } else {
                 format!("{}&format=simplified", part.query)
             },
-            order: order(&terms, p),
-            attrs: residual.as_ref().and_then(|_| attrs(c, &terms, p)),
+            order: self.order.clone(),
+            attrs: residual.as_ref().and_then(|_| self.attrs.clone()),
             sys_attrs: false,
-            context: terms.context(),
+            context: self.terms.context(),
         };
-        let at = if i == start { offset } else { 0 };
-        let room = if i < start {
-            0
-        } else {
-            limit.saturating_sub(out.features.len())
-        };
-        let page = antares_ops::Page {
-            start: at,
-            size: room,
-            whole: residual.is_none(),
-        };
-        let (docs, next, count) =
-            scanned(view.scan(caller, &pushdown, residual.as_ref(), page).await)?;
-        let count = match (&residual, count) {
-            (None, count) => count,
-            // ponytail: the count reads the residual's answer again, within the budget; a
-            // count kept beside the cursor when one request reads both.
-            (Some(program), _) => {
-                let whole = antares_ops::Page {
-                    start: 0,
-                    size: 0,
-                    whole: true,
-                };
-                match view.scan(caller, &pushdown, Some(program), whole).await {
-                    Err(Refusal::TooManyResults { .. }) => None,
-                    answer => scanned(answer)?.2,
-                }
-            }
-        };
-        out.matched = out
-            .matched
-            .zip(count)
-            .map(|(m, n)| m.saturating_add(u64::try_from(n).unwrap_or(u64::MAX)));
-        let got = docs.len();
-        out.features.extend(docs.into_iter().map(|d| {
-            let d = if residual.is_some() { simplified(d) } else { d };
-            Value::Object(feature(c, &terms, &d, refs))
-        }));
-        if i < start || out.next.is_some() {
-            continue;
-        }
-        // Without a residual the whole count says whether more remains past this page.
-        let next = match residual {
-            Some(_) => next,
-            None => count
-                .filter(|n| at.saturating_add(got) < *n)
-                .map(|_| at.saturating_add(got)),
-        };
-        // A part after the one that filled the page answers its whole count and, holding
-        // anything, starts the next page at its offset 0.
-        out.next = next.map(|next| token(i, next, digest));
+        Ok(Reading {
+            residual,
+            pushdown,
+            pos: if self.part == self.start.0 {
+                self.start.1
+            } else {
+                0
+            },
+            first: true,
+            budget: antares_ops::RESIDUAL_SCAN,
+            count: None,
+        })
     }
-    Ok(out)
 }
 
 /// Why the residual refused the filter: too large (400), a construct it does not read with the
