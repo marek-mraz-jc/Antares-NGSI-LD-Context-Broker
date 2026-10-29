@@ -575,20 +575,56 @@ async fn evaluated(
     let pushdown = pushdown(set, picked, expansions, filter);
     Ok(if counted || filter.sort.is_some() {
         // The whole answer, counted and sorted here (ADR-0028 rule 5); the
-        // cursor is a position in it.
-        let whole = ScanPage {
-            start: 0,
-            size: 0,
-            whole: true,
+        // cursor is a position in it. It is read in upstream parts and only what the page
+        // can serve is kept (T-6049): the window of a count, the first `skip + top` of a
+        // sort, the earlier in upstream order first among equals as a whole stable sort has
+        // them.
+        let window = (cursor, skip, top, page);
+        let from = cursor.saturating_add(skip);
+        let keep = from.saturating_add(top.unwrap_or(u64::MAX).min(page));
+        let keep = usize::try_from(keep).unwrap_or(usize::MAX);
+        let from = usize::try_from(from).unwrap_or(usize::MAX);
+        let mut kept = Vec::new();
+        let total = match &filter.sort {
+            None => {
+                let mut at = 0usize;
+                scan_parts(reads, caller, &pushdown, program, version, |docs| {
+                    for doc in docs {
+                        if (from..keep).contains(&at) {
+                            kept.push(doc);
+                        }
+                        at = at.saturating_add(1);
+                    }
+                    Ok(())
+                })
+                .await?
+            }
+            Some(keys) => {
+                let total = scan_parts(reads, caller, &pushdown, program, version, |mut docs| {
+                    attach(&mut docs, filter, version)?;
+                    kept.append(&mut docs);
+                    if kept.len() > keep.saturating_mul(2) {
+                        sort(&mut kept, keys);
+                        kept.truncate(keep);
+                    }
+                    Ok(())
+                })
+                .await?;
+                sort(&mut kept, keys);
+                kept.truncate(keep);
+                kept.drain(..from.min(kept.len()));
+                total
+            }
         };
-        let (mut docs, _) = scanned(reads, caller, &pushdown, program, whole, version).await?;
-        attach(&mut docs, filter, version)?;
-        if let Some(keys) = &filter.sort {
-            sort(&mut docs, keys);
-        }
-        let (docs, total, next) = paged(docs, (cursor, skip, top, page), link);
+        let total = u64::try_from(total).unwrap_or(u64::MAX);
+        let next = next_page(
+            u64::try_from(kept.len()).unwrap_or(u64::MAX),
+            total,
+            window,
+            link,
+        );
         Served {
-            docs: Docs::Held(docs),
+            docs: Docs::Held(kept),
             total,
             next,
         }
@@ -658,10 +694,22 @@ pub(crate) fn paged<T>(
         .take(usize::try_from(take).unwrap_or(usize::MAX))
         .collect();
     let served = u64::try_from(items.len()).unwrap_or(u64::MAX);
-    let next = from.saturating_add(served);
-    let next = (served > 0 && next < end)
-        .then(|| link(next, 0, top.map(|top| top.saturating_sub(served))));
+    let next = next_page(served, total, (cursor, skip, top, page), link);
     (items, total, next)
+}
+
+/// The link after a page of `served` items of a whole answer of `total`, as [`paged`] serves
+/// it.
+fn next_page(
+    served: u64,
+    total: u64,
+    (cursor, skip, top, _): (u64, u64, Option<u64>, u64),
+    link: &(dyn Fn(u64, u64, Option<u64>) -> String + Sync),
+) -> Option<String> {
+    let from = cursor.saturating_add(skip);
+    let end = top.map_or(total, |top| total.min(from.saturating_add(top)));
+    let next = from.saturating_add(served);
+    (served > 0 && next < end).then(|| link(next, 0, top.map(|top| top.saturating_sub(served))))
 }
 
 /// The page a collection read serves: its Entities, the count when asked,
@@ -871,13 +919,8 @@ pub(crate) async fn count(
         Some(program) => {
             filter.sort = None;
             let pushdown = pushdown(set, None, &[], &mut filter);
-            let whole = ScanPage {
-                start: 0,
-                size: 0,
-                whole: true,
-            };
-            let (docs, _) = scanned(reads, caller, &pushdown, &program, whole, version).await?;
-            u64::try_from(docs.len()).unwrap_or(u64::MAX)
+            let total = scan_parts(reads, caller, &pushdown, &program, version, |_| Ok(())).await?;
+            u64::try_from(total).unwrap_or(u64::MAX)
         }
     };
     Ok((
@@ -1959,7 +2002,50 @@ pub(crate) async fn scanned(
     page: ScanPage,
     version: ODataVersion,
 ) -> Result<(Vec<Value>, Option<usize>), ODataErrorResponse> {
-    match reads.view.scan(caller, pushdown, Some(program), page).await {
+    let result = reads.view.scan(caller, pushdown, Some(program), page).await;
+    scan_answer(result, version)
+}
+
+/// A whole scanned answer read in upstream parts of at most one store read of admitted
+/// Entities each (T-6049): `take` is handed each part in upstream order, and the count of all
+/// is returned. The parts share one budget of upstream reads: an answer past
+/// [`RESIDUAL_SCAN`] is refused as a whole read of it is.
+async fn scan_parts(
+    reads: &Reads,
+    caller: &Caller,
+    pushdown: &Pushdown,
+    program: &Program,
+    version: ODataVersion,
+    mut take: impl FnMut(Vec<Value>) -> Result<(), ODataErrorResponse>,
+) -> Result<usize, ODataErrorResponse> {
+    let mut budget = RESIDUAL_SCAN.saturating_add(1);
+    let (mut start, mut count) = (0, 0usize);
+    loop {
+        let page = ScanPage {
+            start,
+            size: reads.view.page_size(),
+            whole: false,
+        };
+        let result = (reads.view)
+            .scan_within(caller, pushdown, program, page, &mut budget)
+            .await;
+        let (docs, next) = scan_answer(result, version)?;
+        count = count.saturating_add(docs.len());
+        take(docs)?;
+        match next {
+            None => return Ok(count),
+            Some(_) if budget == 0 => return Err(too_many(version)),
+            Some(next) => start = next,
+        }
+    }
+}
+
+/// The OData answer of one scan.
+fn scan_answer(
+    result: Result<Scanned, Refusal>,
+    version: ODataVersion,
+) -> Result<(Vec<Value>, Option<usize>), ODataErrorResponse> {
+    match result {
         // T-3823: a scanned join is refused like a pushed one when the walk stopped short
         Ok(Scanned::Page {
             truncated: true, ..
@@ -1970,22 +2056,15 @@ pub(crate) async fn scanned(
             Ok((Vec::new(), None))
         }
         Ok(Scanned::Answer(answer)) => Err(refused(answer.status(), version)),
-        Err(Refusal::TooManyResults { .. }) => Err(ODataErrorResponse::new(
-            StatusCode::BAD_REQUEST,
-            "TooManyResults",
-            &format!(
-                "the answer holds more than the {RESIDUAL_SCAN} Entities one request may read: narrow it with $filter"
-            ),
-        )
-        .with_version(version)),
+        Err(Refusal::TooManyResults { .. }) => Err(too_many(version)),
         // An evaluation past the residual's MAX_STEPS: a nested `any` over a long list reaches
         // it within MAX_NODES (T-4031)
-        Err(Refusal::Malformed(TOO_COMPLEX)) => Err(ODataErrorResponse::new(
-            StatusCode::BAD_REQUEST,
-            "TooComplexQuery",
-            TOO_COMPLEX,
-        )
-        .with_version(version)),
+        Err(Refusal::Malformed(TOO_COMPLEX)) => {
+            Err(
+                ODataErrorResponse::new(StatusCode::BAD_REQUEST, "TooComplexQuery", TOO_COMPLEX)
+                    .with_version(version),
+            )
+        }
         Err(other) => Err(refused(other.status(), version)),
     }
 }
@@ -1993,6 +2072,17 @@ pub(crate) async fn scanned(
 /// The join walk stopped at the broker's lookup budget (4.5.23.1): an OData
 /// client cannot see the NGSI-LD warning, so a partial expansion is refused
 /// (S1, O6, D9).
+fn too_many(version: ODataVersion) -> ODataErrorResponse {
+    ODataErrorResponse::new(
+        StatusCode::BAD_REQUEST,
+        "TooManyResults",
+        &format!(
+            "the answer holds more than the {RESIDUAL_SCAN} Entities one request may read: narrow it with $filter"
+        ),
+    )
+    .with_version(version)
+}
+
 fn truncated_join(version: ODataVersion) -> ODataErrorResponse {
     ODataErrorResponse::new(
         StatusCode::BAD_REQUEST,
