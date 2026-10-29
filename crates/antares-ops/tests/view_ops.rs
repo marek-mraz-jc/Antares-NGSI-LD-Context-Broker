@@ -140,11 +140,11 @@ async fn read_whole(ops: Ops, id: String, caller: Caller) -> Response {
     };
     let req = OpsRequest::new(Method::GET, "/ngsi-ld/v1/entities?type=Car");
     let read = match view.run(OperationId::QueryEntities, &caller, req).await {
-        Ok(answer) => view.read_answer(answer.into_body()).await,
+        Ok(answer) => view.read_answer(answer.into_body(), "test").await,
         Err(refusal) => Err(refusal),
     };
     match read {
-        Ok(bytes) => bytes.into_response(),
+        Ok(bytes) => bytes.into_bytes().into_response(),
         Err(refusal) => refusal.ngsi_ld(),
     }
 }
@@ -450,6 +450,16 @@ async fn a_view_answer_past_the_buffer_bound_is_413() {
         a.json.get("detail"),
         Some(&json!(antares_ops::bounds::ANSWER_TOO_LARGE))
     );
+}
+
+/// T-5895: a view's answer the broker's buffered-answer pool has no room
+/// for is `Refusal::Overloaded`: 503 with Retry-After, no body.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_view_answer_past_the_answer_pool_is_503() {
+    let small = TestBroker::with_answer_pool(16).await.expect("broker");
+    let (_b, app) = broker_on(small).await.expect("broker");
+    let a = send(&app, Method::GET, "/x/probe/cars/read", &[], None).await;
+    assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "{}", a.json);
 }
 
 #[tokio::test(flavor = "multi_thread")]

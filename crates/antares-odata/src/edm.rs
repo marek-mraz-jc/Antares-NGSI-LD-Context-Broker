@@ -182,6 +182,9 @@ pub struct Set {
     /// Each Property that keys the target of a navigation (R6, T-3761), by
     /// its CSDL name: the target's EntitySet.
     pub references: BTreeMap<String, String>,
+    /// Each navigation with such a Property, by CSDL name: the Property a bind
+    /// of it sets to the target's key (CSDL XML 8.5, T-5906).
+    pub bound: BTreeMap<String, String>,
     /// The filter of the named output this set serves (docs API/11 EP-159, T-5225), a conjunct
     /// of every read of it; `None` for a class's own set.
     pub output: Option<antares_ops::outputs::Filter>,
@@ -213,7 +216,17 @@ pub struct Edm {
     /// one) then `.m` and [`MAPPING_VERSION`], `1.2.0.m1` (a character outside the URL's unreserved
     /// set becomes `_`); `$schemaversion` takes it.
     pub schema_version: String,
+    /// The `{Set}_history` sets by name (T-5908), apart from `sets` so no read, write, filter
+    /// hop or `$expand` of the current state reaches them.
+    pub histories: BTreeMap<String, Set>,
 }
+
+/// What a history set's name adds to its class set's: `-` is no `SimpleIdentifier` character
+/// (CSDL XML 17.2), so the OGC `{type}-history` is `{Set}_history` here.
+pub const HISTORY_SUFFIX: &str = "_history";
+
+/// The IRI of a history row's `observedAt` member; no Entity has it.
+pub const OBSERVED_AT_IRI: &str = "urn:antares:odata:history:observedAt";
 
 /// Builds the model of view `view` from `schema` and what the view shows.
 /// A class the view does not show, a slot it does not show of that class,
@@ -297,9 +310,11 @@ pub fn build(
         }
         set.annotations = capabilities(&members, writable, required);
         container.entity_sets.push(set);
+        let (references, bound) = constrain(schema, class, &visible, &mut ty, &members);
         let set = Set {
             type_iri: schema.class_iri(class),
-            references: constrain(schema, class, &visible, &mut ty, &members),
+            references,
+            bound,
             members,
             identifier,
             writable,
@@ -321,7 +336,194 @@ pub fn build(
         namespace,
         sets,
         schema_version,
+        histories: BTreeMap::new(),
     })
+}
+
+/// `edm` with a read-only `{Set}_history` beside each class's set (T-5908), for a view that
+/// offers the Temporal Query: one row per Entity and `observedAt`, keyed by both, its members
+/// the class's (a navigation as its object URIs, R5) holding the values valid at that instant.
+/// A class whose set would collide with a name the model holds, or whose members name `id` or
+/// `observedAt`, gets none.
+#[must_use]
+pub fn histories(mut edm: Edm) -> Edm {
+    let Some(own) = edm
+        .csdl
+        .schemas
+        .iter_mut()
+        .find(|s| s.entity_container.is_some())
+    else {
+        return edm;
+    };
+    let taken: BTreeSet<String> = own
+        .entity_types
+        .iter()
+        .map(|t| t.name.clone())
+        .chain(edm.sets.keys().cloned())
+        .collect();
+    let mut types = Vec::new();
+    let mut sets = Vec::new();
+    for (name, set) in edm.sets.iter().filter(|(_, s)| s.output.is_none()) {
+        let history = format!("{name}{HISTORY_SUFFIX}");
+        // a row's key takes `id` and `observedAt`; a set showing no member has no history
+        let plain = set
+            .members
+            .keys()
+            .filter(|k| !matches!(k.as_str(), "id" | "observedAt"))
+            .count();
+        let serves = plain == set.members.len() && plain > 0;
+        let class = own.entity_types.iter().find(|t| t.name == *name);
+        let (Some(class), true, false) = (class, serves, taken.contains(&history)) else {
+            continue;
+        };
+        let (ty, members) = history_type(&history, name, class, set);
+        let mut entity_set =
+            EntitySet::new(history.clone(), format!("{}.{history}", edm.namespace));
+        entity_set.annotations = history_capabilities(&members);
+        types.push(ty);
+        sets.push(entity_set);
+        let set = Set {
+            members,
+            identifier: None,
+            writable: Writable::default(),
+            references: BTreeMap::new(),
+            bound: BTreeMap::new(),
+            output: None,
+            type_iri: set.type_iri.clone(),
+        };
+        edm.histories.insert(history, set);
+    }
+    own.entity_types.extend(types);
+    own.entity_container
+        .iter_mut()
+        .for_each(|c| c.entity_sets.append(&mut sets));
+    edm
+}
+
+/// The EntityType of `class`'s history set `history` and its members: the key, then the
+/// class's properties nullable, each navigation as its object URIs (R5).
+fn history_type(
+    history: &str,
+    name: &str,
+    class: &EntityType,
+    set: &Set,
+) -> (EntityType, BTreeMap<String, Member>) {
+    let mut members: BTreeMap<String, Member> = set
+        .members
+        .iter()
+        .map(|(n, m)| {
+            let shape = match &m.shape {
+                Shape::Nav { collection, .. } => Shape::Url {
+                    collection: *collection,
+                },
+                other => other.clone(),
+            };
+            (
+                n.clone(),
+                Member {
+                    shape,
+                    written: Written::Never,
+                    ..m.clone()
+                },
+            )
+        })
+        .collect();
+    let mut ty = EntityType::new(history.to_owned());
+    // a 4.0 model serves an Untyped member as a dynamic property, as the class does
+    ty.open = class.open;
+    ty.key = vec!["id".into(), "observedAt".into()];
+    ty.annotations.push(iri(&set.type_iri));
+    ty.annotations.push(description(&format!(
+            "The stored history of {name}: one row per Entity and observedAt, its values those valid at that instant"
+        )));
+    ty.properties
+        .push(Property::new("id", TypeRef::single("Edm.String")).required());
+    ty.properties
+        .push(Property::new("observedAt", TypeRef::single("Edm.DateTimeOffset")).required());
+    ty.properties
+        .extend(class.properties.iter().cloned().map(|mut p| {
+            p.nullable = true;
+            p
+        }));
+    let urls = class.navigation_properties.iter().filter_map(|nav| {
+        let m = members.get(&nav.name)?;
+        let many = m.shape == Shape::Url { collection: true };
+        let ty_ref = if many {
+            TypeRef::collection("Edm.String")
+        } else {
+            TypeRef::single("Edm.String")
+        };
+        let mut p = Property::new(nav.name.clone(), ty_ref);
+        p.annotations.push(iri(&m.iri));
+        Some(p)
+    });
+    ty.properties.extend(urls.collect::<Vec<_>>());
+    members.insert(
+        "observedAt".into(),
+        Member {
+            iri: OBSERVED_AT_IRI.into(),
+            shape: Shape::Value {
+                edm: "Edm.DateTimeOffset",
+                collection: false,
+            },
+            list: false,
+            json: false,
+            untyped: false,
+            written: Written::Never,
+        },
+    );
+    (ty, members)
+}
+
+/// The Capabilities of a history set (T-5908): read only, countable, filtered and sorted by
+/// its single values, no `$search` and no `$expand`.
+fn history_capabilities(members: &BTreeMap<String, Member>) -> Vec<Annotation> {
+    let record = |term: &str, members: Vec<(&str, Expr)>| {
+        Annotation::new(
+            format!("Capabilities.{term}"),
+            Expr::Record(members.into_iter().map(|(m, v)| (m.into(), v)).collect()),
+        )
+    };
+    let not_scalar = || {
+        Expr::Collection(
+            members
+                .iter()
+                .filter(|(_, m)| !m.shape.scalar())
+                .map(|(name, _)| Expr::PropertyPath(name.clone()))
+                .collect(),
+        )
+    };
+    vec![
+        record(
+            "InsertRestrictions",
+            vec![("Insertable", Expr::Bool(false))],
+        ),
+        record("UpdateRestrictions", vec![("Updatable", Expr::Bool(false))]),
+        record("DeleteRestrictions", vec![("Deletable", Expr::Bool(false))]),
+        record("CountRestrictions", vec![("Countable", Expr::Bool(true))]),
+        record(
+            "SearchRestrictions",
+            vec![("Searchable", Expr::Bool(false))],
+        ),
+        record(
+            "FilterRestrictions",
+            vec![
+                ("Filterable", Expr::Bool(true)),
+                ("NonFilterableProperties", not_scalar()),
+            ],
+        ),
+        record(
+            "SortRestrictions",
+            vec![
+                ("Sortable", Expr::Bool(true)),
+                ("NonSortableProperties", not_scalar()),
+            ],
+        ),
+        record(
+            "ExpandRestrictions",
+            vec![("Expandable", Expr::Bool(false))],
+        ),
+    ]
 }
 
 /// `edm` with one EntitySet per output of the view's `representations.odata` (docs API/11
@@ -396,16 +598,18 @@ fn own_schema(namespace: String, schema: &linkml_model::Model) -> (Schema, Strin
 /// Property with `odata_referential_constraint` gets a `ReferentialConstraint`
 /// to the target's key, when the view shows all three, the Property is
 /// not required and has the key's Edm type (CSDL XML 8.5). The Properties
-/// that hold, by CSDL name, with the target's EntitySet.
+/// that hold, by CSDL name, with the target's EntitySet, and each such
+/// navigation with its Property.
 fn constrain(
     schema: &linkml_model::Model,
     class: &str,
     visible: &BTreeMap<&str, (String, &BTreeSet<String>)>,
     ty: &mut EntityType,
     members: &BTreeMap<String, Member>,
-) -> BTreeMap<String, String> {
+) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
     let slots = schema.class_slots(class);
     let mut references = BTreeMap::new();
+    let mut bound = BTreeMap::new();
     for (name, slot) in &slots {
         let (Some(dependent), Range::Class(target)) =
             (slot.annotations.get(REFERENCE_TAG), schema.range(slot))
@@ -437,9 +641,10 @@ fn constrain(
         };
         nav.referential_constraints
             .push(ReferentialConstraint::new(property.clone(), key));
+        bound.insert(nav.name.clone(), property.clone());
         references.insert(property, set);
     }
-    references
+    (references, bound)
 }
 
 /// The EntitySet of a visible class, its key's CSDL name and Edm type: the
@@ -858,6 +1063,51 @@ fn capabilities(
         restriction("DeepInsertSupport", vec![("Supported", flag(false))]),
         restriction("DeepUpdateSupport", vec![("Supported", flag(false))]),
     ]
+    .into_iter()
+    .chain(paging(members))
+    .collect()
+}
+
+/// A key, `$top` and `$skip` on the set; below one Entity, inside
+/// `$expand(...)` too, only `$select` applies (Q31 to Q33, ADR-0024
+/// decision 5): the rest of a navigation's options are 501.
+fn paging(members: &BTreeMap<String, Member>) -> [Annotation; 4] {
+    let restricted = members
+        .iter()
+        .filter(|(_, m)| matches!(m.shape, Shape::Nav { .. }))
+        .map(|(name, _)| nested_only_select(name))
+        .collect();
+    [
+        Annotation::new(
+            "Capabilities.NavigationRestrictions",
+            Expr::Record(vec![(
+                "RestrictedProperties".into(),
+                Expr::Collection(restricted),
+            )]),
+        ),
+        Annotation::new("Capabilities.IndexableByKey", Expr::Bool(true)),
+        Annotation::new("Capabilities.TopSupported", Expr::Bool(true)),
+        Annotation::new("Capabilities.SkipSupported", Expr::Bool(true)),
+    ]
+}
+
+/// One `NavigationRestrictions` row: the navigation `name` takes `$select`
+/// and no other option. No `CountRestrictions` member: the record type in
+/// the vocabulary the .NET client ships has none and refuses `$metadata`.
+fn nested_only_select(name: &str) -> Expr {
+    let off = |member: &str| Expr::Record(vec![(member.into(), Expr::Bool(false))]);
+    Expr::Record(vec![
+        (
+            "NavigationProperty".into(),
+            Expr::NavigationPropertyPath(name.into()),
+        ),
+        ("FilterRestrictions".into(), off("Filterable")),
+        ("SearchRestrictions".into(), off("Searchable")),
+        ("SortRestrictions".into(), off("Sortable")),
+        ("TopSupported".into(), Expr::Bool(false)),
+        ("SkipSupported".into(), Expr::Bool(false)),
+        ("IndexableByKey".into(), Expr::Bool(false)),
+    ])
 }
 
 /// C18 to C20.
@@ -866,6 +1116,7 @@ fn container_capabilities() -> Vec<Annotation> {
         Annotation::new(format!("Capabilities.{term}"), Expr::Bool(value))
     };
     vec![
+        // the lowest level: the pinned suite proves none higher (docs/src/odata.md section 6)
         Annotation::new(
             "Capabilities.ConformanceLevel",
             Expr::EnumMember {
@@ -898,6 +1149,16 @@ fn container_capabilities() -> Vec<Annotation> {
             ]),
         ),
         flag("QuerySegmentSupported", true),
+        // the operators and functions a `$filter` translates, nothing else (T-5907)
+        Annotation::new(
+            "Capabilities.FilterFunctions",
+            Expr::Collection(
+                crate::functions::filter_functions()
+                    .into_iter()
+                    .map(|f| Expr::String(f.into()))
+                    .collect(),
+            ),
+        ),
         flag("CrossJoinSupported", false),
         flag("ComputeSupported", true),
         // Q19: the `$apply` transformations served (T-3937, T-3985)
@@ -1138,6 +1399,10 @@ mod tests {
                 .filter(|n| !n.referential_constraints.is_empty())
                 .map(|n| (n.name.clone(), n.referential_constraints.clone()))
                 .collect();
+            assert_eq!(
+                desc.bound.keys().collect::<Vec<_>>(),
+                navs.keys().collect::<Vec<_>>()
+            );
             (navs, desc.references.clone())
         };
         let (navs, references) = constraints(&shown(
@@ -1187,6 +1452,84 @@ mod tests {
             );
         }
         assert!(constraints(&shown(&s, &[("Desc", &every)])).0.is_empty());
+    }
+
+    #[test]
+    fn a_history_set_stands_beside_each_class_set_keyed_by_id_and_observed_at() {
+        let s = schema();
+        let shown = shown(
+            &s,
+            &[("Car", CAR_ALL), ("Person", &["name"]), ("Garage", &[])],
+        );
+        for version in [CsdlVersion::V4_01, CsdlVersion::V4_0] {
+            let edm =
+                histories(build("city-cars", &s, &shown, Writable::default(), version).unwrap());
+            odata_csdl::validate(&edm.csdl, &odata_csdl::Limits::strict()).unwrap();
+            let names: Vec<&str> = edm.histories.keys().map(String::as_str).collect();
+            assert_eq!(
+                names,
+                ["Car_history", "Person_history"],
+                "Garage shows no member"
+            );
+            let car = edm.histories.get("Car_history").unwrap();
+            let shape = |name: &str| car.members.get(name).map(|m| m.shape.clone());
+            assert_eq!(shape("drivers"), Some(Shape::Url { collection: true }));
+            assert_eq!(shape("owner"), Some(Shape::Url { collection: false }));
+            assert_eq!(car.writable, Writable::default());
+            let ty = edm
+                .csdl
+                .schemas
+                .iter()
+                .flat_map(|s| &s.entity_types)
+                .find(|t| t.name == "Car_history")
+                .unwrap();
+            assert_eq!(ty.key, ["id", "observedAt"]);
+            assert_eq!(ty.navigation_properties.len(), 0);
+            let drivers = ty.properties.iter().find(|p| p.name == "drivers").unwrap();
+            assert_eq!(drivers.ty, TypeRef::collection("Edm.String"));
+        }
+        let built = || {
+            build(
+                "city-cars",
+                &s,
+                &shown,
+                Writable::default(),
+                CsdlVersion::V4_01,
+            )
+            .unwrap()
+        };
+        let mut reserved = built();
+        let name = reserved
+            .sets
+            .get("Person")
+            .unwrap()
+            .members
+            .get("name")
+            .unwrap()
+            .clone();
+        reserved
+            .sets
+            .get_mut("Person")
+            .unwrap()
+            .members
+            .insert("observedAt".into(), name);
+        let mut taken = built();
+        let person = taken.sets.get("Person").unwrap().clone();
+        taken.sets.insert("Car_history".into(), person);
+        for (edm, kept) in [(reserved, "Car_history"), (taken, "Person_history")] {
+            let names: Vec<String> = histories(edm).histories.into_keys().collect();
+            assert_eq!(
+                names,
+                [kept],
+                "a reserved member or a taken name makes no history"
+            );
+        }
+        let mut bare = built();
+        bare.csdl.schemas.clear();
+        assert!(
+            histories(bare).histories.is_empty(),
+            "no container, no history"
+        );
     }
 
     #[test]

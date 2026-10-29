@@ -24,6 +24,8 @@ mod batch;
 mod below;
 pub mod edm;
 mod filter;
+mod functions;
+mod history;
 mod names;
 mod paths;
 mod read;
@@ -57,9 +59,22 @@ pub const SCHEMA_LIMITS: linkml_model::Limits = linkml_model::Limits {
 /// The longest request header the surface reads (`Accept`, `OData-*`).
 pub const MAX_HEADER_LEN: usize = 4096;
 
-/// The bytes of built models a pod keeps (T-3441 7.3, T-4354), each weighed
-/// by its CSDL document's XML: 256 views of one ordinary model fit.
-const MODEL_CACHE_BYTES: u64 = 64 << 20;
+/// The bytes of built models a pod keeps by default (T-3441 7.3, T-4354),
+/// each weighed by its CSDL document's XML: 64 views of one ordinary model
+/// fit. 16 MiB is this cache's share of the broker's default 200 MiB memory
+/// budget (T-5895); [`set_model_cache_bytes`] sets another share.
+pub const DEFAULT_MODEL_CACHE_BYTES: u64 = 16 << 20;
+
+static MODEL_CACHE_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(DEFAULT_MODEL_CACHE_BYTES);
+
+/// Sets the bytes of built models the pod keeps, and of the LinkML schema
+/// source the models are read from. Both caches are sized when they are
+/// first used, so the broker calls this before it serves.
+pub fn set_model_cache_bytes(models: u64, linkml_models: u64) {
+    MODEL_CACHE_BYTES.store(models, std::sync::atomic::Ordering::Relaxed);
+    linkml_model::cache::set_max_bytes(linkml_models);
+}
 
 /// The OData surface.
 #[derive(Debug, Clone, Copy, Default)]
@@ -82,6 +97,8 @@ impl Surface for OData {
     }
 
     fn router(&self, ops: Ops) -> Router {
+        // T-5912: every NGSI-LD write of a Tenant with a schema keeps to it.
+        ops.check_writes(linkml_model::check::entity_text);
         let handler = any(move |req: Request| {
             let ops = ops.clone();
             async move { serve(&ops, req).await }
@@ -284,9 +301,9 @@ async fn query_in_body(req: Request, max: usize) -> Result<Request, ODataErrorRe
 /// The key is compared whole, so two views never share a model by a
 /// collision. ponytail: no engine probe bits yet; section 4's Capabilities
 /// add them to the key when the model reads the engine.
-/// The view, what it shows, its writes, the schema revision, CSDL 4.01, and its
-/// `representations.odata` as written.
-type ModelKey = (String, edm::Shown, edm::Writable, u64, bool, String);
+/// The view, what it shows, its writes, the schema revision, CSDL 4.01, its
+/// `representations.odata` as written, and whether it offers the Temporal Query (T-5908).
+type ModelKey = (String, edm::Shown, edm::Writable, u64, bool, String, bool);
 
 /// A built model, its CSDL document and that document's `ETag`.
 type Built = (Arc<edm::Edm>, Arc<odata_csdl::Model>, Option<String>);
@@ -338,7 +355,7 @@ fn model(
 ) -> Option<Built> {
     static CACHE: LazyLock<moka::sync::Cache<ModelKey, (Built, u32)>> = LazyLock::new(|| {
         moka::sync::Cache::builder()
-            .max_capacity(MODEL_CACHE_BYTES)
+            .max_capacity(MODEL_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed))
             .weigher(|_key: &ModelKey, value: &(Built, u32)| value.1)
             .build()
     });
@@ -368,6 +385,7 @@ fn model(
         view.representation("odata")
             .map(ToString::to_string)
             .unwrap_or_default(),
+        view.allows(OperationId::TemporalQuery),
     );
     if let Some((hit, _)) = CACHE.get(&key) {
         return Some(hit);
@@ -386,6 +404,7 @@ fn model(
         .filter_map(|(_, o)| o.ok())
         .collect();
     let edm = edm::outputs(edm, &listed);
+    let edm = if key.6 { edm::histories(edm) } else { edm };
     tracing::debug!(
         view = id,
         schema_revision = revision,
@@ -447,6 +466,16 @@ fn not_found() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T-5895: the shares the broker sets are what the model caches take.
+    #[test]
+    fn the_set_shares_are_kept() {
+        set_model_cache_bytes(DEFAULT_MODEL_CACHE_BYTES, linkml_model::cache::MAX_BYTES);
+        assert_eq!(
+            MODEL_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+            DEFAULT_MODEL_CACHE_BYTES
+        );
+    }
 
     #[test]
     fn the_surface_names_its_endpoint() {

@@ -89,11 +89,8 @@ pub(crate) async fn create(
         ctx.service_root,
         Segment::Key(key.clone())
     );
-    let minimal = headers
-        .get_all("Prefer")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .any(|v| v.contains("return=minimal"));
+    let preferred = returned(headers);
+    let minimal = preferred == Some(Return::Minimal);
     let mut answer = if minimal {
         no_content(version)
     } else {
@@ -119,7 +116,41 @@ pub(crate) async fn create(
             .insert("OData-EntityId", location.clone());
     }
     answer.headers_mut().insert(LOCATION, location);
-    Ok(answer)
+    Ok(applied(answer, preferred))
+}
+
+/// The `return` preference of a write (Protocol 4.01 8.2.8.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Return {
+    Minimal,
+    Representation,
+}
+
+/// The `return` preference `Prefer` names, the first one of several.
+fn returned(headers: &HeaderMap) -> Option<Return> {
+    headers
+        .get_all("Prefer")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .find_map(|p| match p.trim().to_ascii_lowercase().as_str() {
+            "return=minimal" => Some(Return::Minimal),
+            "return=representation" => Some(Return::Representation),
+            _ => None,
+        })
+}
+
+/// `answer` with the `return` preference it honoured in `Preference-Applied` (Protocol 4.01 8.3.4).
+fn applied(mut answer: Response, preferred: Option<Return>) -> Response {
+    let value = match preferred {
+        Some(Return::Minimal) => "return=minimal",
+        Some(Return::Representation) => "return=representation",
+        None => return answer,
+    };
+    answer
+        .headers_mut()
+        .insert("Preference-Applied", HeaderValue::from_static(value));
+    answer
 }
 
 /// W1: the URN of a create that names no key and the key value it is
@@ -135,7 +166,8 @@ fn minted(set: &Set, set_name: &str) -> (String, Value) {
 }
 
 /// `PATCH` (W4) and `PUT` (W6) of an Entity: Merge or Replace Entity of
-/// the set's type, `204`. A key in the body must be the URL's; an Entity
+/// the set's type, `204`, or `200` with the Entity as the view reads it under
+/// `Prefer: return=representation`. A key in the body must be the URL's; an Entity
 /// that is absent, of another type or hidden is `404`, never created
 /// (W7).
 pub(crate) async fn change(
@@ -144,6 +176,7 @@ pub(crate) async fn change(
     ctx: &Ctx<'_>,
     (set_name, key): (&str, &Key),
     kind: WriteKind,
+    headers: &HeaderMap,
     body: &[u8],
 ) -> Result<Response, ODataErrorResponse> {
     let version = ctx.version;
@@ -182,7 +215,24 @@ pub(crate) async fn change(
         version,
     )
     .await?;
-    Ok(no_content(version))
+    let preferred = returned(headers);
+    let answer = if preferred == Some(Return::Representation) {
+        // The view reads it as any other Entity: what it hides stays out.
+        let key = canonical_key(set, &id);
+        entity(
+            reads,
+            caller,
+            ctx,
+            set_name,
+            &key,
+            &QueryOptions::default(),
+            headers,
+        )
+        .await?
+    } else {
+        no_content(version)
+    };
+    Ok(applied(answer, preferred))
 }
 
 /// A `PUT` replaces the whole Entity, and the surface serves only the default instance of an
@@ -323,6 +373,21 @@ async fn bind(
             member.iri.clone(),
             json!({"type": "Relationship", "object": urn}),
         );
+        // R6: the Property the navigation's constraint names takes the target's key.
+        let dependent = set
+            .bound
+            .get(&bind.navigation)
+            .and_then(|p| set.members.get(p));
+        let key = set_of(reads, &bind.target.set, version)?
+            .identifier
+            .as_ref()
+            .and_then(|i| urn.strip_prefix(i.prefix.as_str()));
+        if let Some((m, a)) = dependent
+            .zip(key)
+            .and_then(|(m, k)| Some((m, attribute(m, &Value::from(k))?)))
+        {
+            doc.insert(m.iri.clone(), a);
+        }
     }
     Ok(())
 }
@@ -443,6 +508,9 @@ fn invalid_key() -> BodyError {
 }
 
 pub(crate) fn body_error(error: &BodyError, version: ODataVersion) -> ODataErrorResponse {
+    if let BodyError::NotImplemented(feature) = error {
+        return crate::read::not_implemented(feature.as_str(), version);
+    }
     ODataErrorResponse {
         status: StatusCode::from_u16(error.status()).unwrap_or(StatusCode::BAD_REQUEST),
         error: ODataError::from(error),
@@ -479,6 +547,7 @@ mod tests {
             type_iri: "https://e.org/T".into(),
             identifier: None,
             references: BTreeMap::new(),
+            bound: BTreeMap::new(),
             writable: crate::edm::Writable::default(),
             members: BTreeMap::from([
                 (

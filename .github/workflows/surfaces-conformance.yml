@@ -29,7 +29,12 @@ name: surfaces-conformance
 #   sta-compliance-external  the OGC CITE ets-sta10 1.5 (TEAM Engine image
 #                    pinned by digest) against view `sta` of ci/views/sta,
 #                    red on any test ci/sta-compliance-baseline.json passes
-#                    (T-4878)
+#                    (T-4878); then the same image with the jar of the
+#                    ets-sta10 fork (pinned commit, @iot.id read as ANY,
+#                    T-5916; Level 3 setup writes nothing, T-5918) against
+#                    view `sta-ets` of ci/views/sta-ets, red on any test
+#                    ci/sta-compliance-fork-baseline.json or the official run
+#                    passes (T-5919)
 #   ws-conformance   docs/api/asyncapi-ws.yaml validated by @asyncapi/cli
 #                    2.16.0, then joinedcontext-conformance tests/ws: the
 #                    scripted sessions of /x/views/all/ws, every message
@@ -106,8 +111,10 @@ env:
   # pin/antares-surfaces, same change as conformance main 494cd93), and the
   # describe_type parity case (T-4537, T-4559; conformance main 2594d95)
   # conformance main d581c6d since T-4879: tests/ws/test_rfc6455.py (RFC 6455
-  # close handshake and protocol-error codes) joins ws-conformance
-  CONFORMANCE_REF: 184b8d8fec7f2f8f9f615eab192a72cab30462d9
+  # close handshake and protocol-error codes) joins ws-conformance;
+  # conformance main 4ab75bd since T-5905: the duration/binary literals move
+  # from REJECTED (501) to MISMATCHED (400) in tests/odata/test_parity.py
+  CONFORMANCE_REF: 4ab75bdae432ebc1ca67ad17d6b9dc8ac2a46d90
   NIGHTLY: ${{ github.event_name != 'pull_request' && !inputs.fast }}
 
 jobs:
@@ -121,7 +128,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: surfaces-conformance
-          save-if: ${{ github.event_name != 'pull_request' }}
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
       - run: cargo build --locked -p antares-broker --features full,linkml
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
@@ -378,18 +385,19 @@ jobs:
           log-file: gate.md
 
   ogc-compliance-external:
-    name: ogc-compliance-external (${{ matrix.view }})
+    name: ogc-compliance-external
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    # One run per Endpoint kind (T-3831): `all` is the conformance Tenant's star
-    # view; the others read the `ogc` Tenant of ci/views/ogc (public, internal
-    # with the Part 4 writes, filtered by q, star, projection, a data cube, the
-    # history collections of T-5100 over ci/views/ogc/history).
-    strategy:
-      fail-fast: false
-      matrix:
-        view: [all, ogc-public, ogc-internal, ogc-filtered, ogc-star, ogc-projection, ogc-cube, ogc-history]
+    timeout-minutes: 45
+    # One ETS run per Endpoint kind (T-3831): `all` is the conformance Tenant's
+    # star view; the others read the `ogc` Tenant of ci/views/ogc (public,
+    # internal with the Part 4 writes, filtered by q, star, projection, a data
+    # cube, the history collections of T-5100 over ci/views/ogc/history).
+    # One job for the eight views (T-6046): each ETS run takes ~7 s and its
+    # setup ~15 s, so eight matrix cells held eight of the account's 20
+    # runners for 30 s each. TEAM Engine starts once; every view gets a fresh
+    # broker (in-memory store) and a fresh rig, so the Part 4 writes of
+    # ogc-internal never reach another view's run. Any red view turns the job red.
     permissions:
       contents: read
       issues: write
@@ -398,60 +406,67 @@ jobs:
       # release candidate), pinned by digest; it tests Part 1 and Part 2 (CRS),
       # no ETS tests Part 4 or Part 5 yet (docs/src/ogc-compliance.md)
       TE_IMAGE: ogccite/ets-ogcapi-features10:1.8-teamengine-5.7@sha256:d884de89ac8dae6ea153766886c706f9ddf6ce172de0c4bd4bdd591d28bdaffe
-      IUT: http://localhost:9090/x/views/${{ matrix.view }}/ogc/features
-      BASELINE: ci/ogc-compliance/${{ matrix.view }}.json
+      VIEWS: all ogc-public ogc-internal ogc-filtered ogc-star ogc-projection ogc-cube ogc-history
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: broker-surfaces
-      - name: Start TEAM Engine, the broker and the views
+      - name: Start TEAM Engine
         run: |
           chmod +x antares
           # host network: TEAM Engine on 8080 reaches the broker at localhost:9090
           docker run -d --name teamengine --network host "$TE_IMAGE"
-          ANTARES_HTTP_PORT=9090 ANTARES_API_SURFACES=admin,views,ogc \
-            ANTARES_SCHEMA_MAX_BYTES=1048576 ./antares > broker.log 2>&1 &
-          for _ in $(seq 1 100); do curl -sf -o /dev/null localhost:9090/q/health && break; sleep 0.2; done
-          dev/views-rig.sh http://localhost:9090
-          dev/views-rig.sh http://localhost:9090 ci/views/ogc
           # the image's own public test account (ogctest), not a secret
           for _ in $(seq 1 60); do
             curl -fsS -m 5 -u ogctest:ogctest -o /dev/null localhost:8080/teamengine/rest/suites && break
             sleep 5
           done
-      - name: The ETS, gated by ci/ogc-compliance/<view>.json
+      - name: The ETS per view, gated by ci/ogc-compliance/<view>.json
         run: |
           dev/ogc-compliance/baseline.py --self-test
-          iut=$(jq -rn --arg u "$IUT" '$u|@uri')
-          curl -sS -m 1500 -u ogctest:ogctest -H 'Accept: application/xml' -o testng-results.xml \
-            "localhost:8080/teamengine/rest/suites/ogcapi-features-1.0/run?iut=$iut&noofcollections=-1" || true
-          set +e
-          dev/ogc-compliance/baseline.py check testng-results.xml "$BASELINE" > gate.md 2>&1
-          rc=$?
-          { echo "## OGC API - Features ETS (ets-ogcapi-features10 1.8), view ${{ matrix.view }}"; cat gate.md; } >> "$GITHUB_STEP_SUMMARY"
-          cat gate.md
-          exit $rc
+          red=
+          for view in $VIEWS; do
+            out=out/$view
+            mkdir -p "$out"
+            ANTARES_HTTP_PORT=9090 ANTARES_API_SURFACES=admin,views,ogc \
+              ANTARES_SCHEMA_MAX_BYTES=1048576 ./antares > "$out/broker.log" 2>&1 &
+            broker=$!
+            for _ in $(seq 1 100); do curl -sf -o /dev/null localhost:9090/q/health && break; sleep 0.2; done
+            dev/views-rig.sh http://localhost:9090
+            dev/views-rig.sh http://localhost:9090 ci/views/ogc
+            iut=$(jq -rn --arg u "http://localhost:9090/x/views/$view/ogc/features" '$u|@uri')
+            curl -sS -m 1500 -u ogctest:ogctest -H 'Accept: application/xml' -o "$out/testng-results.xml" \
+              "localhost:8080/teamengine/rest/suites/ogcapi-features-1.0/run?iut=$iut&noofcollections=-1" || true
+            rc=0
+            dev/ogc-compliance/baseline.py check "$out/testng-results.xml" "ci/ogc-compliance/$view.json" > "$out/gate.md" 2>&1 || rc=$?
+            { echo "## OGC API - Features ETS (ets-ogcapi-features10 1.8), view $view"; cat "$out/gate.md"; } >> "$GITHUB_STEP_SUMMARY"
+            echo "== view $view: exit $rc"
+            cat "$out/gate.md"
+            [ "$rc" = 0 ] || red="$red $view"
+            kill "$broker" 2>/dev/null || true
+            wait "$broker" || true
+            # the next view's broker binds 9090 again
+            for _ in $(seq 1 50); do curl -sf -o /dev/null localhost:9090/q/health || break; sleep 0.2; done
+          done
+          { echo "Red views:${red:- none}"; for v in $red; do echo "- $v"; done; } | tee out/red.md
+          [ -z "$red" ]
       - name: TEAM Engine log
         if: always()
-        run: docker logs teamengine > teamengine.log 2>&1 || true
+        run: docker logs teamengine > out/teamengine.log 2>&1 || true
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
-          name: ogc-compliance-external-${{ matrix.view }}
-          path: |
-            testng-results.xml
-            gate.md
-            broker.log
-            teamengine.log
+          name: ogc-compliance-external
+          path: out/
           retention-days: 14
       - name: File an issue on nightly failure
         if: failure() && github.event_name == 'schedule'
         uses: ./.github/actions/failure-issue
         with:
-          title: ogc-compliance-external (${{ matrix.view }}) went red
-          body: A test the OGC API - Features ETS passed in ci/ogc-compliance/${{ matrix.view }}.json fails now.
-          log-file: gate.md
+          title: ogc-compliance-external went red
+          body: A test the OGC API - Features ETS passed in ci/ogc-compliance/<view>.json fails now (views listed below).
+          log-file: out/red.md
 
   sta-compliance-external:
     name: sta-compliance-external
@@ -467,9 +482,32 @@ jobs:
       # Sensing 1.0; none exists for 1.1), its only image tag, pinned by digest
       TE_IMAGE: ogccite/ets-sta10:1.5-teamengine-6.0.0-RC2@sha256:e1ec8dc3508ea3355f059abee98737f5d2c00434aeffa298d80ea04361c93db3
       IUT: http://localhost:9090/x/views/sta/sta/v1.1
+      # The fork's run reads the Capability3Tests fixtures, seeded through NGSI-LD (T-5918)
+      FORK_IUT: http://localhost:9090/x/views/sta-ets/sta/v1.1
       BASELINE: ci/sta-compliance-baseline.json
+      # The fork's patches over tag 1.5: @iot.id read as ANY (15-078r6 Table 2,
+      # ets-sta10#40) and a Level 3 setup that writes nothing (T-5918),
+      # docs/src/sta-compliance.md section 4. Built by the pinned Maven image into
+      # the official image above, so the jar is the only difference.
+      FORK_REPO: marek-mraz-jc/ets-sta10
+      FORK_COMMIT: 5d5d9793c1cbae502a603f4630d1984b97044fd3
+      MAVEN_IMAGE: maven:3.9-eclipse-temurin-17@sha256:1a352420f7aba21f5ad08df31bab55f74c013fb491f1ae8ab1dd7ff9ed698584
+      FORK_BASELINE: ci/sta-compliance-fork-baseline.json
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.FORK_REPO }}
+          ref: ${{ env.FORK_COMMIT }}
+          path: ets-sta10-fork
+          persist-credentials: false
+      - name: Build the fork's jar into the official image
+        run: |
+          test "$(git -C ets-sta10-fork rev-parse HEAD)" = "$FORK_COMMIT"
+          docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD/ets-sta10-fork:/src" -w /src \
+            "$MAVEN_IMAGE" mvn -B -q -Dmaven.repo.local=/tmp/m2 -DskipTests package
+          printf 'FROM %s\nCOPY ets-sta10-1.5.jar /usr/local/tomcat/webapps/teamengine/WEB-INF/lib/ets-sta10-1.5.jar\n' \
+            "$TE_IMAGE" | docker build -t ets-sta10-fork -f - ets-sta10-fork/target
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: broker-surfaces
@@ -481,6 +519,7 @@ jobs:
           ANTARES_HTTP_PORT=9090 ANTARES_API_SURFACES=admin,views,sta ./antares > broker.log 2>&1 &
           for _ in $(seq 1 100); do curl -sf -o /dev/null localhost:9090/q/health && break; sleep 0.2; done
           dev/views-rig.sh http://localhost:9090 ci/views/sta
+          dev/views-rig.sh http://localhost:9090 ci/views/sta-ets
           # the image's own public test account (ogctest), not a secret
           for _ in $(seq 1 60); do
             curl -fsS -m 5 -u ogctest:ogctest -o /dev/null localhost:8080/teamengine/rest/suites && break
@@ -499,9 +538,33 @@ jobs:
           { echo "## SensorThings ETS (ets-sta10 1.5), view sta"; cat gate.md; } >> "$GITHUB_STEP_SUMMARY"
           cat gate.md
           exit $rc
+      - name: The fork's ETS, gated by ci/sta-compliance-fork-baseline.json and the official run
+        if: always()
+        run: |
+          docker logs teamengine > teamengine.log 2>&1 || true
+          docker rm -f teamengine
+          docker run -d --name teamengine --network host ets-sta10-fork
+          for _ in $(seq 1 60); do
+            curl -fsS -m 5 -u ogctest:ogctest -o /dev/null localhost:8080/teamengine/rest/suites && break
+            sleep 5
+          done
+          iut=$(jq -rn --arg u "$FORK_IUT" '$u|@uri')
+          curl -sS -m 1500 -u ogctest:ogctest -H 'Accept: application/xml' -o fork-testng-results.xml \
+            "localhost:8080/teamengine/rest/suites/sta10/run?iut=$iut&ics=3" || true
+          set +e
+          dev/ogc-compliance/baseline.py check fork-testng-results.xml "$FORK_BASELINE" > fork-gate.md 2>&1
+          rc=$?
+          # The patch only adds passes: every test the official image passes passes on the fork.
+          dev/ogc-compliance/baseline.py write testng-results.xml official.json > /dev/null 2>&1
+          dev/ogc-compliance/baseline.py check fork-testng-results.xml official.json > fork-gap.md 2>&1
+          gap=$?
+          { echo "## SensorThings ETS fork ($FORK_REPO@${FORK_COMMIT:0:7}), view sta-ets"; cat fork-gate.md
+            echo "### Against the official run"; cat fork-gap.md; } >> "$GITHUB_STEP_SUMMARY"
+          cat fork-gate.md fork-gap.md
+          [ "$rc" = 0 ] && [ "$gap" = 0 ]
       - name: TEAM Engine log
         if: always()
-        run: docker logs teamengine > teamengine.log 2>&1 || true
+        run: docker logs teamengine > fork-teamengine.log 2>&1 || true
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
@@ -509,15 +572,19 @@ jobs:
           path: |
             testng-results.xml
             gate.md
+            fork-testng-results.xml
+            fork-gate.md
+            fork-gap.md
             broker.log
             teamengine.log
+            fork-teamengine.log
           retention-days: 14
       - name: File an issue on nightly failure
         if: failure() && github.event_name == 'schedule'
         uses: ./.github/actions/failure-issue
         with:
           title: sta-compliance-external went red
-          body: A test the SensorThings ETS passed in ci/sta-compliance-baseline.json fails now.
+          body: A test the SensorThings ETS passed in ci/sta-compliance-baseline.json or ci/sta-compliance-fork-baseline.json fails now.
           log-file: gate.md
 
   ws-conformance:

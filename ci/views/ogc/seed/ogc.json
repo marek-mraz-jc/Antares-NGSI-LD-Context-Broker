@@ -79,6 +79,126 @@
     "scope": "/SK/BA"
   },
   {
+    "id": "urn:ngsi-ld:AirQualityObserved:ets-meridian",
+    "type": "AirQualityObserved",
+    "temperature": {
+      "type": "Property",
+      "value": 5.0,
+      "observedAt": "2026-05-01T08:00:00Z"
+    },
+    "NO2": {
+      "type": "Property",
+      "value": 30,
+      "observedAt": "2026-05-01T08:00:00Z"
+    },
+    "location": {
+      "type": "GeoProperty",
+      "value": {
+        "type": "Point",
+        "coordinates": [
+          0.1,
+          51.5
+        ]
+      }
+    }
+  },
+  {
+    "id": "urn:ngsi-ld:AirQualityObserved:ets-equator",
+    "type": "AirQualityObserved",
+    "temperature": {
+      "type": "Property",
+      "value": 5.0,
+      "observedAt": "2026-05-01T08:00:00Z"
+    },
+    "NO2": {
+      "type": "Property",
+      "value": 30,
+      "observedAt": "2026-05-01T08:00:00Z"
+    },
+    "location": {
+      "type": "GeoProperty",
+      "value": {
+        "type": "Point",
+        "coordinates": [
+          -75.0,
+          0.2
+        ]
+      }
+    }
+  },
+  {
+    "id": "urn:ngsi-ld:AirQualityObserved:ets-antimeridian",
+    "type": "AirQualityObserved",
+    "temperature": {
+      "type": "Property",
+      "value": 5.0,
+      "observedAt": "2026-05-01T08:00:00Z"
+    },
+    "NO2": {
+      "type": "Property",
+      "value": 30,
+      "observedAt": "2026-05-01T08:00:00Z"
+    },
+    "location": {
+      "type": "GeoProperty",
+      "value": {
+        "type": "Point",
+        "coordinates": [
+          179.0,
+          67.0
+        ]
+      }
+    }
+  },
+  {
+    "id": "urn:ngsi-ld:AirQualityObserved:ets-north",
+    "type": "AirQualityObserved",
+    "temperature": {
+      "type": "Property",
+      "value": 5.0,
+      "observedAt": "2026-05-01T08:00:00Z"
+    },
+    "NO2": {
+      "type": "Property",
+      "value": 30,
+      "observedAt": "2026-05-01T08:00:00Z"
+    },
+    "location": {
+      "type": "GeoProperty",
+      "value": {
+        "type": "Point",
+        "coordinates": [
+          10.0,
+          87.0
+        ]
+      }
+    }
+  },
+  {
+    "id": "urn:ngsi-ld:AirQualityObserved:ets-south",
+    "type": "AirQualityObserved",
+    "temperature": {
+      "type": "Property",
+      "value": 5.0,
+      "observedAt": "2026-05-01T08:00:00Z"
+    },
+    "NO2": {
+      "type": "Property",
+      "value": 30,
+      "observedAt": "2026-05-01T08:00:00Z"
+    },
+    "location": {
+      "type": "GeoProperty",
+      "value": {
+        "type": "Point",
+        "coordinates": [
+          -10.0,
+          -87.0
+        ]
+      }
+    }
+  },
+  {
     "id": "urn:ngsi-ld:Reading:1",
     "type": "Reading",
     "district": {

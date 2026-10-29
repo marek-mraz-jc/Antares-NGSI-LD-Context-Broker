@@ -70,9 +70,7 @@ pub(super) async fn query_temporal_outer(
         eff.insert("limit".into(), st.max_limit.to_string());
         eff.insert("id".into(), chunk.join(","));
         let resp = query_temporal_inner(st, &eff, headers, &filter).await?;
-        let bytes = axum::body::to_bytes(resp.into_body(), st.max_answer_bytes)
-            .await
-            .map_err(|_| NgsiError::TooManyResults(crate::bounds::ANSWER_TOO_LARGE.into()))?;
+        let bytes = st.read_answer(resp.into_body(), "temporal").await?;
         matching.extend(
             serde_json::from_slice::<Value>(&bytes)
                 .ok()
@@ -782,6 +780,12 @@ async fn fetch_temporal(
     let tf = antares_store::filter::TemporalFilter {
         ids: qry.ids.as_deref(),
         types: qry.types.as_deref(),
+        // the rules admit only ids these match: the store skips the rest
+        // instead of walking the type into its 10 000-row ceiling (T-6052)
+        id_patterns: qry
+            .types_rule
+            .as_deref()
+            .and_then(|r| crate::policy::shared_id_patterns(&r.rules)),
         attrs: qry.entity_attr_filter.as_deref(),
         // a condition rebuilds each instance's state from the whole
         // history; rules without one read only the window (T-4246)
@@ -1215,9 +1219,7 @@ pub(crate) async fn build_temporal_map(
     // Box::pin: build_temporal_map is reachable from query_temporal_inner
     // (entityMap=true), so this recursive edge needs indirection.
     let resp = Box::pin(query_temporal_inner(st, &eff, headers, filter)).await?;
-    let bytes = axum::body::to_bytes(resp.into_body(), st.max_answer_bytes)
-        .await
-        .map_err(|_| NgsiError::TooManyResults(crate::bounds::ANSWER_TOO_LARGE.into()))?;
+    let bytes = st.read_answer(resp.into_body(), "temporal").await?;
     // 5.5.14: the map FIXES the Entities considered by every later request, so
     // an unreadable candidate set must fail rather than become "no candidates".
     let candidates: Value = serde_json::from_slice(&bytes)

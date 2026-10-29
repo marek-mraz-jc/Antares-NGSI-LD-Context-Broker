@@ -15,6 +15,7 @@ role = "protocol"
 memchr = { version = "2", default-features = false, features = ["std"] }
 # float_roundtrip: a number in a member body reaches the member's reader with the same bits
 # (found by tests/props.rs); odata-json reads it the same way.
+serde = { version = "1", default-features = false, features = ["std"] }
 serde_json = { version = "1", default-features = false, features = ["std", "float_roundtrip"] }
 
 [dev-dependencies]

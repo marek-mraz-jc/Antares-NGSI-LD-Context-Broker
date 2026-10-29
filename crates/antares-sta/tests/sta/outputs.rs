@@ -103,10 +103,10 @@ async fn a_filtered_output_never_holds_an_entity_outside_its_filter_by_query_or_
     )
     .await;
     assert_eq!((status, ids(&series).len()), (StatusCode::OK, 3));
-    // the Device and the Stop are no source of the output: its Sensors are only the one of
-    // Datastreams whose Entity names no Device (T-5205)
+    // the Device and the Stop are no source of the output, and each of its Datastreams names a
+    // Device, so it lists no Sensor, not even the unknown one (T-5205, T-5916)
     for (set, want) in [
-        ("/Sensors", vec!["unknown".to_owned()]),
+        ("/Sensors", Vec::<String>::new()),
         (
             "/Locations?$filter=id%20eq%20'urn:ngsi-ld:Stop:1'",
             Vec::new(),

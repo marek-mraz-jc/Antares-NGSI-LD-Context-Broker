@@ -44,6 +44,7 @@ mod operation;
 pub mod outputs;
 pub mod percent;
 mod scan;
+pub mod view_cache;
 pub mod views;
 
 /// The one `GeoJSON` geometry rule of the broker (T-5208): the default instance, valid, RFC 7946
@@ -87,9 +88,9 @@ pub use antares_model::{EntityId, NgsiError, TenantId};
 /// WebSocket message never passes the HTTP bounds layer).
 pub mod bounds {
     pub use antares_api::bounds::{
-        json_depth, temporal_default_instances, temporal_instance_limit, ANSWER_TOO_LARGE,
-        DEFAULT_LIMIT, MAX_ANSWER_BYTES, MAX_BATCH_ITEMS, MAX_BODY_BYTES, MAX_JSON_DEPTH,
-        MAX_LIMIT,
+        json_depth, temporal_default_instances, temporal_instance_limit, HeldAnswer,
+        ANSWER_POOL_RETRY_SECONDS, ANSWER_TOO_LARGE, DEFAULT_LIMIT, MAX_ANSWER_BYTES,
+        MAX_BATCH_ITEMS, MAX_BODY_BYTES, MAX_JSON_DEPTH, MAX_LIMIT, MEMORY_OVERLOADED,
     };
 }
 
@@ -123,9 +124,10 @@ const LOGGED_DETAIL_BYTES: usize = 4096;
 #[derive(Clone)]
 pub struct Ops {
     state: AppState,
-    /// The narrowed handle of each view served so far, so a request does
-    /// not build the narrowed state and its in-process router anew.
-    views: Arc<Mutex<BTreeMap<String, ViewOps>>>,
+    /// The narrowed handle of each view served lately, so a request does
+    /// not build the narrowed state and its in-process router anew; an
+    /// idle one is dropped ([`view_cache`]).
+    views: Arc<Mutex<view_cache::ViewCache<ViewOps>>>,
     /// The surface these operations are run for, named on each one's log
     /// line (threat G10); `None` for the broker's own in-process forwards.
     surface: Option<Arc<str>>,
@@ -398,12 +400,28 @@ impl Ops {
     /// ([`bounds::MAX_ANSWER_BYTES`]): the page size bounds the Entities, not the
     /// bytes, and every concurrent request holds its buffer.
     ///
+    /// The answer holds its share of the broker's buffered-answer pool until
+    /// it drops (T-5895).
+    ///
     /// # Errors
-    /// [`Refusal::Limit`] with [`bounds::ANSWER_TOO_LARGE`] past the bound.
-    pub async fn read_answer(&self, body: Body) -> Result<axum::body::Bytes, Refusal> {
-        axum::body::to_bytes(body, self.state.max_answer_bytes)
+    /// [`Refusal::Limit`] with [`bounds::ANSWER_TOO_LARGE`] past the bound,
+    /// [`Refusal::Overloaded`] while the pool has no room.
+    pub async fn read_answer(
+        &self,
+        body: Body,
+        surface: &'static str,
+    ) -> Result<bounds::HeldAnswer, Refusal> {
+        self.state
+            .read_answer(body, surface)
             .await
-            .map_err(|_| Refusal::Limit(bounds::ANSWER_TOO_LARGE))
+            .map_err(|r| match r {
+                antares_api::bounds::AnswerRefusal::OverBudget => Refusal::Overloaded {
+                    retry_after: Some(HeaderValue::from(
+                        antares_api::bounds::ANSWER_POOL_RETRY_SECONDS,
+                    )),
+                },
+                _ => Refusal::Limit(bounds::ANSWER_TOO_LARGE),
+            })
     }
 
     /// The operations of the loaded view `id`, or `None` when no view of
@@ -444,27 +462,37 @@ impl Ops {
             None => None,
             Some(a) => Some(a.0.clone().downcast::<mapping::Mapping>().ok()?),
         };
-        let mut cache = self.views.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(hit) = cache.get(id).filter(|c| Arc::ptr_eq(&c.view, view)) {
-            return Some(hit.clone());
-        }
-        let made = ViewOps {
-            inner: Self::new(self.state.with_view(view.clone()), self.surface.clone()),
-            view: view.clone(),
-            tenant,
-            operations: operations
-                .iter()
-                .filter_map(|o| OperationId::from_id(o))
-                .collect(),
-            mapping,
-            names: Arc::new(names::of_view(context.as_deref())?),
-            representations: representations.clone(),
+        let build = || {
+            Some(ViewOps {
+                inner: Self::new(self.state.with_view(view.clone()), self.surface.clone()),
+                view: view.clone(),
+                tenant,
+                operations: operations
+                    .iter()
+                    .filter_map(|o| OperationId::from_id(o))
+                    .collect(),
+                mapping,
+                names: Arc::new(names::of_view(context.as_deref())?),
+                representations: representations.clone(),
+            })
         };
         // Only views loaded now stay cached: a removed one goes with the
-        // first view served after its removal.
-        cache.retain(|k, _| table.contains_key(k));
-        cache.insert(id.to_owned(), made.clone());
-        Some(made)
+        // next sweep. A changed view is a new `CompiledView`, so a handle
+        // of the old one is never served again.
+        let (made, gone) = self
+            .views
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_build(
+                id,
+                |held| Arc::ptr_eq(&held.view, view),
+                |k| table.contains_key(k),
+                std::time::Instant::now(),
+                view_cache::idle(),
+                build,
+            );
+        view_cache::release(gone);
+        made
     }
 
     /// Run `op` as the caller of the outer request.
@@ -612,8 +640,12 @@ impl ViewOps {
     ///
     /// # Errors
     /// [`Refusal::Limit`] past the bound.
-    pub async fn read_answer(&self, body: Body) -> Result<axum::body::Bytes, Refusal> {
-        self.inner.read_answer(body).await
+    pub async fn read_answer(
+        &self,
+        body: Body,
+        surface: &'static str,
+    ) -> Result<bounds::HeldAnswer, Refusal> {
+        self.inner.read_answer(body, surface).await
     }
 
     /// Whether the view allows `op`.
@@ -630,6 +662,15 @@ impl ViewOps {
         self.inner
             .forward_through(Some(self.view.id()), req, self_url)
             .await
+    }
+
+    /// A handle on the view compilation this request reads through (T-5909): it compares
+    /// equal ([`std::sync::Weak::ptr_eq`]) only to the same compilation, so a surface cache
+    /// keyed by it is not served after the view's rules change.
+    #[must_use]
+    pub fn generation(&self) -> std::sync::Weak<dyn std::any::Any + Send + Sync> {
+        let any: Arc<dyn std::any::Any + Send + Sync> = self.view.clone();
+        Arc::downgrade(&any)
     }
 
     /// The one Tenant the view serves (ADR-0023 rule 10).
@@ -1280,6 +1321,13 @@ impl Ops {
     pub fn add_admin(&self, routes: Router) {
         self.state.views.add_admin(routes);
     }
+
+    /// Hold every NGSI-LD write of a Tenant with a schema to `check`
+    /// (T-5912, [`antares_api::schema_writes`]): a surface that reads
+    /// schemas registers it; the first registration holds.
+    pub fn check_writes(&self, check: antares_api::schema_writes::SchemaCheck) {
+        self.state.views.schema_writes.set(check);
+    }
 }
 
 /// A surface as the broker mounts it: closed, every route 404, while no
@@ -1484,6 +1532,20 @@ pub mod test_kit {
         pub async fn with_max_answer_bytes(bytes: usize) -> Result<Self, String> {
             let mut state = AppState::new("antares-test".into());
             state.max_answer_bytes = bytes;
+            antares_api::wire(&mut state).await;
+            let reload = crate::views::install(&state).await?;
+            Ok(Self { state, reload })
+        }
+
+        /// [`TestBroker::new`] whose buffered answers share a pool of `bytes`
+        /// (the memory budget's share otherwise, T-5895), so a test fills it
+        /// without holding 64 MiB.
+        ///
+        /// # Errors
+        /// The view table's.
+        pub async fn with_answer_pool(bytes: usize) -> Result<Self, String> {
+            let mut state = AppState::new("antares-test".into());
+            state.answer_pool = antares_api::bounds::AnswerPool::new(bytes);
             antares_api::wire(&mut state).await;
             let reload = crate::views::install(&state).await?;
             Ok(Self { state, reload })

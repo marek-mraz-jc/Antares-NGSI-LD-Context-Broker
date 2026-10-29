@@ -181,6 +181,38 @@ Entity outside it answers the 404 of an absent one. The class's own set and an
 Entity's `_types` stay as they were. An output whose class the model does not
 show, or whose name a class's set already takes, serves nobody.
 
+### 2.2 History sets
+
+A view that offers `temporal_query` serves, beside each class's EntitySet
+`{Set}`, a read-only EntitySet `{Set}_history` (T-5908), the OData form of
+the OGC `{type}-history` collections (`ogc.md` section 7). `-` is no
+SimpleIdentifier character (CSDL XML 17.2), so the name takes `_`.
+
+- One row per Entity and stored `observedAt`, keyed by both:
+  `Car_history(id='urn:ngsi-ld:Car:7',observedAt=2026-10-01T10:05:00Z)`.
+- Its members are the class's, nullable, a navigation as its object URIs:
+  each holds the Attribute's latest default instance (no `datasetId`) at or
+  before the row's `observedAt`, so a row of a label change still holds the
+  speed observed earlier. An Attribute the view or the Policy hides makes no
+  row and holds no value; an instance without `observedAt` is in no row.
+- Every read is the view's Query Temporal Evolution of Entities (`attrs` the
+  members, `lastN=1000`, the broker's default instance ceiling), so the view's
+  rules and the Policy narrow the history as they narrow the current state.
+- `$filter` is evaluated over each row; its top-level bounds on `observedAt`
+  narrow the read: `ge`, `gt` or `eq` give `timeAt` (`timerel=after`), `lt`
+  gives `endTimeAt` (`between`) or `timeAt` (`before`). A lower bound adds one
+  `timerel=before&lastN=1` read, so the first rows of the window hold the
+  values valid then. An `id eq` conjunct is the read's `id`.
+- Rows come in Entity order, then `observedAt` ascending; `$top`, `$skip`
+  and `odata.maxpagesize` page them. `$count`, `/$count` and an `$orderby`
+  other than `id, observedAt` read the whole answer, at most 10 000 rows
+  kept and 1 000 Entities read, so a `$filter` keeping no row still stops
+  there (`400 TooManyResults` past either: narrow by `id` or `observedAt`).
+- `$select` takes members; `$expand`, `$search`, `$apply` and `$compute` are
+  `501`, an `ngsild.` option `400`, every write `405`.
+- Unlike the OGC history, a GeoProperty written without `observedAt` is in
+  no row, and a row has no `validTo`: a window's upper bound would cut it.
+
 ## 3. Writes
 
 Each write is one NGSI-LD operation of the view, gated like a read, and
@@ -192,8 +224,8 @@ Attribute comes from the model, never from the shape of a value.
 |---|---|
 | `POST {Set}` | Create Entity of the set's type, `id` from the body; `201` with the Entity as the view reads it and `Location`, or `204` and `OData-EntityId` under `Prefer: return=minimal` |
 | `nav@odata.bind` (4.0), `nav: {"@id": …}` (4.01) | a Relationship; the target is read first with Retrieve Entity under the view |
-| `PATCH {Set}('{id}')` | Merge Entity `?type=`: a `null` is the NGSI-LD Null and deletes the Attribute; `204` |
-| `PUT {Set}('{id}')` | Replace Entity `?type=`: what the body omits is removed; `204`. The Entity is read under the view first: one holding an Attribute instance with a `datasetId` is `409` (the surface does not serve those instances, so a replace would delete them unseen; `PATCH` keeps them), and one holding an Attribute the view hides is refused by the view (threat-model D6) (T-5206) |
+| `PATCH {Set}('{id}')` | Merge Entity `?type=`: a `null` is the NGSI-LD Null and deletes the Attribute; `204`, or `200` with the Entity as the view reads it under `Prefer: return=representation`; a `return` preference is echoed in `Preference-Applied`. A bind of a navigation with a `ReferentialConstraint` also sets the constrained Property to the target's key |
+| `PUT {Set}('{id}')` | Replace Entity `?type=`: what the body omits is removed; `204` (`Prefer: return=` as for `PATCH`). The Entity is read under the view first: one holding an Attribute instance with a `datasetId` is `409` (the surface does not serve those instances, so a replace would delete them unseen; `PATCH` keeps them), and one holding an Attribute the view hides is refused by the view (threat-model D6) (T-5206) |
 | `DELETE {Set}('{id}')` | Delete Entity `?type=`; `204` |
 | `PUT {Set}('{id}')/{prop}` | Replace Attribute `?type=` in the member's kind; `404` when the Entity does not hold it (a `PATCH` of the Entity adds it); `204` |
 | `PATCH {Set}('{id}')/{prop}` | Partial Attribute Update `?type=`; `null` is the NGSI-LD Null; `204` |
@@ -326,7 +358,20 @@ refuse (`NonFilterableProperties`, `NonSortableProperties`), `Expandable`
 one level, no upsert, deep insert or deep update, and `Searchable`. The
 container declares `QuerySegmentSupported`, `ComputeSupported`,
 `BatchSupported` and `BatchSupport` (`multipart/mixed` and `application/json`, continue on
-error, no Content-ID references; T-3723). The annotations are advisory:
+error, no Content-ID references; T-3723). Since T-5907 each EntitySet also
+declares `IndexableByKey`, `TopSupported` and `SkipSupported`, and
+`NavigationRestrictions` gives each navigation property `$select` and no
+other option (`Filterable`, `Searchable`, `Sortable`,
+`TopSupported`, `SkipSupported` and `IndexableByKey` false), as a path below
+one Entity and an `$expand(...)` serve it; the record carries no
+`CountRestrictions`, which the Capabilities vocabulary of the .NET client
+(Microsoft.OData.Edm) lacks and refuses as an extra property; `ExpandRestrictions` `MaxLevels`
+is 1. The container's `FilterFunctions` lists exactly the operators and
+functions a `$filter` translates (`eq` to `mod`, `in`, `any`, `all` and the
+functions of section 4); a name outside it is `501`. `ConformanceLevel` is
+`Minimal`, the lowest level of the enumeration: the pinned suite measures
+Minimal at 85.0 %, Intermediate at 79.8 % and Advanced at 61.1 % (T-5906),
+so no higher level is proven (`odata-compliance.md` section 5). The annotations are advisory:
 every request is still gated, and a read the engine denies is `403`
 whatever they say.
 
@@ -351,8 +396,8 @@ write forms of later rounds are `501`.
 
 These NGSI-LD features have no OData mapping and are not served (T-5206 finding 16):
 
-- temporal representations and history: the surface reads current state only; a later
-  `{Set}('id')/<prop>/history` bound function would need its own operation row;
+- temporal representations: history is served only as the `{Set}_history` sets (section 2.2),
+  never as `temporalValues` or aggregated values;
 - `deletedAt`, `expiresAt` and `ngsildproof`: system and proof members outside the EDM base type;
 - the full LanguageMap: one text per read (`ngsild.lang` or `@none`); writing a LanguageProperty is `400`;
 - named instances (`datasetId`): only the default instance; no `_datasets` member;
@@ -364,6 +409,25 @@ These NGSI-LD features have no OData mapping and are not served (T-5206 finding 
 
 A change of the view's `@context` renames no member (names come from the slot names); a change
 of the schema can, and `@odata.metadataEtag` is then the only signal.
+
+A `501 NotImplemented` names the construct and the reason in a fixed
+message, `<construct>: no NGSI-LD equivalent (ADR-0024 decision 5)`; the
+construct is one of these names, never a request value
+(`tests/odata_refused.rs` sends one request per row):
+
+| Construct | Where it comes from |
+|---|---|
+| `$index`, `$deltatoken`, `$root`, `$it and $this`, `$each`, `$crossjoin and $all` | URL options and resources ADR-0024 decision 5 leaves out |
+| `type cast or bound operation` | a qualified segment: a cast, a derived type, an action or a function |
+| `$filter path segment`, `ordinal index`, `media resource`, `non-ASCII identifier` | path forms with no NGSI-LD resource |
+| `nested query option`, `nested $count`, `a nested $expand, $levels or a path in $expand`, `annotation path`, `* after a path in $expand` | options inside `$expand(...)` past `$select` (section 5) |
+| `$select of a navigation, a path or an annotation` | a `$select` item that is not a plain member |
+| `method call`, `has operator`, `cast and isof`, `in over a non-literal`, `literal type`, `JSON literal`, `key or filter in an expression path`, `parameter alias bound to an expression` | `$filter` forms the parser does not take (section 4) |
+| `this $filter expression`, `this $orderby expression`, `this $compute expression`, `this $apply expression` | a parsed expression the translation to `q` and the residual cannot hold |
+| `$apply transformation`, `search after aggregate in $apply`, `$apply beside another query option, under /$ref or /$count`, `$apply under /$count` | `$apply` outside section 2's list |
+| `$filter, $search or $apply on one Entity`, `a query option other than $select below one Entity`, `a path to a system member`, `/$value of a non-primitive value`, `this resource path`, `$id outside $entity`, `a $schemaversion other than the served one` | reads below one Entity and resource options |
+| `a write to a whole entity set (delta update)`, `a write to /$value`, `a write appending to a collection property`, `a write to this resource path`, `removing one object of a Relationship`, `deep insert`, `deep update`, `binding a collection-valued navigation property`, `binding a navigation property to null`, `a conditional write (If-Match, If-None-Match)`, `a query option on a write` | write forms of section 3 |
+| `change sets`, `atomicity groups`, `references to another member's result`, `this method in a batch`, `binary member bodies` | `$batch` forms of section 3.1 |
 
 An error is `{"error": {"code", "message"}}` with a fixed message: it
 names no hidden type or Attribute, echoes no literal of the request and

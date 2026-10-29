@@ -202,9 +202,10 @@ async fn datastreams_are_one_per_measured_instance_and_a_hidden_attribute_has_no
 async fn sensors_are_the_shown_devices_the_entities_point_at() -> Result<(), String> {
     let f = fixture().await?;
     let a = sta(&f.app, "/Sensors").await;
-    // T-5205 finding 7: the Sensor of the Datastreams that name no Device comes first.
-    assert_eq!(ids(&a.body), ["unknown", "urn:ngsi-ld:Device:1"]);
-    assert_eq!(at(&a.body, "/value/1/metadata"), json!(["speed"]));
+    // T-5205 finding 7: the Sensor of the Datastreams that name no Device comes first, and only
+    // while one does (T-5916): every Entity of `city` with a Datastream names a Device.
+    assert_eq!(ids(&a.body), ["urn:ngsi-ld:Device:1"]);
+    assert_eq!(at(&a.body, "/value/0/metadata"), json!(["speed"]));
     let one = sta(&f.app, "/Sensors('urn:ngsi-ld:Device:1')").await;
     assert_eq!(at(&one.body, "/name"), "radar 1");
     assert_eq!(
@@ -216,14 +217,11 @@ async fn sensors_are_the_shown_devices_the_entities_point_at() -> Result<(), Str
         StatusCode::NOT_FOUND
     );
     // T-5205 finding 8: a Sensor's name is no Entity Attribute this surface filters on.
+    // T-5918: it is judged over the Sensors the view answered.
     let none = sta(&f.app, "/Sensors?$filter=name eq 'Hlavná'").await;
-    assert_eq!(
-        (none.status, at(&none.body, "/error/message")),
-        (
-            StatusCode::BAD_REQUEST,
-            json!("$filter: name is not a property Sensors are filtered on")
-        )
-    );
+    assert_eq!((none.status, ids(&none.body).len()), (StatusCode::OK, 0));
+    let radar = sta(&f.app, "/Sensors?$filter=name eq 'radar 1'").await;
+    assert_eq!(ids(&radar.body), ["urn:ngsi-ld:Device:1"]);
     Ok(())
 }
 

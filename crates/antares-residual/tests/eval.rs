@@ -3,8 +3,8 @@
 //! with its unknown and mistyped rows (ADR-0028 rules 2 and 7).
 
 use ngsild_residual::{
-    compile, eval, Cmp, Date, DateTime, Error, Expr, Func, Lit, Member, Path, Program, Time, Truth,
-    MAX_DEPTH, MAX_NODES, MAX_STRING_BYTES,
+    compile, eval, Cmp, Date, DateTime, Duration, Error, Expr, Func, Lit, Member, Path, Program,
+    Time, Truth, MAX_DEPTH, MAX_NODES, MAX_STRING_BYTES,
 };
 use serde_json::{json, Value};
 
@@ -758,4 +758,111 @@ fn a_value_is_json_of_its_kind_and_unknown_is_none() {
         Box::new(Expr::Lit(Lit::Int(10))),
     );
     assert_eq!(value(over), Ok(Some(json!(true))));
+}
+
+/// T-5905: a duration, bytes and a time NGSI-LD stores as text compare as the values they spell
+/// (`OData` `Edm.Duration`, `Edm.Binary`, `Edm.TimeOfDay`), and `InRange` is a narrowing cast.
+#[test]
+fn durations_bytes_and_times_stored_as_text_compare_as_values() {
+    let stored = json!({
+        "id": "urn:ngsi-ld:Product:1", "type": "Product",
+        "ship": {"type": "Property", "value": "P1DT2H30M"},
+        "back": {"type": "Property", "value": "-P1D"},
+        "data": {"type": "Property", "value": "dGVzdA=="},
+        "opens": {"type": "Property", "value": "09:30:00Z"},
+        "junk": {"type": "Property", "value": "soon"},
+        "status": {"type": "Property", "value": 300}
+    });
+    let d = |t: &str| Lit::Duration(Duration::parse(t).unwrap_or_else(|| unreachable!("{t}")));
+    let cmp = |op, attr: &str, lit: Lit| Expr::Cmp(op, Box::new(p(attr)), Box::new(Expr::Lit(lit)));
+    for (e, want) in [
+        (cmp(Cmp::Eq, "ship", d("PT95400S")), Truth::True),
+        (cmp(Cmp::Gt, "ship", d("P1D")), Truth::True),
+        (cmp(Cmp::Lt, "ship", d("PT1H")), Truth::False),
+        (cmp(Cmp::Eq, "back", d("-PT24H")), Truth::True),
+        (cmp(Cmp::Eq, "junk", d("P1D")), Truth::Unknown),
+        (
+            cmp(Cmp::Eq, "data", Lit::Binary(b"test".to_vec())),
+            Truth::True,
+        ),
+        (
+            cmp(Cmp::Ne, "data", Lit::Binary(vec![1, 2, 3])),
+            Truth::True,
+        ),
+        (cmp(Cmp::Eq, "opens", Lit::Binary(vec![])), Truth::Unknown),
+        (
+            cmp(
+                Cmp::Eq,
+                "opens",
+                Lit::Time(Time::parse("09:30:00").unwrap_or_else(|| unreachable!())),
+            ),
+            Truth::True,
+        ),
+    ] {
+        assert_eq!(on(&e, &stored), want, "{e:?}");
+    }
+    let narrowed = |low, high| {
+        Expr::Call(
+            Func::InRange,
+            vec![
+                p("status"),
+                Expr::Lit(Lit::Int(low)),
+                Expr::Lit(Lit::Int(high)),
+            ],
+        )
+    };
+    let is_null = |e: Expr| Expr::IsNull(Box::new(e));
+    assert_eq!(on(&is_null(narrowed(0, 255)), &stored), Truth::True);
+    assert_eq!(on(&is_null(narrowed(-32768, 32767)), &stored), Truth::False);
+    assert_eq!(on(&is_null(narrowed(400, 500)), &stored), Truth::True);
+    // a duration or bytes compare with nothing but text that spells one
+    let pm10 =
+        json!({"id": "urn:ngsi-ld:P:2", "type": "P", "pm10": {"type": "Property", "value": 12}});
+    assert_eq!(on(&cmp(Cmp::Eq, "pm10", d("P1D")), &pm10), Truth::Unknown);
+    assert_eq!(
+        on(&cmp(Cmp::Eq, "pm10", Lit::Binary(vec![12])), &pm10),
+        Truth::Unknown
+    );
+    // and read back as their text
+    for (lit, text) in [
+        (d("P1DT2H30M"), "P1DT2H30M"),
+        (Lit::Binary(b"test".to_vec()), "dGVzdA"),
+    ] {
+        let value = compile(&Expr::Lit(lit), now()).and_then(|p| p.value(&pm10));
+        assert_eq!(value, Ok(Some(json!(text))));
+    }
+    for text in [
+        "PT1.5S",
+        "P1DT2H30M",
+        "PT2H",
+        "PT30M",
+        "PT45S",
+        "P2DT0.000001S",
+    ] {
+        assert_eq!(
+            Duration::parse(text).map(|d| d.to_string()),
+            Some(text.into())
+        );
+    }
+    assert_eq!(
+        Duration::parse("-P1D").map(|d| d.to_string()),
+        Some("-P1D".into())
+    );
+    assert_eq!(
+        Duration::parse("P0D").map(|d| d.to_string()),
+        Some("PT0S".into())
+    );
+    for bad in [
+        "P",
+        "PT",
+        "P1Y",
+        "P1M",
+        "PT1S2H",
+        "1D",
+        "P1DT",
+        "PT.5S",
+        "PT99999999999999999999S",
+    ] {
+        assert_eq!(Duration::parse(bad), None, "{bad}");
+    }
 }

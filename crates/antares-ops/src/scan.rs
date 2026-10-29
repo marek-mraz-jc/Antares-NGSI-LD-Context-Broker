@@ -98,13 +98,40 @@ impl ViewOps {
         match residual {
             None => self.direct(caller, pushdown, page).await,
             Some(program) => {
-                let upstream = self.inner.state.max_limit;
-                let filled = self
-                    .fill(caller, pushdown, program, page, (RESIDUAL_SCAN, upstream))
-                    .await?;
-                Ok(filled.0)
+                let mut budget = RESIDUAL_SCAN;
+                self.scan_within(caller, pushdown, program, page, &mut budget)
+                    .await
             }
         }
+    }
+
+    /// [`ViewOps::scan`] with a residual and at most `budget` upstream Entities read, less
+    /// what it read: a surface reading one page in several scans carries the one
+    /// [`RESIDUAL_SCAN`] budget across them (T-6036).
+    ///
+    /// # Errors
+    /// As [`ViewOps::scan`], [`Refusal::TooManyResults`] against `budget`.
+    pub async fn scan_within(
+        &self,
+        caller: &Caller,
+        pushdown: &Pushdown,
+        residual: &Program,
+        page: Page,
+        budget: &mut usize,
+    ) -> Result<Scanned, Refusal> {
+        let upstream = self.inner.state.max_limit;
+        let (scanned, read) = self
+            .fill(caller, pushdown, residual, page, (*budget, upstream))
+            .await?;
+        *budget = budget.saturating_sub(read);
+        Ok(scanned)
+    }
+
+    /// The most Entities one upstream Query Entities answers (the broker's `max_limit`, at
+    /// least 1): the page a surface streaming its answer reads at a time (T-6036).
+    #[must_use]
+    pub fn page_size(&self) -> usize {
+        self.inner.state.max_limit.max(1)
     }
 
     /// The pushdown alone: [`ViewOps::run`] in upstream pages of the broker's `max_limit`
@@ -381,7 +408,7 @@ async fn read(view: &ViewOps, answer: Response) -> Result<Result<Upstream, Respo
         .get("NGSILD-Results-Count")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok());
-    let bytes = view.read_answer(answer.into_body()).await?;
+    let bytes = view.read_answer(answer.into_body(), "scan").await?;
     match serde_json::from_slice(&bytes).ok() {
         Some(Value::Array(entities)) => Ok(Ok((entities, total, truncated))),
         _ => Err(Refusal::Malformed(

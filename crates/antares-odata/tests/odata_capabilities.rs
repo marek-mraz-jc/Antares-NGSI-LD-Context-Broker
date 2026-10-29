@@ -23,8 +23,9 @@ const SCHEMA: &str = r#"{
   "id": "https://example.org/city", "name": "city",
   "prefixes": {"city": {"prefix_prefix": "city", "prefix_reference": "https://example.org/city/"}},
   "default_prefix": "city",
-  "classes": {"Car": {"slots": ["speed", "tags", "doc", "brand"]}},
+  "classes": {"Car": {"slots": ["speed", "tags", "doc", "brand", "location"]}},
   "slots": {"speed": {"range": "float"}, "doc": {}, "brand": {"range": "string"},
+            "location": {"annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "GeoProperty"}}},
             "tags": {"annotations": {"ngsi_ld_kind": {"tag": "ngsi_ld_kind", "value": "ListProperty"}}}}
 }"#;
 
@@ -83,7 +84,7 @@ async fn broker(deny: bool) -> Result<(TestBroker, Router), String> {
     let view = json!({
         "id": "cars", "tenant": "city", "@context": {"city": "https://example.org/city/"},
         "selector": ["city:Car"],
-        "rules": [{"types": ["city:Car"], "attributes": ["city:speed", "city:tags", "city:doc", "city:brand"]}],
+        "rules": [{"types": ["city:Car"], "attributes": ["city:speed", "city:tags", "city:doc", "city:brand", "city:location"]}],
         "operations": ["query_entities", "retrieve_entity"]
     })
     .to_string();
@@ -320,5 +321,112 @@ async fn head_passes_the_gate_the_get_does() {
         let (status, _, body) = fetch(&app, Method::HEAD, &uri).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
         assert!(body.is_empty(), "{path}: {body:?}");
+    }
+}
+
+/// The strings of the collection annotation `term` on the container.
+fn strings(xml: &str, term: &str) -> Vec<String> {
+    let Some(at) = xml.find(&format!(r#"Term="Capabilities.{term}""#)) else {
+        return Vec::new();
+    };
+    let annotation = xml
+        .get(at..)
+        .unwrap_or_default()
+        .split("</Annotation>")
+        .next()
+        .unwrap_or_default();
+    annotation
+        .split("<String>")
+        .skip(1)
+        .filter_map(|s| s.split("</String>").next())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `Capabilities.FilterFunctions` lists exactly what a `$filter` serves
+/// (T-5907): each name, used once, is answered 200, and the list is this
+/// one, so a function the evaluator gains turns this red until the list
+/// and docs/src/odata.md name it.
+#[tokio::test(flavor = "multi_thread")]
+async fn filter_functions_are_the_served_operators_and_functions() {
+    const SERVED: &[(&str, &str)] = &[
+        ("eq", "speed eq 3"),
+        ("ne", "speed ne 4"),
+        ("gt", "speed gt 2"),
+        ("ge", "speed ge 3"),
+        ("lt", "speed lt 4"),
+        ("le", "speed le 3"),
+        ("and", "speed gt 2 and speed lt 4"),
+        ("or", "speed gt 9 or speed lt 4"),
+        ("not", "not (speed gt 4)"),
+        ("in", "speed in (3,4)"),
+        ("add", "speed add 1 eq 4"),
+        ("sub", "speed sub 1 eq 2"),
+        ("mul", "speed mul 2 eq 6"),
+        ("div", "speed div 3 eq 1"),
+        ("divby", "speed divby 3 eq 1"),
+        ("mod", "speed mod 2 eq 1"),
+        ("any", "tags/any(t:t eq 'a')"),
+        ("all", "tags/all(t:t eq 'a')"),
+        ("contains", "contains(brand,'a')"),
+        ("startswith", "startswith(brand,'a')"),
+        ("endswith", "endswith(brand,'a')"),
+        (
+            "geo.intersects",
+            "geo.intersects(location,geography'SRID=4326;Polygon((0 0,1 0,1 1,0 1,0 0))')",
+        ),
+        ("concat", "concat(brand,'x') eq 'ax'"),
+        ("indexof", "indexof(brand,'a') eq 0"),
+        ("length", "length(brand) eq 1"),
+        ("matchesPattern", "matchesPattern(brand,'%5Ea')"),
+        ("substring", "substring(brand,1) eq 'a'"),
+        ("tolower", "tolower(brand) eq 'a'"),
+        ("toupper", "toupper(brand) eq 'A'"),
+        ("trim", "trim(brand) eq 'a'"),
+        ("year", "year(now()) gt 2000"),
+        ("month", "month(now()) ge 1"),
+        ("day", "day(now()) ge 1"),
+        ("hour", "hour(now()) ge 0"),
+        ("minute", "minute(now()) ge 0"),
+        ("second", "second(now()) ge 0"),
+        ("fractionalseconds", "fractionalseconds(now()) ge 0"),
+        ("totaloffsetminutes", "totaloffsetminutes(now()) eq 0"),
+        ("date", "date(now()) gt 2000-01-01"),
+        ("time", "time(now()) ge 00:00:00"),
+        ("now", "now() gt 2000-01-01T00:00:00Z"),
+        ("mindatetime", "mindatetime() lt now()"),
+        ("maxdatetime", "maxdatetime() gt now()"),
+        ("round", "round(speed) eq 3"),
+        ("floor", "floor(speed) eq 3"),
+        ("ceiling", "ceiling(speed) eq 3"),
+    ];
+    let (_b, app) = broker(false).await.expect("broker");
+    let (status, xml) = send(&app, Method::GET, &format!("{ROOT}/$metadata"), None).await;
+    assert_eq!(status, StatusCode::OK, "{xml}");
+    assert_eq!(
+        strings(&xml, "FilterFunctions"),
+        SERVED.iter().map(|(f, _)| *f).collect::<Vec<_>>(),
+        "{xml}"
+    );
+    for (function, filter) in SERVED {
+        let uri = format!("{ROOT}/Car?$filter={}", filter.replace(' ', "%20"));
+        let (status, body) = send(&app, Method::GET, &uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{function}: {uri}: {body}");
+    }
+    // a function the list leaves out is refused, named
+    let uri = format!("{ROOT}/Car?$filter=geo.distance(location,location)%20lt%201");
+    let (status, body) = send(&app, Method::GET, &uri, None).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert!(
+        body.contains("method call: no NGSI-LD equivalent"),
+        "{body}"
+    );
+    for annotation in [
+        r#"<Annotation Term="Capabilities.IndexableByKey" Bool="true"/>"#,
+        r#"<Annotation Term="Capabilities.TopSupported" Bool="true"/>"#,
+        r#"<Annotation Term="Capabilities.SkipSupported" Bool="true"/>"#,
+        r#"<Annotation Term="Capabilities.ConformanceLevel" EnumMember="Capabilities.ConformanceLevelType/Minimal"/>"#,
+    ] {
+        assert!(xml.contains(annotation), "{annotation}: {xml}");
     }
 }

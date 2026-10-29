@@ -749,3 +749,27 @@ function = "Session::drain"
 lines = 2
 branches = 2
 reason = "the queue overflowing while the session drains it at once (an MQTT connection is never detached, so the queue only overflows under a burst faster than in-process reads), and a PUBLISH failing inside it (Session::publish)"
+
+[[exclusion]]
+crate = "antares-odata"
+file = "src/history.rs"
+function = "antares_odata::history::rows"
+lines = 1
+branches = 0
+reason = "the residual refuses an evaluation past MAX_STEPS (2^20 nodes visited) as TooComplexQuery; a history row is one Entity's state, so no test filter reaches that bound (tests/odata_history.rs covers every other path of rows)"
+
+[[exclusion]]
+crate = "antares-odata"
+file = "src/history.rs"
+function = "antares_odata::history::batch"
+lines = 1
+branches = 0
+reason = "the `?` that carries rows()'s TooComplexQuery refusal out, the evaluator bound of the history::rows entry above"
+
+[[exclusion]]
+crate = "antares-odata"
+file = "src/history.rs"
+function = "antares_odata::history::key_of"
+lines = 1
+branches = 0
+reason = "odata-url types each key value, an alias's too, against the history EntityType (id Edm.String, observedAt Edm.DateTimeOffset) and answers 404 first; tests/odata_history.rs sends an Int alias and a single key"

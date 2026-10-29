@@ -245,6 +245,36 @@ alone() { # <crate> <fn>: the test by its full path, in a process of its own
 
 target=$(python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])' <<< "$meta")
 
+# workspace.yml's postgis service, for the crates whose pg tests skip without
+# ANTARES_TEST_DATABASE_URL: the same image (PostgreSQL 16, the major dev and
+# prod run, T-6021) on a port docker picks, removed when the run ends
+pg_name=preflight-pg-$$
+postgis() {
+  local image port i
+  image=$(sed -n 's/^ *image: \(postgis\/postgis:.*\)$/\1/p' .github/workflows/workspace.yml | head -1)
+  [[ -n $image ]] || { echo "no postgis/postgis image line in .github/workflows/workspace.yml"; return 1; }
+  docker info > /dev/null 2>&1 || {
+    echo "missing tool: a running docker (the pg tests of ${crates[*]} skip without a database); or set ANTARES_TEST_DATABASE_URL"
+    return 1
+  }
+  docker run -d --rm --name "$pg_name" --shm-size=1g -p 127.0.0.1::5432 \
+    -e POSTGRES_USER=antares -e POSTGRES_PASSWORD=antares -e POSTGRES_DB=antares "$image" || return 1
+  # over TCP: the entrypoint's init server listens on the socket only
+  for ((i = 0; i < 120; i++)); do
+    docker exec "$pg_name" pg_isready -q -h 127.0.0.1 -U antares && break
+    sleep 1
+  done
+  ((i < 120)) || { docker logs "$pg_name" | tail -n 20; return 1; }
+  port=$(docker port "$pg_name" 5432/tcp | sed -n '1s/.*://p')
+  docker exec "$pg_name" psql -U antares -Atc 'SELECT version(), postgis_lib_version()'
+  echo "postgresql://antares:antares@localhost:$port/antares" > "$work/pg-url"
+}
+if [[ -z ${ANTARES_TEST_DATABASE_URL:-} ]] && printf '%s\n' "${crates[@]}" | grep -qxE 'antares-(sql|api|broker|ops)'; then
+  trap 'docker rm -f "$pg_name" > /dev/null 2>&1' EXIT
+  step 00 postgis postgis
+  [[ -s $work/pg-url ]] && ANTARES_TEST_DATABASE_URL=$(< "$work/pg-url") && export ANTARES_TEST_DATABASE_URL
+fi
+
 # the debug lane: clippy, the tests, the added tests alone, the debug builds
 debug_lane() {
   if ((${#crates[@]})); then

@@ -7,6 +7,7 @@ function with the uncovered line and branch counts and a reason. The list cannot
 whose function is gone, or whose counts no longer match what is uncovered there, is red too.
 
     dev/coverage-gate.py                     measure and check every such crate (CI job coverage-surfaces)
+    dev/coverage-gate.py --shard K/N         only the K-th of N shards of them (one CI runner each, T-6035)
     dev/coverage-gate.py --check CRATE JSON  check one `cargo llvm-cov report --json` export
     dev/coverage-gate.py --self-test         one synthetic report per red condition, and a green one
 
@@ -138,21 +139,31 @@ def measure(crate: dict) -> dict:
     return json.loads(out)
 
 
-def main() -> int:
+def shard(crates: list[dict], k: int, n: int) -> list[dict]:
+    """The K-th (1-based) of N shards: crates with a broker feature (a broker test build each, the
+    long ones) are dealt round-robin first, then the rest, so every shard gets its share of both."""
+    order = sorted(crates, key=lambda c: (not c["feature"], c["name"]))
+    return order[k - 1::n]
+
+
+def main(k: int = 1, n: int = 1) -> int:
     entries = exclusions()
     crates = new_crates()
     if not crates:
         print("coverage-surfaces: no new crates (none has metadata.antares.role ops, surface, protocol or ngsild)")
         return 0
+    mine_shard = shard(crates, k, n)
     errors = []
-    for crate in crates:
+    for crate in mine_shard:
         mine = [e for e in entries if e["crate"] == crate["name"]]
         errors += check(crate["name"], crate["dir"], measure(crate), mine)
-    known = {c["name"] for c in crates}
-    errors += [f"{e['crate']}: listed in {EXCLUSIONS.name} but not a new crate" for e in entries if e["crate"] not in known]
+    if k == 1:  # once per run, not per shard
+        known = {c["name"] for c in crates}
+        errors += [f"{e['crate']}: listed in {EXCLUSIONS.name} but not a new crate" for e in entries if e["crate"] not in known]
     for e in errors:
         print(e)
-    print(f"coverage-surfaces: {len(crates)} crates, {'red' if errors else 'OK'}")
+    print(f"coverage-surfaces: shard {k}/{n}, {len(mine_shard)} of {len(crates)} crates "
+          f"({', '.join(c['name'] for c in mine_shard)}), {'red' if errors else 'OK'}")
     return 1 if errors else 0
 
 
@@ -190,6 +201,14 @@ def self_test() -> int:
         ("no file of the crate in the report", report([parse], (2, 1), (2, 1), files_dir="/w/crates/other"), [], "no file under"),
     ]
     failed = 0
+    many = [{"name": f"c{i:02}", "dir": "", "feature": "f" if i % 3 == 0 else None} for i in range(31)]
+    for n in (1, 2, 3, 4):
+        dealt = [c["name"] for k in range(1, n + 1) for c in shard(many, k, n)]
+        sizes = [len(shard(many, k, n)) for k in range(1, n + 1)]
+        heavy = [sum(1 for c in shard(many, k, n) if c["feature"]) for k in range(1, n + 1)]
+        ok = sorted(dealt) == sorted(c["name"] for c in many) and max(sizes) - min(sizes) <= 1 and max(heavy) - min(heavy) <= 1
+        print(f"{'ok  ' if ok else 'FAIL'} {n} shards measure every crate once, evenly: sizes {sizes}, with a feature {heavy}")
+        failed += not ok
     for name, rep, entries, red in cases:
         errors = check("antares-x", d, rep, entries)
         ok = not errors if red is None else any(red in e for e in errors)
@@ -209,6 +228,11 @@ if __name__ == "__main__":
                      [e for e in exclusions() if e["crate"] == crate["name"]])
         print("\n".join(errs) or "OK")
         sys.exit(1 if errs else 0)
+    if len(sys.argv) == 3 and sys.argv[1] == "--shard":
+        k, _, n = sys.argv[2].partition("/")
+        if not (k.isdigit() and n.isdigit() and 1 <= int(k) <= int(n)):
+            sys.exit(f"--shard wants K/N with 1 <= K <= N, not {sys.argv[2]}")
+        sys.exit(main(int(k), int(n)))
     if sys.argv[1:]:
         sys.exit(__doc__)
     sys.exit(main())

@@ -113,6 +113,8 @@ pub(crate) mod types_attrs;
 // never in a vanilla build.
 mod ops;
 mod router;
+#[cfg(feature = "views")]
+pub mod schema_writes;
 #[cfg(test)]
 mod tests;
 #[cfg(feature = "views")]
@@ -1173,7 +1175,8 @@ mod clause_5_2_21 {
     /// Table 5.2.21-1 (JSON form): lastN is a positive INTEGER — zero,
     /// negative, fractional and string values are all outside the value
     /// space; timerel is limited to before/after/between; endTimeAt is
-    /// mandatory for between; timeproperty is limited to the four 4.8 names.
+    /// mandatory for between; timeproperty is limited to the 4.8 names
+    /// (expiresAt among them, 5.2.4 NOTE 2).
     #[tokio::test]
     async fn temporal_query_json_member_value_spaces() {
         let ok = json!({"timerel": "after", "timeAt": "2020-01-01T00:00:00Z"});
@@ -1194,7 +1197,13 @@ mod clause_5_2_21 {
         assert_eq!(st, StatusCode::BAD_REQUEST);
         let (st, _) = post_tq(with("timerel", json!("between")), "").await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "between without endTimeAt");
-        let (st, _) = post_tq(with("timeproperty", json!("expiresAt")), "").await;
+        let (st, body) = post_tq(with("timeproperty", json!("expiresAt")), "").await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "expiresAt is a 4.8 timeproperty: {body}"
+        );
+        let (st, _) = post_tq(with("timeproperty", json!("lastUsedAt")), "").await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "timeproperty outside 4.8 set");
         let (st, _) = post_tq(with("timeAt", json!(20200101)), "").await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "timeAt must be a string");

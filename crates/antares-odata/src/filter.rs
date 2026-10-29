@@ -24,8 +24,10 @@
 //! `@context` that defines them (`OpsRequest::context`).
 
 use crate::edm::{Member, Set, Shape};
+use crate::functions::{signature, NUMBER};
 use antares_ops::residual::{
-    self, Cmp, Date, DateTime, Expr as RExpr, Func, Lit, Member as RMember, Path, Spatial, Time,
+    self, decode_base64, Cmp, Date, DateTime, Duration, Expr as RExpr, Func, Lit,
+    Member as RMember, Path, Spatial, Time,
 };
 use odata_url::{
     ArithOp, CompareOp, Compute, Expr, Geography, Literal, MemberPath, Method, OrderBy, Search,
@@ -66,9 +68,9 @@ pub(crate) struct Translated {
     pub(crate) order: Option<String>,
     /// The terms `q` and `orderBy` use, term to IRI.
     pub(crate) context: Map<String, Value>,
-    /// Whether `q` follows a Relationship (F24): the broker evaluates a
-    /// hop only under a `join` (5.7.2.4).
-    pub(crate) linked: bool,
+    /// How many Relationships deep `q` follows one (F24, T-5906), 0 for none: the broker
+    /// evaluates a hop only under a `join` at least that deep (5.7.2.4).
+    pub(crate) linked: usize,
     /// F29: the `geoQ` of a `geo.intersects` conjunct, the GeoProperty's
     /// term and the polygon's `coordinates`.
     pub(crate) geo: Option<(String, String)>,
@@ -148,6 +150,9 @@ pub(crate) enum SortBy {
     System(String),
     /// The `$compute` value of this name.
     Computed(String),
+    /// The value of the Attribute of the second term on the Entity the Relationship of the
+    /// first term targets, as the join inlined it (T-5906).
+    Linked(String, String),
 }
 
 impl SortBy {
@@ -155,7 +160,10 @@ impl SortBy {
     fn key(&self) -> &str {
         match self {
             Self::Id => "id",
-            Self::Value(name) | Self::System(name) | Self::Computed(name) => name,
+            Self::Value(name)
+            | Self::System(name)
+            | Self::Computed(name)
+            | Self::Linked(name, _) => name,
         }
     }
 }
@@ -177,9 +185,10 @@ pub(crate) fn translate(
         sets,
         aliases,
         context: &mut out.context,
-        linked: false,
+        linked: 0,
         expand_values: Vec::new(),
         lambdas: Vec::new(),
+        hops: Vec::new(),
         lang: lang.unwrap_or("@none"),
     };
     let mut conjuncts = Vec::new();
@@ -227,6 +236,72 @@ pub(crate) fn translate(
         out.q = Some(q);
     }
     Ok(out)
+}
+
+/// `filter` over a history set (T-5908): the first `id` conjunct as `ids`, every other conjunct
+/// residual, which the surface evaluates over the rows it builds from the temporal answer.
+pub(crate) fn residual_whole(
+    filter: &Expr,
+    set: &Set,
+    aliases: &[(String, Literal)],
+) -> Result<Translated, Refused> {
+    let mut out = Translated::default();
+    let none = BTreeMap::new();
+    let mut terms = Terms {
+        set,
+        sets: &none,
+        aliases,
+        context: &mut out.context,
+        linked: 0,
+        expand_values: Vec::new(),
+        lambdas: Vec::new(),
+        hops: Vec::new(),
+        lang: "@none",
+    };
+    let (mut ids, mut residual) = (None, Vec::new());
+    for conjunct in conjuncts_of(filter) {
+        match ids_of(conjunct, aliases)? {
+            Some(found) if ids.is_none() => ids = Some(found),
+            Some(found) => residual.push(RExpr::In(
+                Box::new(RExpr::Path(Path::Id)),
+                found.into_iter().map(Lit::Str).collect(),
+            )),
+            None => residual.push(terms.residual(conjunct)?),
+        }
+    }
+    out.ids = ids;
+    out.residual = residual;
+    Ok(out)
+}
+
+/// The instants the top-level conjuncts bound `member` by (T-5908): each `ge`, `gt` or `eq`
+/// literal a lower bound, each `lt` or `le` literal an upper one, `le` and `eq` with whether
+/// the bound is inclusive. Any other conjunct bounds nothing.
+pub(crate) fn bounds_of<'e>(
+    filter: &'e Expr,
+    member: &str,
+    aliases: &'e [(String, Literal)],
+) -> Vec<(CompareOp, &'e str)> {
+    conjuncts_of(filter)
+        .into_iter()
+        .filter_map(|c| {
+            let Expr::Compare(l, op, r) = c else {
+                return None;
+            };
+            let named = |e: &Expr| matches!(plain(e), Some([only]) if only == member);
+            let (op, lit) = if named(l) {
+                (*op, literal(r, aliases).ok()?)
+            } else if named(r) {
+                (mirrored(*op), literal(l, aliases).ok()?)
+            } else {
+                return None;
+            };
+            match lit {
+                Literal::DateTimeOffset(t) => Some((op, t.as_str())),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// `$search` (URL 5.1.7, Q14) as the `$filter` conjunct it means here: a word or phrase
@@ -335,32 +410,46 @@ pub(crate) fn holds_member(filter: &Expr, name: &str) -> bool {
 
 /// Adds `$orderby` to `out` as `orderBy` (Q9) over the same terms: `id`, or
 /// a scalar Attribute; a member the model marks not sortable (C12) is 400,
-/// the base members and the other shapes are a later round's.
-pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Result<(), Refused> {
-    // `orderBy` names Attributes of the Entity itself: no navigation.
-    let sets = BTreeMap::new();
+/// the base members and the other shapes are a later round's. A scalar of the
+/// target of a single-valued navigation (`Category/Name`, URL 5.1.5) has no
+/// `orderBy` form: the surface sorts by it over the joined answer (T-5906).
+pub(crate) fn order(
+    items: &[OrderBy],
+    set: &Set,
+    sets: &BTreeMap<String, Set>,
+    out: &mut Translated,
+) -> Result<(), Refused> {
     let mut terms = Terms {
         set,
-        sets: &sets,
+        sets,
         aliases: &[],
         context: &mut out.context,
-        linked: false,
+        linked: 0,
         expand_values: Vec::new(),
         lambdas: Vec::new(),
+        hops: Vec::new(),
         lang: "@none",
     };
     let mut keys = Vec::new();
     for item in items {
-        let single = match &item.expr {
+        let (single, hop) = match &item.expr {
             Expr::Member(MemberPath {
                 variable: None,
                 path,
             }) => match path.as_slice() {
-                [name] => Some(name.as_str()),
-                _ => None,
+                [name] => (Some(name.as_str()), None),
+                [nav, name] => (None, Some((nav, name))),
+                _ => (None, None),
             },
-            _ => None,
+            _ => (None, None),
         };
+        if let Some(hop) = hop {
+            keys.push(SortKey {
+                by: terms.linked_key(hop)?,
+                descending: item.descending,
+            });
+            continue;
+        }
         let by = match single {
             None => return Err(Refused::Later),
             Some(name) if out.computed.iter().any(|(c, _)| c == name) => {
@@ -381,15 +470,18 @@ pub(crate) fn order(items: &[OrderBy], set: &Set, out: &mut Translated) -> Resul
             descending: item.descending,
         });
     }
-    if keys
-        .iter()
-        .any(|k| matches!(k.by, SortBy::System(_) | SortBy::Computed(_)))
-    {
+    if keys.iter().any(|k| {
+        matches!(
+            k.by,
+            SortBy::System(_) | SortBy::Computed(_) | SortBy::Linked(..)
+        )
+    }) {
+        out.linked = out.linked.max(terms.linked);
         out.sort_system = true;
         out.sort_reads = keys
             .iter()
             .filter_map(|k| match &k.by {
-                SortBy::Value(term) => Some(term.clone()),
+                SortBy::Value(term) | SortBy::Linked(term, _) => Some(term.clone()),
                 SortBy::Id | SortBy::System(_) | SortBy::Computed(_) => None,
             })
             .collect();
@@ -430,9 +522,10 @@ pub(crate) fn compute(
         sets: &sets,
         aliases,
         context: &mut out.context,
-        linked: false,
+        linked: 0,
         expand_values: Vec::new(),
         lambdas: Vec::new(),
+        hops: Vec::new(),
         lang: "@none",
     };
     for item in items {
@@ -555,19 +648,34 @@ struct Terms<'a> {
     sets: &'a BTreeMap<String, Set>,
     aliases: &'a [(String, Literal)],
     context: &'a mut Map<String, Value>,
-    linked: bool,
+    linked: usize,
     expand_values: Vec<String>,
     /// The `any`/`all` variables the residual is inside, innermost last,
     /// each with the Edm type of its list's items.
     lambdas: Vec<(String, &'static str)>,
+    /// The `any` variables over a collection-valued navigation `q` is inside, innermost last.
+    hops: Vec<Hop<'a>>,
     /// The `LanguageMap` entry a LanguageProperty is compared in, as it is read.
     lang: &'a str,
+}
+
+/// An `any` variable over a collection-valued navigation (T-5906): an item is an Entity of
+/// `set`, and a member `m` of it is the linked-entity term `{open}m` closed by `depth` braces
+/// (TS 104 175 4.9, `rel{Type:m}`).
+struct Hop<'a> {
+    variable: String,
+    set: &'a Set,
+    open: String,
+    depth: usize,
 }
 
 impl<'a> Terms<'a> {
     /// One boolean expression as `q`.
     fn term(&mut self, e: &Expr) -> Result<String, Refused> {
         match e {
+            // Inside `any` over a navigation each term may match another target: `and` is the
+            // residual's, `or` distributes (`any(a or b)` is `any(a) or any(b)`).
+            Expr::And(..) if !self.hops.is_empty() => Err(Refused::Later),
             Expr::And(l, r) => Ok(format!("({});({})", self.term(l)?, self.term(r)?)),
             Expr::Or(l, r) => Ok(format!("({})|({})", self.term(l)?, self.term(r)?)),
             Expr::Compare(l, op, r) => self.compare(l, *op, r),
@@ -590,6 +698,9 @@ impl<'a> Terms<'a> {
             },
             // `$filter=flag`: a Boolean member as the predicate.
             Expr::Member(_) => Ok(format!("{}==true", self.scalar(e)?)),
+            Expr::Any { collection, lambda } if self.navigation(collection).is_some() => {
+                self.linked_any(collection, lambda.as_ref())
+            }
             Expr::Any {
                 collection,
                 lambda: Some((variable, body)),
@@ -648,6 +759,60 @@ impl<'a> Terms<'a> {
             self.term_of(&member.iri),
             values.join(",")
         ))
+    }
+
+    /// The collection-valued navigation a lambda ranges over, of the set or of the item of an
+    /// enclosing `any` over a navigation: the Relationship, the target set, and the term the
+    /// path is inside with its depth.
+    fn navigation(&self, collection: &MemberPath) -> Option<(&'a Member, &'a Set, String, usize)> {
+        let (from, open, depth) = match &collection.variable {
+            None => (self.set, String::new(), 0),
+            Some(v) => {
+                let hop = self.hops.iter().rev().find(|h| &h.variable == v)?;
+                (hop.set, hop.open.clone(), hop.depth)
+            }
+        };
+        let [name] = collection.path.as_slice() else {
+            return None;
+        };
+        let member = from.members.get(name)?;
+        let Shape::Nav {
+            target,
+            collection: true,
+        } = &member.shape
+        else {
+            return None;
+        };
+        Some((member, self.sets.get(target)?, open, depth))
+    }
+
+    /// T-5906: `nav/any(d: body)` over a collection-valued navigation as the linked-entity terms
+    /// of TS 104 175 4.9, which hold when one target the caller may read matches (the broker
+    /// resolves each object through the caller's narrowing, a hidden one like a dangling link,
+    /// O26); `nav/any()` is the Relationship being present.
+    fn linked_any(
+        &mut self,
+        collection: &MemberPath,
+        lambda: Option<&(String, Box<Expr>)>,
+    ) -> Result<String, Refused> {
+        let (rel, target, open, depth) = self.navigation(collection).ok_or(Refused::Later)?;
+        let rel = self.term_of(&rel.iri);
+        let Some((variable, body)) = lambda else {
+            // the Relationship itself, as deep as the enclosing hops
+            self.linked = self.linked.max(depth);
+            return Ok(format!("{open}{rel}{}", "}".repeat(depth)));
+        };
+        self.linked = self.linked.max(depth.saturating_add(1));
+        let ty = self.term_of(&target.type_iri);
+        self.hops.push(Hop {
+            variable: variable.clone(),
+            set: target,
+            open: format!("{open}{rel}{{{ty}:"),
+            depth: depth.saturating_add(1),
+        });
+        let term = self.term(body);
+        self.hops.pop();
+        term
     }
 
     /// F29: `geo.intersects(p, geography'SRID=4326;Polygon(...)')` as a
@@ -778,12 +943,10 @@ impl<'a> Terms<'a> {
         else {
             return Err(Refused::Later);
         };
-        let name = self.scalar(member)?;
+        let (name, edm) = self.typed_member(member)?;
         // URL 5.1.1.5: the string functions take a string; NGSI-LD would
         // match no other value without saying why.
-        let string = matches!(member, Expr::Member(MemberPath { path, .. })
-            if self.leaf(path).is_some_and(|(_, m)| matches!(m.shape, Shape::Value { edm: "Edm.String", .. })));
-        if !string {
+        if edm != "Edm.String" {
             return Err(Refused::Bad);
         }
         let escaped = escape(s);
@@ -829,13 +992,29 @@ impl<'a> Terms<'a> {
 
     /// [`Self::scalar`]'s term and the Edm type of its value.
     fn typed_member(&mut self, e: &Expr) -> Result<(String, &'static str), Refused> {
-        let Expr::Member(MemberPath {
-            variable: None,
-            path,
-        }) = e
-        else {
+        let Expr::Member(MemberPath { variable, path }) = e else {
             return Err(Refused::Later);
         };
+        let hop = match variable {
+            None => None,
+            Some(v) => Some(
+                self.hops
+                    .iter()
+                    .rev()
+                    .find(|h| &h.variable == v)
+                    .ok_or(Refused::Later)?,
+            ),
+        };
+        if let Some(hop) = hop {
+            let (open, close) = (hop.open.clone(), "}".repeat(hop.depth));
+            let [name] = path.as_slice() else {
+                return Err(Refused::Later);
+            };
+            let member = hop.set.members.get(name).ok_or(Refused::Later)?;
+            let edm = scalar_edm(member)?;
+            let attr = self.term_of(&member.iri);
+            return Ok((format!("{open}{attr}{close}"), edm));
+        }
         // F21: the `observedAt` of a member of the set, as EXAMPLE 9's
         // `temperature.observedAt`.
         if let [name, annotation] = path.as_slice() {
@@ -849,30 +1028,32 @@ impl<'a> Terms<'a> {
         // `_types`, the system members) and complex paths (F20, F28, F33)
         // are a later round's.
         let (via, member) = self.leaf(path).ok_or(Refused::Later)?;
-        let edm = match &member.shape {
-            // The shapes `Shape::scalar` names, the test the model's
-            // NonFilterableProperties and NonSortableProperties are written
-            // from (C11, C12).
-            Shape::Value {
-                edm,
-                collection: false,
-            } => *edm,
-            // T-5333: an Untyped Property compares by its JSON value, as `q` does.
-            Shape::Json if member.untyped => "Edm.Untyped",
-            Shape::Json => return Err(Refused::Bad),
-            _ => return Err(Refused::Later),
-        };
+        let edm = scalar_edm(member)?;
         let attr = self.term_of(&member.iri);
         let term = match via {
             None => attr,
             Some((rel, target)) => {
-                self.linked = true;
+                self.linked = self.linked.max(1);
                 let rel = self.term_of(&rel.iri);
                 let ty = self.term_of(&target.type_iri);
                 format!("{rel}{{{ty}:{attr}}}")
             }
         };
         Ok((term, edm))
+    }
+
+    /// The sort key of `nav/name`, a sortable scalar of the target of a single-valued navigation.
+    fn linked_key(&mut self, (nav, name): (&String, &String)) -> Result<SortBy, Refused> {
+        let Some((Some((rel, _)), member)) = self.leaf(&[nav.clone(), name.clone()]) else {
+            return Err(Refused::Later);
+        };
+        if !member.shape.sortable() {
+            return Err(Refused::Bad);
+        }
+        scalar_edm(member)?;
+        self.linked = self.linked.max(1);
+        let rel = self.term_of(&rel.iri);
+        Ok(SortBy::Linked(rel, self.term_of(&member.iri)))
     }
 
     /// The term `t{n}` of an IRI, minted on first use.
@@ -1176,6 +1357,21 @@ impl<'a> Terms<'a> {
     }
 }
 
+/// The Edm type a member compares as: the shapes `Shape::scalar` names, the test the model's
+/// `NonFilterableProperties` and `NonSortableProperties` are written from (C11, C12).
+fn scalar_edm(member: &Member) -> Result<&'static str, Refused> {
+    match &member.shape {
+        Shape::Value {
+            edm,
+            collection: false,
+        } => Ok(*edm),
+        // T-5333: an Untyped Property compares by its JSON value, as `q` does.
+        Shape::Json if member.untyped => Ok("Edm.Untyped"),
+        Shape::Json => Err(Refused::Bad),
+        _ => Err(Refused::Later),
+    }
+}
+
 /// URL 5.1.1.1: a literal compared with a member of type `edm` is of that
 /// type, an integer within its range (T-3725); `null` compares with any.
 fn typed(edm: &str, literals: &[Literal]) -> Result<(), Refused> {
@@ -1199,7 +1395,7 @@ fn plain(e: &Expr) -> Option<&[String]> {
 
 /// The Edm types this surface checks; a value of another type is taken
 /// where a function asks (as [`fits`] takes any literal for it).
-const KNOWN: [&str; 14] = [
+const KNOWN: [&str; 16] = [
     "Edm.String",
     "Edm.Boolean",
     "Edm.Guid",
@@ -1214,14 +1410,9 @@ const KNOWN: [&str; 14] = [
     "Edm.Single",
     "Edm.Double",
     "Edm.Decimal",
+    "Edm.Duration",
+    "Edm.Binary",
 ];
-
-/// The families a numeric parameter takes.
-const NUMBER: &[&str] = &["integer", "number"];
-const STRING: &[&str] = &["Edm.String"];
-const DATE: &[&str] = &["Edm.Date", "Edm.DateTimeOffset"];
-const TIME: &[&str] = &["Edm.TimeOfDay", "Edm.DateTimeOffset"];
-const INSTANT: &[&str] = &["Edm.DateTimeOffset"];
 
 /// An Edm type's family: the integer types, the other numbers, or itself.
 fn family(edm: &str) -> &str {
@@ -1254,52 +1445,8 @@ fn literal_edm(lit: &Literal) -> Option<&'static str> {
         Literal::DateTimeOffset(_) => "Edm.DateTimeOffset",
         Literal::TimeOfDay(_) => "Edm.TimeOfDay",
         Literal::Geography(_) => "Edm.Geography",
-    })
-}
-
-/// A method's residual function, the families each argument takes (the
-/// last for the rest), and its result type; `None` for the result means
-/// the first argument's (the rounding functions). `geo.intersects` is a
-/// conjunct of its own (F29), never a value.
-type Signature = (
-    Func,
-    &'static [&'static [&'static str]],
-    Option<&'static str>,
-);
-
-fn signature(method: Method) -> Option<Signature> {
-    const BOOL: Option<&str> = Some("Edm.Boolean");
-    const INT: Option<&str> = Some("Edm.Int32");
-    const STR: Option<&str> = Some("Edm.String");
-    Some(match method {
-        Method::Contains => (Func::Contains, &[STRING], BOOL),
-        Method::StartsWith => (Func::StartsWith, &[STRING], BOOL),
-        Method::EndsWith => (Func::EndsWith, &[STRING], BOOL),
-        Method::MatchesPattern => (Func::MatchesPattern, &[STRING], BOOL),
-        Method::Concat => (Func::Concat, &[STRING], STR),
-        Method::IndexOf => (Func::IndexOf, &[STRING], INT),
-        Method::Length => (Func::Length, &[STRING], INT),
-        Method::Substring => (Func::Substring, &[STRING, NUMBER], STR),
-        Method::ToLower => (Func::ToLower, &[STRING], STR),
-        Method::ToUpper => (Func::ToUpper, &[STRING], STR),
-        Method::Trim => (Func::Trim, &[STRING], STR),
-        Method::Year => (Func::Year, &[DATE], INT),
-        Method::Month => (Func::Month, &[DATE], INT),
-        Method::Day => (Func::Day, &[DATE], INT),
-        Method::Hour => (Func::Hour, &[TIME], INT),
-        Method::Minute => (Func::Minute, &[TIME], INT),
-        Method::Second => (Func::Second, &[TIME], INT),
-        Method::FractionalSeconds => (Func::FractionalSeconds, &[TIME], Some("Edm.Decimal")),
-        Method::TotalOffsetMinutes => (Func::TotalOffsetMinutes, &[INSTANT], INT),
-        Method::Date => (Func::Date, &[INSTANT], Some("Edm.Date")),
-        Method::Time => (Func::Time, &[INSTANT], Some("Edm.TimeOfDay")),
-        Method::Now => (Func::Now, &[], Some("Edm.DateTimeOffset")),
-        Method::MinDateTime => (Func::MinDateTime, &[], Some("Edm.DateTimeOffset")),
-        Method::MaxDateTime => (Func::MaxDateTime, &[], Some("Edm.DateTimeOffset")),
-        Method::Round => (Func::Round, &[NUMBER], None),
-        Method::Floor => (Func::Floor, &[NUMBER], None),
-        Method::Ceiling => (Func::Ceiling, &[NUMBER], None),
-        Method::GeoIntersects => return None,
+        Literal::Duration(_) => "Edm.Duration",
+        Literal::Binary(_) => "Edm.Binary",
     })
 }
 
@@ -1325,6 +1472,8 @@ fn fits(edm: &str, lit: &Literal) -> bool {
             | ("Edm.Date", Literal::Date(_))
             | ("Edm.DateTimeOffset", Literal::DateTimeOffset(_))
             | ("Edm.TimeOfDay", Literal::TimeOfDay(_))
+            | ("Edm.Duration", Literal::Duration(_))
+            | ("Edm.Binary", Literal::Binary(_))
             | (
                 "Edm.Single" | "Edm.Double" | "Edm.Decimal",
                 Literal::Int(_) | Literal::Decimal(_)
@@ -1336,6 +1485,9 @@ fn fits(edm: &str, lit: &Literal) -> bool {
             )
     );
     match edm {
+        // a finite decimal past the `Edm.Single` range is no Single (5.1.1.5)
+        "Edm.Single" if same => !matches!(lit, Literal::Decimal(raw)
+            if raw.parse::<f64>().is_ok_and(|n| n.is_finite() && n.abs() > f64::from(f32::MAX))),
         _ if same => true,
         "Edm.Byte" => range(0, 255),
         "Edm.SByte" => range(-128, 127),
@@ -1343,7 +1495,8 @@ fn fits(edm: &str, lit: &Literal) -> bool {
         "Edm.Int32" => range(i32::MIN.into(), i32::MAX.into()),
         "Edm.Int64" => range(i64::MIN, i64::MAX),
         "Edm.String" | "Edm.Boolean" | "Edm.Guid" | "Edm.Date" | "Edm.DateTimeOffset"
-        | "Edm.TimeOfDay" | "Edm.Single" | "Edm.Double" | "Edm.Decimal" | "Edm.Untyped" => false,
+        | "Edm.TimeOfDay" | "Edm.Single" | "Edm.Double" | "Edm.Decimal" | "Edm.Untyped"
+        | "Edm.Duration" | "Edm.Binary" => false,
         _ => true,
     }
 }
@@ -1390,11 +1543,16 @@ fn residual_lit(lit: &Literal) -> Result<Lit, Refused> {
     match lit {
         Literal::Bool(b) => Ok(Lit::Bool(*b)),
         Literal::Int(n) => Ok(Lit::Int(*n)),
-        Literal::Decimal(raw) => match raw.parse::<f64>() {
-            Ok(n) if n.is_finite() => Ok(Lit::Num(n)),
+        Literal::Decimal(raw) => match (raw.as_str(), raw.parse::<f64>()) {
+            ("INF", _) => Ok(Lit::Num(f64::INFINITY)),
+            ("-INF", _) => Ok(Lit::Num(f64::NEG_INFINITY)),
+            ("NaN", _) => Ok(Lit::Num(f64::NAN)),
+            (_, Ok(n)) if n.is_finite() => Ok(Lit::Num(n)),
             _ => Err(Refused::Bad),
         },
         Literal::String(s) | Literal::Guid(s) => Ok(Lit::Str(s.clone())),
+        Literal::Duration(d) => parsed(Duration::parse(d).map(Lit::Duration)),
+        Literal::Binary(b) => parsed(decode_base64(b).map(Lit::Binary)),
         Literal::Date(d) => parsed(Date::parse(d).map(Lit::Date)),
         Literal::DateTimeOffset(t) => parsed(DateTime::parse(t).map(Lit::DateTime)),
         Literal::TimeOfDay(t) => parsed(Time::parse(t).map(Lit::Time)),
@@ -1456,6 +1614,10 @@ fn value(lit: &Literal) -> Result<String, Refused> {
         Literal::Bool(b) => Ok(b.to_string()),
         Literal::Int(n) if (-MAX_EXACT..=MAX_EXACT).contains(n) => Ok(n.to_string()),
         Literal::Int(_) => Err(Refused::Bad),
+        // INF, -INF and NaN have no NGSI-LD number: the residual compares them (T-5905)
+        Literal::Decimal(raw) if matches!(raw.as_str(), "INF" | "-INF" | "NaN") => {
+            Err(Refused::Later)
+        }
         Literal::Decimal(raw) => match raw.parse::<f64>() {
             Ok(n) if n.is_finite() => Ok(Value::from(n).to_string()),
             _ => Err(Refused::Bad),
@@ -1464,9 +1626,16 @@ fn value(lit: &Literal) -> Result<String, Refused> {
         Literal::String(s) | Literal::Guid(s) => Ok(Value::from(s.as_str()).to_string()),
         Literal::Date(d) => Ok(d.clone()),
         Literal::DateTimeOffset(t) if t.ends_with('Z') => Ok(t.clone()),
-        Literal::TimeOfDay(t) => Ok(format!("{t}Z")),
-        // An offset other than Z, null in a list, a geography: later rounds.
-        Literal::DateTimeOffset(_) | Literal::Null | Literal::Geography(_) => Err(Refused::Later),
+        // An offset other than Z, null in a list, a geography: later rounds. A time of day, a
+        // duration and bytes NGSI-LD stores as text the q string order does not compare
+        // (`09:30:00` and `09:30:00Z`, `PT2H` and `P1D`, padded and unpadded base64): the
+        // residual compares the values they spell (T-5905).
+        Literal::DateTimeOffset(_)
+        | Literal::Null
+        | Literal::Geography(_)
+        | Literal::TimeOfDay(_)
+        | Literal::Duration(_)
+        | Literal::Binary(_) => Err(Refused::Later),
     }
 }
 
@@ -1491,6 +1660,7 @@ fn escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::functions::STRING;
 
     fn translate(
         filter: &Expr,
@@ -1518,6 +1688,7 @@ mod tests {
             type_iri: "https://e.org/Car".into(),
             identifier: None,
             references: BTreeMap::new(),
+            bound: BTreeMap::new(),
             writable: crate::edm::Writable::default(),
             members: BTreeMap::from([
                 (
@@ -1549,6 +1720,11 @@ mod tests {
                 (
                     "span".into(),
                     member("https://e.org/span", value("Edm.Duration", false)),
+                ),
+                // a type this surface does not check
+                (
+                    "clip".into(),
+                    member("https://e.org/clip", value("Edm.Stream", false)),
                 ),
                 (
                     "label".into(),
@@ -1849,11 +2025,6 @@ mod tests {
             ),
             cmp(m("doc"), CompareOp::Eq, lit(Literal::Int(1))),
             cmp(m("speed"), CompareOp::Eq, lit(Literal::Int(MAX_EXACT + 1))),
-            cmp(
-                m("speed"),
-                CompareOp::Eq,
-                lit(Literal::Decimal("INF".into())),
-            ),
         ] {
             assert_eq!(q(&e), Err(Refused::Bad), "{e:?}");
         }
@@ -1968,9 +2139,11 @@ mod tests {
                 arith(m("speed"), ArithOp::Add, int(1)),
             ),
             cmp(m("name"), CompareOp::Ne, m("name")),
+            // two durations compare as durations (T-5905)
+            cmp(m("span"), CompareOp::Lt, m("span")),
             // a type this surface does not check compares with any
-            cmp(m("span"), CompareOp::Eq, m("name")),
-            cmp(m("name"), CompareOp::Eq, m("span")),
+            cmp(m("clip"), CompareOp::Eq, m("name")),
+            cmp(m("name"), CompareOp::Eq, m("clip")),
             cmp(
                 call_of(Method::Year, vec![lit(Literal::Date("2026-01-02".into()))]),
                 CompareOp::Eq,
@@ -2104,7 +2277,9 @@ mod tests {
                 CompareOp::Eq,
                 int(1),
             ),
-            call_of(Method::Round, vec![m("span")]),
+            call_of(Method::Round, vec![m("clip")]),
+            // a value of a type this surface does not check as a predicate
+            Expr::Not(Box::new(m("clip"))),
             // a lambda over a Relationship's object
             Expr::Any {
                 collection: MemberPath {
@@ -2117,6 +2292,11 @@ mod tests {
         for e in later {
             assert_eq!(q(&e), Err(Refused::Later), "{e:?}");
         }
+        // a duration is no number (T-5905)
+        assert_eq!(
+            q(&call_of(Method::Round, vec![m("span")])),
+            Err(Refused::Bad)
+        );
     }
 
     #[test]
@@ -2134,10 +2314,11 @@ mod tests {
         assert_eq!(family("Edm.Int16"), "integer");
         assert_eq!(family("Edm.Single"), "number");
         assert_eq!(
-            takes_arg(STRING, "Edm.Duration"),
+            takes_arg(STRING, "Edm.Stream"),
             Ok(()),
             "an unknown type is taken"
         );
+        assert_eq!(takes_arg(STRING, "Edm.Duration"), Err(Refused::Bad));
         assert_eq!(literal_edm(&Literal::Null), None);
     }
 
@@ -2179,7 +2360,7 @@ mod tests {
             descending: false,
         }];
         assert_eq!(
-            order(&by, &set(), &mut Translated::default()),
+            order(&by, &set(), &BTreeMap::new(), &mut Translated::default()),
             Err(Refused::Later),
             "orderBy reads a `.` as a path: not this round's"
         );
@@ -2372,9 +2553,18 @@ mod tests {
                 Literal::DateTimeOffset("2026-10-11T08:00:00Z".into()),
                 "2026-10-11T08:00:00Z",
             ),
-            (Literal::TimeOfDay("08:00:00".into()), "08:00:00Z"),
         ] {
             assert_eq!(value(&lit), Ok(want.to_owned()), "{lit:?}");
+        }
+        // NGSI-LD stores these as text q does not order: the residual compares them (T-5905)
+        for lit in [
+            Literal::TimeOfDay("08:00:00".into()),
+            Literal::Duration("P1D".into()),
+            Literal::Binary("AQID".into()),
+            Literal::Decimal("INF".into()),
+            Literal::Decimal("NaN".into()),
+        ] {
+            assert_eq!(value(&lit), Err(Refused::Later), "{lit:?}");
         }
     }
 
@@ -2395,6 +2585,7 @@ mod tests {
             order(
                 &[by("speed", true), by("id", false), by("name", false)],
                 &set(),
+                &BTreeMap::new(),
                 &mut t
             ),
             Ok(())
@@ -2428,7 +2619,11 @@ mod tests {
                 Refused::Later,
             ),
         ] {
-            assert_eq!(order(&items, &set(), &mut t), Err(refused), "{items:?}");
+            assert_eq!(
+                order(&items, &set(), &BTreeMap::new(), &mut t),
+                Err(refused),
+                "{items:?}"
+            );
         }
     }
 
@@ -2525,7 +2720,7 @@ mod tests {
         let t = translate(&e, &set(), &BTreeMap::new(), &[]).unwrap_or_default();
         assert_eq!(t.q.as_deref(), Some("(t0>1)"));
         assert_eq!(t.residual.len(), 1);
-        assert!(!t.linked, "a failed push leaves no join behind");
+        assert_eq!(t.linked, 0, "a failed push leaves no join behind");
         // an offset date-time is one instant `q` cannot say: evaluated
         let offset = cmp(
             Expr::Member(MemberPath {
@@ -2626,7 +2821,7 @@ mod tests {
             })
             .collect();
         let mut t = Translated::default();
-        order(&items, set, &mut t).map(|()| t)
+        order(&items, set, &BTreeMap::new(), &mut t).map(|()| t)
     }
 
     #[test]
@@ -2744,11 +2939,6 @@ mod tests {
             ))),
             not(m("speed")),
             not(cmp(m("doc"), CompareOp::Eq, int(1))),
-            not(cmp(
-                m("speed"),
-                CompareOp::Gt,
-                lit(Literal::Decimal("NaN".into())),
-            )),
         ] {
             assert_eq!(q(&e), Err(Refused::Bad), "{e:?}");
         }
@@ -2778,8 +2968,22 @@ mod tests {
         }
         // a type this surface does not check takes any literal
         assert_eq!(
-            q(&cmp(m("span"), CompareOp::Eq, lit(Literal::Int(1)))).as_deref(),
+            q(&cmp(m("clip"), CompareOp::Eq, lit(Literal::Int(1)))).as_deref(),
             Ok("(t0==1)")
+        );
+        // a duration takes a duration literal, which the residual compares (T-5905)
+        assert_eq!(
+            q(&cmp(m("span"), CompareOp::Eq, lit(Literal::Int(1)))),
+            Err(Refused::Bad)
+        );
+        assert_eq!(
+            q(&cmp(
+                m("span"),
+                CompareOp::Eq,
+                lit(Literal::Duration("P1D".into()))
+            ))
+            .as_deref(),
+            Ok("")
         );
         let below = Expr::Not(Box::new(reading(CompareOp::Ge, Literal::Int(5))));
         assert_eq!(evaluated(&below, Some(json!(3))), Some(True));
@@ -2866,6 +3070,179 @@ mod tests {
         );
     }
 
+    /// The test set with a member of each Edm type T-5905 serves.
+    fn typed_set() -> Set {
+        let mut typed = set();
+        for (name, edm) in [
+            ("weight", "Edm.Single"),
+            ("price", "Edm.Double"),
+            ("rating", "Edm.Byte"),
+            ("qty", "Edm.Int16"),
+            ("ship", "Edm.Duration"),
+            ("data", "Edm.Binary"),
+            ("opens", "Edm.TimeOfDay"),
+        ] {
+            typed.members.insert(
+                name.into(),
+                Member {
+                    iri: format!("https://e.org/{name}"),
+                    shape: Shape::Value {
+                        edm,
+                        collection: false,
+                    },
+                    list: false,
+                    json: false,
+                    untyped: false,
+                    written: crate::edm::Written::Always,
+                },
+            );
+        }
+        typed
+    }
+
+    /// T-5905: a literal past its type's range or of another type is 400 before any read, and
+    /// the literals read as their residual values.
+    #[test]
+    fn an_edm_literal_past_its_range_or_type_is_bad() {
+        let typed = typed_set();
+        let c = |name: &str, op, l: Literal| cmp(m(name), op, lit(l));
+        let dec = |t: &str| Literal::Decimal(t.into());
+        // past the type's range, or of another type: 400 before any read
+        for e in [
+            c("weight", CompareOp::Eq, dec("3.5e38")),
+            c("weight", CompareOp::Eq, Literal::String("3.5".into())),
+            c("rating", CompareOp::Eq, Literal::Int(256)),
+            c("qty", CompareOp::Gt, Literal::Int(32768)),
+            c("ship", CompareOp::Eq, Literal::String("P1D".into())),
+            c("ship", CompareOp::Eq, Literal::Int(86400)),
+            c("data", CompareOp::Eq, Literal::String("dGVzdA==".into())),
+            c("opens", CompareOp::Eq, Literal::Duration("PT1H".into())),
+        ] {
+            assert_eq!(
+                translate(&e, &typed, &BTreeMap::new(), &[]).map(|_| ()),
+                Err(Refused::Bad),
+                "{e:?}"
+            );
+        }
+        // an integer is a Single, and the literals read as their residual values
+        assert!(translate(
+            &c("weight", CompareOp::Gt, Literal::Int(1)),
+            &typed,
+            &BTreeMap::new(),
+            &[]
+        )
+        .is_ok());
+        assert_eq!(
+            literal_edm(&Literal::Duration("P1D".into())),
+            Some("Edm.Duration")
+        );
+        assert_eq!(
+            literal_edm(&Literal::Binary("AQID".into())),
+            Some("Edm.Binary")
+        );
+        assert_eq!(residual_lit(&dec("-INF")), Ok(Lit::Num(f64::NEG_INFINITY)));
+        assert_eq!(format!("{:?}", residual_lit(&dec("NaN"))), "Ok(Num(NaN))");
+        assert_eq!(residual_lit(&dec("1e999")), Err(Refused::Bad));
+        assert_eq!(value(&dec("1e999")), Err(Refused::Bad));
+        // a Single within its range is pushed as a q number
+        assert_eq!(
+            translate(
+                &c("weight", CompareOp::Gt, dec("1.5e2")),
+                &typed,
+                &BTreeMap::new(),
+                &[]
+            )
+            .map(|t| t.q),
+            Ok(Some("(t0>150.0)".into()))
+        );
+    }
+
+    /// T-5905: each Edm type NGSI-LD stores as text or as a JSON number is compared as its
+    /// value in the residual: its literal is read, a literal past its range or of another type
+    /// is 400 before any read, and the filter keeps the Entities whose value holds it.
+    #[test]
+    fn every_edm_type_ngsi_ld_carries_is_filtered_by_its_value() {
+        use residual::Truth::{self, False, True};
+        use serde_json::{json, Value as J};
+        let typed = typed_set();
+        let now = DateTime::parse("2026-10-28T12:00:00Z");
+        let on = |e: &Expr, stored: J| -> Result<Truth, Refused> {
+            let t = translate(e, &typed, &BTreeMap::new(), &[])?;
+            assert_eq!(t.q, None, "{e:?} is the residual's");
+            let p = program(&t, now.ok_or(Refused::Later)?)?.ok_or(Refused::Later)?;
+            let entity = json!({"id": "urn:ngsi-ld:P:1", "type": "P",
+                "t0": {"type": "Property", "value": stored}});
+            p.eval(&entity).map_err(|_| Refused::Later)
+        };
+        let c = |name: &str, op, l: Literal| cmp(m(name), op, lit(l));
+        let dec = |t: &str| Literal::Decimal(t.into());
+        for (e, stored, want) in [
+            (c("weight", CompareOp::Ne, dec("INF")), json!(3.5), True),
+            (c("weight", CompareOp::Lt, dec("INF")), json!(3.5), True),
+            (c("price", CompareOp::Gt, dec("-INF")), json!(0.0), True),
+            (c("price", CompareOp::Eq, dec("NaN")), json!(15.5), False),
+            (
+                c("ship", CompareOp::Eq, Literal::Duration("PT95400S".into())),
+                json!("P1DT2H30M"),
+                True,
+            ),
+            (
+                c("ship", CompareOp::Gt, Literal::Duration("PT1H".into())),
+                json!("PT45S"),
+                False,
+            ),
+            (
+                c("ship", CompareOp::Eq, Literal::Duration("-P1D".into())),
+                json!("-PT24H"),
+                True,
+            ),
+            (
+                c("data", CompareOp::Eq, Literal::Binary("dGVzdA".into())),
+                json!("dGVzdA=="),
+                True,
+            ),
+            (
+                c("data", CompareOp::Eq, Literal::Binary(String::new())),
+                json!(""),
+                True,
+            ),
+            (
+                c("data", CompareOp::Ne, Literal::Binary("AQID".into())),
+                json!("dGVzdA=="),
+                True,
+            ),
+            (
+                c(
+                    "opens",
+                    CompareOp::Eq,
+                    Literal::TimeOfDay("09:30:00".into()),
+                ),
+                json!("09:30:00"),
+                True,
+            ),
+            (
+                c(
+                    "opens",
+                    CompareOp::Eq,
+                    Literal::TimeOfDay("09:30:00".into()),
+                ),
+                json!("09:30:00Z"),
+                True,
+            ),
+            (
+                c(
+                    "opens",
+                    CompareOp::Ge,
+                    Literal::TimeOfDay("09:30:00".into()),
+                ),
+                json!("09:29:59.5Z"),
+                False,
+            ),
+        ] {
+            assert_eq!(on(&e, stored), Ok(want), "{e:?}");
+        }
+    }
+
     /// `$search` folds to a constant where no String property can hold a term, and reads only
     /// the single-valued String properties otherwise (T-3750).
     #[test]
@@ -2925,6 +3302,217 @@ mod tests {
         assert_eq!(
             translated.ok().map(|t| (t.q.is_some(), t.residual.len())),
             Some((true, 1))
+        );
+    }
+
+    /// T-5906: a Car whose `parts` (collection) and `maker` (single) navigate to Parts, a Part
+    /// with `lang` and `parts` of its own.
+    fn navigating() -> (Set, BTreeMap<String, Set>) {
+        let mut car = set();
+        let nav = |iri: &str, collection| Member {
+            iri: iri.into(),
+            shape: Shape::Nav {
+                target: "Parts".into(),
+                collection,
+            },
+            list: false,
+            json: false,
+            untyped: false,
+            written: crate::edm::Written::Always,
+        };
+        car.members
+            .insert("parts".into(), nav("https://e.org/parts", true));
+        car.members
+            .insert("maker".into(), nav("https://e.org/maker", false));
+        let mut part = set();
+        part.type_iri = "https://e.org/Part".into();
+        part.members
+            .insert("parts".into(), nav("https://e.org/parts", true));
+        (car, BTreeMap::from([("Parts".to_owned(), part)]))
+    }
+
+    fn mp(variable: Option<&str>, names: &[&str]) -> MemberPath {
+        MemberPath {
+            variable: variable.map(str::to_owned),
+            path: names.iter().map(|n| (*n).to_owned()).collect(),
+        }
+    }
+
+    fn over(variable: &str, names: &[&str]) -> Expr {
+        Expr::Member(mp(Some(variable), names))
+    }
+
+    fn any(collection: MemberPath, lambda: Option<(&str, Expr)>) -> Expr {
+        Expr::Any {
+            collection,
+            lambda: lambda.map(|(v, body)| (v.to_owned(), Box::new(body))),
+        }
+    }
+
+    #[test]
+    fn any_over_a_navigation_is_a_linked_entity_term() {
+        let (car, sets) = navigating();
+        let q =
+            |e: &Expr| translate(e, &car, &sets, &[]).map(|t| (t.q.unwrap_or_default(), t.linked));
+        let en = |v: &str| {
+            cmp(
+                over(v, &["name"]),
+                CompareOp::Eq,
+                lit(Literal::String("EN".into())),
+            )
+        };
+        // URL 5.1.1.13.1 over a Relationship: one target the caller reads matches (4.9)
+        assert_eq!(
+            q(&any(mp(None, &["parts"]), Some(("d", en("d"))))),
+            Ok((r#"(t0{t1:t2}=="EN")"#.to_owned(), 1))
+        );
+        // `or` distributes over the targets, `contains` is a pattern on the target's term
+        let or = Expr::Or(Box::new(en("d")), Box::new(en("d")));
+        assert_eq!(
+            q(&any(mp(None, &["parts"]), Some(("d", or)))),
+            Ok((r#"((t0{t1:t2}=="EN")|(t0{t1:t2}=="EN"))"#.to_owned(), 1))
+        );
+        let contains = Expr::Call(
+            Method::Contains,
+            vec![over("d", &["name"]), lit(Literal::String("a.b".into()))],
+        );
+        assert_eq!(
+            q(&any(mp(None, &["parts"]), Some(("d", contains)))),
+            Ok((r#"(t0{t1:t2}~="a\.b")"#.to_owned(), 1))
+        );
+        // `any()` is the Relationship being there
+        assert_eq!(
+            q(&any(mp(None, &["parts"]), None)),
+            Ok(("(t0)".to_owned(), 0))
+        );
+        // two hops nest the terms and the join
+        let nested = any(
+            mp(None, &["parts"]),
+            Some(("r", any(mp(Some("r"), &["parts"]), Some(("d", en("d")))))),
+        );
+        assert_eq!(
+            q(&nested),
+            Ok((r#"(t0{t1:t0{t1:t2}}=="EN")"#.to_owned(), 2))
+        );
+        let nested_empty = any(
+            mp(None, &["parts"]),
+            Some(("r", any(mp(Some("r"), &["parts"]), None))),
+        );
+        assert_eq!(q(&nested_empty), Ok(("(t0{t1:t0})".to_owned(), 1)));
+    }
+
+    #[test]
+    fn what_any_over_a_navigation_cannot_say_in_q_is_refused() {
+        let (car, sets) = navigating();
+        let q = |e: &Expr| translate(e, &car, &sets, &[]).map(|t| t.q);
+        let en = cmp(
+            over("d", &["name"]),
+            CompareOp::Eq,
+            lit(Literal::String("EN".into())),
+        );
+        // `and` may hold on two targets, `all` has no q form: neither is pushed
+        let and = Expr::And(Box::new(en.clone()), Box::new(en.clone()));
+        assert_eq!(
+            q(&any(mp(None, &["parts"]), Some(("d", and)))),
+            Err(Refused::Later)
+        );
+        let all = Expr::All {
+            collection: mp(None, &["parts"]),
+            lambda: ("d".into(), Box::new(en.clone())),
+        };
+        assert_eq!(q(&all), Err(Refused::Later));
+        // a member the target does not have, a path below it, a variable out of scope
+        let missing = cmp(over("d", &["nope"]), CompareOp::Eq, lit(Literal::Int(1)));
+        assert_eq!(
+            q(&any(mp(None, &["parts"]), Some(("d", missing)))),
+            Err(Refused::Later)
+        );
+        let deep = cmp(
+            over("d", &["name", "x"]),
+            CompareOp::Eq,
+            lit(Literal::Int(1)),
+        );
+        assert_eq!(
+            q(&any(mp(None, &["parts"]), Some(("d", deep)))),
+            Err(Refused::Later)
+        );
+        let stray = cmp(over("x", &["name"]), CompareOp::Eq, lit(Literal::Int(1)));
+        assert_eq!(
+            q(&any(mp(None, &["parts"]), Some(("d", stray)))),
+            Err(Refused::Later)
+        );
+        // a single-valued navigation is no collection to range over
+        assert_eq!(q(&any(mp(None, &["maker"]), None)), Err(Refused::Later));
+        // a path through a single navigation to a collection is no lambda this round maps
+        assert_eq!(
+            q(&any(mp(None, &["maker", "parts"]), None)),
+            Err(Refused::Later)
+        );
+        // a value of another type than the target's member is 400, as on the set itself
+        let typed = cmp(over("d", &["name"]), CompareOp::Eq, lit(Literal::Int(1)));
+        assert_eq!(
+            q(&any(mp(None, &["parts"]), Some(("d", typed)))),
+            Err(Refused::Bad)
+        );
+        let doc = cmp(over("d", &["doc"]), CompareOp::Eq, lit(Literal::Int(1)));
+        assert_eq!(
+            q(&any(mp(None, &["parts"]), Some(("d", doc)))),
+            Err(Refused::Bad)
+        );
+    }
+
+    #[test]
+    fn orderby_a_member_of_a_single_navigation_target_is_a_surface_sort() {
+        let (car, sets) = navigating();
+        let by = |names: &[&str], descending| OrderBy {
+            expr: path(names),
+            descending,
+        };
+        let mut t = Translated::default();
+        assert_eq!(
+            order(
+                &[by(&["maker", "name"], true), by(&["name"], false)],
+                &car,
+                &sets,
+                &mut t
+            ),
+            Ok(())
+        );
+        let keys: Vec<(SortBy, bool)> = t
+            .sort
+            .unwrap_or_default()
+            .into_iter()
+            .map(|k| (k.by, k.descending))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                (SortBy::Linked("t0".into(), "t1".into()), true),
+                (SortBy::Value("t1".into()), false)
+            ]
+        );
+        assert_eq!(
+            (t.linked, t.sort_reads),
+            (1, vec!["t0".to_owned(), "t1".to_owned()])
+        );
+        // a collection, a member the target lacks or does not sort, a deeper path
+        for names in [
+            &["parts", "name"][..],
+            &["maker", "nope"],
+            &["maker", "doc"],
+            &["maker", "name", "x"],
+        ] {
+            let refused = order(&[by(names, false)], &car, &sets, &mut Translated::default());
+            assert!(refused.is_err(), "{names:?}");
+        }
+        assert_eq!(
+            order(
+                &[by(&["maker", "doc"], false)],
+                &car,
+                &sets,
+                &mut Translated::default()
+            ),
+            Err(Refused::Bad)
         );
     }
 }

@@ -395,6 +395,8 @@ impl Display for Literal {
                 f.write_char('\'')
             }
             Literal::Geography(geography) => write!(f, "{geography}"),
+            Literal::Duration(text) => write!(f, "duration'{}'", text.replace('+', "%2B")),
+            Literal::Binary(text) => write!(f, "binary'{text}'"),
         }
     }
 }

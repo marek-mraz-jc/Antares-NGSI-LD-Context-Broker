@@ -52,6 +52,8 @@ pub const RELOAD_ENV: &str = "ANTARES_VIEWS_RELOAD_MS";
 /// bytes. No default: unset, the broker takes no schema (T-3628).
 pub const SCHEMA_MAX_ENV: &str = "ANTARES_SCHEMA_MAX_BYTES";
 
+pub use antares_api::schema_writes::{Mode as SchemaWrites, SCHEMA_WRITES_ENV};
+
 /// The platform's history retention (DM-97): attribute instances of an
 /// Entity that no `historyRetention`, type rule or `*` rule of its Tenant
 /// covers are deleted once older than this duration (`P28D`). Unset keeps
@@ -60,7 +62,13 @@ pub const HISTORY_DEFAULT_ENV: &str = "ANTARES_RETENTION_HISTORY_DEFAULT";
 
 /// Every variable the view table reads. The broker accepts these as config
 /// keys from here, so a new one is added in this crate alone (T-3766).
-pub const ENV_KEYS: &[&str] = &[RELOAD_ENV, SCHEMA_MAX_ENV, HISTORY_DEFAULT_ENV];
+pub const ENV_KEYS: &[&str] = &[
+    RELOAD_ENV,
+    SCHEMA_MAX_ENV,
+    HISTORY_DEFAULT_ENV,
+    antares_api::schema_writes::SCHEMA_WRITES_ENV,
+    crate::view_cache::VIEW_IDLE_ENV,
+];
 
 /// The largest view document `/q/views` accepts, in bytes.
 pub const MAX_VIEW_BYTES: usize = 64 * 1024;
@@ -767,11 +775,26 @@ fn platform_history(raw: Option<String>) -> Result<Option<std::time::Duration>, 
 /// # Errors
 /// The store's, or routes set already.
 pub async fn install(state: &AppState) -> Result<Reload, String> {
+    state
+        .views
+        .schema_writes
+        .set_mode(schema_writes(std::env::var(SCHEMA_WRITES_ENV).ok())?);
+    crate::view_cache::configure()?;
     install_with(
         state,
         platform_history(std::env::var(HISTORY_DEFAULT_ENV).ok())?,
     )
     .await
+}
+
+/// [`SCHEMA_WRITES_ENV`]: `report` unset, fatal at startup when it names
+/// no mode (T-5912).
+fn schema_writes(value: Option<String>) -> Result<SchemaWrites, String> {
+    match value {
+        None => Ok(SchemaWrites::Report),
+        Some(v) => SchemaWrites::parse(&v)
+            .ok_or_else(|| format!("{SCHEMA_WRITES_ENV} is enforce, report or off")),
+    }
 }
 
 /// [`install`] with the platform's history retention given, not read from
@@ -1317,6 +1340,19 @@ fn problem(status: StatusCode, title: &str, detail: &str) -> Response {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// T-5912: unset reports, a mode name sets it, anything else is fatal.
+    #[test]
+    fn the_schema_writes_key_names_a_mode_or_fails_startup() {
+        assert_eq!(schema_writes(None), Ok(SchemaWrites::Report));
+        assert_eq!(
+            schema_writes(Some("enforce".into())),
+            Ok(SchemaWrites::Enforce)
+        );
+        assert_eq!(schema_writes(Some("off".into())), Ok(SchemaWrites::Off));
+        let refused = schema_writes(Some("on".into())).unwrap_err();
+        assert!(refused.contains(SCHEMA_WRITES_ENV), "{refused}");
+    }
 
     /// F-ANT4-029: the revision is FNV-1a 64 over the documents' bytes, the
     /// same number in every build and on every pod.

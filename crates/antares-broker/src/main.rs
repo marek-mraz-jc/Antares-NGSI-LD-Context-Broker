@@ -86,6 +86,9 @@ const KNOWN_KEYS: &[&str] = &[
     // trusted producer legitimately batches larger (the spec sets no ceiling).
     "ANTARES_MAX_BATCH_ITEMS",
     "ANTARES_MAX_BODY_BYTES",
+    // The process-wide memory budget the caches and the buffered-answer pool
+    // split (T-5895).
+    "ANTARES_MEMORY_BUDGET",
     "ANTARES_CORS_ORIGINS",
     // The policy engine every operation is asked about, and how long it has
     // to answer before the seam denies (ADR-0020). The built-in allow-all
@@ -1125,7 +1128,23 @@ async fn run(
 
     // Trailing-slash tolerance: Table 6.2-1 spells collection resources with a
     // trailing '/'; normalize before routing.
+    // T-5895: one process-wide memory budget, split over every cache before
+    // the first of them is built and over the buffered-answer pool
+    let budget = match std::env::var("ANTARES_MEMORY_BUDGET") {
+        Ok(v) => antares_api::bounds::MemoryBudget::parse(&v)?,
+        Err(_) => antares_api::bounds::MemoryBudget::default(),
+    };
+    budget.apply();
+    #[cfg(feature = "odata")]
+    antares_odata::set_model_cache_bytes(budget.odata_models(), budget.linkml_models());
+    #[cfg(feature = "linkml")]
+    antares_linkml::set_cache_bytes(
+        usize::try_from(budget.linkml_renders()).unwrap_or(usize::MAX),
+        budget.linkml_models(),
+    );
+    tracing::info!(bytes = budget.total, "memory budget");
     let mut state = AppState::with_drivers(host_alias, store, temporal, &store_name);
+    budget.set_on(&mut state);
     state.temporal_name = temporal_name;
     state.delivery = antares_api::DeliveryPolicy::from_env().unwrap_or_default();
     state.temporal_record = std::env::var("ANTARES_TEMPORAL_RECORD")

@@ -56,7 +56,8 @@ ${vehicle_payload_file}=    2020-08-vehicle-temporal-representation.jsonld
 
 021_27_06 Timeproperty Is Limited To The Four Temporal Property Names
     [Documentation]    5.2.21 Table 5.2.21-1: timeproperty allowed values are
-    ...    "observedAt", "createdAt", "modifiedAt" and "deletedAt"
+    ...    "observedAt", "createdAt", "modifiedAt" and "deletedAt"; TS 104 175 5.2.4 NOTE 2
+    ...    adds "expiresAt", so the refused value is a name neither version lists
     [Tags]    te-query    5_2_21    since_v1.9.1
     temporalQ-json-invalid-timeproperty-query.jsonld    400    BadRequestData    ${None}
 

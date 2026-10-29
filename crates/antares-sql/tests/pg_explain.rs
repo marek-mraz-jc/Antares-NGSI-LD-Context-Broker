@@ -276,6 +276,62 @@ fn geo_where(
     inline(&c.sql, &binds)
 }
 
+/// The statement `store::pg::entity::Probe` builds for `cond`, its cap
+/// inlined (the store's unit tests pin the text).
+fn probe_sql(cond: &str) -> String {
+    let rows = format!("FROM entity_values WHERE {cond}");
+    format!(
+        "SELECT CASE WHEN n < 1001 THEN ARRAY(SELECT id {rows}) END \
+         FROM (SELECT count(*) AS n FROM (SELECT 1 {rows} LIMIT 1001) r) c"
+    )
+}
+
+/// T-6056: a probe whose term matches more than its cap counts index
+/// entries and never reads an id: `speed >= 50` matches half of 100 000
+/// Entities, and its id read used to fetch 1 001 heap rows only to throw
+/// them away. A term under the cap (`speed == 42`, 1 000 rows) reads its
+/// ids. As antares_app under RLS.
+#[tokio::test]
+async fn a_probe_past_its_cap_reads_no_ids() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    seed_rls(&pool).await;
+    app_role(&pool).await;
+    let mut tx = pool.begin().await.expect("tx");
+    sqlx::query("SET LOCAL ROLE antares_app")
+        .execute(&mut *tx)
+        .await
+        .expect("role");
+    sqlx::query("SELECT set_config('antares.tenant', $1, true)")
+        .bind(RLS_A)
+        .execute(&mut *tx)
+        .await
+        .expect("tenant");
+    for (cond, reads) in [
+        ("f >= 50", false),
+        ("f = ANY(ARRAY[42, 'NaN'::float8])", true),
+    ] {
+        let sql = probe_sql(&format!(
+            "tenant_id = '{RLS_A}' AND attr = 'https://x/speed' AND {cond}"
+        ));
+        let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) {sql}"
+        )))
+        .fetch_all(&mut *tx)
+        .await
+        .expect("explain");
+        let plan = rows.join("\n");
+        let never = plan.contains("never executed");
+        assert!(plan.contains("i_entity_values_num"), "{cond}:\n{plan}");
+        assert_eq!(never, !reads, "{cond}:\n{plan}");
+        let ids: Option<Vec<String>> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_one(&mut *tx)
+            .await
+            .expect("probe");
+        assert_eq!(ids.map(|v| v.len()), reads.then_some(1000), "{cond}");
+    }
+}
+
 /// T-4852: every NGSI-LD query shape of `docs/src/performance.md`'s RLS
 /// table, as the broker's role plans it beside a second Tenant of the same
 /// size: each reads an index for its selective predicate, none walks the
@@ -291,9 +347,7 @@ async fn every_query_shape_reads_an_index_under_rls() {
     let speed = |cond: &str| {
         format!(r#"entity @? '$."https://x/speed"[*]."value" ? (@ {cond})'::jsonpath"#)
     };
-    let probe = |cond: &str| {
-        format!("SELECT id FROM entity_values WHERE tenant_id = '{RLS_A}' AND {cond} LIMIT 1001")
-    };
+    let probe = |cond: &str| probe_sql(&format!("tenant_id = '{RLS_A}' AND {cond}"));
     // A walk: a sequential scan, a primary key read with the predicate left
     // as a filter, or any other index whose condition is the Tenant alone,
     // except the partial indexes that hold a sliver of it by construction
@@ -524,6 +578,37 @@ async fn a_pooled_session_starts_no_parallel_workers() {
         !plan.contains("Gather"),
         "a page plans parallel workers:\n{plan}"
     );
+}
+
+/// T-5904: a pooled session compiles no JIT. A `q` page's expiry subplans
+/// (`LIVE_ENTITY`) cost it ~5e8, past every JIT threshold: 4.4 s of LLVM
+/// compile for a 1 ms page, which `statement_timeout` cannot interrupt. The
+/// threshold is forced to 0 here, so the plan would carry a JIT block on any
+/// seed size if the session allowed one.
+#[tokio::test]
+async fn a_pooled_session_compiles_no_jit() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    seed_rls(&pool).await;
+    let jit: String = sqlx::query_scalar("SHOW jit")
+        .fetch_one(&pool)
+        .await
+        .expect("show");
+    assert_eq!(jit, "off");
+    let mut tx = pool.begin().await.expect("tx");
+    sqlx::query("SET LOCAL jit_above_cost = 0")
+        .execute(&mut *tx)
+        .await
+        .expect("threshold");
+    let w = format!("tenant_id = '{RLS_A}' AND (expires_at IS NULL OR expires_at > now())");
+    let q = r#"entity @? '$."https://x/speed"[*]."value" ? (@ == 42)'::jsonpath"#;
+    let page = type_page(&format!("{w} AND {q}"), &[&["https://x/T1"]], 21);
+    let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXPLAIN {page}")))
+        .fetch_all(&mut *tx)
+        .await
+        .expect("explain");
+    let plan = rows.join("\n");
+    assert!(!plan.contains("JIT"), "a page compiles JIT:\n{plan}");
 }
 
 /// T-4907: a deep page skips its OFFSET over ids read from the type index
@@ -1444,6 +1529,66 @@ async fn the_temporal_page_qualification_reads_each_station_newest_first() {
         "the probe fetched {refused} rows the window refused for {STATIONS} stations — plan:\n{plan}"
     );
     assert_eq!(qualified, STATIONS, "every station has rows in the window");
+
+    // Under a view's rule the probe keeps to the shown Attributes: one probe
+    // per Attribute on the full btree prefix. Postgres 16 (dev's CNPG image)
+    // reads `attr_id = ANY(..)` as no ordered index condition and sorted every
+    // row of the station in the widened bound (dev: 5.9 s for 577 stations);
+    // 17 orders it, so the plan text pins the per-Attribute equality.
+    let qual =
+        pg::temporal::has_history(&format!(" AND {} AND {column}", text.sql), "DESC", Some(4));
+    let mut tx = pool.begin().await.expect("tx");
+    for s in [
+        "SET LOCAL plan_cache_mode = force_generic_plan",
+        "SET LOCAL ROLE antares_app",
+        "SELECT set_config('antares.tenant', 'pgexplain-bikes', true)",
+    ] {
+        sqlx::query(s).execute(&mut *tx).await.expect(s);
+    }
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "PREPARE t5616_shown(text, text, text, text[]) AS \
+         SELECT count(*) FROM temporal_entities m WHERE m.tenant_id = $1 AND {qual}"
+    )))
+    .execute(&mut *tx)
+    .await
+    .expect("prepare");
+    let args = format!(
+        "('{T}', 'observedAt', '2004-03-13T12:00:00Z', ARRAY['https://x/name', 'https://x/bikes'])"
+    );
+    let qualified: i64 =
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXECUTE t5616_shown{args}")))
+            .fetch_one(&mut *tx)
+            .await
+            .expect("execute");
+    let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, FORMAT TEXT) EXECUTE t5616_shown{args}"
+    )))
+    .fetch_all(&mut *tx)
+    .await
+    .expect("explain");
+    tx.rollback().await.expect("rollback");
+    let plan = plan.join("\n");
+    let refused: i64 = plan
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("Rows Removed by Filter: "))
+        .filter_map(|n| n.trim().parse::<i64>().ok())
+        .sum();
+    assert!(
+        plan.contains("(attr_id = s.attr)") && !plan.contains("attr_id = ANY"),
+        "the shown-Attribute probe is no equality per Attribute — plan:\n{plan}"
+    );
+    assert!(
+        !plan.contains("->  Sort "),
+        "the shown-Attribute probe sorts the station's rows — plan:\n{plan}"
+    );
+    assert!(
+        refused < STATIONS,
+        "the shown-Attribute probe fetched {refused} rows the window refused for {STATIONS} stations — plan:\n{plan}"
+    );
+    assert_eq!(
+        qualified, STATIONS,
+        "every station has shown rows in the window"
+    );
 }
 
 /// F-ANT1-016: the query geometry's validity probe runs on the query's own

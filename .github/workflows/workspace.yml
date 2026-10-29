@@ -18,6 +18,19 @@ on:
         description: "matrix cells per job at a time"
         type: number
         default: 16
+      base:
+        # the commit the change is measured from (fast.yml passes a train's
+        # merge base with dev, T-6035): the fuzz smoke and the feature-alone
+        # shards skip what the change does not reach. Empty runs everything.
+        description: "base commit of the change under test (empty: run everything)"
+        type: string
+        default: ""
+
+# Caches (T-6035): a run reads the caches of its own ref and of dev, the
+# default branch, and none of another branch's. Every train ran on a new
+# train/<stamp> ref, found no cache and wrote ~10 GB of its own, which
+# evicted the rest: each train compiled every dependency cold. Only dev
+# writes now (fast.yml's nightly run there); trains and pull requests read.
 
 # Compiles and tests the workspace and uploads reports; the token only
 # has to read the checkout.
@@ -25,6 +38,143 @@ permissions:
   contents: read
 
 jobs:
+  # The longest jobs come first (T-6035): the account runs about 20 jobs at a
+  # time, queued in file order, and a long job queued last sets the wall time.
+  coverage-surfaces:
+    # Every new crate of the surfaces epic (metadata.antares.role ops,
+    # surface or protocol) covers 100 % of its lines and branches, minus
+    # what ci/coverage-exclusions.toml lists with a reason; an entry that
+    # is covered now or names a gone function is red too (surfaces-test-plan
+    # section 1, T-3491). A new crate joins by its role, without a YAML
+    # edit; with none yet the gate says so and passes. Existing crates keep
+    # T-3468's 95 % floor. Nightly for llvm-cov's --branch.
+    # Three shards (T-6035): the 31 crates measured one after another took
+    # 1708 s on one runner (run 40826783005); dev/coverage-gate.py --shard
+    # deals the broker-feature crates and the rest evenly. A red shard is a
+    # red run; the thresholds and exclusions are the same file for each.
+    name: Coverage of the new crates (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.max_parallel }}
+      matrix:
+        shard: [1/3, 2/3, 3/3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
+        with:
+          components: llvm-tools-preview
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          key: coverage-surfaces-${{ strategy.job-index }}
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-llvm-cov
+      - name: Coverage gate self-test
+        run: python3 dev/coverage-gate.py --self-test
+      - name: 100 % lines and branches, minus the listed exclusions
+        run: python3 dev/coverage-gate.py --shard ${{ matrix.shard }}
+
+  features:
+    # GOAL point 2 (T-3465): every cargo feature builds, lints and tests on
+    # its own. The feature-sets job checks no-default and all-features, where a
+    # feature that only compiles next to another one passes unseen; this one
+    # takes each feature alone. A new feature joins it by being declared:
+    # cargo-hack enumerates them from the manifests.
+    # Excluded: `console` (antares-broker), the tokio-console hook for local
+    # debugging, which needs RUSTFLAGS="--cfg tokio_unstable" and is never in
+    # a release (crates/antares-broker/Cargo.toml).
+    # One entry per feature-carrying crate (measured 2026-10-10, 8 jobs:
+    # check of all 26 combinations 144 s, clippy of the 18 140 s, one
+    # antares-api test run 165 s x 7 features, one antares-broker run 69 s x
+    # 4): a single job would pass 15 minutes on a runner, a split one stays
+    # well under.
+    name: Each feature alone (${{ matrix.package }}${{ matrix.partition && format(' {0}', matrix.partition) || '' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ inputs.max_parallel }}
+      matrix:
+        # `package`, not `crate`: dev/spec.py reads the first `crate:` matrix
+        # as the shared-crates one
+        package: [workspace, antares-notifier, antares-sql]
+        # antares-api's seven feature runs took 24 min in one job (run
+        # 38064052714): cargo-hack's --partition deals them to four runners
+        # (T-3540).
+        include:
+          - { package: antares-api, partition: 1/4 }
+          - { package: antares-api, partition: 2/4 }
+          - { package: antares-api, partition: 3/4 }
+          - { package: antares-api, partition: 4/4 }
+          # antares-broker's 13 features took 26 min in one job (run
+          # 40826783005, 1220 s of tests): three runners (T-6035).
+          - { package: antares-broker, partition: 1/3 }
+          - { package: antares-broker, partition: 2/3 }
+          - { package: antares-broker, partition: 3/3 }
+          # ADR-0027 section 6 (T-3493): the stripped release binary per
+          # surface feature against vanilla; not a crate, so no clippy or
+          # test step runs for it. Eleven release builds in a row reached the
+          # 30 min limit (trains 0217-1, 0307-1): a runner per two features,
+          # each with its own vanilla build (T-4680); fat LTO links a release
+          # build about 3 min longer than thin did (T-5234).
+          - { package: binary-size, partition: 1/6 }
+          - { package: binary-size, partition: 2/6 }
+          - { package: binary-size, partition: 3/6 }
+          - { package: binary-size, partition: 4/6 }
+          - { package: binary-size, partition: 5/6 }
+          - { package: binary-size, partition: 6/6 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # T-6035: a shard whose package the change does not reach (no file in
+      # it or in a crate below it, and none outside every crate) skips with
+      # a notice; no base, or any doubt, runs it (dev/touched-packages.py)
+      - name: Does the change reach ${{ matrix.package }}
+        id: reach
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || inputs.base }}
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          python3 dev/touched-packages.py --self-test > /dev/null
+          [ -z "$BASE" ] || git fetch -q --depth=1 origin "$BASE" || BASE=
+          run=$(python3 dev/touched-packages.py "$BASE" "$PACKAGE" 2> reach.txt) || run=true
+          cat reach.txt
+          [ "$run" = false ] && echo "::notice title=Each feature alone ($PACKAGE) skipped::$(cat reach.txt)"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        if: steps.reach.outputs.run != 'false'
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ steps.reach.outputs.run != 'false' && !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          key: features-${{ matrix.package }}-${{ strategy.job-index }}
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        if: steps.reach.outputs.run != 'false'
+        with:
+          tool: cargo-hack
+      - name: Every crate builds with each of its features alone
+        if: steps.reach.outputs.run != 'false' && matrix.package == 'workspace'
+        run: cargo hack check --locked --workspace --exclude antares-wasm --each-feature --exclude-features console
+      - name: Clippy with each feature alone
+        if: steps.reach.outputs.run != 'false' && matrix.package != 'workspace' && matrix.package != 'binary-size'
+        run: cargo hack clippy --locked --each-feature --exclude-features console ${{ matrix.partition && format('--partition {0}', matrix.partition) || '' }} -p ${{ matrix.package }} --all-targets -- -D warnings
+      - name: Tests with each feature alone
+        if: steps.reach.outputs.run != 'false' && matrix.package != 'workspace' && matrix.package != 'binary-size'
+        run: cargo hack test --locked --each-feature --exclude-features console ${{ matrix.partition && format('--partition {0}', matrix.partition) || '' }} -p ${{ matrix.package }}
+      # The budget is ADR-0027 section 6's "binary size" row, read from the
+      # ADR (`full` and each feature alone <= vanilla + 15 MiB, T-5246); the table goes to the step summary.
+      - name: Binary size per surface feature
+        if: steps.reach.outputs.run != 'false' && matrix.package == 'binary-size'
+        run: |
+          python3 dev/surface-features.py --self-test
+          python3 dev/surface-features.py sizes ${{ matrix.partition }}
+
   workspace:
     # fmt + clippy + the workspace test suite across the feature matrix, with
     # live PostGIS / TimescaleDB / mosquitto so no integration test skips
@@ -45,7 +195,11 @@ jobs:
       CARGO_TERM_COLOR: always
     services: &workspace-services
       postgis:
-        image: ghcr.io/baosystems/postgis:17-3.5
+        # The major dev and prod run (CNPG postgis:16-3.6-system-trixie): a
+        # plan fast on 17 sorted every row on 16 (T-5616, T-6021). 16.15 with
+        # PostGIS 3.6.4 on trixie, amd64 only, so no arm job uses it;
+        # dev/preflight.sh starts this same line. strict.yml keeps 17.
+        image: postgis/postgis:16-3.6@sha256:d07ce3f06f657b6516c7511412232e97174d7e9dcf4c9fe520109b682b44a201
         env:
           POSTGRES_USER: antares
           POSTGRES_PASSWORD: antares
@@ -53,7 +207,10 @@ jobs:
         # host ports must stay below 32768: the ephemeral range (32768-60999)
         # collides with random outbound source ports -> "address already in use"
         ports: ["15432:5432"]
+        # docker's 64 MB /dev/shm: 16's parallel VACUUM failed 53100 "could
+        # not resize shared memory segment" in pg_explain (run 40821321485)
         options: >-
+          --shm-size=1g
           --health-cmd "pg_isready -U antares"
           --health-interval 5s --health-timeout 3s --health-retries 20
       # The store integration tests run against BOTH temporal modes —
@@ -66,6 +223,7 @@ jobs:
           POSTGRES_DB: antares
         ports: ["15433:5432"]
         options: >-
+          --shm-size=1g
           --health-cmd "pg_isready -U antares"
           --health-interval 5s --health-timeout 3s --health-retries 20
     steps:
@@ -94,7 +252,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
-          save-if: ${{ github.event_name != 'pull_request' }}
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
           # a red job still saves its target dir, so the retry is warm
           cache-on-failure: true
       # The whole cargo suite runs under nextest so every config emits JUnit
@@ -413,7 +571,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
-          save-if: ${{ github.event_name != 'pull_request' }}
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
           cache-on-failure: true
           key: feature-sets-${{ matrix.set }}
       - *nextest
@@ -460,7 +618,7 @@ jobs:
       - name: Targets this change touches
         id: pick
         env:
-          BASE: ${{ github.event.pull_request.base.sha }}
+          BASE: ${{ github.event.pull_request.base.sha || inputs.base }}
         run: |
           targets=$(python3 dev/fuzz-smoke.py --list ${BASE:+--base "$BASE"} | paste -sd' ')
           echo "touched: ${targets:-none}"
@@ -471,12 +629,13 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fuzz
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
       - if: steps.pick.outputs.targets != ''
         run: cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Replay and fuzz the touched targets
         if: steps.pick.outputs.targets != ''
         env:
-          BASE: ${{ github.event.pull_request.base.sha }}
+          BASE: ${{ github.event.pull_request.base.sha || inputs.base }}
         run: python3 dev/fuzz-smoke.py --run ${BASE:+--base "$BASE"}
       - name: Upload crash artifacts
         if: failure()
@@ -485,110 +644,6 @@ jobs:
           name: fuzz-smoke-artifacts
           path: fuzz/artifacts/
           if-no-files-found: ignore
-
-  features:
-    # GOAL point 2 (T-3465): every cargo feature builds, lints and tests on
-    # its own. The feature-sets job checks no-default and all-features, where a
-    # feature that only compiles next to another one passes unseen; this one
-    # takes each feature alone. A new feature joins it by being declared:
-    # cargo-hack enumerates them from the manifests.
-    # Excluded: `console` (antares-broker), the tokio-console hook for local
-    # debugging, which needs RUSTFLAGS="--cfg tokio_unstable" and is never in
-    # a release (crates/antares-broker/Cargo.toml).
-    # One entry per feature-carrying crate (measured 2026-10-10, 8 jobs:
-    # check of all 26 combinations 144 s, clippy of the 18 140 s, one
-    # antares-api test run 165 s x 7 features, one antares-broker run 69 s x
-    # 4): a single job would pass 15 minutes on a runner, a split one stays
-    # well under.
-    name: Each feature alone (${{ matrix.package }}${{ matrix.partition && format(' {0}', matrix.partition) || '' }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      max-parallel: ${{ inputs.max_parallel }}
-      matrix:
-        # `package`, not `crate`: dev/spec.py reads the first `crate:` matrix
-        # as the shared-crates one
-        package: [workspace, antares-broker, antares-notifier, antares-sql]
-        # antares-api's seven feature runs took 24 min in one job (run
-        # 38064052714): cargo-hack's --partition deals them to four runners
-        # (T-3540).
-        include:
-          - { package: antares-api, partition: 1/4 }
-          - { package: antares-api, partition: 2/4 }
-          - { package: antares-api, partition: 3/4 }
-          - { package: antares-api, partition: 4/4 }
-          # ADR-0027 section 6 (T-3493): the stripped release binary per
-          # surface feature against vanilla; not a crate, so no clippy or
-          # test step runs for it. Eleven release builds in a row reached the
-          # 30 min limit (trains 0217-1, 0307-1): a runner per two features,
-          # each with its own vanilla build (T-4680); fat LTO links a release
-          # build about 3 min longer than thin did (T-5234).
-          - { package: binary-size, partition: 1/6 }
-          - { package: binary-size, partition: 2/6 }
-          - { package: binary-size, partition: 3/6 }
-          - { package: binary-size, partition: 4/6 }
-          - { package: binary-size, partition: 5/6 }
-          - { package: binary-size, partition: 6/6 }
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        with:
-          save-if: ${{ github.event_name != 'pull_request' }}
-          key: features-${{ matrix.package }}-${{ strategy.job-index }}
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
-        with:
-          tool: cargo-hack
-      - name: Every crate builds with each of its features alone
-        if: matrix.package == 'workspace'
-        run: cargo hack check --locked --workspace --exclude antares-wasm --each-feature --exclude-features console
-      - name: Clippy with each feature alone
-        if: matrix.package != 'workspace' && matrix.package != 'binary-size'
-        run: cargo hack clippy --locked --each-feature --exclude-features console ${{ matrix.partition && format('--partition {0}', matrix.partition) || '' }} -p ${{ matrix.package }} --all-targets -- -D warnings
-      - name: Tests with each feature alone
-        if: matrix.package != 'workspace' && matrix.package != 'binary-size'
-        run: cargo hack test --locked --each-feature --exclude-features console ${{ matrix.partition && format('--partition {0}', matrix.partition) || '' }} -p ${{ matrix.package }}
-      # The budget is ADR-0027 section 6's "binary size" row, read from the
-      # ADR (`full` and each feature alone <= vanilla + 15 MiB, T-5246); the table goes to the step summary.
-      - name: Binary size per surface feature
-        if: matrix.package == 'binary-size'
-        run: |
-          python3 dev/surface-features.py --self-test
-          python3 dev/surface-features.py sizes ${{ matrix.partition }}
-
-  coverage-surfaces:
-    # Every new crate of the surfaces epic (metadata.antares.role ops,
-    # surface or protocol) covers 100 % of its lines and branches, minus
-    # what ci/coverage-exclusions.toml lists with a reason; an entry that
-    # is covered now or names a gone function is red too (surfaces-test-plan
-    # section 1, T-3491). A new crate joins by its role, without a YAML
-    # edit; with none yet the gate says so and passes. Existing crates keep
-    # T-3468's 95 % floor. Nightly for llvm-cov's --branch.
-    name: Coverage of the new crates
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
-        with:
-          components: llvm-tools-preview
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        with:
-          save-if: ${{ github.event_name != 'pull_request' }}
-          key: coverage-surfaces
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
-        with:
-          tool: cargo-llvm-cov
-      - name: Coverage gate self-test
-        run: python3 dev/coverage-gate.py --self-test
-      - name: 100 % lines and branches, minus the listed exclusions
-        run: python3 dev/coverage-gate.py
 
   odata-csdl-conformance:
     # The `$metadata` odata-csdl writes, against the OASIS artefacts pinned by
@@ -604,7 +659,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
-          save-if: ${{ github.event_name != 'pull_request' }}
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
           key: odata-csdl-conformance
       - name: xmllint
         run: |
@@ -626,7 +681,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
-          save-if: ${{ github.event_name != 'pull_request' }}
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
           key: odata-url-abnf
       - run: pip install --quiet --disable-pip-version-check pyyaml==6.0.3
       - name: odata_url_abnf_testcases
@@ -645,7 +700,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
-          save-if: ${{ github.event_name != 'pull_request' }}
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
       # --locked matters most here: without it an old cargo would happily
       # resolve older dependency versions and the MSRV claim would be proven
       # against a lockfile nothing else uses.
@@ -670,7 +725,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
-          save-if: ${{ github.event_name != 'pull_request' }}
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
       - run: cargo check --locked -p ${{ matrix.crate }} -j 2
       - run: cargo test --locked -p ${{ matrix.crate }} -j 2
       # T-3912: each example reads real NGSI-LD input from the ETSI suite's fixtures; it has to
@@ -734,7 +789,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
-          save-if: ${{ github.event_name != 'pull_request' }}
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
       - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-semver-checks@0.50.0

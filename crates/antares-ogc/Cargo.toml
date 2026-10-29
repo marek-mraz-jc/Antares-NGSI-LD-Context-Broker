@@ -22,6 +22,7 @@ tabular = ["dep:antares-export", "antares-export/csv", "antares-export/zip", "de
 [dependencies]
 antares-ops = { workspace = true }
 antares-export = { workspace = true, optional = true }
+futures-util = { workspace = true, features = ["alloc"] }
 axum = { version = "0.8", default-features = false, features = ["query"] }
 # a file's provenance names when it was written (T-4477)
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }

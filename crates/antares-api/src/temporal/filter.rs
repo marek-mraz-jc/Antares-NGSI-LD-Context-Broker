@@ -51,8 +51,10 @@ pub(super) fn cap_keeps_shown(
 /// The Attributes the store may qualify an Entity for a page through under
 /// `rules` (T-5616): `Some(None)` any, `Some(Some(list))` only these, `None`
 /// where the rules' verdict on an Entity is not the store's, so it may not
-/// page. It is where every rule names Entities by type alone (no condition,
-/// id or idPattern) through the same windows, every type the rules name
+/// page. It is where every rule names Entities by type alone (no condition
+/// or id; an idPattern only where every rule shares the same ones the store
+/// writes exactly, [`crate::policy::shared_id_patterns`], T-6052) through the
+/// same windows, every type the rules name
 /// shows the same Attributes (the union of its rules: a list longer than a
 /// rule holds is split over several rules of the same types, T-5835), no
 /// type hides Attributes of its own, each requested type is named by a
@@ -81,10 +83,17 @@ pub(super) fn page_attrs(
                     .iter()
                     .all(|w| w.to.is_none() && w.opens_by(s, late))
             }));
+    // the store selects by the rules' shared idPatterns too (T-6052)
+    let patterns = crate::policy::shared_id_patterns(&rules.rules);
+    let by_ids = |r: &crate::policy::Rule| {
+        r.admits_by_type_alone()
+            || patterns
+                .is_some_and(|p| !r.is_conditional() && r.ids.is_empty() && r.id_patterns == p)
+    };
     let alike = rules
         .rules
         .iter()
-        .all(|r| r.admits_by_type_alone() && r.temporal == first.temporal);
+        .all(|r| by_ids(r) && r.temporal == first.temporal);
     // what an Entity of `t` shows: every Attribute, or the union of its rules' lists
     let shown = |t: &String| {
         let of = || rules.rules.iter().filter(|r| r.types.contains(t));

@@ -125,12 +125,12 @@ references), T-3737 (one `Content-Length` on `HEAD`), T-3738 (`$entity`
 
 | Level | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
-| Minimal | 198 | 75 | 20 | 72.5 % |
-| Intermediate | 266 | 70 | 14 | 79.2 % |
-| Advanced | 306 | 223 | 38 | 57.8 % |
-| **All** (suite summary) | 770 | 368 | 72 | 67.7 % |
+| Minimal | 232 | 41 | 20 | 85.0 % |
+| Intermediate | 268 | 68 | 14 | 79.8 % |
+| Advanced | 323 | 206 | 38 | 61.1 % |
+| **All** (suite summary) | 823 | 315 | 72 | 72.3 % |
 
-Measured by surfaces-conformance 40436883749 on `25f4c58` (train 20261027-0206), written by tasks/train.
+Measured by surfaces-conformance 40875442936 on `dd73670` (train 20261029-1230), written by tasks/train.
 
 `$metadata` declares `Capabilities.ConformanceLevel` `Minimal` (row C19). The table above is
 the measured level: the claim is not proven while Minimal stays under 100 %, and each failing
@@ -174,6 +174,10 @@ Each failing area is a task, or a decision with its reason:
 | Edm types beyond String, Double and Int64, Core and Capabilities annotations from the LinkML schema | 4.4, 5.1.1.x, 5.1.4 to 5.1.8, 14.1, vocab_* | T-3722: the schema's `edm_type`, `description`, `odata_computed`, `odata_immutable` and the class's `odata_insertable`, `odata_updatable`, `odata_deletable` (`ci/odata-compliance/schema.json`, as the reference model declares them); the type scripts' metadata tests pass, their filters stay in the rows below (functions, `cast`, arithmetic, `binary'…'` and `duration'…'` literals, the `f` suffix of a Single) |
 | The vocabulary scripts look for the terms on an EntityType named `Product` in the first schema of `$metadata` (`Antares.NgsiLd`, the surface's own vocabulary) and for set restrictions only in external `<Annotations Target="….Container/Set">` blocks | vocab_core_*, vocab_capabilities_*, 14.1 | a limit of the suite: CSDL 14.3 lets an annotation sit inline on its target, which is where the surface writes it, and an EntitySet here is named after its class and so is its EntityType (`Products`). The terms are there: `ReadOnlyItems` refuses `POST`, `PATCH` and `DELETE` with 405 |
 | A create naming a `ProductID` no Product has was accepted, so the suite skipped its foreign-key test (it passed on dev only because a ProductDescriptions create without a key was 400 `MissingKey`, before T-3720 and T-3721) | 11.4.15 | T-3761: the schema's `Product` navigation carries `odata_referential_constraint: ProductID` (`ci/odata-compliance/schema.json`), `$metadata` states the `ReferentialConstraint`, and a create, replace or merge whose `ProductID` names an absent or hidden Product is 400 `BadRequest` (mapping row R6); a bind (`Product@odata.bind`) to a missing Product is 400 (T-3760) |
+| `duration'…'` and `binary'…'` literals, the `f` suffix of a Single, `INF`, `-INF` and `NaN`, a TimeOfDay NGSI-LD stores with or without its `Z`, an `Edm.Binary` served padded | 5.1.1.4, 5.1.1.5, 5.1.6, 5.1.7, 5.1.8 | T-5905: read and range-checked (a literal past its type, or of another type, is 400 before any read); NGSI-LD stores these values as text whose string order is not their value order, so the residual compares the value each spells; `Edm.Binary` is served as unpadded base64url (JSON Format 7.1) |
+| `Data ne binary'AQID'` and `ShippingTime ne duration'P0D'` expect an Entity whose value is null to be left out | 5.1.6, 5.1.8 | by design: OData URL 5.1.1.1.2 makes `ne` true when one operand is null and the other is not (the reference server answers by SQL `<>`, which drops NULL rows) |
+| A Product created without `Rating`, `Temperature` or `Quantity` reads them as null; the reference model gives them a CSDL `DefaultValue` of 0 that a create applies | 5.1.1.2, 5.1.1.3 | open: a LinkML `ifabsent` as `DefaultValue`, written on create. The seed gives the three Products the reference server seeds with 0 that value (`ci/odata-compliance/seed.json`) |
+| `cast` and `isof` | 5.1.1.2 to 5.1.1.4, 5.1.5 to 5.1.8 | open (T-5905 handover): the parser answers them 501 |
 | An enum as an `EnumType` with integer members (`Status eq 1`, flags) | 5.3, 5.1.1 | not supported, by design: mapping section 3.4 keeps an enum an `Edm.String` with `Validation.AllowedValues`, because NGSI-LD values such as `pm2.5` are no CSDL member names |
 | `BatchSupported` was declared false while `$batch` is served; HEAD on a collection or an Entity answered 501 | 11.4.9.x, 11.4.11 | T-3723: declared and served; the batch scripts run, their failures are in the baseline |
 | Multipart `$batch` framed with bare LF line ends; a JSON batch under `OData-MaxVersion: 4.0`; independent requests and `dependsOn` after a failure | 11.4.9, 11.4.9.1, 11.4.9.3, 19_json_batch | T-3726 |
@@ -190,6 +194,15 @@ Each failing area is a task, or a decision with its reason:
 | Deep insert, deep update, `$ref` writes on collection-valued navigation, `If-Match`/`If-None-Match` and ETags | 11.4.6.x, 11.4.7, 11.4.8, 11.5.1, 8.2.2 | not supported, by design: ADR-0024 section 5 (W3, W8, W18, W19, W32) |
 | Asynchronous requests (`Prefer: respond-async`) | 13.1, 11.4.10 | not supported, by design: `AsynchronousRequestsSupported` is false; every request answers synchronously |
 | The `Company` singleton and derived types (`ProductType` discriminator) | 9.1, 11.2.16, 11.2.13 | not supported, by design: an NGSI-LD type is an entity set, with no singleton and no inheritance beyond the abstract Relationship base (ADR-0024 section 5) |
+
+| `any` over a collection-valued navigation, `$orderby` by a member of a single-valued navigation's target, the key missing under `$select` (the NGSI-LD `id` served instead), a bind that left the constrained `CategoryID` unset, `Prefer: return=` on `PATCH` | 11.2.9, 5.1.3, 11.3.11, 11.2.5.2, 11.2.5.11, 11.4.2.1, 11.4.12 | T-5906: `any` is the linked-entity `q` term `nav{Type:member}` (TS 104 175 4.9) resolved through the caller's narrowing, `or` distributes, `any()` is the Relationship present; the surface sorts by the joined target's value; `$select` keeps the key; the schema's `Category` carries `odata_referential_constraint: CategoryID`, as the reference model's foreign key does |
+| The suite form-encodes every query (Go `url.QueryEscape`): a space inside a string literal and after a lambda's `:` arrives as `+` | 11.2.9, 5.1.3, 11.2.5.1, 11.3.5 | a limit of the suite, by design here (first row): OData URL 4.01 section 5 makes the query follow its ABNF, where `BWS` and a string literal hold `%20` and never `+` ("in real URLs they must be percent-encoded as %20", the note under Example 32). With `%20` the same requests pass (`crates/antares-odata/tests/odata_navigation.rs`). A fork that encodes with `%20` is the candidate under the owner's 2026-10-28 rule |
+| `and` inside `any` over a navigation, `all` over a navigation | 11.2.9, 5.1.3 | open: TS 104 175 4.9 matches each linked term on its own target, so `any(d: a and b)` has no `q` form; a two-step read (the targets matching the body, then the Relationship's objects) is the next round |
+| `POST` with `Prefer: return=minimal` expects `201` | 11.4.12 | a limit of the suite: Protocol 4.01 11.4.2 answers a create under `return=minimal` with `204 No Content` and `OData-EntityId`, which the surface does |
+| Custom query options other than `ngsild.*` | 5.2 | not supported, by design: mapping row Q27 and ADR-0028 rule 6 refuse an unknown option with 400, as NGSI-LD refuses an unknown parameter, so a misspelt option never widens an answer silently |
+| An enum compared by its integer (`Status eq 1`, `Status gt 0`) | 11.3.5, 5.1.1.2 | not supported, by design (the `EnumType` row above): the suite's oracle reads `Status` as an enum member name |
+| Complex-type paths (`ShippingAddress/City` in `$filter`, `$orderby`, a path segment), `eq null` on a complex value | 5.2, 5.2.1 | open: an inlined class is `Edm.Untyped` (P2); a CSDL `ComplexType` from the inlined class, mapped to `q` `p[sub]`, is the next round |
+| `join`, `outerjoin`, hierarchy transformations, a sequence inside `groupby`, an `aggregate` after `concat`, `topcount(0)` | 11.2.5.4.1, 11.2.5.4.2 | open (T-3985 rows): answered 501, a non-positive count is not yet 400 |
 
 A by-design line names its reason; the gate keeps such tests as known
 failures and never skips them.

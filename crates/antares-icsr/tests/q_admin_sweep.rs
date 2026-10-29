@@ -38,6 +38,11 @@ const ROUTES: &[(&str, &str, &[&str])] = &[
         "/q/tenants/acme/import",
         &["POST"],
     ),
+    (
+        "/tenants/{tenant}/types/{type}/attributes",
+        "/q/tenants/acme/types/Room/attributes",
+        &["GET"],
+    ),
     ("/dead-letters", "/q/dead-letters", &["GET"]),
     (
         "/dead-letters/{id}",

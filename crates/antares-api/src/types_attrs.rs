@@ -928,6 +928,47 @@ pub async fn entity_type_info(
     go.await.unwrap_or_else(|e| e.into_response())
 }
 
+// ---------- GET /q/tenants/{tenant}/types/{type}/attributes (T-6001) ----------
+
+/// The Attribute names the Tenant's Entities of one type hold, for an
+/// operator's plan: a write replacing whole Entities is refused while a
+/// stored Entity holds a name its view does not admit (`WriteGuard::pre_whole`),
+/// and only the broker knows the stored names. Names only, never a value;
+/// each compacted under the policy @context the views compare names in, and
+/// the type expanded the same way. The fold is the one `/types/{type}` runs,
+/// bounded by `MAX_FOLD_DOCS`; `partial` says it stopped there. A Tenant or
+/// type with no Entity answers an empty list.
+pub(crate) async fn stored_attributes(
+    State(st): State<AppState>,
+    Path((raw, type_name)): Path<(String, String)>,
+) -> Response {
+    let go = async {
+        let tenant = antares_model::TenantId::new(&raw)
+            .ok()
+            .filter(|_| !crate::router::reserved_tenant(&raw))
+            .ok_or_else(|| NgsiError::BadRequestData(format!("invalid tenant: {raw:?}")))?;
+        let ctx = crate::repr::policy_context();
+        let iri = ctx.expand_key(&type_name);
+        let max = *crate::bounds::MAX_FOLD_DOCS;
+        let (mut stats, partial) = type_stats(&st, &tenant, max, Narrow::Type(&iri), None).await?;
+        let names: Vec<String> = stats
+            .remove(&iri)
+            .unwrap_or_default()
+            .1
+            .keys()
+            .map(|a| ctx.compact_iri(a))
+            .collect();
+        let body = json!({
+            "tenant": tenant.as_str(),
+            "type": ctx.compact_iri(&iri),
+            "attributes": names,
+            "partial": partial,
+        });
+        Ok::<_, ApiError>((StatusCode::OK, axum::Json(body)).into_response())
+    };
+    go.await.unwrap_or_else(|e| e.into_response())
+}
+
 // ---------- GET /attributes (5.7.8/5.7.9) ----------
 
 /// 4.5.13 Attribute List Representation, members per Table 5.2.27-1

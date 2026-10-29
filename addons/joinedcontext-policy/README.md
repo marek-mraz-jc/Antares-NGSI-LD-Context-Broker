@@ -21,6 +21,7 @@ token and strips them from every client request.
 | `x-jc-roles` | roles, comma separated; the Endpoint roles (`endpoint:{project}/{endpoint}[/{role}]`) the gateway resolved for this request among them |
 | `x-jc-restricted` | `true` when the caller opted into the restricted signal (O-3 (b)) |
 | `x-jc-did` | the data-space participant a transfer token names (platform DS-02, map K38) |
+| `x-jc-read-only` | `true` when the caller's token is a read-only connector's (platform S-49): every operation but a read is refused, whatever the policies grant; any value counts |
 
 Each value, and each member of a list, is percent-encoded UTF-8 (RFC 3986:
 the unreserved characters `A-Z a-z 0-9 - . _ ~` stay as they are, every
@@ -106,6 +107,11 @@ A document that does not parse is refused and the previous one keeps
 deciding; a Tenant with no document denies every platform caller.
 
 ## 3. Decisions
+
+A read-only caller (`x-jc-read-only`) is refused every clause other than a
+read (`policy::FILTERABLE`, `policy::NAME_READS`) and the retrieval of one
+Subscription, Registration or Registration Subscription (5.8.3, 5.10.1,
+5.11.4) before any policy is read, and the tool probe offers it none.
 
 1. The policies that apply: those of the request's view when the document
    lists it (`views`), every policy otherwise; of those, the ones whose

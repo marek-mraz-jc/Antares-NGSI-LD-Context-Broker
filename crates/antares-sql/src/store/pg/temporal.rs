@@ -334,24 +334,36 @@ fn history(tenant: &str, entity: &str) -> String {
 /// text predicate then refused: ~115 rows an Entity on the helsinki-bikes
 /// history, past the 30 s statement timeout for 577 Entities (T-5616).
 /// `attrs`, the bind of the Attribute IRIs a policy shows, keeps the probe to
-/// their rows.
+/// their rows, one probe per Attribute along the full (tenant, entity, attr,
+/// observed_at) prefix: an `attr_id = ANY(..)` filter is no index condition
+/// beside the window's column bound, so Postgres sorted every row of the
+/// Entity within the widened bound for its LIMIT 1 (dev: 148 rows and a heap
+/// fetch each per station, 29k buffers and 5.9 s for 577 stations; T-5616).
+/// A `bare` Entity (migration 0030) holds no row and is not probed: each
+/// probe reads every weekly partition of its parent, and a type of 19 782
+/// Entities without history passed the 30 s statement timeout (T-5835).
 pub fn has_history(preds: &str, dir: &str, attrs: Option<usize>) -> String {
-    let (x, r) = attrs.map_or_else(Default::default, |n| {
-        (
-            format!(" AND ai.attr_id = ANY(${n})"),
-            format!(
-                " AND ai.attr_no IN (SELECT i.id FROM iri_ids i \
-                 WHERE i.tenant_id = m.tenant_id AND i.iri = ANY(${n}))"
-            ),
-        )
-    });
+    let Some(n) = attrs else {
+        return format!(
+            "NOT m.bare AND ((SELECT true FROM attr_instances ai \
+               WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id{preds} \
+               ORDER BY ai.attr_id {dir}, ai.observed_at {dir} LIMIT 1) IS NOT NULL \
+             OR (SELECT true FROM attr_rows ai \
+               WHERE ai.tenant_id = m.tenant_id AND ai.entity_no = iri_no(m.tenant_id, m.id){preds} \
+               ORDER BY ai.attr_no {dir}, ai.observed_at {dir} LIMIT 1) IS NOT NULL)"
+        );
+    };
     format!(
-        "((SELECT true FROM attr_instances ai \
-           WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id{x}{preds} \
-           ORDER BY ai.attr_id {dir}, ai.observed_at {dir} LIMIT 1) IS NOT NULL \
-         OR (SELECT true FROM attr_rows ai \
-           WHERE ai.tenant_id = m.tenant_id AND ai.entity_no = iri_no(m.tenant_id, m.id){r}{preds} \
-           ORDER BY ai.attr_no {dir}, ai.observed_at {dir} LIMIT 1) IS NOT NULL)"
+        "NOT m.bare AND (EXISTS (SELECT 1 FROM unnest(${n}::text[]) s(attr) CROSS JOIN LATERAL \
+           (SELECT true FROM attr_instances ai \
+             WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id AND ai.attr_id = s.attr{preds} \
+             ORDER BY ai.observed_at {dir} LIMIT 1) h) \
+         OR EXISTS (SELECT 1 FROM iri_ids i CROSS JOIN LATERAL \
+           (SELECT true FROM attr_rows ai \
+             WHERE ai.tenant_id = m.tenant_id AND ai.entity_no = iri_no(m.tenant_id, m.id) \
+               AND ai.attr_no = i.id{preds} \
+             ORDER BY ai.observed_at {dir} LIMIT 1) h \
+           WHERE i.tenant_id = m.tenant_id AND i.iri = ANY(${n})))"
     )
 }
 
@@ -529,6 +541,23 @@ async fn insert_rows(
     let rows = if dedup { unseen(rows) } else { rows };
     if rows.is_empty() {
         return Ok(());
+    }
+    // The row stays locked until this write commits, so the bare sweep skips
+    // it, or this waits for the sweep to commit and then sees its mark
+    // (migration 0030). Every caller writes the Entity's temporal row first.
+    let bare: Option<bool> = sqlx::query_scalar(
+        "SELECT bare FROM temporal_entities WHERE tenant_id = $1 AND id = $2 FOR SHARE",
+    )
+    .bind(tenant.as_str())
+    .bind(entity_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if bare == Some(true) {
+        sqlx::query("UPDATE temporal_entities SET bare = false WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_str())
+            .bind(entity_id)
+            .execute(&mut *tx)
+            .await?;
     }
     // The Attributes given an instance in a dataset (migration 0009): lastN
     // keeps every row of these, so the read needs to know them.
@@ -1660,6 +1689,25 @@ impl PgTemporalStore {
                 "(m.types[1] = ANY(${n}) OR (cardinality(m.types) > 1 AND m.types && ${n}))"
             ));
         }
+        // a policy's idPatterns, as the entity query takes them (T-5826,
+        // T-6052): every one written or none, so the rows stay a superset
+        if let Some(res) = f.id_patterns.and_then(|ps| {
+            ps.iter()
+                .map(|p| antares_store::filter::id_pattern_sql(p))
+                .collect::<Option<Vec<_>>>()
+        }) {
+            let any: Vec<String> = res
+                .into_iter()
+                .map(|re| {
+                    binds.push(B::Text(re));
+                    format!("regexp_like(m.id COLLATE \"C\", ${})", binds.len())
+                })
+                .collect();
+            wheres.push(match any.as_slice() {
+                [] => "false".to_owned(),
+                _ => format!("({})", any.join(" OR ")),
+            });
+        }
         if let Some(attrs) = f.attrs {
             binds.push(B::Arr(super::storable(attrs)));
             wheres.push(format!(
@@ -2407,6 +2455,7 @@ mod tests {
             "{sql}"
         );
         assert_eq!(sql.matches(" AND ai.x").count(), 2, "{sql}");
+        assert!(sql.starts_with("NOT m.bare AND ("), "{sql}");
         assert!(!sql.contains("EXISTS"), "{sql}");
         assert!(!sql.contains("ANY("), "{sql}");
     }
@@ -2416,11 +2465,21 @@ mod tests {
     #[test]
     fn the_page_qualification_keeps_to_the_shown_attributes() {
         let sql = has_history(" AND ai.x", "DESC", Some(9));
-        assert!(sql.contains("ai.attr_id = ANY($9)"), "{sql}");
+        assert!(sql.contains("unnest($9::text[]) s(attr)"), "{sql}");
         assert!(
-            sql.contains("ai.attr_no IN (SELECT i.id FROM iri_ids i WHERE i.tenant_id = m.tenant_id AND i.iri = ANY($9))"),
+            sql.contains("ai.attr_id = s.attr AND ai.x ORDER BY ai.observed_at DESC LIMIT 1"),
             "{sql}"
         );
+        assert!(
+            sql.contains("ai.attr_no = i.id AND ai.x ORDER BY ai.observed_at DESC LIMIT 1"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("i.tenant_id = m.tenant_id AND i.iri = ANY($9)"),
+            "{sql}"
+        );
+        assert!(!sql.contains("attr_id = ANY"), "{sql}");
+        assert!(sql.starts_with("NOT m.bare AND ("), "{sql}");
     }
 
     /// T-5616: the read takes the N newest alone only where the Entity's

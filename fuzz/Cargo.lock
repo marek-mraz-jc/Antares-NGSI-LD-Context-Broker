@@ -1584,6 +1584,7 @@ name = "odata-batch"
 version = "0.3.0"
 dependencies = [
  "memchr",
+ "serde",
  "serde_json",
 ]
 

@@ -360,6 +360,7 @@ dependencies = [
  "odata-json",
  "odata-url",
  "proptest",
+ "serde",
  "serde_json",
  "tokio",
  "tower",
@@ -377,6 +378,7 @@ dependencies = [
  "axum",
  "bytes",
  "chrono",
+ "futures-util",
  "http-body-util",
  "linkml-model",
  "ogc-cql2",
@@ -2742,6 +2744,7 @@ version = "0.3.0"
 dependencies = [
  "memchr",
  "proptest",
+ "serde",
  "serde_json",
 ]
 
@@ -5368,9 +5371,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.0.1"
+version = "9.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e49ade69c4434c55dd651d36fe05f38e0578db948b773cbc01c48c4b5e560692"
+checksum = "6e04976da629d3b04204ba8105b396a193af8ad2583b2c79bfb3ab8af580a11e"
 dependencies = [
  "crc32fast",
  "flate2",

@@ -191,6 +191,108 @@ async fn entity_values_follow_create_update_replace_and_delete() {
     assert!(keyed().await.is_empty(), "a deleted Entity leaves no row");
 }
 
+/// T-5772: an update rewrites only the `entity_values` rows that changed
+/// (0029). A document move that keeps every value (a new `observedAt`)
+/// leaves every row in place, a changed value replaces that Attribute's row
+/// alone, and after each write the rows equal those of the stored document.
+#[tokio::test]
+async fn an_update_rewrites_only_the_entity_values_rows_that_changed() {
+    use antares_sql::store::pg::entity::PgEntityStore;
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let t = TenantId::new("pg_entity_values_diff").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let store = PgEntityStore::new(pool.clone());
+    let id = "urn:ngsi-ld:V:diff";
+    let _ = store.delete(&t, id).await.expect("clear");
+    let doc = serde_json::json!({"id": id, "type": "V",
+        "speed": [{"type": "Property", "value": 1, "observedAt": "2026-10-29T00:00:00Z"}],
+        "name": [{"type": "Property", "value": "a"}]});
+    assert!(store.create(&t, id, &doc).await.expect("create"));
+    // Each row with the transaction that wrote it, and whether the stored
+    // rows are exactly entity_value_rows() of the stored document.
+    let rows = || async {
+        let rows: Vec<(String, Option<f64>, Option<String>, String)> = sqlx::query_as(
+            "SELECT attr, f, txt, xmin::text FROM entity_values
+              WHERE tenant_id = $1 AND id = $2 ORDER BY attr, f, txt",
+        )
+        .bind(t.as_str())
+        .bind(id)
+        .fetch_all(&pool)
+        .await
+        .expect("rows");
+        let same: bool = sqlx::query_scalar(
+            "SELECT NOT EXISTS (
+               (SELECT attr, f, txt FROM entity_values WHERE tenant_id = $1 AND id = $2
+                EXCEPT SELECT r.attr, r.f, r.txt FROM entities e, entity_value_rows(e.entity) r
+                        WHERE e.tenant_id = $1 AND e.id = $2)
+               UNION ALL
+               (SELECT r.attr, r.f, r.txt FROM entities e, entity_value_rows(e.entity) r
+                 WHERE e.tenant_id = $1 AND e.id = $2
+                EXCEPT SELECT attr, f, txt FROM entity_values WHERE tenant_id = $1 AND id = $2))",
+        )
+        .bind(t.as_str())
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("compare");
+        (rows, same)
+    };
+    let set = |path: &'static str, v: serde_json::Value| {
+        let (store, t) = (&store, &t);
+        async move {
+            store
+                .mutate(t, id, |d| {
+                    d[path][0] = v.clone();
+                    Ok::<_, ()>(())
+                })
+                .await
+                .expect("mutate")
+                .expect("present")
+                .expect("applied");
+        }
+    };
+    let (before, same) = rows().await;
+    assert!(same, "created rows follow the document");
+    assert_eq!(before.len(), 2);
+
+    set(
+        "speed",
+        serde_json::json!({"type": "Property", "value": 1, "observedAt": "2026-10-29T01:00:00Z"}),
+    )
+    .await;
+    let (moved, same) = rows().await;
+    assert!(same, "rows follow the document after an observedAt move");
+    assert_eq!(moved, before, "no row rewritten when no value changed");
+
+    set("speed", serde_json::json!({"type": "Property", "value": 2})).await;
+    let (changed, same) = rows().await;
+    assert!(same, "rows follow the document after a value change");
+    assert_eq!(changed.first(), before.first(), "the name row stays");
+    assert_eq!(
+        changed.get(1).map(|r| (r.0.as_str(), r.1)),
+        Some(("speed", Some(2.0)))
+    );
+    assert_ne!(changed.get(1).map(|r| &r.3), before.get(1).map(|r| &r.3));
+
+    // Past 32 scalars the Attribute is one NaN row, and back again.
+    let many: Vec<i64> = (0..40).collect();
+    set(
+        "speed",
+        serde_json::json!({"type": "Property", "value": many}),
+    )
+    .await;
+    let (unknown, same) = rows().await;
+    assert!(same, "rows follow the document into the unknown mark");
+    assert_eq!(unknown.len(), 2);
+    assert!(unknown.get(1).and_then(|r| r.1).is_some_and(f64::is_nan));
+    set("speed", serde_json::json!({"type": "Property", "value": 5})).await;
+    let (back, same) = rows().await;
+    assert!(same, "rows follow the document out of the unknown mark");
+    assert_eq!(back.get(1).map(|r| r.1), Some(Some(5.0)));
+    assert!(store.delete(&t, id).await.expect("delete").is_some());
+}
+
 /// T-5303: a term more than 1 000 Entities match probes no id list and the
 /// page reads as before; one that fewer match reads only those. Both count
 /// exactly.

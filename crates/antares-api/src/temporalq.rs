@@ -8,6 +8,17 @@ use antares_model::{dt_key, NgsiError};
 use serde_json::Value;
 use std::collections::HashMap;
 
+/// The timeproperty names of 4.8 (TS 104 175 5.2.4 NOTE 2): the structural
+/// timestamps "observedAt, createdAt, modifiedAt, deletedAt, expiresAt ...
+/// can be used as timeproperty in Temporal Queries".
+pub const TIMEPROPERTIES: &[&str] = &[
+    "observedAt",
+    "createdAt",
+    "modifiedAt",
+    "deletedAt",
+    "expiresAt",
+];
+
 #[derive(Clone)]
 pub struct TemporalQ {
     pub timerel: String,
@@ -37,7 +48,7 @@ impl TemporalQ {
             // bare timeproperty: representation keyed on it; instances that
             // lack it are excluded (retrieval-by-deletedAt, 020_17/18)
             if let Some(tp) = params.get("timeproperty") {
-                if !["observedAt", "createdAt", "modifiedAt", "deletedAt"].contains(&tp.as_str()) {
+                if !TIMEPROPERTIES.contains(&tp.as_str()) {
                     return Err(bad(format!("invalid timeproperty {tp:?}")));
                 }
                 return Ok(Some(Self {
@@ -69,8 +80,7 @@ impl TemporalQ {
             .get("timeproperty")
             .cloned()
             .unwrap_or_else(|| "observedAt".into());
-        if !["observedAt", "createdAt", "modifiedAt", "deletedAt"].contains(&timeproperty.as_str())
-        {
+        if !TIMEPROPERTIES.contains(&timeproperty.as_str()) {
             return Err(bad(format!("invalid timeproperty {timeproperty:?}")));
         }
         Ok(Some(Self {
@@ -187,6 +197,43 @@ mod tests {
         let q = tq("after", "1970-01-01T00:00:00Z", None);
         assert_eq!(q.timeproperty, "observedAt");
         assert!(!q.instance_matches(&json!({"modifiedAt": "2020-01-01T00:00:00Z"})));
+    }
+
+    /// 5.2.4 NOTE 2: expiresAt is a timeproperty; a window over it keeps the
+    /// instances whose expiresAt falls in it, and an instance without one is
+    /// non-matching (4.11), as for createdAt or modifiedAt.
+    #[test]
+    fn expires_at_is_a_timeproperty_and_its_window_selects() {
+        let mut p = HashMap::new();
+        for (k, v) in [
+            ("timerel", "between"),
+            ("timeAt", "2030-01-01T00:00:00Z"),
+            ("endTimeAt", "2030-01-02T00:00:00Z"),
+            ("timeproperty", "expiresAt"),
+        ] {
+            p.insert(k.to_owned(), v.to_owned());
+        }
+        let q = TemporalQ::from_params(&p, true).unwrap().unwrap();
+        assert_eq!(q.timeproperty, "expiresAt");
+        assert!(q.instance_matches(&json!({"expiresAt": "2030-01-01T12:00:00Z"})));
+        assert!(!q.instance_matches(&json!({"expiresAt": "2030-01-02T00:00:00Z"})));
+        assert!(!q.instance_matches(&json!({"observedAt": "2030-01-01T12:00:00Z"})));
+        let bare = HashMap::from([("timeproperty".to_owned(), "expiresAt".to_owned())]);
+        let q = TemporalQ::from_params(&bare, false).unwrap().unwrap();
+        assert_eq!(q.timerel, "any");
+    }
+
+    /// A timeproperty outside the 4.8 set is 400 on both parameter shapes.
+    #[test]
+    fn unknown_timeproperty_is_refused() {
+        for tp in ["lastUsedAt", "foo", "ExpiresAt"] {
+            let bare = HashMap::from([("timeproperty".to_owned(), tp.to_owned())]);
+            assert!(TemporalQ::from_params(&bare, false).is_err(), "{tp}");
+            let mut p = bare.clone();
+            p.insert("timerel".to_owned(), "after".to_owned());
+            p.insert("timeAt".to_owned(), "2020-01-01T00:00:00Z".to_owned());
+            assert!(TemporalQ::from_params(&p, true).is_err(), "{tp}");
+        }
     }
 
     /// 4.11 grammar: only before/after/between; timeAt mandatory and a

@@ -554,7 +554,8 @@ async fn a_window_page_reads_only_its_instances_from_postgres() {
 /// the Attributes it shows (the request's own `attrs` among them), so a
 /// type-wide query reads one page of Entities, not all 577 bike stations.
 /// Every rule shape whose verdict on an Entity the store cannot see keeps the
-/// page in the API.
+/// page in the API; an idPattern the store writes exactly is one it sees
+/// (T-6052).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_type_only_rule_pages_in_the_store_through_its_attributes() {
     let speed = vec![format!("{DC}speed")];
@@ -569,6 +570,12 @@ async fn a_type_only_rule_pages_in_the_store_through_its_attributes() {
     };
     let by_pattern = Rule {
         id_patterns: vec!["urn:ngsi-ld:Vehicle:.*".into()],
+        ..plain()
+    };
+    // T-6052: a pattern the store writes exactly pages there too, and one
+    // that misses the Entity shows nothing
+    let by_exact = |p: &str| Rule {
+        id_patterns: vec![p.into()],
         ..plain()
     };
     for (rule, query, paged, shown) in [
@@ -594,6 +601,18 @@ async fn a_type_only_rule_pages_in_the_store_through_its_attributes() {
         (opens_late, "type=Vehicle", None, vec![9, 10]),
         (conditional(), "type=Vehicle", None, vec![7, 8, 9, 10]),
         (by_pattern, "type=Vehicle", None, vec![7, 8, 9, 10]),
+        (
+            by_exact("^urn:ngsi-ld:Vehicle:[a-z]+$"),
+            "type=Vehicle",
+            Some(Some(speed.clone())),
+            vec![7, 8, 9, 10],
+        ),
+        (
+            by_exact("urn:ngsi-ld:Vehicle:bus-[a-z]+"),
+            "type=Vehicle",
+            Some(Some(speed.clone())),
+            Vec::new(),
+        ),
         (plain(), "type=Vehicle,Bus", None, vec![7, 8, 9, 10]),
     ] {
         let (st, recording) = state(rule.clone()).await;

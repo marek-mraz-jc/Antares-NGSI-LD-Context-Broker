@@ -367,6 +367,12 @@ pub struct Shared {
     /// The most bytes of one in-process answer a handler buffers
     /// ([`crate::bounds::MAX_ANSWER_BYTES`]).
     pub max_answer_bytes: usize,
+    /// The bytes every concurrently buffered answer holds together, from
+    /// the memory budget ([`crate::bounds::MemoryBudget::answers`]).
+    pub answer_pool: Arc<crate::bounds::AnswerPool>,
+    /// The charged bytes of ImplicitlyCreated @contexts one Tenant may hold
+    /// ([`crate::bounds::MemoryBudget::implicit_contexts`]).
+    pub implicit_context_bytes: u64,
     /// One shared outbound client, timeouts set at construction.
     pub http: antares_jsonld::HttpClient,
     /// Federation-forwarding client — longer deadline: the ETSI mock replies
@@ -530,6 +536,21 @@ impl std::ops::DerefMut for AppState {
 }
 
 impl AppState {
+    /// An in-process answer read whole, under `max_answer_bytes` and
+    /// charged to `answer_pool` until the returned value drops
+    /// (T-5895).
+    ///
+    /// # Errors
+    /// [`crate::bounds::AnswerRefusal`]: over the per-answer bound, no room in
+    /// the pool, or a failed body.
+    pub async fn read_answer(
+        &self,
+        body: axum::body::Body,
+        surface: &'static str,
+    ) -> Result<crate::bounds::HeldAnswer, crate::bounds::AnswerRefusal> {
+        crate::bounds::read_answer(&self.answer_pool, body, self.max_answer_bytes, surface).await
+    }
+
     /// This state's broker, told apart from the other brokers of the
     /// process: its narrowed copies share it, and no live broker shares it
     /// with another.
@@ -789,6 +810,11 @@ impl AppState {
                 temporal_instance_limit: crate::bounds::temporal_instance_limit(),
                 temporal_default_instances: crate::bounds::temporal_default_instances(),
                 max_answer_bytes: crate::bounds::MAX_ANSWER_BYTES,
+                answer_pool: crate::bounds::AnswerPool::new(
+                    usize::try_from(crate::bounds::MemoryBudget::default().answers())
+                        .unwrap_or(usize::MAX),
+                ),
+                implicit_context_bytes: crate::bounds::MemoryBudget::default().implicit_contexts(),
                 http: http.clone(),
                 fed_http: outbound_client(
                     egress_policy,

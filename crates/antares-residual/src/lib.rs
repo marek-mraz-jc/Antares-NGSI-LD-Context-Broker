@@ -18,6 +18,7 @@
 //!
 #![doc = include_str!("../README.md")]
 
+mod binary;
 mod eval;
 mod geometry;
 mod pattern;
@@ -28,9 +29,10 @@ use std::fmt;
 use regex::Regex;
 use serde_json::Value;
 
+pub use binary::{base64url, decode_base64};
 pub use geometry::MAX_GEO_VERTICES;
 pub use pattern::{MAX_PATTERN_BYTES, MAX_PROGRAM_BYTES};
-pub use time::{Date, DateTime, Time};
+pub use time::{Date, DateTime, Duration, Time};
 
 /// The deepest nesting of an expression (rule 7).
 pub const MAX_DEPTH: usize = 64;
@@ -158,6 +160,10 @@ pub enum Lit {
     Date(Date),
     /// A time of day.
     Time(Time),
+    /// A day-time duration; a string value compares with one as the duration it spells.
+    Duration(Duration),
+    /// Bytes; a string value compares with them as the base64 text it is ([`decode_base64`]).
+    Binary(Vec<u8>),
     /// A `GeoJSON` geometry object (`type`, `coordinates`), checked at [`compile`] as the
     /// NGSI-LD `georel` checks its `geometry`: RFC 7946 shape, WGS84 range, at most
     /// [`MAX_GEO_VERTICES`] positions.
@@ -283,6 +289,9 @@ pub enum Func {
     /// CQL2 `a ^ b`: an integer for two integers and an exponent from 0, a number otherwise;
     /// an overflow or a result that is no finite number is unknown.
     Pow,
+    /// `a` when it is a number from `b` to `c`, unknown otherwise: `OData` `cast` to a
+    /// narrower numeric type.
+    InRange,
     /// `-a`.
     Neg,
 }
@@ -314,6 +323,7 @@ impl Func {
             | Self::Ceiling
             | Self::Neg => (1, 1),
             Self::Substring => (2, 3),
+            Self::InRange => (3, 3),
             _ => (2, 2),
         }
     }

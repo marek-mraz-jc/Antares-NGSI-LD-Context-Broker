@@ -8,13 +8,14 @@ use std::collections::BTreeSet;
 
 /// The headers this engine reads, in the order
 /// `ANTARES_POLICY_SUBJECT_HEADERS` lists them.
-pub const HEADERS: [&str; 6] = [
+pub const HEADERS: [&str; 7] = [
     "x-jc-subject",
     "x-jc-groups",
     "x-jc-roles",
     "x-jc-client",
     "x-jc-restricted",
     "x-jc-did",
+    "x-jc-read-only",
 ];
 
 /// The prefix of an Endpoint caller role, `endpoint:{project}/{name}` (AP-97).
@@ -44,6 +45,10 @@ pub struct Platform {
     pub restricted: bool,
     /// `x-jc-did`: the data-space participant a transfer token names (DS-02).
     pub did: Option<String>,
+    /// `x-jc-read-only` present, whatever its value: a read-only connector's token, which reads
+    /// and never writes (platform S-49). Only `true` is ever sent; any other value is a
+    /// malformed marker and still holds the caller to reads (deny by default).
+    pub read_only: bool,
 }
 
 impl Caller {
@@ -97,6 +102,7 @@ impl Caller {
             },
             did: one("x-jc-did"),
             restricted: get("x-jc-restricted").is_some_and(|v| v.eq_ignore_ascii_case("true")),
+            read_only: get("x-jc-read-only").is_some(),
             user,
             client,
         })
@@ -223,6 +229,21 @@ mod tests {
         }
         let p = platform(caller(&[("x-jc-subject", "a"), ("x-jc-restricted", "yes")]))?;
         assert!(!p.restricted && p.roles.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn any_read_only_marker_holds_the_caller_to_reads() -> Result<(), String> {
+        let p = platform(caller(&[("x-jc-subject", "a")]))?;
+        assert!(!p.read_only);
+        // only `true` is sent; a malformed marker is still a marker (deny by default)
+        for value in ["true", "TRUE", "false", "", "1"] {
+            let p = platform(caller(&[("x-jc-subject", "a"), ("x-jc-read-only", value)]))?;
+            assert!(p.read_only, "{value:?}");
+        }
+        // the marker alone makes a platform caller, never one from inside the cluster
+        let p = platform(caller(&[("x-jc-read-only", "true")]))?;
+        assert!(p.read_only && p.roles.contains("public"));
         Ok(())
     }
 

@@ -144,20 +144,37 @@ async fn each_historical_location_has_its_own_geometry() -> Result<(), String> {
 #[tokio::test]
 async fn a_filter_reads_sta_names_and_the_catalogue_link_its_type() -> Result<(), String> {
     let f = fixture().await?;
+    // T-5918: a property no `q` names is judged over the collection the view answered.
     let all = sta(&f.app, "/Observations?$filter=result gt 0").await;
-    assert_eq!(
-        (all.status, at(&all.body, "/error/message")),
-        (
-            StatusCode::BAD_REQUEST,
-            json!("$filter: result is not a property Observations are filtered on")
-        )
+    assert_eq!(all.status, StatusCode::OK, "{}", all.body);
+    let results = at(&all.body, "/value")
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_ne!(results.len(), 0);
+    assert!(
+        results
+            .iter()
+            .all(|o| o.get("result").and_then(Value::as_f64) > Some(0.0)),
+        "{}",
+        all.body
     );
     let result = sta(
         &f.app,
         "/Datastreams('urn:ngsi-ld:Car:1%2Fspeed')/Observations?$filter=result gt 8",
     )
     .await;
-    assert_eq!(result.status, StatusCode::BAD_REQUEST);
+    assert_eq!(result.status, StatusCode::OK, "{}", result.body);
+    let kept = at(&result.body, "/value")
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        kept.iter()
+            .all(|o| o.get("result").and_then(Value::as_f64) > Some(8.0)),
+        "{}",
+        result.body
+    );
     let cars = sta(
         &f.app,
         "/Datastreams?$filter=Thing/properties/type eq 'Car' and Thing/name eq 'Žltá'",
@@ -200,18 +217,37 @@ async fn select_expand_and_top_answer_as_documented() -> Result<(), String> {
         "{}",
         deep.body
     );
-    let refused = sta(&f.app, "/Observations?$expand=Datastream").await;
+    // T-5918: every navigation path is expanded, one through its navigation link.
+    let inlined = sta(&f.app, "/Observations?$expand=Datastream/Thing").await;
+    assert_eq!(inlined.status, StatusCode::OK, "{}", inlined.body);
+    assert!(
+        at(&inlined.body, "/value/0/Datastream/Thing/@iot.id").is_string(),
+        "{}",
+        inlined.body
+    );
+    let refused = sta(&f.app, "/Observations?$expand=Sensor").await;
     assert_eq!(
         (refused.status, at(&refused.body, "/error/message")),
         (
             StatusCode::BAD_REQUEST,
-            json!("$expand: Datastream is not served on Observations")
+            json!("$expand: Sensor is not a navigation path of Observations")
         )
     );
     let count = sta(&f.app, "/Things?$top=0&$count=true").await;
     assert_eq!(count.body, json!({"@iot.count": 5, "value": []}));
-    let order = sta(&f.app, "/Things?$orderby=phenomenonTime desc").await;
-    assert_eq!(order.status, StatusCode::BAD_REQUEST);
+    let order = sta(&f.app, "/Things?$orderby=name desc").await;
+    let names: Vec<Value> = at(&order.body, "/value")
+        .as_array()
+        .map(|v| {
+            v.iter()
+                .map(|t| t.get("name").cloned().unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut sorted = names.clone();
+    sorted.sort_by_key(|n| std::cmp::Reverse(n.as_str().map(str::to_owned)));
+    assert_eq!((order.status, names.len()), (StatusCode::OK, 5));
+    assert_eq!(names, sorted);
     Ok(())
 }
 
@@ -253,10 +289,12 @@ async fn the_type_selector_and_the_count_alone_hold_at_their_edges() -> Result<(
 }
 
 /// F-ANT5-004: the unknown Sensor heading the first page is no Entity served, so the next link
-/// resumes at the second Entity and every Device is listed once over the pages.
+/// resumes at the second Entity and every Device is listed once over the pages. Car:9 names no
+/// Device, so the unknown Sensor has its Datastream.
 #[tokio::test]
 async fn sensor_pages_list_every_device_once() -> Result<(), String> {
-    let mut entities = Vec::new();
+    let mut entities = vec![json!({"id": "urn:ngsi-ld:Car:9", "type": "Car",
+        "speed": {"type": "Property", "value": 5}})];
     for i in 1..=3 {
         let device = format!("urn:ngsi-ld:Device:{i}");
         entities.push(json!({"id": format!("urn:ngsi-ld:Car:{i}"), "type": "Car",
@@ -285,6 +323,113 @@ async fn sensor_pages_list_every_device_once() -> Result<(), String> {
             "urn:ngsi-ld:Device:2",
             "urn:ngsi-ld:Device:3"
         ]
+    );
+    Ok(())
+}
+
+/// T-5918: options combine in the order 15-078r6 9.3.3.1 gives: `$filter`, then `$count`,
+/// `$orderby`, `$skip`, `$top` (ets-sta10 Capability3Tests.checkQueriesPriorityOrdering).
+#[tokio::test]
+async fn query_options_apply_in_their_evaluation_order() -> Result<(), String> {
+    let f = fixture().await?;
+    let all = sta(&f.app, "/Observations?$filter=result gt 0").await;
+    let mut results: Vec<f64> = at(&all.body, "/value")
+        .as_array()
+        .map(|v| {
+            v.iter()
+                .filter_map(|o| o.get("result").and_then(Value::as_f64))
+                .collect()
+        })
+        .unwrap_or_default();
+    results.sort_by(f64::total_cmp);
+    assert!(results.len() > 1, "{}", all.body);
+    let page = sta(
+        &f.app,
+        "/Observations?$count=true&$top=1&$skip=1&$orderby=result%20asc&$filter=result%20gt%200",
+    )
+    .await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    assert_eq!(at(&page.body, "/@iot.count"), json!(results.len()));
+    assert_eq!(
+        at(&page.body, "/value").as_array().map(Vec::len),
+        Some(1),
+        "{}",
+        page.body
+    );
+    assert_eq!(
+        at(&page.body, "/value/0/result").as_f64(),
+        results.get(1).copied()
+    );
+    let next = at(&page.body, "/@iot.nextLink");
+    assert!(
+        next.as_str().is_some_and(|l| l.ends_with("$skip=2")),
+        "{next}"
+    );
+    Ok(())
+}
+
+/// T-5918: what a filter or an order over the collection refuses, and where it applies.
+#[tokio::test]
+async fn a_filter_over_the_collection_names_what_it_cannot_judge() -> Result<(), String> {
+    let f = fixture().await?;
+    let native = sta(
+        &f.app,
+        "/Datastreams('urn:ngsi-ld:Car:1%2Fspeed')/Observations?$orderby=phenomenonTime%20desc",
+    )
+    .await;
+    assert_eq!(native.status, StatusCode::OK, "{}", native.body);
+    for (path, message) in [
+        (
+            "/Things('urn:ngsi-ld:Car:1')?$orderby=name",
+            "$filter and $orderby apply to a collection",
+        ),
+        (
+            "/Things('urn:ngsi-ld:Car:1')/name/$value?$filter=name%20eq%20'a'",
+            "$filter and $orderby apply to a collection",
+        ),
+        (
+            "/Things?$orderby=nosuch",
+            "$orderby: nosuch is no property of these resources; quote a text",
+        ),
+    ] {
+        let a = sta(&f.app, path).await;
+        assert_eq!(
+            (a.status, at(&a.body, "/error/message")),
+            (StatusCode::BAD_REQUEST, json!(message)),
+            "{path}"
+        );
+    }
+    // an empty collection holds no name to check
+    let empty = sta(
+        &f.app,
+        "/Things('urn:ngsi-ld:Device:1')/Datastreams?$filter=zzz%20eq%201",
+    )
+    .await;
+    assert_eq!((empty.status, ids(&empty.body).len()), (StatusCode::OK, 0));
+    let counted = sta(
+        &f.app,
+        "/Observations?$top=0&$count=true&$filter=result%20gt%200",
+    )
+    .await;
+    assert_eq!(at(&counted.body, "/value"), json!([]));
+    assert!(
+        at(&counted.body, "/@iot.count").as_u64() > Some(0),
+        "{}",
+        counted.body
+    );
+    assert_eq!(at(&counted.body, "/@iot.nextLink"), Value::Null);
+    // a Sensor the view hides expands as null, and nothing below it is read
+    let hidden = sta(
+        &f.app,
+        "/Things('urn:ngsi-ld:Car:2')/Datastreams?$expand=Sensor/Datastreams",
+    )
+    .await;
+    assert_eq!(hidden.status, StatusCode::OK, "{}", hidden.body);
+    assert_eq!(
+        at(&hidden.body, "/value/0/Sensor"),
+        Value::Null,
+        "{}",
+        hidden.body
     );
     Ok(())
 }

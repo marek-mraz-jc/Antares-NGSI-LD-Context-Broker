@@ -23,6 +23,7 @@
 mod api;
 mod crs;
 mod export;
+mod extent;
 mod features;
 mod filter;
 mod history;
@@ -179,6 +180,8 @@ impl Surface for Ogc {
     }
 
     fn router(&self, ops: Ops) -> Router {
+        // T-5912: every NGSI-LD write of a Tenant with a schema keeps to it.
+        ops.check_writes(linkml_model::check::entity_text);
         let handler = any(move |caller: Caller, req: Request| {
             let ops = ops.clone();
             async move { serve(&ops, &caller, req).await }
@@ -240,7 +243,13 @@ async fn serve(ops: &Ops, caller: &Caller, req: Request) -> Response {
         return answer;
     }
     let (mut parts, body) = answer.into_parts();
-    let Ok(read) = ops.read_answer(body).await else {
+    // A streamed page (T-6036) sends no length: its HEAD states none either, and an empty body
+    // of no stated size keeps axum from writing `Content-Length: 0`.
+    if axum::body::HttpBody::size_hint(&body).exact().is_none() {
+        let none = futures_util::stream::empty::<Result<String, std::io::Error>>();
+        return Response::from_parts(parts, Body::from_stream(none));
+    }
+    let Ok(read) = ops.read_answer(body, "ogc").await else {
         let (parts, _) = problem(
             StatusCode::PAYLOAD_TOO_LARGE,
             antares_ops::bounds::ANSWER_TOO_LARGE,
@@ -303,9 +312,9 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
         (["collections"], _) if asked.file.is_some() => {
             at.bundle(&pairs, asked.file.unwrap_or_default()).await
         }
-        (["collections"], true) => document(JSON, &at.collections()),
+        (["collections"], true) => document(JSON, &at.collections().await),
         (["collections", c], true) => match collections.get(*c) {
-            Some(c) => document(JSON, &at.collection(c)),
+            Some(c) => document(JSON, &at.collection(c).await),
             None => not_found(),
         },
         (["functions"], true) => document(JSON, &json!({"functions": []})),
@@ -753,13 +762,11 @@ impl Here<'_> {
         })
     }
 
-    /// C5: every collection, with its links.
-    fn collections(&self) -> Value {
-        let all: Vec<Value> = self
-            .collections
-            .values()
-            .map(|c| self.collection(c))
-            .collect();
+    /// C5: every collection, with its links; their extents are read side by side.
+    async fn collections(&self) -> Value {
+        let all: Vec<Value> =
+            futures_util::future::join_all(self.collections.values().map(|c| self.collection(c)))
+                .await;
         json!({
             "links": [link("self", JSON, &format!("{}/collections", self.base))],
             "crs": [crs::CRS84, crs::CRS84H],
@@ -767,8 +774,8 @@ impl Here<'_> {
         })
     }
 
-    /// C7: one collection; no `extent` (M8).
-    fn collection(&self, c: &Collection) -> Value {
+    /// C7: one collection, with the `extent` of what the caller reads (C6, M8).
+    async fn collection(&self, c: &Collection) -> Value {
         let at = format!("{}/collections/{}", self.base, c.id);
         let mut links = vec![
             link("self", JSON, &at),
@@ -789,6 +796,10 @@ impl Here<'_> {
                 }))),
             ),
             ("description", c.description.as_deref().map(Value::from)),
+            (
+                "extent",
+                extent::of(self.view, self.id, self.caller, c).await,
+            ),
             ("itemType", Some(Value::from("feature"))),
             ("crs", Some(json!([crs::CRS84, crs::CRS84H]))),
             ("storageCrs", Some(Value::from(crs::CRS84))),
@@ -817,15 +828,63 @@ impl Here<'_> {
             Err(refused) => return refused.reply(),
         };
         let digest = items::digest(self.id, &c.id, pairs);
-        let page = match features::page(self.view, self.caller, c, &p, digest, self.refs(p.profile))
-            .await
-        {
-            Ok(page) => page,
+        let close = self.close(c, pairs, query, p.profile);
+        if c.history {
+            return match features::page(self.view, self.caller, c, &p, digest, self.refs(p.profile))
+                .await
+            {
+                Ok(page) => in_crs(
+                    p.crs,
+                    close.document(page.features, page.next.as_deref(), page.matched),
+                ),
+                Err(refused) => refused.reply(),
+            };
+        }
+        let mut cursor = match items::Cursor::new(c, &p, digest) {
+            Ok(cursor) => cursor,
             Err(refused) => return refused.reply(),
         };
+        let mut held = Vec::new();
+        // A page that fits one store read is answered whole, with its length (T-6036).
+        while let Some(more) = match cursor
+            .chunk(self.view, self.caller, c, self.refs(p.profile))
+            .await
+        {
+            Ok(more) => more,
+            Err(refused) => return refused.reply(),
+        } {
+            held.extend(more);
+            if !cursor.done() && held.len() >= self.view.page_size() {
+                let rest = Streamed {
+                    view: self.view.clone(),
+                    caller: self.caller.clone(),
+                    c: c.clone(),
+                    base: self.base.to_owned(),
+                    profile: p.profile,
+                    cursor,
+                    close,
+                    returned: held.len(),
+                };
+                return in_crs(p.crs, rest.reply(&held));
+            }
+        }
+        in_crs(
+            p.crs,
+            close.document(held, cursor.next.as_deref(), cursor.matched),
+        )
+    }
+
+    /// The members of an `items` answer beside its Features.
+    fn close(
+        &self,
+        c: &Collection,
+        pairs: &[(String, String)],
+        query: Option<&str>,
+        profile: items::Profile,
+    ) -> Close {
         let at = format!("{}/collections/{}/items", self.base, c.id);
         let this = query.map_or_else(|| at.clone(), |q| format!("{at}?{q}"));
-        let mut links = vec![
+        let links = vec![
             link("self", GEOJSON, &this),
             link(
                 "collection",
@@ -833,32 +892,37 @@ impl Here<'_> {
                 &format!("{}/collections/{}", self.base, c.id),
             ),
         ];
-        if let Some(token) = &page.next {
-            let kept = pairs
-                .iter()
-                .filter(|(n, _)| n != "next")
-                .map(|(n, v)| format!("{}={}", items::encode(n), items::encode(v)));
-            let query: Vec<String> = kept.chain([format!("next={token}")]).collect();
-            links.push(link("next", GEOJSON, &format!("{at}?{}", query.join("&"))));
-        }
-        links.extend(profile_link(c, p.profile));
+        let kept: Vec<String> = pairs
+            .iter()
+            .filter(|(n, _)| n != "next")
+            .map(|(n, v)| format!("{}={}", items::encode(n), items::encode(v)))
+            .chain([String::from("next=")])
+            .collect();
         let separator = if this.contains('?') { '&' } else { '?' };
-        for e in export::ITEMS {
-            let (f, media) = (e.0, e.1);
-            links.push(link("alternate", media, &format!("{this}{separator}f={f}")));
+        let after = profile_link(c, profile)
+            .into_iter()
+            .chain(
+                export::ITEMS
+                    .iter()
+                    .map(|e| link("alternate", e.1, &format!("{this}{separator}f={}", e.0))),
+            )
+            .collect();
+        Close {
+            // C17: when the answer was made, a response time and no Entity time; whole
+            // seconds, so a HEAD states the length of the GET.
+            stamp: items::now()
+                .and_then(|t| {
+                    let seconds = t.unix_micros().checked_div(1_000_000)?;
+                    antares_ops::residual::DateTime::from_unix_micros(
+                        seconds.checked_mul(1_000_000)?,
+                    )
+                })
+                .as_ref()
+                .map(ToString::to_string),
+            links,
+            next_at: format!("{at}?{}", kept.join("&")),
+            after,
         }
-        let returned = page.features.len();
-        let mut body = json!({
-            "type": "FeatureCollection",
-            "features": page.features,
-            "numberReturned": returned,
-            "links": links,
-        });
-        // Optional in Part 1: omitted when the count would need more than the budget reads.
-        if let (Some(matched), Some(members)) = (page.matched, body.as_object_mut()) {
-            members.insert("numberMatched".into(), json!(matched));
-        }
-        in_crs(p.crs, document(GEOJSON, &body))
     }
 
     /// C19: one Feature; `properties` and `profile` are its only parameters (S6, S7).
@@ -887,6 +951,117 @@ impl Here<'_> {
             Err(refused) => refused.reply(),
         }
     }
+}
+
+/// What a `FeatureCollection` holds beside `features` (C11, C16, C17): known before its page is
+/// read, but for `next`, `numberReturned` and `numberMatched`.
+struct Close {
+    stamp: Option<String>,
+    /// `self` and `collection`, before a `next` link.
+    links: Vec<Value>,
+    /// The `next` link's URI without its token.
+    next_at: String,
+    /// The `profile` and `alternate` links, after a `next` link.
+    after: Vec<Value>,
+}
+
+impl Close {
+    /// The members but `type` and `features`.
+    fn members(
+        &self,
+        next: Option<&str>,
+        matched: Option<u64>,
+        returned: usize,
+    ) -> serde_json::Map<String, Value> {
+        let links: Vec<Value> = self
+            .links
+            .iter()
+            .cloned()
+            .chain(next.map(|t| link("next", GEOJSON, &format!("{}{t}", self.next_at))))
+            .chain(self.after.iter().cloned())
+            .collect();
+        let mut members = serde_json::Map::new();
+        members.insert("timeStamp".into(), json!(self.stamp));
+        members.insert("numberReturned".into(), json!(returned));
+        members.insert("links".into(), Value::from(links));
+        // Optional in Part 1: omitted when the count would need more than the budget reads.
+        if let Some(matched) = matched {
+            members.insert("numberMatched".into(), json!(matched));
+        }
+        members
+    }
+
+    /// A page read whole.
+    fn document(&self, features: Vec<Value>, next: Option<&str>, matched: Option<u64>) -> Reply {
+        let mut body = self.members(next, matched, features.len());
+        body.insert("type".into(), json!("FeatureCollection"));
+        body.insert("features".into(), Value::from(features));
+        document(GEOJSON, &Value::Object(body))
+    }
+}
+
+/// A page past one store read, written as it is read (T-6036): each further store read is
+/// one body frame, so the request holds one upstream page of Features, and the members known
+/// only at the end follow `features`. A refusal after the first byte ends the body with an
+/// error: the client sees a broken transfer, never a complete `FeatureCollection`.
+struct Streamed {
+    view: ViewOps,
+    caller: Caller,
+    c: Collection,
+    base: String,
+    profile: items::Profile,
+    cursor: items::Cursor,
+    close: Close,
+    returned: usize,
+}
+
+impl Streamed {
+    /// The answer whose body starts with the Features `held` and goes on with the rest.
+    fn reply(self, held: &[Value]) -> Reply {
+        let opening = format!(
+            "{{\"type\":\"FeatureCollection\",\"features\":[{}",
+            listed(held).get(1..).unwrap_or_default()
+        );
+        let rest = futures_util::stream::unfold(Some(self), |state| async move {
+            let mut s = state?;
+            let refs = items::Refs {
+                profile: s.profile,
+                base: &s.base,
+                alternate: s.view.allows(OperationId::RetrieveEntity),
+            };
+            match s.cursor.chunk(&s.view, &s.caller, &s.c, refs).await {
+                Ok(Some(more)) => {
+                    s.returned = s.returned.saturating_add(more.len());
+                    Some((Ok(listed(&more)), Some(s)))
+                }
+                Ok(None) => {
+                    let members =
+                        s.close
+                            .members(s.cursor.next.as_deref(), s.cursor.matched, s.returned);
+                    let tail = Value::Object(members).to_string();
+                    Some((Ok(format!("],{}", tail.get(1..).unwrap_or_default())), None))
+                }
+                Err(Problem(_, detail)) => Some((Err(std::io::Error::other(detail)), None)),
+            }
+        });
+        let body = futures_util::StreamExt::chain(futures_util::stream::iter([Ok(opening)]), rest);
+        (
+            StatusCode::OK,
+            [(CONTENT_TYPE, GEOJSON)],
+            Body::from_stream(body),
+        )
+            .into_response()
+    }
+}
+
+/// Each Feature after a comma.
+fn listed(features: &[Value]) -> String {
+    let mut out = String::new();
+    for f in features {
+        out.push(',');
+        out.push_str(&f.to_string());
+    }
+    out
 }
 
 #[cfg(test)]

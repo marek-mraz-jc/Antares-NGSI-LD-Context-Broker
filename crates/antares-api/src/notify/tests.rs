@@ -2902,6 +2902,26 @@ mod stable_comparison {
 mod delivery_share {
     use super::*;
 
+    /// Counts the deliveries the sweep holds open once its first round is
+    /// out. A loaded runner can take seconds before the sweep opens its
+    /// first connection, so a fixed sleep read 0 (full run 40695109842):
+    /// wait for the first connection, bounded, then give the rest of the
+    /// round the settle time.
+    async fn in_flight_after_sweep(opened: &std::sync::atomic::AtomicUsize) -> usize {
+        let slow = crate::state::slow_factor();
+        let first = async {
+            while opened.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+        let wait = std::time::Duration::from_secs(slow.saturating_mul(10));
+        // a timeout leaves the count at 0 for the caller's assert to name
+        let _ = tokio::time::timeout(wait, first).await;
+        let settle = std::time::Duration::from_millis(slow.saturating_mul(400));
+        tokio::time::sleep(settle).await;
+        opened.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// A Subscription belongs to one tenant (5.2.12), and a delivery to an
     /// endpoint that accepts and never answers holds its slot until the
     /// endpoint's timeout expires — up to 30 s (Table 5.2.15-1). A tenant
@@ -2973,9 +2993,7 @@ mod delivery_share {
                 .expect("seed subscription");
         }
         let sweep = tokio::spawn(async move { interval_tick(&st).await });
-        let settle = 400 * crate::state::slow_factor();
-        tokio::time::sleep(std::time::Duration::from_millis(settle)).await;
-        let in_flight = opened.load(std::sync::atomic::Ordering::SeqCst);
+        let in_flight = in_flight_after_sweep(&opened).await;
         sweep.abort();
         assert!(in_flight > 0, "the sweep delivered nothing at all");
         assert!(
@@ -3057,9 +3075,7 @@ mod delivery_share {
                 .expect("seed subscription");
         }
         let sweep = tokio::spawn(async move { interval_tick(&st).await });
-        let settle = 400 * crate::state::slow_factor();
-        tokio::time::sleep(std::time::Duration::from_millis(settle)).await;
-        let in_flight = opened.load(std::sync::atomic::Ordering::SeqCst);
+        let in_flight = in_flight_after_sweep(&opened).await;
         sweep.abort();
         assert!(in_flight > 0, "the sweep delivered nothing at all");
         assert!(

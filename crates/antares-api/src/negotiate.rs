@@ -113,6 +113,10 @@ impl From<NgsiError> for ApiError {
             if d == antares_model::error::DB_OVERLOADED {
                 return Self::Overloaded(RETRY_AFTER_SECONDS);
             }
+            // T-5895: the buffered-answer pool frees as answers finish
+            if d == antares_model::error::MEMORY_OVERLOADED {
+                return Self::Overloaded(crate::bounds::ANSWER_POOL_RETRY_SECONDS);
+            }
         }
         Self::Ngsi(e)
     }
@@ -804,15 +808,25 @@ pub(crate) fn sys_attrs_asked(params: &std::collections::HashMap<String, String>
 /// one entity of memory rather than the whole body.
 /// Json and LdJson only — GeoJSON wraps a FeatureCollection object and takes
 /// the buffered `respond` path.
-pub(crate) fn respond_list(
+pub(crate) fn respond_list<D>(
     status: StatusCode,
-    docs: Vec<Value>,
+    docs: D,
     ctx: &Context,
     accept: Accept,
     tenant: &TenantId,
-) -> Response {
+) -> Response
+where
+    D: IntoIterator<Item = Value>,
+    D::IntoIter: Send + 'static,
+{
     if accept == Accept::GeoJson {
-        return respond(status, Value::Array(docs), ctx, accept, tenant);
+        return respond(
+            status,
+            Value::Array(docs.into_iter().collect()),
+            ctx,
+            accept,
+            tenant,
+        );
     }
     let ld_ctx = (accept == Accept::LdJson).then(|| served_context(ctx));
     let content_type = match accept {

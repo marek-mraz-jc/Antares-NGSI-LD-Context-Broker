@@ -39,7 +39,7 @@ pub(crate) async fn property(
     let member = set
         .members
         .get(name)
-        .ok_or_else(|| not_implemented(version))?;
+        .ok_or_else(|| not_implemented("a path to a system member", version))?;
     let id = admitted(reads, caller, set, key, options, version).await?;
     let target = format!(
         "/ngsi-ld/v1/entities/{}/attrs/{}",
@@ -59,7 +59,7 @@ pub(crate) async fn property(
     let instances = Value::Array(instances);
     let value = member_value(&member.shape, default_instance(Some(&instances)));
     if raw {
-        let text = raw_text(value).ok_or_else(|| not_implemented(version))?;
+        let text = raw_text(value).ok_or_else(|| not_implemented(NON_PRIMITIVE, version))?;
         return Ok((StatusCode::OK, [(CONTENT_TYPE, "text/plain")], text).into_response());
     }
     let mut body = Map::new();
@@ -179,8 +179,8 @@ pub(crate) async fn related(
         }
         return Ok(json_response(version, ctx.level, body));
     }
-    let picked =
-        selected(target_set, options.select.as_ref()).map_err(|()| not_implemented(version))?;
+    let select = options.select.as_ref();
+    let picked = selected(target_set, select).map_err(|()| not_implemented(SELECT, version))?;
     let found = targets(
         reads,
         caller,
@@ -276,6 +276,10 @@ pub(crate) fn nav_of<'s>(set: &'s Set, name: &str) -> (&'s str, &'s str, bool) {
 
 /// The raw `$value` of a primitive (URL 4.7): a string as it is, a number
 /// or a Boolean as JSON writes it; `None` for anything else.
+/// The constructs this module answers `501`.
+const NON_PRIMITIVE: &str = "/$value of a non-primitive value";
+const SELECT: &str = "$select of a navigation, a path or an annotation";
+
 fn raw_text(value: Value) -> Option<String> {
     match value {
         Value::String(s) => Some(s),
@@ -312,6 +316,7 @@ mod tests {
             type_iri: "https://e.org/T".into(),
             identifier: None,
             references: std::collections::BTreeMap::new(),
+            bound: std::collections::BTreeMap::new(),
             writable: crate::edm::Writable::default(),
             members: std::collections::BTreeMap::from([
                 (

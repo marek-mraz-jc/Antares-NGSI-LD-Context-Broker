@@ -126,6 +126,7 @@ mod temporal_drain;
 mod temporal_driver_6_3_2;
 mod temporal_expand_values_5_7_4;
 mod temporal_fed_paging_5_7_4;
+mod temporal_id_pattern_pg;
 mod temporal_instance_patch_5_6_14;
 mod temporal_lang_5_7_4;
 mod temporal_matrix;

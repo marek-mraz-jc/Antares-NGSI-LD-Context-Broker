@@ -345,7 +345,13 @@
       "range": "decimal"
     },
     "Category": {
-      "range": "Categories"
+      "range": "Categories",
+      "annotations": {
+        "odata_referential_constraint": {
+          "tag": "odata_referential_constraint",
+          "value": "CategoryID"
+        }
+      }
     },
     "Descriptions": {
       "range": "ProductDescriptions",

@@ -81,6 +81,82 @@ jobs:
           body: A surface bench did not run; the logs are in the bench-surfaces artifact.
           log-file: results/bench-surfaces/bench-surfaces.md
 
+  # The heavy mixed workload against the memory budget (T-5898): 30 concurrent large reads on
+  # every surface (temporal over all 577 stations, 1000-row geo and q pages, OGC limit=10000 with
+  # its next page, OData $filter and $batch, STA $expand, MCP summarize) with upserts beside
+  # them for 10 minutes, first on the baseline commit, then on this one. dev/perf/heavy.py fails
+  # the job on any failed read (503 MEMORY_OVERLOADED or another 5xx), or a peak RSS, p95 or p99
+  # more than 10 % over the baseline's; the 200 MB RSS target is reported in heavy.md until the
+  # large surface pages stream (later/antares-stream-large-surface-pages.md). BASE_REF is
+  # origin/dev before the memory budget (T-5895); move it to a newer green commit to compare
+  # against that one. Weekly and on dispatch only: one run takes about 150 minutes.
+  heavy:
+    if: github.event.schedule == '41 8 * * 0' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      issues: write
+    services:
+      postgis:
+        image: ghcr.io/baosystems/postgis:17-3.5
+        env:
+          POSTGRES_USER: antares
+          POSTGRES_PASSWORD: antares
+          POSTGRES_DB: antares
+        ports: ["15432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U antares"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      CARGO_TERM_COLOR: always
+      BASE_REF: a376b65659eaa0c74207b922e9ac2b869c9094ff
+      FEATURES: full,jc-policy,linkml,parquet,tabular,ical,feed
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: The verdict fails a 503, a slowdown or RSS growth over the baseline and a missing run
+        run: python3 dev/perf/heavy.py --selftest
+      - uses: grafana/setup-k6-action@43b9fc21641a76002687994433dd586f56e791b1 # v1.2.2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: bench-heavy
+      - name: Build the baseline and this commit
+        run: |
+          set -euo pipefail
+          mkdir -p bin
+          git fetch --depth 1 origin "$BASE_REF"
+          git worktree add ../base FETCH_HEAD
+          (cd ../base && cargo build --locked --release -p antares-broker --features "$FEATURES" --target-dir "$GITHUB_WORKSPACE/target")
+          cp target/release/antares bin/antares-base
+          cargo build --locked --release -p antares-broker --features "$FEATURES"
+          cp target/release/antares bin/antares-head
+      - name: Heavy workload, baseline then this commit
+        env:
+          DATABASE_URL: postgresql://antares:antares@localhost:15432/antares
+          BIN: bin/antares-head
+          BASE_BIN: bin/antares-base
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq postgresql-client >/dev/null
+          status=0
+          dev/perf/heavy.sh || status=$?
+          cat results/heavy/heavy.md >> "$GITHUB_STEP_SUMMARY" || true
+          exit "$status"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: bench-heavy
+          path: results/heavy/
+          retention-days: 30
+      - name: File an issue on a scheduled failure
+        if: failure() && github.event_name == 'schedule'
+        uses: ./.github/actions/failure-issue
+        with:
+          title: bench-surfaces heavy workload went red
+          body: The heavy workload failed a read, or grew resident memory or slowed past the baseline; the table and the k6 logs are in the bench-heavy artifact.
+          log-file: results/heavy/heavy.md
+
   # The run's tables committed to the perf-history branch, where they stay
   # after the artifact above expires (T-4853). Scheduled runs on dev only.
   history:

@@ -400,7 +400,12 @@ fn valued<'q>(q: &'q QNode, expand: &dyn Fn(&str) -> String) -> Option<(String, 
 const PROBE_ROWS: i64 = 1001;
 
 /// A read of `entity_values` (0024) for the ids a term's matches are among,
-/// `$1` the Tenant: its statement and binds.
+/// `$1` the Tenant: its statement and binds. The statement counts the
+/// matching rows up to `PROBE_ROWS` first, from the index alone (every
+/// column `cond` reads but `txt` is a key of `i_entity_values_num`), and
+/// reads their ids only under the cap: an unselective term (`level>=40`
+/// of a 0..99 level) cost 1 001 heap reads per page and threw every id
+/// away (T-6056: 4 418 calls, 46.7 s of a 60 s run). NULL past the cap.
 struct Probe {
     sql: String,
     binds: Vec<Bind>,
@@ -410,9 +415,11 @@ impl Probe {
     fn new(tenant: &TenantId, attr: Bind, cond: &str, mut binds: Vec<Bind>) -> Self {
         binds.splice(0..0, [Bind::Text(tenant.as_str().to_owned()), attr]);
         binds.push(Bind::Int(PROBE_ROWS));
+        let rows = format!("FROM entity_values WHERE tenant_id = $1 AND {cond}");
         let sql = format!(
-            "SELECT id FROM entity_values WHERE tenant_id = $1 AND {cond} LIMIT ${}",
-            binds.len()
+            "SELECT CASE WHEN n < ${cap} THEN ARRAY(SELECT id {rows}) END \
+             FROM (SELECT count(*) AS n FROM (SELECT 1 {rows} LIMIT ${cap}) r) c",
+            cap = binds.len()
         );
         Self { sql, binds }
     }
@@ -457,8 +464,8 @@ async fn probe_ids(
     tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
     p: &Probe,
 ) -> Result<Option<Vec<String>>, sqlx::Error> {
-    let mut qy =
-        sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(p.sql.clone())).persistent(false);
+    let mut qy = sqlx::query_scalar::<_, Option<Vec<String>>>(sqlx::AssertSqlSafe(p.sql.clone()))
+        .persistent(false);
     for b in &p.binds {
         qy = match b {
             Bind::Text(s) | Bind::Path(s) => qy.bind(s),
@@ -467,10 +474,9 @@ async fn probe_ids(
             Bind::Int(n) => qy.bind(n),
         };
     }
-    let mut ids = qy.fetch_all(&mut **tx).await?;
-    if i64::try_from(ids.len()).map_or(true, |n| n >= PROBE_ROWS) {
+    let Some(mut ids) = qy.fetch_one(&mut **tx).await? else {
         return Ok(None);
-    }
+    };
     ids.sort_unstable();
     ids.dedup();
     Ok(Some(ids))
@@ -2274,9 +2280,13 @@ mod tests {
             assert_eq!(iri, attr, "{q}");
             let p = value_probe(&tenant, iri, key);
             let limit = p.binds.len();
+            let rows = format!("FROM entity_values WHERE tenant_id = $1 AND attr = $2 AND {cond}");
             assert_eq!(
                 p.sql,
-                format!("SELECT id FROM entity_values WHERE tenant_id = $1 AND attr = $2 AND {cond} LIMIT ${limit}"),
+                format!(
+                    "SELECT CASE WHEN n < ${limit} THEN ARRAY(SELECT id {rows}) END \
+                     FROM (SELECT count(*) AS n FROM (SELECT 1 {rows} LIMIT ${limit}) r) c"
+                ),
                 "{q}"
             );
             let texts: Vec<&str> = p
@@ -2330,7 +2340,9 @@ mod tests {
         let p = attrs_probe(&tenant, &attrs).expect("probe");
         assert_eq!(
             p.sql,
-            "SELECT id FROM entity_values WHERE tenant_id = $1 AND attr = ANY($2) LIMIT $3"
+            "SELECT CASE WHEN n < $3 THEN ARRAY(SELECT id FROM entity_values WHERE tenant_id = $1 \
+             AND attr = ANY($2)) END FROM (SELECT count(*) AS n FROM (SELECT 1 FROM entity_values \
+             WHERE tenant_id = $1 AND attr = ANY($2) LIMIT $3) r) c"
         );
         assert!(matches!(p.binds.get(1), Some(Bind::TextArr(v)) if v.as_slice() == attrs));
         for own in OWN_MEMBERS {
