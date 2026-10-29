@@ -385,18 +385,19 @@ jobs:
           log-file: gate.md
 
   ogc-compliance-external:
-    name: ogc-compliance-external (${{ matrix.view }})
+    name: ogc-compliance-external
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    # One run per Endpoint kind (T-3831): `all` is the conformance Tenant's star
-    # view; the others read the `ogc` Tenant of ci/views/ogc (public, internal
-    # with the Part 4 writes, filtered by q, star, projection, a data cube, the
-    # history collections of T-5100 over ci/views/ogc/history).
-    strategy:
-      fail-fast: false
-      matrix:
-        view: [all, ogc-public, ogc-internal, ogc-filtered, ogc-star, ogc-projection, ogc-cube, ogc-history]
+    timeout-minutes: 45
+    # One ETS run per Endpoint kind (T-3831): `all` is the conformance Tenant's
+    # star view; the others read the `ogc` Tenant of ci/views/ogc (public,
+    # internal with the Part 4 writes, filtered by q, star, projection, a data
+    # cube, the history collections of T-5100 over ci/views/ogc/history).
+    # One job for the eight views (T-6046): each ETS run takes ~7 s and its
+    # setup ~15 s, so eight matrix cells held eight of the account's 20
+    # runners for 30 s each. TEAM Engine starts once; every view gets a fresh
+    # broker (in-memory store) and a fresh rig, so the Part 4 writes of
+    # ogc-internal never reach another view's run. Any red view turns the job red.
     permissions:
       contents: read
       issues: write
@@ -405,64 +406,67 @@ jobs:
       # release candidate), pinned by digest; it tests Part 1 and Part 2 (CRS),
       # no ETS tests Part 4 or Part 5 yet (docs/src/ogc-compliance.md)
       TE_IMAGE: ogccite/ets-ogcapi-features10:1.8-teamengine-5.7@sha256:d884de89ac8dae6ea153766886c706f9ddf6ce172de0c4bd4bdd591d28bdaffe
-      IUT: http://localhost:9090/x/views/${{ matrix.view }}/ogc/features
-      BASELINE: ci/ogc-compliance/${{ matrix.view }}.json
+      VIEWS: all ogc-public ogc-internal ogc-filtered ogc-star ogc-projection ogc-cube ogc-history
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: broker-surfaces
-      - name: Start TEAM Engine, the broker and the views
+      - name: Start TEAM Engine
         run: |
           chmod +x antares
           # host network: TEAM Engine on 8080 reaches the broker at localhost:9090
           docker run -d --name teamengine --network host "$TE_IMAGE"
-          ANTARES_HTTP_PORT=9090 ANTARES_API_SURFACES=admin,views,ogc \
-            ANTARES_SCHEMA_MAX_BYTES=1048576 ./antares > broker.log 2>&1 &
-          for _ in $(seq 1 100); do curl -sf -o /dev/null localhost:9090/q/health && break; sleep 0.2; done
-          dev/views-rig.sh http://localhost:9090
-          dev/views-rig.sh http://localhost:9090 ci/views/ogc
           # the image's own public test account (ogctest), not a secret
           for _ in $(seq 1 60); do
             curl -fsS -m 5 -u ogctest:ogctest -o /dev/null localhost:8080/teamengine/rest/suites && break
             sleep 5
           done
-      - name: The ETS, gated by ci/ogc-compliance/<view>.json
+      - name: The ETS per view, gated by ci/ogc-compliance/<view>.json
         run: |
           dev/ogc-compliance/baseline.py --self-test
-          iut=$(jq -rn --arg u "$IUT" '$u|@uri')
-          curl -sS -m 1500 -u ogctest:ogctest -H 'Accept: application/xml' -o testng-results.xml \
-            "localhost:8080/teamengine/rest/suites/ogcapi-features-1.0/run?iut=$iut&noofcollections=-1" || true
-          set +e
-          dev/ogc-compliance/baseline.py check testng-results.xml "$BASELINE" > gate.md 2>&1
-          rc=$?
-          { echo "## OGC API - Features ETS (ets-ogcapi-features10 1.8), view ${{ matrix.view }}"; cat gate.md; } >> "$GITHUB_STEP_SUMMARY"
-          cat gate.md
-          exit $rc
+          red=
+          for view in $VIEWS; do
+            out=out/$view
+            mkdir -p "$out"
+            ANTARES_HTTP_PORT=9090 ANTARES_API_SURFACES=admin,views,ogc \
+              ANTARES_SCHEMA_MAX_BYTES=1048576 ./antares > "$out/broker.log" 2>&1 &
+            broker=$!
+            for _ in $(seq 1 100); do curl -sf -o /dev/null localhost:9090/q/health && break; sleep 0.2; done
+            dev/views-rig.sh http://localhost:9090
+            dev/views-rig.sh http://localhost:9090 ci/views/ogc
+            iut=$(jq -rn --arg u "http://localhost:9090/x/views/$view/ogc/features" '$u|@uri')
+            curl -sS -m 1500 -u ogctest:ogctest -H 'Accept: application/xml' -o "$out/testng-results.xml" \
+              "localhost:8080/teamengine/rest/suites/ogcapi-features-1.0/run?iut=$iut&noofcollections=-1" || true
+            rc=0
+            dev/ogc-compliance/baseline.py check "$out/testng-results.xml" "ci/ogc-compliance/$view.json" > "$out/gate.md" 2>&1 || rc=$?
+            { echo "## OGC API - Features ETS (ets-ogcapi-features10 1.8), view $view"; cat "$out/gate.md"; } >> "$GITHUB_STEP_SUMMARY"
+            echo "== view $view: exit $rc"
+            cat "$out/gate.md"
+            [ "$rc" = 0 ] || red="$red $view"
+            kill "$broker" 2>/dev/null || true
+            wait "$broker" || true
+            # the next view's broker binds 9090 again
+            for _ in $(seq 1 50); do curl -sf -o /dev/null localhost:9090/q/health || break; sleep 0.2; done
+          done
+          { echo "Red views:${red:- none}"; for v in $red; do echo "- $v"; done; } | tee out/red.md
+          [ -z "$red" ]
       - name: TEAM Engine log
         if: always()
-        run: docker logs teamengine > teamengine.log 2>&1 || true
+        run: docker logs teamengine > out/teamengine.log 2>&1 || true
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
-          name: ogc-compliance-external-${{ matrix.view }}
-          path: |
-            testng-results.xml
-            gate.md
-            fork-testng-results.xml
-            fork-gate.md
-            fork-gap.md
-            broker.log
-            teamengine.log
-            fork-teamengine.log
+          name: ogc-compliance-external
+          path: out/
           retention-days: 14
       - name: File an issue on nightly failure
         if: failure() && github.event_name == 'schedule'
         uses: ./.github/actions/failure-issue
         with:
-          title: ogc-compliance-external (${{ matrix.view }}) went red
-          body: A test the OGC API - Features ETS passed in ci/ogc-compliance/${{ matrix.view }}.json fails now.
-          log-file: gate.md
+          title: ogc-compliance-external went red
+          body: A test the OGC API - Features ETS passed in ci/ogc-compliance/<view>.json fails now (views listed below).
+          log-file: out/red.md
 
   sta-compliance-external:
     name: sta-compliance-external

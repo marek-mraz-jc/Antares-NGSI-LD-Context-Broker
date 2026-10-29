@@ -15,10 +15,13 @@ runs on every pull request to `dev`, nightly and on `v*` tags:
 1. It takes the `full` broker of the `build` job and starts it on port 9090
    with `ANTARES_API_SURFACES=admin,views,ogc`.
 2. It loads `ci/views`, then `ci/views/ogc`, with `dev/views-rig.sh`. The job
-   is a matrix over seven views, one per kind of Endpoint (section 7): `all`
+   runs over eight views, one per kind of Endpoint (section 7): `all`
    reads the `conformance` Tenant (collection `AirQualityObserved`, three
-   seeded Entities with a `location`); the six `ogc-*` views read the `ogc`
-   Tenant, which adds the geometry-less class `Reading`.
+   seeded Entities with a `location`); the seven `ogc-*` views read the `ogc`
+   Tenant, which adds the geometry-less class `Reading`. One job runs the
+   views one after another (T-6046) and starts a fresh broker with a fresh
+   rig for each, so one view's writes never reach the next run; a red view
+   turns the job red.
 3. It starts TEAM Engine from the image
    `ogccite/ets-ogcapi-features10:1.8-teamengine-5.7`, pinned by digest
    (`sha256:d884de89…bdaffe`), on the host network.
@@ -29,8 +32,8 @@ runs on every pull request to `dev`, nightly and on `v*` tags:
 5. It gates the run with `dev/ogc-compliance/baseline.py check` against
    `ci/ogc-compliance/<view>.json` (section 3).
 
-The artifact `ogc-compliance-external-<view>` holds the TestNG document, the gate's
-Markdown, the broker log and the TEAM Engine log. The job summary shows the
+The artifact `ogc-compliance-external` holds `<view>/testng-results.xml`, the
+gate's Markdown and the broker log of each view, `red.md` and the TEAM Engine log. The job summary shows the
 per-class table. The job holds no secret: the broker's `/q` routes stay
 inside the runner, the TEAM Engine account `ogctest` is the image's public
 test account, and the seed is public test data.
