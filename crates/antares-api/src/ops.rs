@@ -15,7 +15,7 @@ impl Admin {
     /// count `/q/health` reports. The destructuring in `router` binds one
     /// name per entry, so a route added to one and not the other does not
     /// compile.
-    pub(crate) const PATHS: [&'static str; 11] = [
+    pub(crate) const PATHS: [&'static str; 12] = [
         "/health",
         "/ready",
         "/metrics",
@@ -24,6 +24,7 @@ impl Admin {
         "/tenants/{tenant}/digest",
         "/tenants/{tenant}/export",
         "/tenants/{tenant}/import",
+        "/tenants/{tenant}/types/{type}/attributes",
         "/dead-letters",
         "/dead-letters/{id}",
         "/dead-letters/{id}/replay",
@@ -40,7 +41,7 @@ impl ApiSurface for Admin {
     }
 
     fn router(&self, st: AppState) -> Router<AppState> {
-        let [health_p, ready_p, metrics_p, tenants_p, tenant_p, digest_p, export_p, import_p, dl_p, dl_id_p, replay_p] =
+        let [health_p, ready_p, metrics_p, tenants_p, tenant_p, digest_p, export_p, import_p, attrs_p, dl_p, dl_id_p, replay_p] =
             Self::PATHS;
         let guard = axum::middleware::from_fn_with_state(st.clone(), admin_auth::require);
         let metrics = Self::metrics_routes(&st, metrics_p);
@@ -51,6 +52,8 @@ impl ApiSurface for Admin {
             .route(digest_p, get(tenant_move::digest))
             .route(export_p, get(tenant_move::export))
             .route(import_p, post(tenant_move::import))
+            // T-6001: the names a replace write would be judged on.
+            .route(attrs_p, get(crate::types_attrs::stored_attributes))
             .route(dl_p, get(dead_letters_list))
             .route(dl_id_p, delete(dead_letter_delete))
             .route(replay_p, post(dead_letter_replay));

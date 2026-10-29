@@ -238,6 +238,45 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /q/tenants/{tenant}/types/{type}/attributes:
+    parameters:
+      - $ref: '#/components/parameters/tenantPath'
+      - name: type
+        in: path
+        required: true
+        description: The Entity type, a term of the core @context or an expanded IRI (percent-encoded).
+        schema: {type: string}
+    get:
+      tags: [Tenants]
+      summary: The Attribute names one type's Entities hold
+      operationId: storedAttributes
+      description: |
+        Names only, never a value, each compacted under the core
+        @context, sorted. An operator's plan reads them before a write
+        that replaces whole Entities, which the view guard refuses while
+        a stored Entity holds a name the view does not admit (T-6001).
+        The fold is the one `/ngsi-ld/v1/types/{type}` runs, bounded by
+        the scan ceiling; `partial` is true when it stopped there. A
+        tenant or type with no Entity answers an empty list.
+      security: [{}, {adminToken: []}]
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '200':
+          description: The names.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tenant, type, attributes, partial]
+                properties:
+                  tenant: {type: string}
+                  type: {type: string}
+                  attributes: {type: array, items: {type: string}}
+                  partial: {type: boolean}
+        '400':
+          $ref: '#/components/responses/BadTenant'
+
   /q/tenants/{tenant}/export:
     parameters:
       - $ref: '#/components/parameters/tenantPath'
