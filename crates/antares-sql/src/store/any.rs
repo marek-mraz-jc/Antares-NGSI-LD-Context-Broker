@@ -227,6 +227,7 @@ const HISTORY_STATS: &str = "WITH RECURSIVE tree(oid) AS (
      WHERE c.relkind = 'r'";
 
 /// One row of [`HISTORY_STATS`].
+#[cfg(feature = "postgres")]
 type HistoryStats = (f64, i64, Option<Vec<String>>, Option<Vec<f64>>, Option<f64>);
 
 /// `tenant`'s `(instances, bytes)` from [`HISTORY_STATS`]: each table's rows
