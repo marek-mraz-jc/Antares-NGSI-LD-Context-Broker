@@ -763,10 +763,8 @@ mod tests {
         let out = compact_instance(&stored, &ctx);
         assert_eq!(out.get(MODIFIED_BY_KEY), None);
         assert_eq!(out[MODIFIED_BY], json!({"type": "Property", "value": "me"}));
-        let mut shown = stored.clone();
-        if let Some(o) = shown.as_object_mut() {
-            o.insert(MODIFIED_BY.into(), by.clone());
-        }
+        let shown = json!({"type": "Property", "value": 1, MODIFIED_BY_KEY: by.clone(),
+            MODIFIED_BY: by.clone(), format!("{DEFAULT}modifiedBy"): forged});
         let out = compact_instance(&shown, &ctx);
         assert_eq!(out.get(MODIFIED_BY_KEY), None);
         assert_eq!(out[MODIFIED_BY], by);

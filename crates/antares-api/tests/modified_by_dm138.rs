@@ -86,7 +86,14 @@ async fn create(st: &AppState, headers: &[(&str, &str)]) {
 }
 
 async fn read(st: &AppState, query: &str, headers: &[(&str, &str)]) -> Value {
-    let (status, body) = send(st, "GET", &format!("/ngsi-ld/v1/entities/{ID}{query}"), headers, None).await;
+    let (status, body) = send(
+        st,
+        "GET",
+        &format!("/ngsi-ld/v1/entities/{ID}{query}"),
+        headers,
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     body
 }
@@ -102,7 +109,11 @@ async fn sys_attrs_answers_the_writer_only_to_a_caller_granted_read_versions() {
     assert_eq!(shown["t"]["modifiedBy"], by, "{shown}");
     assert_eq!(shown["u"]["modifiedBy"], by, "{shown}");
     assert!(shown["t"]["modifiedAt"].is_string(), "{shown}");
-    assert_eq!(shown.get("modifiedBy"), None, "an Entity member it is not: {shown}");
+    assert_eq!(
+        shown.get("modifiedBy"),
+        None,
+        "an Entity member it is not: {shown}"
+    );
 
     let plain = read(&st, "", &GRANTED).await;
     assert!(!plain.to_string().contains("modifiedBy"), "{plain}");
@@ -112,12 +123,25 @@ async fn sys_attrs_answers_the_writer_only_to_a_caller_granted_read_versions() {
     let forged = read(&st, "?options=sysAttrs", &[("jc-read-versions", "true")]).await;
     assert!(!forged.to_string().contains("modifiedBy"), "{forged}");
     let simplified = read(&st, "?options=sysAttrs,keyValues", &GRANTED).await;
-    assert!(!simplified.to_string().contains("modifiedBy"), "{simplified}");
+    assert!(
+        !simplified.to_string().contains("modifiedBy"),
+        "{simplified}"
+    );
     let concise = read(&st, "?options=sysAttrs,concise", &GRANTED).await;
     assert_eq!(concise["t"]["modifiedBy"], by, "{concise}");
-    let (status, page) = send(&st, "GET", "/ngsi-ld/v1/entities?type=Sensor&options=sysAttrs", &GRANTED, None).await;
+    let (status, page) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities?type=Sensor&options=sysAttrs",
+        &GRANTED,
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{page}");
-    assert_eq!(page[0]["t"]["modifiedBy"], by, "a query answers it too: {page}");
+    assert_eq!(
+        page[0]["t"]["modifiedBy"], by,
+        "a query answers it too: {page}"
+    );
 }
 
 #[cfg(feature = "jc")]
@@ -136,9 +160,15 @@ async fn each_change_moves_the_writer_of_the_attributes_it_touched() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     let shown = read(&st, "?options=sysAttrs", &GRANTED).await;
-    assert_eq!(shown["t"]["modifiedBy"]["organization"], "utility", "{shown}");
+    assert_eq!(
+        shown["t"]["modifiedBy"]["organization"], "utility",
+        "{shown}"
+    );
     assert_eq!(shown["t"]["modifiedBy"]["actor"], "u-operator", "{shown}");
-    assert_eq!(shown["u"]["modifiedBy"]["organization"], "city", "untouched: {shown}");
+    assert_eq!(
+        shown["u"]["modifiedBy"]["organization"], "city",
+        "untouched: {shown}"
+    );
 
     // 5.6.3 update; a write the gateway did not send names nobody, so the
     // writer it replaced does not stay behind on a value it did not write
