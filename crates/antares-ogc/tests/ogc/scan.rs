@@ -376,3 +376,167 @@ async fn a_refused_query_is_the_views_refusal() -> Result<(), String> {
     }
     Ok(())
 }
+
+/// An answer as frames: its status, its `Content-Length`, each body frame, and whether the
+/// body ended in an error.
+async fn frames(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+) -> (StatusCode, bool, Vec<String>, bool) {
+    use http_body_util::BodyExt as _;
+    use tower::ServiceExt as _;
+    let req = axum::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(axum::body::Body::empty())
+        .unwrap_or_default();
+    let Ok(resp) = app.clone().oneshot(req).await;
+    let (status, sized) = (resp.status(), resp.headers().contains_key("content-length"));
+    let mut body = resp.into_body();
+    let mut out = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let Ok(frame) = frame else {
+            return (status, sized, out, true);
+        };
+        if let Ok(data) = frame.into_data() {
+            out.push(String::from_utf8_lossy(&data).into_owned());
+        }
+    }
+    (status, sized, out, false)
+}
+
+/// T-6036: past one store read a page is written one store read per frame, each frame holding
+/// at most one upstream page of Features, with no length; what the frames make is the page a
+/// broker reading it in one store read answers, and its `HEAD` sends none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_past_one_store_read_streams_and_equals_the_page_read_whole() -> Result<(), String> {
+    let whole = fixture().await?;
+    let mut streams = 0;
+    // One Entity per store read, and two, where Cars 2 and 4 fill a residual's read at the end
+    // of the store's answer.
+    for max_limit in [1, 2] {
+        let streamed = fixture_with(TestBroker::with_max_limit(max_limit).await?).await?;
+        let south = format!("bbox=-180,-10,180,10&{WORLD}");
+        for query in queries().into_iter().chain([south]) {
+            for limit in ["limit=1", "limit=3", "limit=1000"] {
+                let uri = with(&query, limit);
+                let mut expected = get(&whole.app, &uri).await.body;
+                let (status, sized, parts, broken) = frames(&streamed.app, "GET", &uri).await;
+                assert_eq!((status, broken), (StatusCode::OK, false), "{uri}");
+                let mut got: Value =
+                    serde_json::from_str(&parts.concat()).map_err(|e| format!("{uri}: {e}"))?;
+                if parts.len() > 1 {
+                    streams += 1;
+                    assert!(!sized, "{uri}: a streamed page states no length");
+                    for part in &parts {
+                        assert!(
+                            part.matches("\"type\":\"Feature\"").count() <= max_limit,
+                            "{uri}: {part}"
+                        );
+                    }
+                }
+                // `links` aside: a store read of one Entity cannot tell its answer ended, so
+                // `next` may name an empty page; the pages followed hold the same Features.
+                for body in [&mut expected, &mut got] {
+                    body.as_object_mut()
+                        .map(|m| (m.remove("timeStamp"), m.remove("links")));
+                }
+                assert_eq!(got, expected, "{uri}");
+                assert_eq!(
+                    pages(&streamed, &uri).await?.0,
+                    pages(&whole, &uri).await?.0,
+                    "{uri}"
+                );
+            }
+        }
+    }
+    assert!(streams > 0, "some page went out in frames");
+    let streamed = fixture_with(TestBroker::with_max_limit(1).await?).await?;
+    let (status, sized, parts, _) = frames(&streamed.app, "HEAD", &with("", "limit=1000")).await;
+    assert_eq!(
+        (status, sized, parts.concat()),
+        (StatusCode::OK, false, String::new())
+    );
+    let (status, sized, _, _) = frames(&streamed.app, "HEAD", &with("", "limit=1")).await;
+    assert_eq!(
+        (status, sized),
+        (StatusCode::OK, true),
+        "a page of one read keeps its length"
+    );
+    Ok(())
+}
+
+/// Once locked, admits as many more queries as its count holds, then refuses each (clause 5.7).
+#[derive(Default)]
+struct ReadsLeft(
+    std::sync::atomic::AtomicBool,
+    std::sync::atomic::AtomicUsize,
+);
+
+impl PolicyEngine for ReadsLeft {
+    fn name(&self) -> &'static str {
+        "reads-left"
+    }
+
+    fn decide<'a>(&'a self, _: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let refused = self.0.load(SeqCst)
+            && op.clause.starts_with("5.7.")
+            && self
+                .1
+                .try_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                .is_err();
+        Box::pin(std::future::ready(if refused {
+            Decision::Deny("no read".into())
+        } else {
+            Decision::Allow
+        }))
+    }
+
+    fn pre_notify(&self, _: &Subject, _: &Value, _: &mut Value) -> NotifyDecision {
+        NotifyDecision::Deliver
+    }
+}
+
+/// T-6036: a store refusing a read after the first byte breaks the body; it never ends as a
+/// complete `FeatureCollection` holding fewer Features than the page.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_after_the_first_byte_breaks_the_body() -> Result<(), String> {
+    schemas_on();
+    let engine = Arc::new(ReadsLeft::default());
+    let broker = TestBroker::with_max_limit(1)
+        .await?
+        .with_policy(engine.clone());
+    let f = fixture_with(broker).await?;
+    let uri = with("", "limit=1000");
+    let (_, _, full, _) = frames(&f.app, "GET", &uri).await;
+    engine.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut broke = 0;
+    for left in 0..12 {
+        engine.1.store(left, std::sync::atomic::Ordering::SeqCst);
+        let (status, _, parts, cut) = frames(&f.app, "GET", &uri).await;
+        if status != StatusCode::OK {
+            assert!(
+                !parts.concat().contains("urn:ngsi-ld:Car"),
+                "{left}: {parts:?}"
+            );
+            continue;
+        }
+        if cut {
+            broke += 1;
+            assert!(
+                serde_json::from_str::<Value>(&parts.concat()).is_err(),
+                "{left}: {parts:?}"
+            );
+        } else {
+            assert_eq!(
+                parts.concat().len(),
+                full.concat().len(),
+                "{left}: the whole page"
+            );
+        }
+    }
+    assert!(broke > 0, "some refusal came after the first byte");
+    Ok(())
+}
