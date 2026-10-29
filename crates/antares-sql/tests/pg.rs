@@ -1392,6 +1392,101 @@ async fn a_write_passes_an_in_flight_history_append_and_a_delete_waits() {
 /// count waits; with a bound under the session's 5 s lock_timeout it gives
 /// up as a statement timeout, and without the hold it answers what the
 /// unbounded count answers.
+/// T-6085: one tenant's history count and size in one bounded pass, each
+/// tenant's own rows only, and the statistics' guess a read takes when that
+/// pass runs out of time lands near the exact numbers.
+#[tokio::test(flavor = "multi_thread")]
+async fn history_usage_is_per_tenant_and_its_estimate_is_near_it() {
+    use antares_store::TemporalDriver;
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect+migrate");
+    let store = antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(
+        pool.clone(),
+    ));
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let a = TenantId::new(&format!("pgusea{run}")).expect("tenant");
+    let b = TenantId::new(&format!("pguseb{run}")).expect("tenant");
+    let shell = serde_json::json!({
+        "id": "urn:x:1", "type": "Room",
+        "createdAt": "2026-08-04T09:00:00Z", "modifiedAt": "2026-08-04T09:00:00Z",
+        "n": {"type": "Property", "value": 1, "observedAt": "2026-08-04T09:00:00Z"}
+    });
+    for (t, n) in [(&a, 300_u32), (&b, 2)] {
+        pg::ensure_tenant(&pool, t).await.expect("tenant row");
+        // history is kept only for an Entity the current state holds
+        antares_store::CurrentStateDriver::create(
+            &store,
+            t,
+            antares_store::Kind::Entity,
+            "urn:x:1",
+            shell.clone(),
+        )
+        .await
+        .expect("entity");
+        TemporalDriver::create(&store, t, "urn:x:1", shell.clone())
+            .await
+            .expect("temporal");
+        let instances: Vec<_> = (0..n)
+            .map(|i| {
+                serde_json::json!({"type": "Property", "value": i,
+                    "observedAt": format!("2026-08-04T09:{:02}:{:02}Z", i / 60, i % 60),
+                    "instanceId": format!("urn:i:{i}")})
+            })
+            .collect();
+        store
+            .temporal_append(t, "urn:x:1", &shell, &serde_json::json!({"n": instances}))
+            .await
+            .expect("append");
+    }
+    let bound = std::time::Duration::from_secs(5);
+    let ua = TemporalDriver::attr_instance_usage(&store, &a, bound)
+        .await
+        .expect("usage a");
+    let ub = TemporalDriver::attr_instance_usage(&store, &b, bound)
+        .await
+        .expect("usage b");
+    assert_eq!(ua.0, 300, "{ua:?}");
+    assert_eq!(ub.0, 2, "{ub:?}");
+    assert_eq!(
+        ua,
+        (
+            TemporalDriver::attr_instance_count(&store, &a)
+                .await
+                .expect("n"),
+            TemporalDriver::attr_instance_bytes(&store, &a)
+                .await
+                .expect("b"),
+        )
+    );
+    assert!(ub.1 > 0 && ub.1 < ua.1, "{ua:?} {ub:?}");
+
+    sqlx::query("ANALYZE attr_instances, attr_rows")
+        .execute(&pool)
+        .await
+        .expect("analyze");
+    let ea = TemporalDriver::attr_instance_estimate(&store, &a)
+        .await
+        .expect("estimate a");
+    let eb = TemporalDriver::attr_instance_estimate(&store, &b)
+        .await
+        .expect("estimate b");
+    assert!(ea.0 >= 150 && ea.0 <= 600, "{ea:?} vs {ua:?}");
+    assert!(ea.1 > 0, "{ea:?}");
+    assert!(eb.0 < ea.0, "{eb:?} {ea:?}");
+
+    for t in [&a, &b] {
+        antares_store::CurrentStateDriver::purge_tenant(&store, t)
+            .await
+            .expect("purge");
+        TemporalDriver::purge_tenant(&store, t)
+            .await
+            .expect("purge");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn history_count_within_gives_up_at_its_bound() {
     use antares_store::TemporalDriver;

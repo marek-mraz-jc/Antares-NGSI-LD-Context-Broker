@@ -199,16 +199,28 @@ addressable through the routes below.
 ```text
 GET /q/tenants/acme
 {"tenant":"acme","counts":{"entities":0,"subscriptions":0,"csourceSubscriptions":0,
-  "registrations":0,"snapshots":0,"entityMaps":0,"distSubs":0,"attrInstances":0}}
+  "registrations":0,"snapshots":0,"entityMaps":0,"distSubs":0,"attrInstances":0},
+ "bytes":{"entities":0,"attrInstances":0,"byType":{}},
+ "estimated":false,"measuredAt":"2026-10-29T18:50:00.000Z"}
 ```
 
 `200`, `404` for a tenant that does not exist, `400` for a name outside the
 tenant grammar or one of the broker's internal names. `createdAt` is present
 on Postgres, where the `tenants` table records it. The default tenant always
-exists (5.5.10) and is always readable, even when empty. `attrInstances`
-counts the tenant's history under a 5 s statement bound, the same bound as a
-size scan: when a long history does not count in time, the answer leaves
-`attrInstances` out and the other counts still answer.
+exists (5.5.10) and is always readable, even when empty.
+
+`attrInstances` and `bytes` are the tenant's usage (T-2890, T-6085): the
+history's attribute instances, and the stored bytes of the current Entities
+(by first type in `byType`) and of the history; their sum is the tenant's
+total. The history is counted and sized in one pass under a 1 s statement
+bound. A longer history takes both numbers from the planner's statistics
+(each history partition's row count and size times the tenant's share of its
+`tenant_id` values) and the answer carries `"estimated": true`; ANALYZE
+keeps these statistics, so a partition autovacuum has not analyzed yet
+counts as empty. `measuredAt` is when the numbers were taken: the broker
+keeps them 5 minutes per tenant, 1 minute after a failed measurement. When
+neither the count nor the estimate answers, `attrInstances`, `bytes`,
+`estimated` and `measuredAt` are left out and the other counts still answer.
 
 ### GET /q/tenants/{tenant}/types/{type}/attributes
 

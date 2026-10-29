@@ -202,6 +202,69 @@ fn row_id(v: &Value) -> &str {
 #[cfg(feature = "postgres")]
 const SIZE_SCAN_TIMEOUT: &str = "SET LOCAL statement_timeout = '5s'";
 
+/// Every table holding history rows (the partitions of both history
+/// parents, a hypertable's chunks: all inherit), with the planner's row
+/// count, its heap and TOAST bytes and the `tenant_id` statistics ANALYZE
+/// left: `(rows, bytes, most common tenants, their frequencies, n_distinct)`.
+/// Catalog reads only, so it answers in milliseconds at any history size.
+#[cfg(feature = "postgres")]
+const HISTORY_STATS: &str = "WITH RECURSIVE tree(oid) AS (
+        SELECT 'attr_instances'::regclass::oid
+        UNION ALL SELECT 'attr_rows'::regclass::oid
+        UNION ALL SELECT i.inhrelid FROM pg_inherits i JOIN tree t ON i.inhparent = t.oid)
+    SELECT greatest(c.reltuples, 0)::float8,
+           (pg_relation_size(c.oid)
+             + CASE WHEN c.reltoastrelid = 0 THEN 0
+                    ELSE pg_total_relation_size(c.reltoastrelid) END)::bigint,
+           s.most_common_vals::text::text[],
+           s.most_common_freqs::float8[],
+           s.n_distinct::float8
+      FROM tree t
+      JOIN pg_class c ON c.oid = t.oid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      LEFT JOIN pg_stats s ON s.schemaname = n.nspname AND s.tablename = c.relname
+                          AND s.attname = 'tenant_id' AND NOT s.inherited
+     WHERE c.relkind = 'r'";
+
+/// One row of [`HISTORY_STATS`].
+type HistoryStats = (f64, i64, Option<Vec<String>>, Option<Vec<f64>>, Option<f64>);
+
+/// `tenant`'s `(instances, bytes)` from [`HISTORY_STATS`]: each table's rows
+/// and bytes times the tenant's share of its rows. The share is the tenant's
+/// most-common-value frequency, or else the rest spread evenly over the
+/// distinct values ANALYZE did not list (a negative `n_distinct` is a
+/// fraction of the rows). ponytail: a table ANALYZE never saw counts 0 rows;
+/// autovacuum analyzes a partition once a tenth of it changed.
+#[cfg(feature = "postgres")]
+fn estimate_history(tenant: &str, rows: &[HistoryStats]) -> (u64, u64) {
+    let (mut count, mut bytes) = (0.0_f64, 0.0_f64);
+    for (tuples, size, vals, freqs, distinct) in rows {
+        let (Some(vals), Some(freqs), Some(distinct)) = (vals, freqs, distinct) else {
+            continue;
+        };
+        let share = match vals.iter().position(|v| v == tenant) {
+            Some(i) => freqs.get(i).copied().unwrap_or(0.0),
+            None => {
+                let distinct = if *distinct < 0.0 {
+                    -distinct * tuples
+                } else {
+                    *distinct
+                };
+                let others = distinct - vals.len() as f64;
+                let rest = 1.0 - freqs.iter().sum::<f64>();
+                if others >= 1.0 && rest > 0.0 {
+                    rest / others
+                } else {
+                    0.0
+                }
+            }
+        };
+        count += share * tuples;
+        bytes += share * (*size).max(0) as f64;
+    }
+    (count.round() as u64, bytes.round() as u64)
+}
+
 /// The attribute instances of one tenant, both history tables.
 #[cfg(feature = "postgres")]
 async fn count_instances(
@@ -2240,6 +2303,58 @@ impl antares_store::TemporalDriver for AnyStore {
             }
         }
     }
+    async fn attr_instance_usage(
+        &self,
+        tenant: &TenantId,
+        bound: std::time::Duration,
+    ) -> Result<(u64, u64), NgsiError> {
+        match self {
+            AnyStore::Mem(s) => {
+                // the memory store counts at once: no bound to apply
+                let _ = bound;
+                Ok((s.attr_instance_count(tenant), s.attr_instance_bytes(tenant)))
+            }
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => {
+                async {
+                    let mut tx = tenant_tx(p, tenant).await?;
+                    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+                        .bind(format!("{}ms", bound.as_millis().max(1)))
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db)?;
+                    // one scan per history parent for both numbers
+                    let (n, b): (i64, i64) = sqlx::query_as(
+                        "SELECT (a.n + r.n)::bigint, (a.b + r.b)::bigint
+                           FROM (SELECT count(*) AS n, coalesce(sum(pg_column_size(x.*)), 0) AS b
+                                   FROM attr_instances x WHERE tenant_id = $1) a,
+                                (SELECT count(*) AS n, coalesce(sum(pg_column_size(x.*)), 0) AS b
+                                   FROM attr_rows x WHERE tenant_id = $1) r",
+                    )
+                    .bind(tenant.as_str())
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(db)?;
+                    Ok((n.max(0) as u64, b.max(0) as u64))
+                }
+                .await
+            }
+        }
+    }
+    async fn attr_instance_estimate(&self, tenant: &TenantId) -> Result<(u64, u64), NgsiError> {
+        match self {
+            // exact, and as fast as a guess would be
+            AnyStore::Mem(s) => Ok((s.attr_instance_count(tenant), s.attr_instance_bytes(tenant))),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => {
+                let rows: Vec<HistoryStats> = sqlx::query_as(HISTORY_STATS)
+                    .fetch_all(p.docs.pool())
+                    .await
+                    .map_err(db)?;
+                Ok(estimate_history(tenant.as_str(), &rows))
+            }
+        }
+    }
     async fn attr_instance_bytes(&self, tenant: &TenantId) -> Result<u64, NgsiError> {
         match self {
             AnyStore::Mem(s) => Ok(s.attr_instance_bytes(tenant)),
@@ -2422,5 +2537,47 @@ mod temporal_only_tests {
             .await
             .expect("recorded");
         assert_eq!(doc["speed"][0]["value"], 1);
+    }
+}
+
+#[cfg(all(test, feature = "postgres"))]
+mod estimate_tests {
+    use super::{estimate_history, HistoryStats};
+
+    fn part(tuples: f64, bytes: i64, vals: &[&str], freqs: &[f64], distinct: f64) -> HistoryStats {
+        (
+            tuples,
+            bytes,
+            Some(vals.iter().map(|v| (*v).to_owned()).collect()),
+            Some(freqs.to_vec()),
+            Some(distinct),
+        )
+    }
+
+    #[test]
+    fn a_listed_tenant_takes_its_frequency_of_each_partition() {
+        let rows = [
+            part(1000.0, 80_000, &["helsinki", "praha"], &[0.75, 0.25], 2.0),
+            part(400.0, 40_000, &["praha"], &[1.0], 1.0),
+        ];
+        assert_eq!(estimate_history("helsinki", &rows), (750, 60_000));
+        assert_eq!(estimate_history("praha", &rows), (650, 60_000));
+    }
+
+    #[test]
+    fn an_unlisted_tenant_shares_the_rest_with_the_other_unlisted_ones() {
+        // 0.4 of the rows over 4 unlisted tenants: 0.1 each
+        let rows = [part(1000.0, 10_000, &["big"], &[0.6], 5.0)];
+        assert_eq!(estimate_history("small", &rows), (100, 1_000));
+        // a negative n_distinct is a fraction of the rows: 0.005 * 1000 = 5
+        let frac = [part(1000.0, 10_000, &["big"], &[0.6], -0.005)];
+        assert_eq!(estimate_history("small", &frac), (100, 1_000));
+    }
+
+    #[test]
+    fn a_tenant_absent_from_a_fully_listed_or_unanalyzed_table_counts_nothing() {
+        let listed = part(1000.0, 10_000, &["a", "b"], &[0.5, 0.5], 2.0);
+        let never: HistoryStats = (5000.0, 99_000, None, None, None);
+        assert_eq!(estimate_history("c", &[listed, never]), (0, 0));
     }
 }

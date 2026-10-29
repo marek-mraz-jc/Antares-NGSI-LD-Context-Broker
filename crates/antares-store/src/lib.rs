@@ -1195,6 +1195,27 @@ pub trait TemporalDriver: Send + Sync {
         let _ = tenant;
         Ok(0)
     }
+    /// [`Self::attr_instance_count`] and [`Self::attr_instance_bytes`] in
+    /// one pass that gives up after `bound` (`GET /q/tenants/{tenant}`,
+    /// T-6085), so a long history costs one scan, not two. The default asks
+    /// the two reads.
+    async fn attr_instance_usage(
+        &self,
+        tenant: &TenantId,
+        bound: std::time::Duration,
+    ) -> Result<(u64, u64), NgsiError> {
+        let count = self.attr_instance_count_within(tenant, bound).await?;
+        Ok((count, self.attr_instance_bytes(tenant).await?))
+    }
+    /// The store's statistics' guess at `(instances, bytes)` of one tenant's
+    /// history, for a read whose exact pass ran out of time (T-6085); the
+    /// answer says it is estimated. A driver without statistics cannot guess.
+    async fn attr_instance_estimate(&self, tenant: &TenantId) -> Result<(u64, u64), NgsiError> {
+        let _ = tenant;
+        Err(NgsiError::OperationNotSupported(
+            "this history store keeps no statistics to estimate from".into(),
+        ))
+    }
     /// Retention of history in one Tenant (`/q/retention`, T-3900, DM-97):
     /// delete at most `batch` attribute instances of the Entities `scope`
     /// names whose instant (`observedAt`, else `modifiedAt`, `deletedAt`,
