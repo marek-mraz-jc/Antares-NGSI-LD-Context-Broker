@@ -618,3 +618,59 @@ proptest! {
         prop_assert_eq!(&paged, &want, "type={:?} paged", groups);
     }
 }
+
+/// T-6070: a `near` whose radius reaches past the antimeridian keeps the
+/// point on its other side in SQL, as PostGIS measures it; the bounding box
+/// `predicate` adds before the geography distance would end at 180.1 and
+/// drop it. The evaluator, which decides, measures without the wrap (its
+/// documented ceiling, `antares_ql::geo::min_distance_m`) and keeps the east
+/// point alone: SQL stays a superset of it.
+#[test]
+fn a_near_across_the_antimeridian_keeps_the_point_beyond_it() {
+    let Some(db) = db() else { return };
+    let tenant = TenantId::new("pgparityantimeridian").expect("tenant");
+    let docs: Vec<Value> = [("east", 179.995), ("west", -179.995)]
+        .iter()
+        .map(|(n, x)| {
+            json!({"id": format!("urn:ngsi-ld:T:{n}"), "type": "T",
+                   "location": {"type": "GeoProperty", "value": {"type": "Point", "coordinates": [x, 0.0]}}})
+        })
+        .collect();
+    let stored = seed(db, &tenant, &docs);
+    let params = HashMap::from([
+        ("georel".to_owned(), "near;maxDistance==10000".to_owned()),
+        ("geometry".to_owned(), "Point".to_owned()),
+        ("coordinates".to_owned(), "[179.99,0]".to_owned()),
+    ]);
+    let geo = GeoQuery::from_params(&params)
+        .expect("parses")
+        .expect("a geoquery");
+    let want: BTreeSet<String> = stored
+        .iter()
+        .filter(|doc| geo.matches(doc, ctx()))
+        .filter_map(|doc| doc["id"].as_str().map(str::to_owned))
+        .collect();
+    let spec = geo.to_sql_spec(ctx());
+    let (got, _) = query(
+        db,
+        &tenant,
+        &EntityFilter {
+            geo: spec.as_slice(),
+            expand: &expand,
+            ..Default::default()
+        },
+    );
+    assert!(
+        got.is_superset(&want),
+        "dropped {:?}",
+        want.difference(&got).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        got,
+        BTreeSet::from([
+            "urn:ngsi-ld:T:east".to_owned(),
+            "urn:ngsi-ld:T:west".to_owned()
+        ]),
+        "PostGIS keeps both points"
+    );
+}
