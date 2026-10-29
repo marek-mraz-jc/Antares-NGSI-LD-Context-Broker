@@ -55,7 +55,9 @@ fn any_literal(c: &mut Cursor<'_>) -> Result<Option<Literal>, UrlError> {
         return Err(c.not_implemented(Feature::Literal));
     }
     if prefixed(c, "duration") {
-        return quoted(c, "durationValue", is_duration).map(|d| Some(Literal::Duration(d)));
+        // `SIGN` before the body: `+` writes itself `%2B`, which the body scan stops at (T-6100)
+        let sign = c.sign().map(String::from).unwrap_or_default();
+        return quoted(c, "durationValue", is_duration).map(|d| Some(Literal::Duration(sign + &d)));
     }
     if prefixed(c, "binary") {
         return quoted(c, "binaryValue", is_base64url).map(|b| Some(Literal::Binary(b)));
@@ -137,11 +139,11 @@ fn quoted(
     }
 }
 
-/// `durationValue` (ABNF): `[ sign ] "P" [ 1*DIGIT "D" ] [ "T" [ 1*DIGIT "H" ] [ 1*DIGIT "M" ]
-/// [ 1*DIGIT [ "." 1*DIGIT ] "S" ] ]`, with at least one component and none after a bare `T`.
+/// `durationValue` (ABNF) after its `[ sign ]`, which the caller reads: `"P" [ 1*DIGIT "D" ]
+/// [ "T" [ 1*DIGIT "H" ] [ 1*DIGIT "M" ] [ 1*DIGIT [ "." 1*DIGIT ] "S" ] ]`, with at least one
+/// component and none after a bare `T`.
 pub(crate) fn is_duration(text: &str) -> bool {
-    let rest = text.strip_prefix(['-', '+']).unwrap_or(text);
-    let Some(rest) = rest.strip_prefix('P') else {
+    let Some(rest) = text.strip_prefix('P') else {
         return false;
     };
     let (days, time) = rest
@@ -855,6 +857,31 @@ mod tests {
         // each writes back the text it was read from
         for text in ["duration'-P1D'", "binary'dGVzdA'"] {
             assert_eq!(ok(text).to_string(), text);
+        }
+        // T-6100 (fuzz odata_url_parse): `SIGN` is `+`, `%2B` or `-`, and the `%2B` a plus writes
+        // itself as reads back to the same literal; one sign only
+        for text in [
+            "duration'+P6DT23H'",
+            "duration'%2BP6DT23H'",
+            "duration'%2bP6DT23H'",
+        ] {
+            assert_eq!(ok(text), Literal::Duration("+P6DT23H".into()), "{text}");
+        }
+        assert_eq!(ok("duration'+P1D'").to_string(), "duration'%2BP1D'");
+        assert_eq!(ok("duration'%2BP1D'").to_string(), "duration'%2BP1D'");
+        for bad in [
+            "duration'+-P1D'",
+            "duration'-+P1D'",
+            "duration'%2B%2BP1D'",
+            "duration'+'",
+        ] {
+            assert!(
+                matches!(
+                    read(bad).unwrap_err().kind,
+                    crate::UrlErrorKind::Syntax { .. }
+                ),
+                "{bad}"
+            );
         }
         // `f` that starts a name is no suffix, and INF/NaN take none
         let mut c = Cursor::new("1foo");
