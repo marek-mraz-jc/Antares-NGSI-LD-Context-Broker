@@ -42,6 +42,7 @@ pub(super) async fn subs_for(
 pub(super) fn stable_eq(a: &Value, b: &Value) -> bool {
     fn volatile(k: &str) -> bool {
         matches!(k, "createdAt" | "modifiedAt" | "instanceId")
+            || k == antares_jsonld::compact::MODIFIED_BY_KEY
     }
     match (a, b) {
         (Value::Object(oa), Value::Object(ob)) => {

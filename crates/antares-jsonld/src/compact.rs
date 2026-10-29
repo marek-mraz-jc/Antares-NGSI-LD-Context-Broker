@@ -7,6 +7,18 @@ use serde_json::{Map, Value};
 use std::borrow::Cow;
 
 /// Entity-instance members whose values stay verbatim during compaction.
+/// The member an attribute instance keeps the writer of its last change in
+/// (platform ADR-N-054 2.8, DM-138): `organization`, `actorKind`, `actor`. A
+/// JSON-LD keyword, so no client's attribute name expands to it; compaction
+/// never answers it, the representation shows it as [`MODIFIED_BY`] where the
+/// caller may see it.
+pub const MODIFIED_BY_KEY: &str = "@modifiedBy";
+
+/// The system member a shown [`MODIFIED_BY_KEY`] is answered as. A
+/// sub-Attribute a client named `modifiedBy` compacts to the same term; the
+/// system member wins, so nobody passes their own text off as the writer.
+pub const MODIFIED_BY: &str = "modifiedBy";
+
 const VERBATIM: &[&str] = &[
     "type",
     "value",
@@ -100,6 +112,9 @@ pub fn compact_instance(inst: &Value, ctx: &Context) -> Value {
     };
     let mut out = Map::new();
     for (k, v) in obj {
+        if k == MODIFIED_BY_KEY || k == MODIFIED_BY {
+            continue;
+        }
         if k == "vocab" || k == "previousVocab" {
             // vocab values compact back to terms
             let compacted = match v {
@@ -145,6 +160,9 @@ pub fn compact_instance(inst: &Value, ctx: &Context) -> Value {
             // sub-attribute
             out.insert(ctx.compact_iri(k), compact_attr_value(v, &ctx.within(k)));
         }
+    }
+    if let Some(by) = obj.get(MODIFIED_BY) {
+        out.insert(MODIFIED_BY.into(), by.clone());
     }
     Value::Object(out)
 }
@@ -731,5 +749,26 @@ mod tests {
         let doc: Value = serde_json::from_str(&nest(20)).expect("within the parser limit");
         let out = compact_entity(&doc, &ctx);
         assert!(out.get("s").is_some());
+    }
+
+    /// DM-138: the stored writer never leaves compaction under its keyword,
+    /// and a shown `modifiedBy` beats a client sub-Attribute of that name.
+    #[test]
+    fn the_stored_writer_is_never_compacted_and_the_shown_one_wins() {
+        let ctx = crate::core_context();
+        let by = json!({"organization": "city", "actorKind": "person", "actor": "u-1"});
+        let forged = json!([{"type": "Property", "value": "me"}]);
+        let stored = json!({"type": "Property", "value": 1, MODIFIED_BY_KEY: by.clone(),
+            format!("{DEFAULT}modifiedBy"): forged.clone()});
+        let out = compact_instance(&stored, &ctx);
+        assert_eq!(out.get(MODIFIED_BY_KEY), None);
+        assert_eq!(out[MODIFIED_BY], json!({"type": "Property", "value": "me"}));
+        let mut shown = stored.clone();
+        if let Some(o) = shown.as_object_mut() {
+            o.insert(MODIFIED_BY.into(), by.clone());
+        }
+        let out = compact_instance(&shown, &ctx);
+        assert_eq!(out.get(MODIFIED_BY_KEY), None);
+        assert_eq!(out[MODIFIED_BY], by);
     }
 }

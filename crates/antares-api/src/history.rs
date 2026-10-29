@@ -170,6 +170,18 @@ pub(crate) fn provenance(operation: &str) -> Value {
     out
 }
 
+/// The `modifiedBy` of the request in flight (DM-138); `None` outside a
+/// request and for a write the gateway did not send.
+pub(crate) fn modified_by() -> Option<Value> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return PROVENANCE
+        .try_with(crate::provenance::modified_by)
+        .ok()
+        .flatten();
+    #[cfg(target_arch = "wasm32")]
+    None
+}
+
 /// Whether the request in flight came through an Endpoint that audits its
 /// changes (ADR-N-054 2.8, DM-136): each change is then kept as a version
 /// whatever the type's history rule says.
@@ -536,6 +548,7 @@ fn payload_of(instance: &Value) -> Value {
             "createdAt",
             "modifiedAt",
             antares_store::PROVENANCE_KEY,
+            antares_jsonld::compact::MODIFIED_BY_KEY,
         ] {
             o.remove(k);
         }

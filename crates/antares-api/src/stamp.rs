@@ -3,8 +3,9 @@
 //! entity and on every attribute instance (4.8, 5.2.4), stamped at the
 //! moment the operation is applied.
 
+use antares_jsonld::compact::MODIFIED_BY_KEY;
 use antares_model::is_meta;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Inject server-managed timestamps into a freshly expanded doc.
 pub fn stamp_new(doc: &mut Value, ts: &str) {
@@ -37,6 +38,7 @@ pub fn stamp_instances(v: &mut Value, ts: &str) {
             if let Some(o) = inst.as_object_mut() {
                 o.insert("createdAt".into(), Value::String(ts.to_owned()));
                 o.insert("modifiedAt".into(), Value::String(ts.to_owned()));
+                stamp_by(o);
                 for (k, sub) in o.iter_mut() {
                     if sub.is_array() && !antares_jsonld::RESERVED_MEMBERS.contains(&k.as_str()) {
                         stamp_instances(sub, ts);
@@ -44,5 +46,16 @@ pub fn stamp_instances(v: &mut Value, ts: &str) {
                 }
             }
         }
+    }
+}
+
+/// Who made an instance's last change (ADR-N-054 2.8, DM-138), set beside
+/// its `modifiedAt` from the request's provenance, which only the gateway's
+/// mesh identity can name: whatever the instance held before goes, so a
+/// write the gateway did not send leaves none.
+pub fn stamp_by(instance: &mut Map<String, Value>) {
+    instance.remove(MODIFIED_BY_KEY);
+    if let Some(by) = crate::history::modified_by() {
+        instance.insert(MODIFIED_BY_KEY.into(), by);
     }
 }

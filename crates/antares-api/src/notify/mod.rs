@@ -447,7 +447,9 @@ pub async fn record_temporal_change(
                 o.entry("instanceId".to_owned())
                     .or_insert_with(|| Value::String(iid));
                 // Who wrote it, for the store's column (T-4665); a store
-                // takes it out before it keeps the instance.
+                // takes it out before it keeps the instance. The row's
+                // provenance says who, so the current state's copy stays out.
+                o.remove(antares_jsonld::compact::MODIFIED_BY_KEY);
                 o.insert(
                     antares_store::PROVENANCE_KEY.to_owned(),
                     crate::history::provenance(operation),

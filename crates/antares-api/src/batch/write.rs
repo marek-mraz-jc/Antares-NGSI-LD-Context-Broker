@@ -1043,12 +1043,18 @@ fn ngsi_of(e: ApiError) -> NgsiError {
 }
 
 /// `a` and `b` hold the same Entity apart from the `modifiedAt` stamps a
-/// merge leaves on the Entity and on each Attribute instance it touched.
-/// Only those two levels are skipped: a `modifiedAt` key inside a value
-/// is data and compares like any other.
+/// merge leaves on the Entity and on each Attribute instance it touched,
+/// the writer beside it included (DM-138). Only those two levels are
+/// skipped: a `modifiedAt` key inside a value is data and compares like any
+/// other.
 pub(super) fn same_but_stamps(a: &Value, b: &Value) -> bool {
     fn without(o: &serde_json::Map<String, Value>) -> impl Iterator<Item = (&String, &Value)> {
-        o.iter().filter(|(k, _)| k.as_str() != "modifiedAt")
+        o.iter().filter(|(k, _)| {
+            !matches!(
+                k.as_str(),
+                "modifiedAt" | antares_jsonld::compact::MODIFIED_BY_KEY
+            )
+        })
     }
     fn same_obj(
         a: &serde_json::Map<String, Value>,

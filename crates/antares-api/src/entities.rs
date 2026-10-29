@@ -282,6 +282,7 @@ async fn retrieve_entity_inner(
     )
     .await?;
     let mut repr = parse_repr(params, &ctx)?;
+    repr.modified_by = crate::provenance::shows_modified_by(headers, st.provenance_from.as_deref());
     crate::repr::narrow_repr(&mut repr, &filter);
     let join = parse_join(params)?;
     check_linked_projection(&repr, &join)?;
@@ -846,6 +847,7 @@ async fn query_entities_inner(
     }
 
     let mut repr = parse_repr(params, &ctx)?;
+    repr.modified_by = crate::provenance::shows_modified_by(headers, st.provenance_from.as_deref());
     crate::repr::narrow_repr(&mut repr, filter);
     crate::repr::note_reads(&mut repr, client_params, &ctx)?;
     let join = parse_join(params)?;
@@ -3171,6 +3173,7 @@ fn merge_with(doc: &mut Value, fragment: &Value, ts: &str, replace: bool) {
                             if let Some(o) = ni.as_object_mut() {
                                 o.insert("createdAt".into(), Value::String(ts.to_owned()));
                                 o.insert("modifiedAt".into(), Value::String(ts.to_owned()));
+                                crate::stamp::stamp_by(o);
                             }
                             cur.push(ni);
                         }
@@ -3211,6 +3214,7 @@ fn merge_instance(target: &mut Value, frag: &Value, ts: &str) {
             t.insert("createdAt".into(), c);
         }
         t.insert("modifiedAt".into(), Value::String(ts.to_owned()));
+        crate::stamp::stamp_by(t);
         return;
     }
     for (k, v) in f {
@@ -3231,6 +3235,7 @@ fn merge_instance(target: &mut Value, frag: &Value, ts: &str) {
         }
     }
     t.insert("modifiedAt".into(), Value::String(ts.to_owned()));
+    crate::stamp::stamp_by(t);
 }
 
 /// RFC 7396 merge patch over a compound (JSON object) member value, with
@@ -3544,6 +3549,7 @@ async fn retrieve_attr_inner(
     )
     .await?;
     let mut repr = parse_repr(params, &ctx)?;
+    repr.modified_by = crate::provenance::shows_modified_by(headers, st.provenance_from.as_deref());
     crate::repr::narrow_repr(&mut repr, &filter);
     antares_model::EntityId::new(id)?;
     antares_model::check_attr_name(attr)?;
