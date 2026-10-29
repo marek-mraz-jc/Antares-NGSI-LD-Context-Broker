@@ -369,14 +369,14 @@ fn date_time_offset(c: &mut Cursor<'_>) -> Option<String> {
 pub(crate) fn number(c: &mut Cursor<'_>) -> Option<Literal> {
     let (text, integer) = number_text(c, true)?;
     // The `f` suffix of an `Edm.Single` literal (OData 2.0 and 3.0 URL conventions, still sent
-    // by clients and the NLstn compliance suite): the same decimal value.
+    // by clients and the NLstn compliance suite): the same value, so `3f` is the Int `3` and
+    // writes back as a literal that parses to the same tree.
     if !text.ends_with(['N', 'F']) && c.peek().is_some_and(|b| b == b'f' || b == b'F') {
         let at = c.pos();
         c.advance(1);
-        if !continues_identifier(c) {
-            return Some(Literal::Decimal(text));
+        if continues_identifier(c) {
+            c.reset(at);
         }
-        c.reset(at);
     }
     if integer {
         if let Ok(value) = text.parse::<i64>() {
@@ -824,7 +824,8 @@ mod tests {
             ("1.5f", Literal::Decimal("1.5".into())),
             ("0.0F", Literal::Decimal("0.0".into())),
             ("1.5e2f", Literal::Decimal("1.5e2".into())),
-            ("-3f", Literal::Decimal("-3".into())),
+            ("-3f", Literal::Int(-3)),
+            ("944F", Literal::Int(944)),
         ] {
             assert_eq!(ok(text), want, "{text}");
         }
