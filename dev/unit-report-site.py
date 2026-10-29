@@ -31,7 +31,7 @@ os.makedirs(out, exist_ok=True)
 # how it reads on the page, in the order CI runs them; anything else lands
 # after these, alphabetically
 PREFERRED = (
-    "default ignored-db-api ignored-db-broker "
+    "default default-1 default-2 ignored-db-api ignored-db-broker "
     "no-default-features all-features timescale-store"
 ).split()
 

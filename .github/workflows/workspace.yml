@@ -176,18 +176,26 @@ jobs:
           python3 dev/surface-features.py sizes ${{ matrix.partition }}
 
   workspace:
-    # fmt + clippy + the workspace test suite across the feature matrix, with
-    # live PostGIS / TimescaleDB / mosquitto so no integration test skips
-    # vacuously.
-    name: Workspace tests
-    # x86, not the arm runner: a COLD workspace clippy there dies with a bare
+    # The workspace test suite on the default features, with live PostGIS /
+    # TimescaleDB / mosquitto / NATS so no integration test skips vacuously.
+    # Two cells, each running half the tests (nextest --partition count:N/2):
+    # one cell took 32 min (run 40887864111: test build 6 min, 4106 tests
+    # 9.7 min, throughput-bound on the runner's 4 CPUs) and was the train's
+    # critical path (T-6072). fmt, clippy and the supply-chain and repo
+    # checks run in the lint job beside them.
+    name: Workspace tests (${{ matrix.part }}/2)
+    # x86, not the arm runner: a COLD workspace build there dies with a bare
     # SIGTERM (exit 143) after 3-10 min — no rustc error, no cancel, and the
     # same cold job peaks at 1.2 GB locally. The msrv and shared-crate jobs
     # keep the arm runner, they run fine there.
     runs-on: ubuntu-latest
-    # 45, not 30: unit-junit alone takes 21-23 min, so a green run ended at
-    # ~29 min and trains 20261026-1835, -1915-2 and -2228 were cancelled at 30.
+    # A cold cache (a branch dev has not cached yet) rebuilds every
+    # dependency; a warm cell ends in ~15 min.
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2]
     env: &workspace-env
       # Live PostGIS for the antares-sql integration tests — without this
       # they skip vacuously and CI proves nothing about the Pg store.
@@ -242,9 +250,6 @@ jobs:
             /usr/local/share/boost /usr/local/graalvm /usr/share/swift || true
           df -h /
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          components: clippy, rustfmt
-          targets: wasm32-unknown-unknown
       # Cache rule for every workflow a pull request or a tag can reach: a
       # pull request reads the cache and never writes one (it starts warm
       # and cannot evict or shadow the branch caches), a v* tag reads none
@@ -298,6 +303,87 @@ jobs:
             [ -n "${!v:-}" ] || { echo "::error::$v gates a test and is unset here"; rc=1; }
           done
           exit $rc
+      # count:N/2 deals each binary's tests round-robin over the two cells,
+      # so both get a share of the slow pg binaries. Both cells build the
+      # same test binaries and share one rust-cache key.
+      - name: The workspace suite, half ${{ matrix.part }} of 2
+        run: dev/unit-junit.sh default-${{ matrix.part }} --workspace --partition count:${{ matrix.part }}/2
+      # nextest cannot execute doctests. They stay gated here (a broken doc
+      # example is still a red build) but contribute no JUnit, which the
+      # /reports/unit/ footer says out loud rather than quietly overcounting.
+      - if: matrix.part == 2
+        run: cargo test --locked --workspace --doc
+      # The federated-store and outbox-drain tests are #[ignore] so that a cell
+      # without a database reports them as ignored instead of silently passing.
+      # This job HAS a database, so it must ask for them by name. Not a blanket
+      # --run-ignored all: that would also pull in the release-only timing gate.
+      # --workspace with a filter, not -p: -p resolves other features, so
+      # cargo rebuilt both binaries for 2 min to run 3 tests in a second.
+      - name: Tests that need a live database
+        if: matrix.part == 1
+        run: |
+          dev/unit-junit.sh ignored-db-api --workspace --run-ignored ignored-only \
+            -E 'binary_id(antares-api::it) & test(/^(split_entities_5_7_2|temporal_fed_paging_5_7_4)::/)'
+          dev/unit-junit.sh ignored-db-broker --workspace --run-ignored ignored-only \
+            -E 'binary_id(antares-broker::bin/antares) & test(outbox_flush_waits)'
+      # file-store, no-default-features and all-features: the feature-sets
+      # job below, beside this one
+      # Same store tests, timescale temporal mode (hypertable DDL branch,
+      # compression-vs-RLS ordering, backend detection).
+      - name: Store tests against the timescale temporal mode
+        if: matrix.part == 1
+        env:
+          ANTARES_TEST_DATABASE_URL: postgresql://antares:antares@localhost:15433/antares
+        run: |
+          # psql may not be preinstalled on the runner image (exit 127)
+          which psql >/dev/null || sudo apt-get install -y -qq postgresql-client
+          PGPASSWORD=antares psql -h localhost -p 15433 -U antares -d antares \
+            -c "CREATE EXTENSION IF NOT EXISTS timescaledb"
+          # the broker's store×temporal combos too: their timescale rows skip
+          # against the plain PostGIS service and only run here for real
+          dev/unit-junit.sh timescale-store --workspace -E 'binary_id(antares-broker::store_combos)'
+          # The margin the reclaim left, after the build that fills the most.
+          df -h /
+      # Uploaded even on a red job: a failing config is exactly the one the
+      # reports page must render, and fold-reports.sh takes the NEWEST bundle.
+      - name: Unit JUnit bundle (folded into /reports/unit/)
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          # fold-reports.sh takes `unit-junit` and every `unit-junit-*`
+          name: ${{ matrix.part == 1 && 'unit-junit' || 'unit-junit-default-2' }}
+          path: unit-junit/
+          if-no-files-found: warn
+
+
+  lint:
+    # The checks that need no database: fmt, the wasm32 and fuzz builds,
+    # clippy, the supply chain and the repo rules. They ran at both ends of
+    # the workspace job and made it the longest job of the train (T-6072).
+    name: Workspace lint and supply chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # clippy --all-features, the vanilla and plugin-example broker builds
+      # and the template smoke all keep artifacts in target/.
+      - name: Reclaim runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/graalvm /usr/share/swift || true
+          df -h /
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+          cache-on-failure: true
       - run: cargo fmt --all --check
       # The browser build is a compile target of this workspace, not a
       # separate product: wasm.yml runs only on dispatch, so a module that
@@ -334,48 +420,6 @@ jobs:
       # built dependencies and catches exactly that.
       - name: The fuzz targets still compile
         run: cargo check --locked --manifest-path fuzz/Cargo.toml --bins
-      - run: dev/unit-junit.sh default --workspace
-      # nextest cannot execute doctests. They stay gated here (a broken doc
-      # example is still a red build) but contribute no JUnit, which the
-      # /reports/unit/ footer says out loud rather than quietly overcounting.
-      - run: cargo test --locked --workspace --doc
-      # The federated-store and outbox-drain tests are #[ignore] so that a cell
-      # without a database reports them as ignored instead of silently passing.
-      # This job HAS a database, so it must ask for them by name. Not a blanket
-      # --run-ignored all: that would also pull in the release-only timing gate.
-      - name: Tests that need a live database
-        run: |
-          dev/unit-junit.sh ignored-db-api -p antares-api --test it \
-            --run-ignored ignored-only \
-            -E 'test(/^(split_entities_5_7_2|temporal_fed_paging_5_7_4)::/)'
-          dev/unit-junit.sh ignored-db-broker -p antares-broker --bin antares \
-            --run-ignored ignored-only outbox_flush_waits
-      # file-store, no-default-features and all-features: the feature-sets
-      # job below, beside this one
-      # Same store tests, timescale temporal mode (hypertable DDL branch,
-      # compression-vs-RLS ordering, backend detection).
-      - name: Store tests against the timescale temporal mode
-        env:
-          ANTARES_TEST_DATABASE_URL: postgresql://antares:antares@localhost:15433/antares
-        run: |
-          # psql may not be preinstalled on the runner image (exit 127)
-          which psql >/dev/null || sudo apt-get install -y -qq postgresql-client
-          PGPASSWORD=antares psql -h localhost -p 15433 -U antares -d antares \
-            -c "CREATE EXTENSION IF NOT EXISTS timescaledb"
-          # the broker's store×temporal combos too: their timescale rows skip
-          # against the plain PostGIS service and only run here for real
-          dev/unit-junit.sh timescale-store -p antares-sql -p antares-broker --test store_combos
-          # The margin the reclaim left, after the build that fills the most.
-          df -h /
-      # Uploaded even on a red job: a failing config is exactly the one the
-      # reports page must render, and fold-reports.sh takes the NEWEST bundle.
-      - name: Unit JUnit bundle (folded into /reports/unit/)
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: unit-junit
-          path: unit-junit/
-          if-no-files-found: warn
       # Supply chain per run (surfaces-threat-model 11.1, T-3489), every
       # tool at an exact version. cargo-audit (run last, beside cargo-deny)
       # reads Cargo.lock whole and fails on any warning (unmaintained,
