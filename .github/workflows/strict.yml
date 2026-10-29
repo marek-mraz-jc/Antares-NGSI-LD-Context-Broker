@@ -88,6 +88,8 @@ jobs:
       CARGO_TERM_COLOR: always
     services:
       postgis:
+        # 17 on purpose: per-push workspace.yml tests 16, the major dev and
+        # prod run (T-6021); this lane keeps the next major tested
         image: ghcr.io/baosystems/postgis:17-3.5
         env:
           POSTGRES_USER: antares
@@ -117,6 +119,8 @@ jobs:
       CARGO_TERM_COLOR: always
     services:
       postgis:
+        # 17 on purpose: per-push workspace.yml tests 16, the major dev and
+        # prod run (T-6021); this lane keeps the next major tested
         image: ghcr.io/baosystems/postgis:17-3.5
         env:
           POSTGRES_USER: antares
