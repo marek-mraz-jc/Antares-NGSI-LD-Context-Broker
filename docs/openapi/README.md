@@ -29,7 +29,10 @@ so moving the pin has to move both.
 
 CI: a PR that touches this file runs `oasdiff breaking` against the
 version on the base branch. Rendering: ReDoc (the CIM 047 Annex B
-recommendation) builds `api.html` beside the book in the Pages deploy.
+recommendation) builds `openapi/ngsi-ld.html` beside the book in the Pages
+deploy, from a bundled render-only copy: `dev/redoc-spec.py` moves the
+Attribute `oneOf` the document repeats in ten schemas into one
+`AnyAttribute` component, without which ReDoc runs out of heap.
 
 ## The broker's own routes
 

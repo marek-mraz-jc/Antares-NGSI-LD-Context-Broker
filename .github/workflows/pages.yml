@@ -76,15 +76,25 @@ jobs:
       # standalone page under /openapi/. Their own directory on purpose: the
       # book already emits api.html and admin-api.html from its chapters of
       # those names, and a render at the site root would overwrite them.
+      # ReDoc renders a bundled copy that dev/redoc-spec.py rewrote: the
+      # vendored ETSI file repeats one Attribute oneOf in ten schemas, and
+      # ReDoc expanding every ordering of them ran out of heap (T-5889).
       - name: Render the API specs with ReDoc
         # fail-soft: a renderer hiccup must not take the whole report deploy
-        # down with it — the page then says so instead of 404ing
+        # down with it — the page then says so instead of 404ing, and the
+        # run summary carries a warning
         run: |
           mkdir -p site/openapi
           for pair in "ngsi-ld-api:ngsi-ld:NGSI-LD API" "antares-admin:admin:Antares operational API"; do
             IFS=: read -r src page title <<< "$pair"
-            npx --yes @redocly/cli@2.49.0 build-docs "docs/openapi/$src.yaml" -o "site/openapi/$page.html" \
-              || echo "<!doctype html><title>$title</title><p>ReDoc render failed this deploy — see docs/openapi/$src.yaml in the repo." > "site/openapi/$page.html"
+            json="$RUNNER_TEMP/$src.json"
+            if npx --yes @redocly/cli@2.49.0 bundle "docs/openapi/$src.yaml" --ext json -o "$json" \
+              && python3 dev/redoc-spec.py "$json" "$json" \
+              && npx --yes @redocly/cli@2.49.0 build-docs "$json" -o "site/openapi/$page.html"; then
+              continue
+            fi
+            echo "::warning title=ReDoc render failed::docs/openapi/$src.yaml did not render; site/openapi/$page.html is a placeholder this deploy"
+            echo "<!doctype html><title>$title</title><p>ReDoc render failed this deploy — see docs/openapi/$src.yaml in the repo." > "site/openapi/$page.html"
           done
 
       - name: Reuse the newest playground bundle (antares-www) at /demo/
@@ -110,8 +120,8 @@ jobs:
             # necessarily this deploy's commit: the wasm build is dispatched,
             # not run per deploy. Say which commit it IS, so a visitor can
             # tell the playground apart from the docs beside it.
-            set -- $art
-            printf '{"commit":"%s","built":"%s"}\n' "$2" "$3" > site/demo/playground-source.json
+            read -r _ commit built <<< "$art"
+            printf '{"commit":"%s","built":"%s"}\n' "$commit" "$built" > site/demo/playground-source.json
           else
             # no playground bundle in retention: docs and reports still
             # deploy; /demo/ appears after the next wasm.yml dispatch
