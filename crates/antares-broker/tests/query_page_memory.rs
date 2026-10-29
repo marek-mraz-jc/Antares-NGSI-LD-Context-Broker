@@ -64,7 +64,10 @@ async fn a_1000_entity_page_is_held_as_text_until_it_is_written() {
     // the page as `Value` trees, as the store read held it before
     let before = live();
     let docs = store
-        .list(&antares_model::TenantId::default(), antares_store::Kind::Entity)
+        .list(
+            &antares_model::TenantId::default(),
+            antares_store::Kind::Entity,
+        )
         .await
         .expect("list");
     let as_values = live().saturating_sub(before);

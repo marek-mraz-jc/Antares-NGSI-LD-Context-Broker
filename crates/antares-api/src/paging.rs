@@ -1405,7 +1405,7 @@ mod tests {
             let pushed = paginate_pre(
                 &st,
                 &p,
-                Vec::new(),
+                Vec::<Value>::new(),
                 "/ngsi-ld/v1/entities",
                 // what the store's count(*) reports for the same query
                 matches.len(),
