@@ -886,3 +886,82 @@ async fn a_history_count_out_of_time_is_left_out_not_zero() {
     assert_eq!(one["counts"]["entities"], 1, "{one}");
     assert_eq!(one["counts"].get("attrInstances"), None, "{one}");
 }
+
+/// T-6001: the Attribute names the Entities of one type hold, names only,
+/// compacted, the other type's names and every value left out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_type_answers_the_attribute_names_its_entities_hold_and_no_value() {
+    let st = state().await;
+    seed(&st, "attrsa", "urn:ngsi-ld:Room:1").await;
+    let more = json!({
+        "id": "urn:ngsi-ld:Room:2", "type": "Room",
+        "humidity": {"type": "Property", "value": 0.42},
+        "inBuilding": {"type": "Relationship", "object": "urn:ngsi-ld:Building:b"}
+    });
+    let car = json!({"id": "urn:ngsi-ld:Car:1", "type": "Car",
+                     "speed": {"type": "Property", "value": 99}});
+    for doc in [more, car] {
+        let (s, b) = send(
+            &st,
+            "POST",
+            "/ngsi-ld/v1/entities",
+            Some(doc),
+            Some("attrsa"),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{b}");
+    }
+    let (s, got) = send(
+        &st,
+        "GET",
+        "/q/tenants/attrsa/types/Room/attributes",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{got}");
+    assert_eq!(
+        got,
+        json!({"tenant": "attrsa", "type": "Room", "partial": false,
+               "attributes": ["humidity", "inBuilding", "temperature"]})
+    );
+    // an expanded type names the same Entities
+    let iri = "https%3A%2F%2Furi.etsi.org%2Fngsi-ld%2Fdefault-context%2FRoom";
+    let (s, same) = send(
+        &st,
+        "GET",
+        &format!("/q/tenants/attrsa/types/{iri}/attributes"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{same}");
+    assert_eq!(same["attributes"], got["attributes"]);
+    // a type nobody wrote and a tenant nobody wrote hold nothing
+    for path in [
+        "/q/tenants/attrsa/types/Boat/attributes",
+        "/q/tenants/attrsnone/types/Room/attributes",
+    ] {
+        let (s, none) = send(&st, "GET", path, None, None).await;
+        assert_eq!(s, StatusCode::OK, "{path}: {none}");
+        assert_eq!(none["attributes"], json!([]), "{path}");
+    }
+}
+
+/// T-6001: the broker's own tenants and names outside the grammar are
+/// refused before any read.
+#[tokio::test(flavor = "multi_thread")]
+async fn stored_attributes_refuse_broker_tenants_and_malformed_names() {
+    let st = state().await;
+    for name in ["snap-index", "distsub-index", "bad%20name"] {
+        let (s, b) = send(
+            &st,
+            "GET",
+            &format!("/q/tenants/{name}/types/Room/attributes"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{name}: {b}");
+    }
+}

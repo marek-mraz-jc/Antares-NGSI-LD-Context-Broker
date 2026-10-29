@@ -42,6 +42,7 @@ schema: `docs/openapi/antares-admin.yaml`, rendered at
 | `GET /q/tenants/{tenant}/digest` | Entity count, history count and a hash over (id, `modifiedAt`) |
 | `GET /q/tenants/{tenant}/export` | The tenant's Entities and history as NDJSON, system attributes kept |
 | `POST /q/tenants/{tenant}/import` | An export into an empty tenant, all or nothing |
+| `GET /q/tenants/{tenant}/types/{type}/attributes` | The Attribute names one type's Entities hold, no values |
 | `GET /q/dead-letters` | Notifications the delivery policy gave up on |
 | `GET`, `PUT`, `DELETE /q/retention/{tenant}` | How long a Tenant keeps each type ([Retention](#retention)) |
 | `POST /q/retention/{tenant}/preview`, `GET /q/retention/{tenant}/deleted` | What a retention document would delete now; what this pod's sweeps deleted ([Retention](#retention)) |
@@ -208,6 +209,22 @@ exists (5.5.10) and is always readable, even when empty. `attrInstances`
 counts the tenant's history under a 5 s statement bound, the same bound as a
 size scan: when a long history does not count in time, the answer leaves
 `attrInstances` out and the other counts still answer.
+
+### GET /q/tenants/{tenant}/types/{type}/attributes
+
+```text
+GET /q/tenants/acme/types/Room/attributes
+{"tenant":"acme","type":"Room","attributes":["humidity","temperature"],"partial":false}
+```
+
+The Attribute names the tenant's Entities of one type hold, compacted under
+the core @context; never a value. A plan reads them before a write that
+replaces whole Entities: the view guard refuses such a write while a stored
+Entity holds a name the view does not admit. `type` is a core-context term or
+an expanded IRI, percent-encoded. `partial` is true when the fold stopped at
+the scan ceiling. `200` with an empty list for a tenant or type with no
+Entity, `400` for a name outside the tenant grammar or one of the broker's
+internal names.
 
 ### DELETE /q/tenants/{tenant}
 
