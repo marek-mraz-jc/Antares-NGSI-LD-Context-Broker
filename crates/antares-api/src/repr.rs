@@ -14,6 +14,10 @@ use std::collections::HashMap;
 #[derive(Debug, Default, Clone)]
 pub struct Repr {
     pub sys_attrs: bool,
+    /// Whether `sysAttrs` also answers each instance's `modifiedBy`
+    /// (DM-138): set from [`crate::provenance::shows_modified_by`], so a
+    /// notification or any read without the gateway's grant never does.
+    pub modified_by: bool,
     pub key_values: bool,
     pub concise: bool,
     /// expanded attribute IRIs to project (attrs=): entity meta stays.
@@ -869,6 +873,12 @@ fn transform_instance(inst: &Value, r: &Repr) -> Value {
             // instances (current-state and temporal alike).
             "createdAt" | "modifiedAt" | "expiresAt" if !r.sys_attrs => continue,
             "type" if r.concise => continue,
+            antares_jsonld::compact::MODIFIED_BY_KEY => {
+                if r.sys_attrs && r.modified_by {
+                    out.insert(antares_jsonld::compact::MODIFIED_BY.into(), v.clone());
+                }
+                continue;
+            }
             _ => {}
         }
         // sub-attributes recurse
@@ -1037,6 +1047,7 @@ pub fn compact_for(
 fn joined_repr(parent: &crate::repr::Repr, key_compact: &str, key_iri: &str) -> crate::repr::Repr {
     let mut r = crate::repr::Repr {
         sys_attrs: parent.sys_attrs,
+        modified_by: parent.modified_by,
         key_values: parent.key_values,
         concise: parent.concise,
         lang: parent.lang.clone(),

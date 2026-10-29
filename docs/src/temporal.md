@@ -50,6 +50,16 @@ believes the `JC-Provenance-Channel`, `JC-Provenance-Actor`, `JC-Reason`
 write is `channel: api` with no actor. A read never returns provenance as
 data, except through `versions=all` (below).
 
+The current state keeps who made each attribute instance's last change
+beside its `modifiedAt`: `modifiedBy` with the write's `organization`,
+`actorKind` and `actor`, from the same believed headers (platform ADR-N-054
+2.8, DM-138). A write the gateway did not send names nobody and clears the
+member, so no earlier writer stays on a value it did not write. A read
+answers `modifiedBy` only with `options=sysAttrs` and only when the gateway
+also sent `JC-Read-Versions: true`; a plain read, a notification and
+keyValues never carry it, and history rows say who in their provenance
+instead. A `jc` build only: vanilla Antares stamps none.
+
 With `ANTARES_HISTORY_BACKFILL=on`, a value whose `observedAt` is older
 than the current one's is a backfill: it goes into history with
 `operation: backfill` and leaves the current state untouched. Off (the

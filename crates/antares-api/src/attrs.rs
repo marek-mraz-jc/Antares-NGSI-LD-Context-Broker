@@ -1057,6 +1057,7 @@ async fn partial_update_inner(
                                 }
                             }
                             t.insert("modifiedAt".into(), Value::String(ts.clone()));
+                            crate::stamp::stamp_by(t);
                         }
                     }
                     if existing.is_empty() {
@@ -1236,6 +1237,7 @@ pub async fn replace_attr(
                                     o.insert("createdAt".into(), Value::String(ts.clone()));
                                 }
                                 o.insert("modifiedAt".into(), Value::String(ts.clone()));
+                                crate::stamp::stamp_by(o);
                             }
                             *slot = ni;
                         }
@@ -1420,6 +1422,7 @@ async fn set_attr_value_inner(
                 let mut ni = with_value(slot, attr, &attr_iri, &value, &ctx, observed)?;
                 if let Some(o) = ni.as_object_mut() {
                     o.insert("modifiedAt".into(), Value::String(ts.clone()));
+                    crate::stamp::stamp_by(o);
                 }
                 *slot = ni;
                 found = true;

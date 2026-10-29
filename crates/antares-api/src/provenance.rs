@@ -118,6 +118,31 @@ pub(crate) fn from_gateway(headers: &HeaderMap, gateway: Option<&str>) -> bool {
     })
 }
 
+/// Whether a read may answer each attribute's `modifiedBy` (ADR-N-054 2.8,
+/// DM-138): only to a caller the gateway grants `readVersions`, since
+/// `actor` is a person's `sub` or a client id. Vanilla answers it to nobody.
+#[cfg(feature = "jc")]
+pub fn shows_modified_by(headers: &HeaderMap, gateway: Option<&str>) -> bool {
+    may_read_versions(headers, gateway)
+}
+
+/// Vanilla: no read answers `modifiedBy`.
+#[cfg(not(feature = "jc"))]
+pub fn shows_modified_by(_headers: &HeaderMap, _gateway: Option<&str>) -> bool {
+    false
+}
+
+/// The `modifiedBy` a write with `provenance` leaves on each attribute it
+/// changes (DM-138): its `organization`, `actorKind` and `actor`; `None` when
+/// it names none of them, as every write the gateway did not send.
+pub fn modified_by(provenance: &Value) -> Option<Value> {
+    let by: serde_json::Map<String, Value> = ["organization", "actorKind", "actor"]
+        .into_iter()
+        .filter_map(|k| Some((k.to_owned(), provenance.get(k)?.clone())))
+        .collect();
+    (!by.is_empty()).then_some(Value::Object(by))
+}
+
 /// `provenance` with its `operation`.
 pub fn with_operation(provenance: &Value, operation: &str) -> Value {
     let mut out = provenance.clone();

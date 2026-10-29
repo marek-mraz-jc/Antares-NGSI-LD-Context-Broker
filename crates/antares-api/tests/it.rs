@@ -56,6 +56,7 @@ mod internal_tenant_leaks;
 mod join_budget_4_5_23;
 mod json_property_value_5_2_6_4_10;
 mod merge_kept_types_10_2_9_4;
+mod modified_by_dm138;
 mod module_boundaries;
 mod narrowing_through_proxies_5_7_2;
 mod no_change_no_notify_5_6;
