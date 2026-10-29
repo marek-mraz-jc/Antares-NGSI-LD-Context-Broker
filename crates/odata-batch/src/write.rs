@@ -133,47 +133,46 @@ pub fn write_multipart<W: Write>(
 /// [`io::ErrorKind::InvalidInput`] for a header with a line break or a non-JSON body that is
 /// not UTF-8; otherwise what `out` answers.
 pub fn write_json<W: Write>(responses: &[Response], mut out: W) -> io::Result<()> {
-    let mut members = Vec::with_capacity(responses.len());
+    // Every member is checked before the first byte; a JSON body is written as its own bytes,
+    // never parsed into a tree beside them (T-6049).
+    let mut bodies = Vec::with_capacity(responses.len());
     for response in responses {
         check_headers(response)?;
-        // Members in the order section 19.2 lists them; serde_json's map would sort them.
-        let mut member: Vec<(&str, Value)> = Vec::with_capacity(4);
+        let json = header(&response.headers, "Content-Type").is_none_or(is_json)
+            && serde_json::from_slice::<serde::de::IgnoredAny>(&response.body).is_ok();
+        let body = if json {
+            None
+        } else {
+            let text = std::str::from_utf8(&response.body);
+            Some(text.map_err(|_| invalid("a binary body in a JSON batch"))?)
+        };
+        bodies.push(body);
+    }
+    out.write_all(b"{\"responses\":[")?;
+    for (at, (response, text)) in responses.iter().zip(bodies).enumerate() {
+        out.write_all(if at == 0 { b"{" } else { b",{" })?;
+        // Members in the order section 19.2 lists them.
         if let Some(id) = &response.id {
-            member.push(("id", id.clone().into()));
+            out.write_all(b"\"id\":")?;
+            serde_json::to_writer(&mut out, id).map_err(io::Error::from)?;
+            out.write_all(b",")?;
         }
-        member.push(("status", response.status.into()));
+        write!(out, "\"status\":{}", response.status)?;
         if !response.headers.is_empty() {
             let headers: Map<String, Value> = response
                 .headers
                 .iter()
                 .map(|(name, value)| (name.clone(), value.clone().into()))
                 .collect();
-            member.push(("headers", headers.into()));
+            out.write_all(b",\"headers\":")?;
+            serde_json::to_writer(&mut out, &headers).map_err(io::Error::from)?;
         }
         if !response.body.is_empty() {
-            let json = header(&response.headers, "Content-Type")
-                .is_none_or(is_json)
-                .then(|| serde_json::from_slice::<Value>(&response.body).ok())
-                .flatten();
-            let body = match json {
-                Some(value) => value,
-                None => String::from_utf8(response.body.clone())
-                    .map_err(|_| invalid("a binary body in a JSON batch"))?
-                    .into(),
-            };
-            member.push(("body", body));
-        }
-        members.push(member);
-    }
-    out.write_all(b"{\"responses\":[")?;
-    for (at, member) in members.iter().enumerate() {
-        out.write_all(if at == 0 { b"{" } else { b",{" })?;
-        for (field, (name, value)) in member.iter().enumerate() {
-            if field > 0 {
-                out.write_all(b",")?;
+            out.write_all(b",\"body\":")?;
+            match text {
+                Some(text) => serde_json::to_writer(&mut out, text).map_err(io::Error::from)?,
+                None => out.write_all(&response.body)?,
             }
-            write!(out, "\"{name}\":")?;
-            serde_json::to_writer(&mut out, value).map_err(io::Error::from)?;
         }
         out.write_all(b"}")?;
     }
