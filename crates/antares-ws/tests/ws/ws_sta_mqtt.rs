@@ -336,11 +336,13 @@ async fn sta_mqtt_refuses_what_is_no_reading_client() -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     assert_eq!(next(&mut ws, WAIT).await?, None, "a text frame");
-    // answer the closing handshake and read on until the server drops the stream, so its close()
-    // returns before the next connection: a client that stops at the Close frame leaves it waiting
+
+    // a client that closes ends its session: the server drops the stream
+    let mut ws = connected(&b, "m2", 0).await?;
+    ws.close(None).await.map_err(|e| e.to_string())?;
     while tokio::time::timeout(WAIT, ws.next())
         .await
-        .map_err(|_| "the server kept the socket after its Close".to_string())?
+        .map_err(|_| "the server kept the socket after the client's Close".to_string())?
         .is_some()
     {}
 
