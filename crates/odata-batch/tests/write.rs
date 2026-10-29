@@ -192,6 +192,34 @@ mod write {
     }
 
     #[test]
+    fn a_json_body_is_written_as_its_own_bytes() {
+        // T-6049: the body is checked and written as sent, its member order kept; a body its
+        // JSON Content-Type does not hold is a string; a binary one refuses the whole batch
+        // before a byte is written
+        let kept = response(None, 200, &[], b" {\"z\":1,\"a\":[1, 2]}\n");
+        let broken = response(
+            None,
+            200,
+            &[("Content-Type", "application/json")],
+            b"{\"a\":",
+        );
+        let mut out = sink();
+        let binary = response(None, 200, &[], b"\xff");
+        assert!(write_json(&[kept.clone(), binary], &mut out).is_err());
+        assert_eq!(out.out, Vec::<u8>::new());
+        let text = String::from_utf8(json(&[kept, broken]).unwrap()).unwrap();
+        assert_eq!(
+            text,
+            concat!(
+                "{\"responses\":[{\"status\":200,\"body\": {\"z\":1,\"a\":[1, 2]}\n},",
+                r#"{"status":200,"headers":{"Content-Type":"application/json"},"body":"{\"a\":"}]}"#
+            )
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["responses"][0]["body"]["a"][1], 2);
+    }
+
+    #[test]
     fn a_failing_sink_fails_every_write() {
         let all = responses();
         for (name, full) in [

@@ -96,7 +96,11 @@ fn car(n: u32) -> Value {
 /// A broker serving the view `cars` over `cars` Cars, made in batches.
 async fn broker(cars: u32) -> Result<(TestBroker, Router), String> {
     std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
-    let b = TestBroker::new().await?;
+    seeded(TestBroker::new().await?, cars).await
+}
+
+/// `b` serving the cars view over `cars` Cars; the schema bound is set before `b` is made.
+async fn seeded(b: TestBroker, cars: u32) -> Result<(TestBroker, Router), String> {
     let app = b.serve(antares_odata::OData)?;
     let view = json!({
         "id": "cars", "tenant": "city",
@@ -245,6 +249,41 @@ async fn a_residual_count_is_the_served_total() -> Result<(), String> {
         assert_eq!(paged, served, "a counted answer pages the same Entities");
         let bare = get(&app, &format!("{ROOT}/Car/$count?$filter={filter}"), &[]).await;
         assert_eq!(bare.body, json!(served.len()), "{filter}");
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_count_or_a_sort_read_in_store_reads_of_one_or_three_equals_the_read_whole(
+) -> Result<(), String> {
+    // T-6049: a counted or surface-sorted read keeps only what its page serves while the
+    // scan reads on; a broker reading one or three Entities at a time answers as one reading
+    // the whole set at once, ties (the Cars without a speed) in id order
+    let (_w, whole) = broker(CARS).await?;
+    let filter = "$filter=not%20(speed%20gt%2020)";
+    let uris = [
+        format!("{ROOT}/Car?$orderby=speed"),
+        format!("{ROOT}/Car?$orderby=speed&$top=3"),
+        format!("{ROOT}/Car?$orderby=speed%20desc&$skip=2&$top=4"),
+        format!("{ROOT}/Car?$orderby=speed%20desc&{filter}&$count=true"),
+        format!("{ROOT}/Car?{filter}&$count=true"),
+        format!("{ROOT}/Car?{filter}&$count=true&$skip=3&$top=5"),
+        format!("{ROOT}/Car?{filter}&$count=true&$skip=40"),
+        format!("{ROOT}/Car/$count?{filter}"),
+    ];
+    for limit in [1, 3] {
+        std::env::set_var(antares_ops::views::SCHEMA_MAX_ENV, "65536");
+        let (_b, parts) = seeded(TestBroker::with_max_limit(limit).await?, CARS).await?;
+        for uri in &uris {
+            let want = get(&whole, uri, &[]).await;
+            let got = get(&parts, uri, &[]).await;
+            assert_eq!(want.status, StatusCode::OK, "{uri}: {}", want.body);
+            assert_eq!(got.body, want.body, "{uri} at {limit}");
+            if !uri.contains("/$count") {
+                let paged = chained(&parts, uri, 2).await?;
+                assert_eq!(paged, chained(&whole, uri, 2).await?, "{uri} at {limit}");
+            }
+        }
     }
     Ok(())
 }

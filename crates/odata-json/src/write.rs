@@ -334,6 +334,51 @@ pub fn write_collection<W: Write>(
     page: &Page<'_>,
     mut out: W,
 ) -> io::Result<()> {
+    write_collection_start(ctx, resource, page.count, &mut out)?;
+    for (at, entity) in entities.iter().enumerate() {
+        write_collection_entity(ctx, resource, entity, at == 0, &mut out)?;
+    }
+    write_collection_end(ctx, page.next_link, out)
+}
+
+/// The start of a collection written as its entities arrive (a streamed answer): what
+/// [`write_collection`] writes up to the `value` array's `[`. [`write_collection_entity`] writes
+/// each entity, [`write_collection_end`] the rest; the three write the bytes of
+/// [`write_collection`].
+///
+/// ```
+/// # use odata_csdl::{CsdlVersion, EntityContainer, EntitySet, EntityType, Model, Schema};
+/// use odata_json::{write_collection_end, write_collection_entity, write_collection_start, Ctx, EntityValue, MetadataLevel, ODataVersion, Resource};
+/// # let mut city = Schema::new("City");
+/// # city.entity_types.push(EntityType::new("Building"));
+/// # let mut service = EntityContainer::new("Service");
+/// # service.entity_sets.push(EntitySet::new("Buildings", "City.Building"));
+/// # city.entity_container = Some(service);
+/// # let model = Model { version: CsdlVersion::V4_01, references: vec![], schemas: vec![city] };
+/// let ctx = Ctx { service_root: "https://example.org/odata/", level: MetadataLevel::None, version: ODataVersion::V4_0, metadata_etag: None };
+/// let buildings = Resource::new(&model, "Buildings").ok_or("no set")?;
+/// let b1 = EntityValue { id: "Buildings('b1')".into(), properties: vec![] };
+/// let mut body = Vec::new();
+/// write_collection_start(&ctx, &buildings, Some(2), &mut body).map_err(|_| "io")?;
+/// write_collection_entity(&ctx, &buildings, &b1, true, &mut body).map_err(|_| "io")?;
+/// write_collection_entity(&ctx, &buildings, &b1, false, &mut body).map_err(|_| "io")?;
+/// write_collection_end(&ctx, Some("https://example.org/odata/Buildings?$skiptoken=2"), &mut body).map_err(|_| "io")?;
+/// assert_eq!(
+///     String::from_utf8_lossy(&body),
+///     r#"{"@odata.count":2,"value":[{},{}],"@odata.nextLink":"https://example.org/odata/Buildings?$skiptoken=2"}"#
+/// );
+/// # Ok::<(), &str>(())
+/// ```
+///
+/// # Errors
+///
+/// What `out` answers.
+pub fn write_collection_start<W: Write>(
+    ctx: &Ctx<'_>,
+    resource: &Resource<'_>,
+    count: Option<u64>,
+    mut out: W,
+) -> io::Result<()> {
     let writer = Writer {
         ctx,
         model: resource.model(),
@@ -344,11 +389,57 @@ pub fn write_collection<W: Write>(
         select: resource.projection(),
     };
     writer.context(&mut members, &target)?;
-    writer.page(&mut members, entities, page, |out, entity| {
-        let mut members = Members::open(out)?;
-        writer.entity(&mut members, resource, entity)?;
-        members.close()
-    })?;
+    if let Some(count) = count {
+        members.member(&writer.control("", "count"), &count)?;
+    }
+    members.name("value")?.write_all(b"[")
+}
+
+/// One entity of a collection begun by [`write_collection_start`], after a comma unless it is
+/// the `first`.
+///
+/// # Errors
+///
+/// What `out` answers.
+pub fn write_collection_entity<W: Write>(
+    ctx: &Ctx<'_>,
+    resource: &Resource<'_>,
+    entity: &EntityValue,
+    first: bool,
+    mut out: W,
+) -> io::Result<()> {
+    if !first {
+        out.write_all(b",")?;
+    }
+    let writer = Writer {
+        ctx,
+        model: resource.model(),
+    };
+    let mut members = Members::open(&mut out)?;
+    writer.entity(&mut members, resource, entity)?;
+    members.close()
+}
+
+/// The end of a collection begun by [`write_collection_start`]: the `value` array's `]`, the
+/// `nextLink` when given, the closing brace.
+///
+/// # Errors
+///
+/// What `out` answers.
+pub fn write_collection_end<W: Write>(
+    ctx: &Ctx<'_>,
+    next_link: Option<&str>,
+    mut out: W,
+) -> io::Result<()> {
+    out.write_all(b"]")?;
+    let mut members = Members {
+        out: &mut out,
+        first: false,
+    };
+    if let Some(next_link) = next_link {
+        let name = format!("{}nextLink", ctx.version.prefix());
+        members.member(&name, next_link)?;
+    }
     members.close()
 }
 
