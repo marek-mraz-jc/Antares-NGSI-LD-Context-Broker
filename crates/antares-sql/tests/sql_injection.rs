@@ -58,6 +58,7 @@ const TEMPLATE_WORDS: &[&str] = &[
     "location_cell",
     "ANY",
     "ARRAY",
+    "ST_MakeEnvelope",
 ];
 
 /// Whether `sql` is template text alone: placeholders, template words and
@@ -92,7 +93,12 @@ fn template_only(sql: &str) -> bool {
         let cover = (c == '=' && tail.starts_with("= ANY(ARRAY["))
             || (c == '[' && word == "ARRAY")
             || (c == ']' && tail.starts_with("])"));
-        if !" ()~@?><,:".contains(c) && !ordering && !cover {
+        // the near box's bounding-box overlap ` && ST_MakeEnvelope(`: one
+        // spaced pair, never a lone or a tripled `&`
+        let overlap = c == '&'
+            && (tail.starts_with("&& ")
+                || (sql[..sql.len() - tail.len()].ends_with(" &") && tail.starts_with("& ")));
+        if !" ()~@?><,:".contains(c) && !ordering && !cover && !overlap {
             return false;
         }
         rest = chars.as_str();
@@ -382,4 +388,33 @@ fn the_geo_cover_is_template_text() {
     assert!(!c.cell_binds.is_empty());
     assert!(!template_only("location_cell = $1"));
     assert!(!template_only("location[$1]"));
+}
+
+#[test]
+fn the_near_box_is_template_text() {
+    let coordinates = json!([10.0, 50.0]);
+    let spec = GeoSpec {
+        rel: Rel::Near {
+            max: Some(1500.0),
+            min: None,
+        },
+        geometry: "Point",
+        coordinates: &coordinates,
+        geoproperty_iri: "",
+    };
+    let c = compile_geo(&spec, "location", 1).expect("a point compiles");
+    assert!(
+        c.sql.contains("location && ST_MakeEnvelope($"),
+        "no box: {}",
+        c.sql
+    );
+    assert!(template_only(&c.sql), "near wrote {}", c.sql);
+    for written in [
+        "location & $1",
+        "location &&& $1",
+        "location&&$1",
+        "location && $1 && $2 & $3",
+    ] {
+        assert!(!template_only(written), "{written}");
+    }
 }

@@ -439,6 +439,25 @@ async fn every_query_shape_reads_an_index_under_rls() {
             "i_entities_type_location_cell",
         ),
         (
+            // T-6070: a near holding ~1 100 of its type's 10 000 Entities
+            // still reads its cover and sorts the matches: bounded by them.
+            // Walking the type in id order to the page's 22 rows was 30x
+            // faster on a dense circle, but where ids sort with place (the
+            // distinct-1000 rig's `load:N`, a URN's numeric suffix) the walk
+            // passed tens of thousands of rows before its first match
+            // (3 500-9 300 buffers a page against 680)
+            "dense geo near of a type",
+            type_page(
+                &format!(
+                    "{w} AND {}",
+                    geo_where(Rel::Near { max: Some(50_000.0), min: None }, "Point", &point)
+                ),
+                &[&[&t1]],
+                22,
+            ),
+            "i_entities_type_location_cell",
+        ),
+        (
             // T-5136: `!location`, the OGC bbox page's Features without a
             // geometry, with the store's leakproof `location IS NULL`
             "no location of a type",
