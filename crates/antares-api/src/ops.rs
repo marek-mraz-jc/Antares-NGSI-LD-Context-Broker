@@ -507,20 +507,7 @@ pub(super) async fn tenant_get(
         }
         Err(e) => return ApiError::from(e).into_response(),
     };
-    // a tenant with a long history counts for seconds: bounded like the
-    // size scans, and a count that did not finish is left out, never 0
-    let instances = match st
-        .temporal
-        .attr_instance_count_within(&tenant, TENANT_COUNT_BOUND)
-        .await
-    {
-        Ok(n) => Some(n),
-        Err(e) => {
-            tracing::warn!(tenant = tenant.as_str(), error = %e, "tenant history not counted");
-            None
-        }
-    };
-    let bytes = tenant_bytes(&st, &tenant).await;
+    let usage = tenant_usage(&st, &tenant).await;
     let mut row = serde_json::json!({
         "tenant": stats.tenant,
         "counts": {
@@ -533,27 +520,31 @@ pub(super) async fn tenant_get(
             "distSubs": stats.dist_subs,
         },
     });
+    // a count that was neither measured nor estimated is left out, never 0
     if let (Some(n), Some(counts)) = (
-        instances,
+        usage.as_ref().and_then(|u| u.get("attrInstances")),
         row.get_mut("counts")
             .and_then(serde_json::Value::as_object_mut),
     ) {
-        counts.insert("attrInstances".into(), n.into());
+        counts.insert("attrInstances".into(), n.clone());
     }
     if let Some(row) = row.as_object_mut() {
         if let Some(c) = stats.created_at {
             row.insert("createdAt".into(), serde_json::Value::String(c));
         }
-        if let Some(b) = bytes {
-            row.insert("bytes".into(), b);
+        for key in ["bytes", "estimated", "measuredAt"] {
+            if let Some(v) = usage.as_ref().and_then(|u| u.get(key)) {
+                row.insert(key.into(), v.clone());
+            }
         }
     }
     (StatusCode::OK, axum::Json(row)).into_response()
 }
 
-/// How long `GET /q/tenants/{tenant}` waits for the history count (T-5304),
-/// the same bound as one size scan.
-pub const TENANT_COUNT_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long `GET /q/tenants/{tenant}` waits for the exact history count and
+/// size (T-5304) before it estimates them from the store's statistics
+/// (T-6085): the read stays under a second on a tenant of millions of rows.
+pub const TENANT_COUNT_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// How long `GET /q/tenants/{tenant}` reuses a measured size (T-2890).
 pub const TENANT_BYTES_TTL: std::time::Duration = std::time::Duration::from_secs(300);
@@ -589,11 +580,14 @@ pub(super) fn bytes_cached_or_claim(
     None
 }
 
-/// `{entities, attrInstances, byType}` in bytes, measured in the store under
-/// the store's own statement bound and kept as [`bytes_cached_or_claim`]
-/// says. `None` when the backend cannot measure, the scan failed or another
-/// read is measuring: the counts still answer, without a size.
-pub(super) async fn tenant_bytes(st: &AppState, tenant: &TenantId) -> Option<serde_json::Value> {
+/// What `GET /q/tenants/{tenant}` adds to the counts, kept as
+/// [`bytes_cached_or_claim`] says: `attrInstances`, `bytes` as
+/// `{entities, attrInstances, byType}`, `estimated` and `measuredAt`. The
+/// history is counted and sized in one pass under [`TENANT_COUNT_BOUND`];
+/// past it both numbers come from the store's statistics and `estimated` is
+/// true. `None` when nothing could be measured or another read is
+/// measuring: the counts still answer, without these.
+pub(super) async fn tenant_usage(st: &AppState, tenant: &TenantId) -> Option<serde_json::Value> {
     let cache = || {
         st.tenant_bytes
             .lock()
@@ -604,28 +598,52 @@ pub(super) async fn tenant_bytes(st: &AppState, tenant: &TenantId) -> Option<ser
     {
         return answer;
     }
-    let measured = async {
-        let entities = st.store.tenant_bytes(tenant).await?;
-        let instances = st.temporal.attr_instance_bytes(tenant).await?;
-        Ok::<_, NgsiError>(serde_json::json!({
-            "entities": entities.entities,
-            "attrInstances": instances,
-            "byType": entities.by_type,
-        }))
-    }
-    .await;
-    let v = match measured {
-        Ok(v) => Some(v),
+    let t = tenant.as_str();
+    let history = match st
+        .temporal
+        .attr_instance_usage(tenant, TENANT_COUNT_BOUND)
+        .await
+    {
+        Ok(h) => Some((h, false)),
         Err(NgsiError::OperationNotSupported(_)) => None,
         Err(e) => {
-            tracing::warn!(tenant = tenant.as_str(), error = %e, "tenant size not measured");
+            tracing::warn!(tenant = t, error = %e, "tenant history not measured, estimating");
+            match st.temporal.attr_instance_estimate(tenant).await {
+                Ok(h) => Some((h, true)),
+                Err(e) => {
+                    tracing::warn!(tenant = t, error = %e, "tenant history not estimated");
+                    None
+                }
+            }
+        }
+    };
+    let entities = match st.store.tenant_bytes(tenant).await {
+        Ok(b) => Some(b),
+        Err(NgsiError::OperationNotSupported(_)) => None,
+        Err(e) => {
+            tracing::warn!(tenant = t, error = %e, "tenant size not measured");
             None
         }
     };
-    cache().insert(
-        tenant.as_str().to_owned(),
-        (std::time::Instant::now(), v.clone()),
-    );
+    let v = history.map(|((count, history_bytes), estimated)| {
+        let mut v = serde_json::json!({
+            "attrInstances": count,
+            "estimated": estimated,
+            "measuredAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        });
+        if let (Some(e), Some(m)) = (entities, v.as_object_mut()) {
+            m.insert(
+                "bytes".into(),
+                serde_json::json!({
+                    "entities": e.entities,
+                    "attrInstances": history_bytes,
+                    "byType": e.by_type,
+                }),
+            );
+        }
+        v
+    });
+    cache().insert(t.to_owned(), (std::time::Instant::now(), v.clone()));
     v
 }
 

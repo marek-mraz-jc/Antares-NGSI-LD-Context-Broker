@@ -810,8 +810,9 @@ async fn one_tenant_answers_its_size_by_type_and_a_purge_measures_it_again() {
 }
 
 /// A history store whose bounded count runs out of time, as a Postgres
-/// tenant with a long history does (T-5304); everything else forwards.
-struct SlowCount(Arc<dyn TemporalDriver>);
+/// tenant with a long history does (T-5304), with the statistics' guess it
+/// gives instead (T-6085), if any; everything else forwards.
+struct SlowCount(Arc<dyn TemporalDriver>, Option<(u64, u64)>);
 
 #[async_trait::async_trait]
 impl TemporalDriver for SlowCount {
@@ -823,6 +824,10 @@ impl TemporalDriver for SlowCount {
         Err(NgsiError::InternalError(
             "database statement timeout".into(),
         ))
+    }
+    async fn attr_instance_estimate(&self, _t: &TenantId) -> Result<(u64, u64), NgsiError> {
+        self.1
+            .ok_or_else(|| NgsiError::OperationNotSupported("no statistics".into()))
     }
     async fn temporal_append(
         &self,
@@ -880,11 +885,38 @@ impl TemporalDriver for SlowCount {
 async fn a_history_count_out_of_time_is_left_out_not_zero() {
     let mut st = state().await;
     seed(&st, "slowh", "urn:ngsi-ld:Room:1").await;
-    st.temporal = Arc::new(SlowCount(st.temporal.clone()));
+    st.temporal = Arc::new(SlowCount(st.temporal.clone(), None));
     let (s, one) = send(&st, "GET", "/q/tenants/slowh", None, None).await;
     assert_eq!(s, StatusCode::OK, "{one}");
     assert_eq!(one["counts"]["entities"], 1, "{one}");
     assert_eq!(one["counts"].get("attrInstances"), None, "{one}");
+    assert_eq!(one.get("estimated"), None, "{one}");
+}
+
+/// T-6085: past its bound the history count and size come from the store's
+/// statistics, and the answer says they are estimated; a history that
+/// counts in time is exact and says when it was measured.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_history_out_of_time_is_estimated_and_says_so() {
+    let mut st = state().await;
+    seed(&st, "esth", "urn:ngsi-ld:Room:1").await;
+    let (s, exact) = send(&st, "GET", "/q/tenants/esth", None, None).await;
+    assert_eq!(s, StatusCode::OK, "{exact}");
+    assert_eq!(exact["estimated"], false, "{exact}");
+    assert!(exact["measuredAt"].as_str().is_some(), "{exact}");
+    assert!(
+        exact["counts"]["attrInstances"].as_u64().is_some(),
+        "{exact}"
+    );
+
+    seed(&st, "estslow", "urn:ngsi-ld:Room:1").await;
+    st.temporal = Arc::new(SlowCount(st.temporal.clone(), Some((240_000, 96_000_000))));
+    let (s, guess) = send(&st, "GET", "/q/tenants/estslow", None, None).await;
+    assert_eq!(s, StatusCode::OK, "{guess}");
+    assert_eq!(guess["estimated"], true, "{guess}");
+    assert_eq!(guess["counts"]["attrInstances"], 240_000, "{guess}");
+    assert_eq!(guess["bytes"]["attrInstances"], 96_000_000, "{guess}");
+    assert_eq!(guess["counts"]["entities"], 1, "{guess}");
 }
 
 /// T-6001: the Attribute names the Entities of one type hold, names only,
