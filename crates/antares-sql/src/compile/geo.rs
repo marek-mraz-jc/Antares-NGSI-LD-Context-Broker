@@ -156,6 +156,23 @@ fn predicate(spec: &GeoSpec<'_>, col: &str, first_bind: usize) -> Option<Compile
             if parts.is_empty() {
                 return None; // `near` with neither bound is not a filter
             }
+            // T-6056: a bounding-box test before the geography distance,
+            // which casts and measures every row the cover read (~45 % of
+            // the distinct-1000 rig's statement time); `&&` compares boxes
+            // rounded outwards, so it only drops rows outside the radius
+            if let Some((x0, y0, x1, y1)) = max.and_then(|m| near_box(coordinates, m)) {
+                let n = first_bind.saturating_add(1).saturating_add(num_binds.len());
+                num_binds.extend([x0 - EDGE, y0 - EDGE, x1 + EDGE, y1 + EDGE]);
+                parts.insert(
+                    0,
+                    format!(
+                        "{col} && ST_MakeEnvelope(${n}, ${}, ${}, ${}, 4326)",
+                        n.saturating_add(1),
+                        n.saturating_add(2),
+                        n.saturating_add(3)
+                    ),
+                );
+            }
             parts.join(" AND ")
         }
         Rel::Within => format!("ST_Within({col}, {g})"),
@@ -223,23 +240,7 @@ pub fn geohash(lon: f64, lat: f64, chars: usize) -> String {
 fn cell_cover(spec: &GeoSpec<'_>) -> Option<Vec<String>> {
     let (x0, y0, x1, y1) = match &spec.rel {
         Rel::Disjoint | Rel::Near { max: None, .. } => return None,
-        Rel::Near { max: Some(m), .. } => {
-            let [x, y] = spec.coordinates.as_array().map(Vec::as_slice)? else {
-                return None;
-            };
-            let (x, y) = (x.as_f64()?, y.as_f64()?);
-            // the radius `predicate` binds, as an angle on a sphere of
-            // 110 km per degree: shorter than any WGS84 degree of latitude
-            let r = ((m * 1.005 + 1.0) / 110_000.0).to_radians();
-            let lat = y.to_radians();
-            // the circle's widest longitude reach (spherical cap)
-            if !r.is_finite() || r.sin() >= lat.cos() {
-                return None;
-            }
-            let dx = (r.sin() / lat.cos()).asin().to_degrees();
-            let dy = r.to_degrees();
-            (x - dx, y - dy, x + dx, y + dy)
-        }
+        Rel::Near { max: Some(m), .. } => near_box(spec.coordinates, *m)?,
         _ => bbox(spec.coordinates)?,
     };
     let (x0, y0, x1, y1) = (x0 - EDGE, y0 - EDGE, x1 + EDGE, y1 + EDGE);
@@ -356,6 +357,27 @@ fn sibling_runs(cells: &[String]) -> usize {
             .filter(|w| matches!(w, [a, b] if next_sibling(a, b)))
             .count(),
     )
+}
+
+/// The box holding every point within `m` metres of the Point
+/// `coordinates`, widened as `predicate` widens the radius; `None` around
+/// a pole.
+fn near_box(coordinates: &Value, m: f64) -> Option<(f64, f64, f64, f64)> {
+    let [x, y] = coordinates.as_array().map(Vec::as_slice)? else {
+        return None;
+    };
+    let (x, y) = (x.as_f64()?, y.as_f64()?);
+    // the radius `predicate` binds, as an angle on a sphere of
+    // 110 km per degree: shorter than any WGS84 degree of latitude
+    let r = ((m * 1.005 + 1.0) / 110_000.0).to_radians();
+    let lat = y.to_radians();
+    // the circle's widest longitude reach (spherical cap)
+    if !r.is_finite() || r.sin() >= lat.cos() {
+        return None;
+    }
+    let dx = (r.sin() / lat.cos()).asin().to_degrees();
+    let dy = r.to_degrees();
+    Some((x - dx, y - dy, x + dx, y + dy))
 }
 
 /// The bounding box of a GeoJSON `coordinates` member, any nesting depth.
@@ -579,7 +601,7 @@ mod tests {
         )
         .expect("compiles");
         assert_eq!(c.geo_binds.len(), 1);
-        assert_eq!(c.num_binds.len(), 2);
+        assert_eq!(c.num_binds.len(), 6, "max, min and the box");
         assert!(c.sql.contains("ST_GeomFromGeoJSON($1)"), "{}", c.sql);
         assert!(c.sql.contains("$2)"), "maxDistance placeholder: {}", c.sql);
         assert!(
@@ -587,9 +609,14 @@ mod tests {
             "minDistance placeholder: {}",
             c.sql
         );
-        let past = 4 + c.cell_binds.len();
         assert!(
-            c.sql.contains("location_cell >= $4"),
+            c.sql.contains("ST_MakeEnvelope($4, $5, $6, $7, 4326)"),
+            "box after: {}",
+            c.sql
+        );
+        let past = 8 + c.cell_binds.len();
+        assert!(
+            c.sql.contains("location_cell >= $8"),
             "cover after: {}",
             c.sql
         );
