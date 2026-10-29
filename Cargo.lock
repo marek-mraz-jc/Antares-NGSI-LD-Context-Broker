@@ -360,6 +360,7 @@ dependencies = [
  "odata-json",
  "odata-url",
  "proptest",
+ "serde",
  "serde_json",
  "tokio",
  "tower",
@@ -2743,6 +2744,7 @@ version = "0.3.0"
 dependencies = [
  "memchr",
  "proptest",
+ "serde",
  "serde_json",
 ]
 

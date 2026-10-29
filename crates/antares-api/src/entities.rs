@@ -982,81 +982,90 @@ async fn query_entities_inner(
         false => links,
     };
 
-    let mut payload: Vec<Value> = page
-        .iter()
-        .filter_map(|doc| {
+    let shape = {
+        let (repr, ctx) = (repr.clone(), ctx.clone());
+        move |doc: &Value| {
             let shaped = apply(doc, &repr);
             // pick projections that match nothing drop the entity entirely
             if repr.pick.is_some() && shaped.as_object().is_some_and(|o| o.is_empty()) {
                 return None;
             }
             Some(compact_for(&repr, &shaped, &ctx))
-        })
-        .collect();
-    if let Some((mode, level)) = &join {
-        let mut complete = true;
-        let held = contained_by(params);
-        // 4.5.23.1 bounds the WIDTH of the retrieval per request, so one
-        // allowance is spent across the whole page: minting a fresh budget per
-        // payload Entity multiplied it by the page size, and a page of
-        // max_limit densely linked Entities bought MAX_JOIN_LOOKUPS lookups
-        // each.
-        let mut budget = MAX_JOIN_LOOKUPS;
-        match mode.as_str() {
-            "inline" => {
-                for p in &mut payload {
-                    complete &= inline_join_beyond(
-                        st,
-                        &tenant,
-                        &ctx,
-                        &repr,
-                        p,
-                        *level,
-                        &held,
-                        &mut budget,
-                        crate::federation::active(params).then_some(headers),
-                    )
-                    .await;
-                }
-            }
-            "flat" => {
-                let mut linked = std::collections::BTreeMap::new();
-                for doc in &page {
-                    complete &= collect_flat_beyond(
-                        st,
-                        &tenant,
-                        &ctx,
-                        &repr,
-                        doc,
-                        *level,
-                        &mut linked,
-                        &held,
-                        &mut budget,
-                    )
-                    .await;
-                }
-                let page_ids: Vec<&str> = page.iter().filter_map(|d| d["id"].as_str()).collect();
-                for (id, (ldoc, lrepr)) in linked {
-                    if !page_ids.contains(&id.as_str()) {
-                        payload.push(compact_for(&lrepr, &apply(&ldoc, &lrepr), &ctx));
+        }
+    };
+    let mut resp = if join.is_none() && accept != Accept::GeoJson {
+        // T-6049: each Entity is shaped as it is written, and the page holds no shaped
+        // copy of itself beside the read one
+        let docs = page.into_iter().filter_map(move |doc| shape(&doc));
+        crate::negotiate::respond_list(StatusCode::OK, docs, &ctx, accept, &tenant)
+    } else {
+        let mut payload: Vec<Value> = page.iter().filter_map(&shape).collect();
+        if let Some((mode, level)) = &join {
+            let mut complete = true;
+            let held = contained_by(params);
+            // 4.5.23.1 bounds the WIDTH of the retrieval per request, so one
+            // allowance is spent across the whole page: minting a fresh budget per
+            // payload Entity multiplied it by the page size, and a page of
+            // max_limit densely linked Entities bought MAX_JOIN_LOOKUPS lookups
+            // each.
+            let mut budget = MAX_JOIN_LOOKUPS;
+            match mode.as_str() {
+                "inline" => {
+                    for p in &mut payload {
+                        complete &= inline_join_beyond(
+                            st,
+                            &tenant,
+                            &ctx,
+                            &repr,
+                            p,
+                            *level,
+                            &held,
+                            &mut budget,
+                            crate::federation::active(params).then_some(headers),
+                        )
+                        .await;
                     }
                 }
+                "flat" => {
+                    let mut linked = std::collections::BTreeMap::new();
+                    for doc in &page {
+                        complete &= collect_flat_beyond(
+                            st,
+                            &tenant,
+                            &ctx,
+                            &repr,
+                            doc,
+                            *level,
+                            &mut linked,
+                            &held,
+                            &mut budget,
+                        )
+                        .await;
+                    }
+                    let page_ids: Vec<&str> =
+                        page.iter().filter_map(|d| d["id"].as_str()).collect();
+                    for (id, (ldoc, lrepr)) in linked {
+                        if !page_ids.contains(&id.as_str()) {
+                            payload.push(compact_for(&lrepr, &apply(&ldoc, &lrepr), &ctx));
+                        }
+                    }
+                }
+                _ => {}
             }
-            _ => {}
+            if !complete {
+                warnings.push(crate::federation::warning(
+                    199,
+                    &crate::federation::alias_for(&st.host_alias, &tenant),
+                    "the linked entity retrieval was truncated",
+                ));
+            }
         }
-        if !complete {
-            warnings.push(crate::federation::warning(
-                199,
-                &crate::federation::alias_for(&st.host_alias, &tenant),
-                "the linked entity retrieval was truncated",
-            ));
+        if accept == Accept::GeoJson {
+            let fc = to_geojson_collection(payload, params.get("geometryProperty"));
+            respond_prefer(StatusCode::OK, fc, &ctx, accept, &tenant, headers)
+        } else {
+            crate::negotiate::respond_list(StatusCode::OK, payload, &ctx, accept, &tenant)
         }
-    }
-    let mut resp = if accept == Accept::GeoJson {
-        let fc = to_geojson_collection(payload, params.get("geometryProperty"));
-        respond_prefer(StatusCode::OK, fc, &ctx, accept, &tenant, headers)
-    } else {
-        crate::negotiate::respond_list(StatusCode::OK, payload, &ctx, accept, &tenant)
     };
     attach_paging(&mut resp, count_hdr, &links);
     attach_warnings(&mut resp, &warnings);

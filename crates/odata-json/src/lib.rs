@@ -60,6 +60,7 @@ pub use read::{
     Target, WriteKind,
 };
 pub use write::{
-    write_collection, write_entity, write_entity_reference, write_entity_references,
-    write_service_document, EntityValue, Page,
+    write_collection, write_collection_end, write_collection_entity, write_collection_start,
+    write_entity, write_entity_reference, write_entity_references, write_service_document,
+    EntityValue, Page,
 };
