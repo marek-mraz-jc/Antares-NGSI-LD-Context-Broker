@@ -339,10 +339,13 @@ fn history(tenant: &str, entity: &str) -> String {
 /// beside the window's column bound, so Postgres sorted every row of the
 /// Entity within the widened bound for its LIMIT 1 (dev: 148 rows and a heap
 /// fetch each per station, 29k buffers and 5.9 s for 577 stations; T-5616).
+/// A `bare` Entity (migration 0030) holds no row and is not probed: each
+/// probe reads every weekly partition of its parent, and a type of 19 782
+/// Entities without history passed the 30 s statement timeout (T-5835).
 pub fn has_history(preds: &str, dir: &str, attrs: Option<usize>) -> String {
     let Some(n) = attrs else {
         return format!(
-            "((SELECT true FROM attr_instances ai \
+            "NOT m.bare AND ((SELECT true FROM attr_instances ai \
                WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id{preds} \
                ORDER BY ai.attr_id {dir}, ai.observed_at {dir} LIMIT 1) IS NOT NULL \
              OR (SELECT true FROM attr_rows ai \
@@ -351,7 +354,7 @@ pub fn has_history(preds: &str, dir: &str, attrs: Option<usize>) -> String {
         );
     };
     format!(
-        "(EXISTS (SELECT 1 FROM unnest(${n}::text[]) s(attr) CROSS JOIN LATERAL \
+        "NOT m.bare AND (EXISTS (SELECT 1 FROM unnest(${n}::text[]) s(attr) CROSS JOIN LATERAL \
            (SELECT true FROM attr_instances ai \
              WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id AND ai.attr_id = s.attr{preds} \
              ORDER BY ai.observed_at {dir} LIMIT 1) h) \
@@ -538,6 +541,23 @@ async fn insert_rows(
     let rows = if dedup { unseen(rows) } else { rows };
     if rows.is_empty() {
         return Ok(());
+    }
+    // The row stays locked until this write commits, so the bare sweep skips
+    // it, or this waits for the sweep to commit and then sees its mark
+    // (migration 0030). Every caller writes the Entity's temporal row first.
+    let bare: Option<bool> = sqlx::query_scalar(
+        "SELECT bare FROM temporal_entities WHERE tenant_id = $1 AND id = $2 FOR SHARE",
+    )
+    .bind(tenant.as_str())
+    .bind(entity_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if bare == Some(true) {
+        sqlx::query("UPDATE temporal_entities SET bare = false WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant.as_str())
+            .bind(entity_id)
+            .execute(&mut *tx)
+            .await?;
     }
     // The Attributes given an instance in a dataset (migration 0009): lastN
     // keeps every row of these, so the read needs to know them.
@@ -2416,6 +2436,7 @@ mod tests {
             "{sql}"
         );
         assert_eq!(sql.matches(" AND ai.x").count(), 2, "{sql}");
+        assert!(sql.starts_with("NOT m.bare AND ("), "{sql}");
         assert!(!sql.contains("EXISTS"), "{sql}");
         assert!(!sql.contains("ANY("), "{sql}");
     }
@@ -2439,6 +2460,7 @@ mod tests {
             "{sql}"
         );
         assert!(!sql.contains("attr_id = ANY"), "{sql}");
+        assert!(sql.starts_with("NOT m.bare AND ("), "{sql}");
     }
 
     /// T-5616: the read takes the N newest alone only where the Entity's
