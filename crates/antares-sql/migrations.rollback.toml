@@ -124,3 +124,7 @@ note = "offset_until is not kept by an older release: after a roll-forward, last
 [0029]
 rollback = "compatible"
 note = "entity_values_on_update writes only the rows that changed; an older release never names the function, and it leaves the same rows 0024's did"
+
+[0030]
+rollback = "compatible"
+note = "an older release never reads bare and does not clear it on a write: after a roll-forward, an Entity marked bare that gained history during the rollback stays out of temporal query pages until its next write or the sweep's next pass over it"
