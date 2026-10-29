@@ -22,9 +22,17 @@ name: fast
 # A train is tested on train/<stamp> and dev then fast-forwards to that same
 # sha (T-3776): the push to dev finds the green fast run on its sha and skips
 # every job, so one train costs one fast run. A dispatch always runs.
+#
+# T-6035: a dispatch on train/<stamp> without `base` compares against the
+# train's merge base with dev, so the surface subset, the fuzz smoke and
+# the feature-alone shards skip what the train does not reach. The nightly
+# schedule runs everything on dev, and it is the one run that writes the
+# Rust caches every train then reads (workspace.yml, "Caches").
 on:
   push:
     branches: [dev]
+  schedule:
+    - cron: "47 0 * * *"
   workflow_dispatch:
     inputs:
       base:
@@ -33,8 +41,10 @@ on:
         default: ""
 
 # One push per train: a newer push supersedes the run of the older one.
+# The nightly run keeps a group of its own: a train landing on dev must not
+# cancel the run that warms the caches.
 concurrency:
-  group: fast-${{ github.ref }}
+  group: fast-${{ github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}
   cancel-in-progress: true
 
 permissions:
@@ -58,8 +68,10 @@ jobs:
     timeout-minutes: 2
     permissions:
       actions: read
+      contents: read
     outputs:
       green: ${{ steps.ask.outputs.green }}
+      base: ${{ steps.base.outputs.base }}
     steps:
       - id: ask
         env:
@@ -73,12 +85,26 @@ jobs:
             [ -n "$runs" ] && green=true && echo "green fast run(s) on $GITHUB_SHA: $runs"
           fi
           echo "green=$green" | tee -a "$GITHUB_OUTPUT"
+      - id: base
+        # what the change is measured from: the dispatch's `base`, a push's
+        # previous tip, a train's merge base with dev; empty runs everything
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ inputs.base || github.event.before }}
+        run: |
+          if [ -z "$BASE" ] && [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [[ $GITHUB_REF_NAME == train/* ]]; then
+            BASE=$(gh api "repos/$GITHUB_REPOSITORY/compare/dev...$GITHUB_SHA" --jq .merge_base_commit.sha) || BASE=
+          fi
+          case $BASE in 0000000000000000000000000000000000000000) BASE= ;; esac
+          echo "base=$BASE" | tee -a "$GITHUB_OUTPUT"
 
   workspace:
     name: Workspace tests
     needs: proven
     if: needs.proven.outputs.green != 'true'
     uses: ./.github/workflows/workspace.yml
+    with:
+      base: ${{ needs.proven.outputs.base }}
 
   changes:
     name: Surface paths
@@ -94,7 +120,7 @@ jobs:
           fetch-depth: 0
       - id: diff
         env:
-          BASE: ${{ inputs.base || github.event.before }}
+          BASE: ${{ needs.proven.outputs.base }}
         run: |
           paths='^(crates/(antares-odata|odata-[^/]+|antares-views|antares-ops|antares-ogc|ogc-[^/]+)/|ci/odata-compliance|ci/views/|dev/odata-compliance/|dev/views-rig\.sh$|\.github/workflows/(fast|surfaces-conformance)\.yml$)'
           if ! git rev-parse -q --verify "${BASE:-none}^{commit}" > /dev/null; then
