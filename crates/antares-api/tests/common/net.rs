@@ -151,3 +151,15 @@ fn content_length(head: &str) -> Option<usize> {
         .and_then(|l| l.split_once(':'))
         .and_then(|(_, v)| v.trim().parse().ok())
 }
+
+/// A port that refuses every connection while the returned socket lives: bound,
+/// never listening. A port merely released can be taken by a parallel test's
+/// ephemeral bind and answer for the "dead" source (T-6074).
+pub fn refused_port() -> (tokio::net::TcpSocket, u16) {
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket
+        .bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("bind");
+    let port = socket.local_addr().expect("addr").port();
+    (socket, port)
+}

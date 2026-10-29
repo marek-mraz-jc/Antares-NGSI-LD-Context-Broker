@@ -43,15 +43,6 @@ fn mock_source(n: usize, tag: &str) -> u16 {
     port
 }
 
-/// A port nothing listens on: the forward fails to connect, which Table
-/// 6.3.17-1 classifies as 199 and the broker MUST report.
-fn dead_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    drop(listener);
-    port
-}
-
 async fn register(st: &AppState, port: u16, tag: &str) {
     let body = json!({
         "id": format!("urn:ngsi-ld:ContextSourceRegistration:warn-{tag}-{port}"),
@@ -129,7 +120,8 @@ async fn a_flooding_source_cannot_crowd_out_the_brokers_own_warning() {
     let st = AppState::new("antares-warnb".into());
     let cap = antares_api::bounds::MAX_PEER_WARNINGS;
     register(&st, mock_source(cap + 40, "loud"), "loud").await;
-    register(&st, dead_port(), "dead").await;
+    let (_held, dead) = crate::common::net::refused_port();
+    register(&st, dead, "dead").await;
 
     let got = query_warnings(&st).await;
     assert!(

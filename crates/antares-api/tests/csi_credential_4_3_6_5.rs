@@ -116,10 +116,15 @@ fn reply(status: &str, body: &str) -> String {
     )
 }
 
-/// A port nothing is listening on: the forward is refused before it is sent.
-fn dead_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    l.local_addr().expect("addr").port()
+/// A port that refuses the forward before it is sent while the socket lives:
+/// bound, never listening, so no parallel test can take it (T-6074).
+fn dead_port() -> (tokio::net::TcpSocket, u16) {
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket
+        .bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("bind");
+    let port = socket.local_addr().expect("addr").port();
+    (socket, port)
 }
 
 async fn call(st: &AppState, method: &str, path: &str) -> (StatusCode, Vec<String>, Value) {
@@ -218,7 +223,7 @@ async fn a_failing_forward_writes_the_credential_nowhere() {
         secret,
     )
     .await;
-    let dead = dead_port();
+    let (_held, dead) = dead_port();
     register(
         &st,
         "urn:ngsi-ld:ContextSourceRegistration:e3c",

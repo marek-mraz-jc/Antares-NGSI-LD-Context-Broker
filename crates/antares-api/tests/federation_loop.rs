@@ -874,11 +874,8 @@ async fn clause_6_3_17_single_source_read_timeout_is_504() {
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{mode}: {doc}");
         assert_eq!(doc["registrationId"], "urn:CSR:Slow", "{doc}");
     }
-    // nothing listens on a port just released
-    let closed = std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .expect("addr")
-        .port();
+    // bound, never listening: every connection is refused
+    let (_held, closed) = crate::common::net::refused_port();
     let st = state();
     let mut reg = csr(
         "urn:CSR:Dead",
