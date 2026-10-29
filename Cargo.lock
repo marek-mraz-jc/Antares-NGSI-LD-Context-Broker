@@ -448,6 +448,7 @@ dependencies = [
  "ngsild-ql",
  "proptest",
  "redb",
+ "regex",
  "ring",
  "serde_json",
  "sqlx",

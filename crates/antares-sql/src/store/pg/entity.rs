@@ -538,6 +538,46 @@ fn count_sql(wheres: &[String], split: Option<&TypeSplit>) -> String {
     format!("SELECT {}", counts.join(" + "))
 }
 
+/// The ids of every arm of `count_sql`, for a count the broker decides id by
+/// id. The arms are disjoint (`arms`), so each id comes once.
+fn ids_sql(wheres: &[String], split: Option<&TypeSplit>) -> String {
+    arms(wheres, split)
+        .iter()
+        .map(|w| format!("SELECT id FROM entities WHERE {w}"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ")
+}
+
+/// How many ids `sql` streams that any of `res` selects. The ids come from
+/// the type and id indexes alone (no document is read), one row at a time.
+async fn count_ids(
+    tx: &mut sqlx::Transaction<'static, sqlx::Postgres>,
+    sql: &str,
+    binds: impl Iterator<Item = &Bind>,
+    res: &[std::sync::Arc<regex::Regex>],
+) -> Result<i64, sqlx::Error> {
+    use futures_util::TryStreamExt;
+    // unprepared, as every statement of `query_in`
+    let mut qy =
+        sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql.to_owned())).persistent(false);
+    for b in binds {
+        qy = match b {
+            Bind::Text(s) | Bind::Path(s) => qy.bind(s),
+            Bind::TextArr(v) => qy.bind(v),
+            Bind::Num(n) => qy.bind(n),
+            Bind::Int(n) => qy.bind(n),
+        };
+    }
+    let mut ids = qy.fetch(&mut **tx);
+    let mut n: i64 = 0;
+    while let Some(id) = ids.try_next().await? {
+        if res.iter().any(|re| re.is_match(&id)) {
+            n = n.saturating_add(1);
+        }
+    }
+    Ok(n)
+}
+
 /// `id_prefixes` as SQL: the bounding byte range of every prefix, which the
 /// C-collated id index (0027) answers in its order, ANDed with the OR of
 /// each prefix's own range. Prefixes with a NUL match nothing (`storable`).
@@ -1203,6 +1243,11 @@ impl PgEntityStore {
         // and sorts the whole prefix range (164k Trees, 10 s on dev) instead
         // of reading the C-collated id index in order up to the page's LIMIT.
         // A function has no estimator and keeps the default third.
+        // The count does not use it: PostgreSQL's regex engine takes 3-12 µs
+        // an id for these patterns (241 752 Gardens: 2.9 s on one core
+        // against 0.2 s for the plain count, T-6066), so `count_ids` matches
+        // the ids in the broker with the rule's own regex instead.
+        let mut id_regexes = None;
         if let Some(ps) = f.id_patterns {
             match ps
                 .iter()
@@ -1210,6 +1255,13 @@ impl PgEntityStore {
                 .collect::<Option<Vec<_>>>()
             {
                 Some(res) => {
+                    // the regex `Rule::selects_id` judges with; a pattern it
+                    // cannot compile leaves the count to SQL
+                    id_regexes = ps
+                        .iter()
+                        .map(|p| antares_ql::regex::compile(&format!("^(?:{p})$")).ok())
+                        .collect::<Option<Vec<_>>>()
+                        .map(|re| (wheres.len(), re));
                     let any: Vec<String> = res
                         .into_iter()
                         .map(|re| {
@@ -1410,23 +1462,38 @@ impl PgEntityStore {
         // count=true with more rows past the page, or an off-the-end page:
         // count the match set under the same WHERE, binds and transaction
         if counted && total.is_none() {
-            // unprepared for the same reason as the statement above
-            let mut cq = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql(
-                &wheres,
-                split.as_ref(),
-            )))
-            .persistent(false);
             // same wheres ⇒ same bind prefix; stop before the
             // projection/page binds, which the count statement lacks
-            for b in binds.iter().take(where_binds) {
-                cq = match b {
-                    Bind::Text(s) | Bind::Path(s) => cq.bind(s),
-                    Bind::TextArr(v) => cq.bind(v),
-                    Bind::Num(n) => cq.bind(n),
-                    Bind::Int(n) => cq.bind(n),
-                };
-            }
-            total = Some(cq.fetch_one(&mut *tx).await?);
+            let where_binds = binds.iter().take(where_binds);
+            total = Some(match &id_regexes {
+                Some((at, res)) => {
+                    let mut wheres = wheres.clone();
+                    // its bind stays numbered and unused: sqlx sends every
+                    // parameter's type, so Postgres needs no reference to it
+                    if let Some(w) = wheres.get_mut(*at) {
+                        "true".clone_into(w);
+                    }
+                    let sql = ids_sql(&wheres, split.as_ref());
+                    count_ids(&mut tx, &sql, where_binds, res).await?
+                }
+                None => {
+                    // unprepared for the same reason as the statement above
+                    let mut cq = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(count_sql(
+                        &wheres,
+                        split.as_ref(),
+                    )))
+                    .persistent(false);
+                    for b in where_binds {
+                        cq = match b {
+                            Bind::Text(s) | Bind::Path(s) => cq.bind(s),
+                            Bind::TextArr(v) => cq.bind(v),
+                            Bind::Num(n) => cq.bind(n),
+                            Bind::Int(n) => cq.bind(n),
+                        };
+                    }
+                    cq.fetch_one(&mut *tx).await?
+                }
+            });
         }
         tx.commit().await?;
         Ok(QueryOutcome {
@@ -2783,6 +2850,29 @@ mod tests {
              AND types[1] = $2) + (SELECT count(*) FROM entities WHERE tenant_id = $1 \
              AND entity ?| $4 AND cardinality(types) > 1 AND types[1] <> ALL($3) \
              AND (types @> $5))"
+        );
+    }
+
+    /// T-6066: a count the broker decides reads the ids of the same arms,
+    /// one id per row, never a document.
+    #[test]
+    fn a_counted_id_walk_reads_the_ids_of_the_counts_arms() {
+        let w = vec!["tenant_id = $1".to_owned(), "true".to_owned()];
+        assert_eq!(
+            ids_sql(&w, None),
+            "SELECT id FROM entities WHERE tenant_id = $1 AND true"
+        );
+        let split = TypeSplit {
+            firsts: vec![2],
+            named: Some(3),
+            selection: "(types @> $5)".to_owned(),
+            exact_first: true,
+        };
+        assert_eq!(
+            ids_sql(&w, Some(&split)),
+            "SELECT id FROM entities WHERE tenant_id = $1 AND true AND types[1] = $2 \
+             UNION ALL SELECT id FROM entities WHERE tenant_id = $1 AND true \
+             AND cardinality(types) > 1 AND types[1] <> ALL($3) AND (types @> $5)"
         );
     }
 
