@@ -159,10 +159,17 @@ fn predicate(spec: &GeoSpec<'_>, col: &str, first_bind: usize) -> Option<Compile
             // T-6056: a bounding-box test before the geography distance,
             // which casts and measures every row the cover read (~45 % of
             // the distinct-1000 rig's statement time); `&&` compares boxes
-            // rounded outwards, so it only drops rows outside the radius
-            if let Some((x0, y0, x1, y1)) = max.and_then(|m| near_box(coordinates, m)) {
+            // rounded outwards, so it only drops rows outside the radius.
+            // Only a box inside [-180, 180) x [-90, 90), as `cell_cover`
+            // keeps: past the antimeridian `&&` would drop a point on the
+            // other side of it
+            if let Some((x0, y0, x1, y1)) = max
+                .and_then(|m| near_box(coordinates, m))
+                .map(|(x0, y0, x1, y1)| (x0 - EDGE, y0 - EDGE, x1 + EDGE, y1 + EDGE))
+                .filter(|&(x0, y0, x1, y1)| in_range(x0, y0, x1, y1))
+            {
                 let n = first_bind.saturating_add(1).saturating_add(num_binds.len());
-                num_binds.extend([x0 - EDGE, y0 - EDGE, x1 + EDGE, y1 + EDGE]);
+                num_binds.extend([x0, y0, x1, y1]);
                 parts.insert(
                     0,
                     format!(
@@ -244,7 +251,7 @@ fn cell_cover(spec: &GeoSpec<'_>) -> Option<Vec<String>> {
         _ => bbox(spec.coordinates)?,
     };
     let (x0, y0, x1, y1) = (x0 - EDGE, y0 - EDGE, x1 + EDGE, y1 + EDGE);
-    if !(x0 >= -180.0 && x1 < 180.0 && y0 >= -90.0 && y1 < 90.0) {
+    if !in_range(x0, y0, x1, y1) {
         return None;
     }
     // the finest precision whose cells tile the box in at most eight
@@ -357,6 +364,12 @@ fn sibling_runs(cells: &[String]) -> usize {
             .filter(|w| matches!(w, [a, b] if next_sibling(a, b)))
             .count(),
     )
+}
+
+/// Whether a box lies inside [-180, 180) x [-90, 90), where it neither
+/// wraps the antimeridian nor reaches past a pole.
+fn in_range(x0: f64, y0: f64, x1: f64, y1: f64) -> bool {
+    x0 >= -180.0 && x1 < 180.0 && y0 >= -90.0 && y1 < 90.0
 }
 
 /// The box holding every point within `m` metres of the Point
@@ -579,6 +592,29 @@ mod tests {
             0.0,
             "a deflated floor never goes negative"
         );
+    }
+
+    /// T-6070: a radius reaching past the antimeridian gets no box, whose
+    /// `&&` would drop the points beyond it, and no cover.
+    #[test]
+    fn a_near_across_the_antimeridian_gets_no_box() {
+        let c = compile_geo(
+            &spec(
+                Rel::Near {
+                    max: Some(10_000.0),
+                    min: None,
+                },
+                "Point",
+                &json!([179.99, 0.0]),
+                "",
+            ),
+            "location",
+            1,
+        )
+        .expect("compiles");
+        assert!(!c.sql.contains("ST_MakeEnvelope"), "{}", c.sql);
+        assert_eq!(c.num_binds.len(), 1, "the radius alone");
+        assert!(c.cell_binds.is_empty(), "no cover: {}", c.sql);
     }
 
     /// Both `near` bounds in one predicate: the geometry keeps the offset and
