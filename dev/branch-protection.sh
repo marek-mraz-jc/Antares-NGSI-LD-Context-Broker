@@ -103,7 +103,9 @@ ruleset protect-dev refs/heads/dev '[]' "[ $hard, { \"type\": \"required_linear_
 ruleset protect-main refs/heads/main '[]' "[ $hard,
   $(pull_request '["merge"]'),
   $(checks "Source of the change" \
-           "Workspace tests / Workspace tests" \
+           "Workspace tests / Workspace tests (1/2)" \
+           "Workspace tests / Workspace tests (2/2)" \
+           "Workspace tests / Workspace lint and supply chain" \
            "Workspace tests / Workspace tests (no-default-features)" \
            "Workspace tests / Workspace tests (all-features)" \
            "Workspace tests / Workspace tests (file-store)" \
@@ -119,7 +121,9 @@ ruleset protect-main refs/heads/main '[]' "[ $hard,
 # Maintainers bypass this one, which is what lets them push commits to dev.
 ruleset dev-pull-requests refs/heads/dev "$admins" "[
   $(pull_request '["rebase", "squash"]'),
-  $(checks "Workspace tests / Workspace tests" \
+  $(checks "Workspace tests / Workspace tests (1/2)" \
+           "Workspace tests / Workspace tests (2/2)" \
+           "Workspace tests / Workspace lint and supply chain" \
            "Workspace tests / Workspace tests (no-default-features)" \
            "Workspace tests / Workspace tests (all-features)" \
            "Workspace tests / Workspace tests (file-store)" \
