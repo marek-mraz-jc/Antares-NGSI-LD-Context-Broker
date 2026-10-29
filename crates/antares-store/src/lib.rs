@@ -548,6 +548,28 @@ pub trait CurrentStateDriver: Send + Sync {
     ) -> Result<filter::QueryOutcome, NgsiError> {
         self.query_entities(tenant, f).await
     }
+    /// `query_entities` with each row as its JSON text (T-6055): a page of
+    /// 1000 stored Entities is ~5x larger as `Value` trees than as text, and
+    /// a caller that decides and writes one Entity at a time holds the page
+    /// as text. The default writes each document out.
+    async fn query_entities_text(
+        &self,
+        tenant: &TenantId,
+        f: &filter::EntityFilter<'_>,
+    ) -> Result<filter::QueryOutcome<Box<serde_json::value::RawValue>>, NgsiError> {
+        let o = self.query_entities(tenant, f).await?;
+        Ok(filter::QueryOutcome {
+            rows: o
+                .rows
+                .into_iter()
+                .map(|d| serde_json::value::to_raw_value(&d))
+                .collect::<Result<_, _>>()
+                .map_err(|e| NgsiError::InternalError(e.to_string()))?,
+            decided: o.decided,
+            paged: o.paged,
+            total: o.total,
+        })
+    }
     /// The Entity types the Tenant's live Entities carry (5.7.5), sorted,
     /// read without the documents: `/types` names them, and folding every
     /// Entity for the names read a whole Tenant per call (T-4610). `None`

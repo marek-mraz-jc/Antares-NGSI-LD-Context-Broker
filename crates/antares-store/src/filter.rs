@@ -117,10 +117,11 @@ pub struct Page {
 /// What `query` produced. `decided` = SQL applied every present predicate
 /// exactly, so re-evaluation cannot drop a row; `paged` = LIMIT/OFFSET
 /// happened in SQL (implies `decided`, except from `query_candidates`),
-/// `total` = the pre-LIMIT match count.
-pub struct QueryOutcome {
+/// `total` = the pre-LIMIT match count. `R` is the row: a document, or its
+/// JSON text from [`crate::CurrentStateDriver::query_entities_text`].
+pub struct QueryOutcome<R = Value> {
     /// Matching entity documents.
-    pub rows: Vec<Value>,
+    pub rows: Vec<R>,
     /// Every present predicate was applied exactly; no re-check needed.
     pub decided: bool,
     /// LIMIT/OFFSET already applied (implies `decided`, except from

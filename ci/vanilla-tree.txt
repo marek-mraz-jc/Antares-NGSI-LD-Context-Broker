@@ -928,6 +928,8 @@ antares-broker v0.3.0
 │   │   ├── uuid feature "v5" (*)
 │   │   ├── ngsild-model feature "default" (*)
 │   │   ├── serde_json feature "default" (*)
+│   │   ├── serde_json feature "raw_value"
+│   │   │   └── serde_json v1.0.151 (*)
 │   │   ├── base64 feature "default" (*)
 │   │   ├── tokio feature "default" (*)
 │   │   ├── tokio feature "macros" (*)
@@ -945,6 +947,7 @@ antares-broker v0.3.0
 │   │   │       ├── chrono feature "serde" (*)
 │   │   │       ├── ngsild-model feature "default" (*)
 │   │   │       ├── serde_json feature "default" (*)
+│   │   │       ├── serde_json feature "raw_value" (*)
 │   │   │       ├── async-trait feature "default"
 │   │   │       │   └── async-trait v0.1.92 (proc-macro)
 │   │   │       │       ├── proc-macro2 feature "default" (*)
@@ -1271,8 +1274,7 @@ antares-broker v0.3.0
 │   │   │   │   │       ├── smallvec feature "default" (*)
 │   │   │   │   │       ├── uuid feature "default" (*)
 │   │   │   │   │       ├── serde_json feature "default" (*)
-│   │   │   │   │       ├── serde_json feature "raw_value"
-│   │   │   │   │       │   └── serde_json v1.0.151 (*)
+│   │   │   │   │       ├── serde_json feature "raw_value" (*)
 │   │   │   │   │       ├── thiserror feature "std" (*)
 │   │   │   │   │       ├── bytes feature "default" (*)
 │   │   │   │   │       ├── futures-util feature "alloc" (*)
@@ -2319,6 +2321,7 @@ antares-broker v0.3.0
 │   ├── uuid feature "v5" (*)
 │   ├── ngsild-model feature "default" (*)
 │   ├── serde_json feature "default" (*)
+│   ├── serde_json feature "raw_value" (*)
 │   ├── reqwest feature "json" (*)
 │   ├── reqwest feature "query" (*)
 │   ├── reqwest feature "rustls-no-provider" (*)
