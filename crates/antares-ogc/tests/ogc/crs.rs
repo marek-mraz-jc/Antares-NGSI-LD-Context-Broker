@@ -76,6 +76,38 @@ async fn unsupported_crs_is_400_with_the_list() -> Result<(), String> {
     )
     .await;
     assert_eq!(fine.status, StatusCode::CREATED, "{}", fine.body);
+    // A Feature without a location keeps `geometry: null` under `?crs=` (RFC 7946 3.2), on the
+    // item and on the items page (T-6034: the ETS transform tests read both).
+    let at = fine
+        .headers
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .ok_or("no Location")?
+        .trim_start_matches("http://localhost:9090")
+        .to_owned();
+    let id = at
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .replace("%3A", ":");
+    for crs in [CRS84, CRS84H] {
+        let item = get(&f.app, &format!("{at}?crs={crs}")).await;
+        assert_eq!(item.status, StatusCode::OK, "{crs}: {}", item.body);
+        assert_eq!(item.body.get("geometry"), Some(&json!(null)), "{crs}");
+        let page = get(
+            &f.app,
+            &format!("/x/views/fleet/ogc/features/collections/Car/items?crs={crs}&limit=1000"),
+        )
+        .await;
+        assert_eq!(page.status, StatusCode::OK, "{crs}: {}", page.body);
+        let feature = page
+            .body
+            .get("features")
+            .and_then(|f| f.as_array())
+            .and_then(|f| f.iter().find(|x| x.get("id") == Some(&json!(id))))
+            .ok_or(format!("{id} not on the {crs} page: {}", page.body))?;
+        assert_eq!(feature.get("geometry"), Some(&json!(null)), "{crs}");
+    }
     Ok(())
 }
 
