@@ -278,7 +278,84 @@ fn cell_cover(spec: &GeoSpec<'_>) -> Option<Vec<String>> {
     }
     cells.sort_unstable();
     cells.dedup();
-    Some(cells)
+    Some(refine(cells, (x0, y0, x1, y1)))
+}
+
+/// Ranges a refined cover may read (`cover_sql` merges sibling cells into
+/// one range each).
+const MAX_COVER_RANGES: usize = 16;
+
+/// `cells` with each cell replaced by its children (one character more)
+/// that touch the box, while the cover stays within `MAX_COVER_RANGES`
+/// runs of siblings. Eight cells of one precision can hold up to 32 times
+/// the box (a geohash character divides a cell in 32), and every row in
+/// them is a heap read under RLS: an 800 m `near` read 5 220 rows for 245
+/// matches (T-6056). A stored cell touching the box lies in a kept child
+/// or is a prefix of one, so the cover stays a superset.
+fn refine(cells: Vec<String>, (x0, y0, x1, y1): (f64, f64, f64, f64)) -> Vec<String> {
+    let mut runs = cells.len();
+    let mut out = Vec::new();
+    for cell in cells {
+        let kids: Vec<String> = BASE32
+            .iter()
+            .map(|b| format!("{cell}{}", char::from(*b)))
+            .filter(|k| {
+                let (a0, b0, a1, b1) = cell_box(k);
+                a0 <= x1 && a1 >= x0 && b0 <= y1 && b1 >= y0
+            })
+            .collect();
+        let more = sibling_runs(&kids).saturating_sub(1);
+        if kids.len() < BASE32.len() && runs.saturating_add(more) <= MAX_COVER_RANGES {
+            runs = runs.saturating_add(more);
+            out.extend(kids);
+        } else {
+            out.push(cell);
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// The region of a geohash cell, the inverse of [`geohash`].
+fn cell_box(cell: &str) -> (f64, f64, f64, f64) {
+    let (mut x, mut y) = ((-180.0_f64, 180.0_f64), (-90.0_f64, 90.0_f64));
+    let mut on_lon = true;
+    for c in cell.bytes() {
+        let bits = BASE32.iter().position(|b| *b == c).unwrap_or(0);
+        for k in (0..5).rev() {
+            let r = if on_lon { &mut x } else { &mut y };
+            let mid = (r.0 + r.1) / 2.0;
+            if (bits >> k) & 1 == 1 {
+                r.0 = mid;
+            } else {
+                r.1 = mid;
+            }
+            on_lon = !on_lon;
+        }
+    }
+    (x.0, y.0, x.1, y.1)
+}
+
+/// Whether `b` is the cell right after `a` among one parent's children.
+fn next_sibling(a: &str, b: &str) -> bool {
+    let index = |s: &str| {
+        s.bytes()
+            .last()
+            .and_then(|c| BASE32.iter().position(|x| *x == c))
+    };
+    a.len() == b.len()
+        && a.get(..a.len().saturating_sub(1)) == b.get(..b.len().saturating_sub(1))
+        && matches!((index(a), index(b)), (Some(i), Some(j)) if j == i.saturating_add(1))
+}
+
+/// The ranges of sorted `cells` once runs of consecutive siblings merge.
+fn sibling_runs(cells: &[String]) -> usize {
+    cells.len().saturating_sub(
+        cells
+            .windows(2)
+            .filter(|w| matches!(w, [a, b] if next_sibling(a, b)))
+            .count(),
+    )
 }
 
 /// The bounding box of a GeoJSON `coordinates` member, any nesting depth.
@@ -305,12 +382,21 @@ fn bbox(v: &Value) -> Option<(f64, f64, f64, f64)> {
 fn cover_sql(cells: &[String], cell_col: &str, first: usize) -> (String, Vec<String>) {
     let mut binds = Vec::new();
     let mut ors = Vec::new();
+    // a run of consecutive siblings is one range, from its first cell to
+    // past its last
+    let mut runs: Vec<(&String, &String)> = Vec::new();
     for c in cells {
+        match runs.last_mut() {
+            Some((_, end)) if next_sibling(end, c) => *end = c,
+            _ => runs.push((c, c)),
+        }
+    }
+    for (start, end) in runs {
         let n = first.saturating_add(binds.len());
         let m = n.saturating_add(1);
         ors.push(format!("({cell_col} >= ${n} AND {cell_col} < ${m})"));
-        binds.push(c.clone());
-        binds.push(format!("{c}~"));
+        binds.push(start.clone());
+        binds.push(format!("{end}~"));
     }
     let mut prefixes: Vec<&str> = cells
         .iter()
@@ -599,7 +685,8 @@ mod tests {
         let s = spec(Rel::Intersects, "Polygon", &poly, "");
         let cells = cell_cover(&s).expect("a small box has a cover");
         assert!(
-            cells.len() <= 8 && cells.iter().all(|c| c.len() == 5),
+            sibling_runs(&cells) <= MAX_COVER_RANGES
+                && cells.iter().all(|c| c.len() == 5 || c.len() == 6),
             "{cells:?}"
         );
         for i in 0..=20 {
@@ -640,6 +727,62 @@ mod tests {
                 "bearing {k}"
             );
         }
+    }
+
+    /// T-6056: the refined cover holds a fraction of its eight cells' area,
+    /// keeps every point of the region, and reads each run of siblings as
+    /// one range.
+    #[test]
+    fn the_refined_cover_reads_less_than_its_cells() {
+        let centre = json!([19.3001, 48.52]);
+        let s = spec(
+            Rel::Near {
+                max: Some(800.0),
+                min: None,
+            },
+            "Point",
+            &centre,
+            "",
+        );
+        let cells = cell_cover(&s).expect("an 800 m circle has a cover");
+        let area = |cs: &[String]| {
+            cs.iter()
+                .map(|c| {
+                    let (a0, b0, a1, b1) = cell_box(c);
+                    (a1 - a0) * (b1 - b0)
+                })
+                .sum::<f64>()
+        };
+        let parents: Vec<String> = {
+            let mut p: Vec<String> = cells.iter().map(|c| geohash_parent(c, 5)).collect();
+            p.dedup();
+            p
+        };
+        assert!(cells.iter().any(|c| c.len() == 6), "{cells:?}");
+        assert!(
+            area(&cells) * 2.0 < area(&parents),
+            "{cells:?} of {parents:?}"
+        );
+        let (sql, binds) = cover_sql(&cells, "location_cell", 1);
+        let ranges = sql.matches(">=").count();
+        assert_eq!(ranges, sibling_runs(&cells), "{sql}");
+        assert!(ranges < cells.len() && ranges <= MAX_COVER_RANGES, "{sql}");
+        assert!(
+            binds.iter().any(|b| b.len() == 5 && !b.ends_with('~')),
+            "parents stay as prefixes: {binds:?}"
+        );
+        // a cell decodes to the region its geohash names
+        let (a0, b0, a1, b1) = cell_box(&geohash(19.3001, 48.52, 7));
+        assert!(a0 <= 19.3001 && 19.3001 < a1 && b0 <= 48.52 && 48.52 < b1);
+        assert!(
+            next_sibling("u2d0", "u2d1")
+                && !next_sibling("u2d1", "u2d0")
+                && !next_sibling("u2d9", "u2e0")
+        );
+    }
+
+    fn geohash_parent(c: &str, n: usize) -> String {
+        c.get(..n).unwrap_or(c).to_owned()
     }
 
     /// No cover where one cannot narrow or would have to wrap.

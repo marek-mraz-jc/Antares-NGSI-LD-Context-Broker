@@ -276,6 +276,62 @@ fn geo_where(
     inline(&c.sql, &binds)
 }
 
+/// The statement `store::pg::entity::Probe` builds for `cond`, its cap
+/// inlined (the store's unit tests pin the text).
+fn probe_sql(cond: &str) -> String {
+    let rows = format!("FROM entity_values WHERE {cond}");
+    format!(
+        "SELECT CASE WHEN n < 1001 THEN ARRAY(SELECT id {rows}) END \
+         FROM (SELECT count(*) AS n FROM (SELECT 1 {rows} LIMIT 1001) r) c"
+    )
+}
+
+/// T-6056: a probe whose term matches more than its cap counts index
+/// entries and never reads an id: `speed >= 50` matches half of 100 000
+/// Entities, and its id read used to fetch 1 001 heap rows only to throw
+/// them away. A term under the cap (`speed == 42`, 1 000 rows) reads its
+/// ids. As antares_app under RLS.
+#[tokio::test]
+async fn a_probe_past_its_cap_reads_no_ids() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    seed_rls(&pool).await;
+    app_role(&pool).await;
+    let mut tx = pool.begin().await.expect("tx");
+    sqlx::query("SET LOCAL ROLE antares_app")
+        .execute(&mut *tx)
+        .await
+        .expect("role");
+    sqlx::query("SELECT set_config('antares.tenant', $1, true)")
+        .bind(RLS_A)
+        .execute(&mut *tx)
+        .await
+        .expect("tenant");
+    for (cond, reads) in [
+        ("f >= 50", false),
+        ("f = ANY(ARRAY[42, 'NaN'::float8])", true),
+    ] {
+        let sql = probe_sql(&format!(
+            "tenant_id = '{RLS_A}' AND attr = 'https://x/speed' AND {cond}"
+        ));
+        let rows: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) {sql}"
+        )))
+        .fetch_all(&mut *tx)
+        .await
+        .expect("explain");
+        let plan = rows.join("\n");
+        let never = plan.contains("never executed");
+        assert!(plan.contains("i_entity_values_num"), "{cond}:\n{plan}");
+        assert_eq!(never, !reads, "{cond}:\n{plan}");
+        let ids: Option<Vec<String>> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_one(&mut *tx)
+            .await
+            .expect("probe");
+        assert_eq!(ids.map(|v| v.len()), reads.then_some(1000), "{cond}");
+    }
+}
+
 /// T-4852: every NGSI-LD query shape of `docs/src/performance.md`'s RLS
 /// table, as the broker's role plans it beside a second Tenant of the same
 /// size: each reads an index for its selective predicate, none walks the
@@ -291,9 +347,7 @@ async fn every_query_shape_reads_an_index_under_rls() {
     let speed = |cond: &str| {
         format!(r#"entity @? '$."https://x/speed"[*]."value" ? (@ {cond})'::jsonpath"#)
     };
-    let probe = |cond: &str| {
-        format!("SELECT id FROM entity_values WHERE tenant_id = '{RLS_A}' AND {cond} LIMIT 1001")
-    };
+    let probe = |cond: &str| probe_sql(&format!("tenant_id = '{RLS_A}' AND {cond}"));
     // A walk: a sequential scan, a primary key read with the predicate left
     // as a filter, or any other index whose condition is the Tenant alone,
     // except the partial indexes that hold a sliver of it by construction
