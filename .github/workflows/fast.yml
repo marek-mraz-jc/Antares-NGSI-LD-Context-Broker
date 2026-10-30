@@ -65,9 +65,9 @@ permissions:
 jobs:
   pins:
     # first and cheapest: a moved tag or a workflow-wide grant must not reach the jobs below (T-5564)
-    name: Workflow pins
+    name: Workflow pins and gitleaks
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 5
     permissions:
       contents: read
     steps:
