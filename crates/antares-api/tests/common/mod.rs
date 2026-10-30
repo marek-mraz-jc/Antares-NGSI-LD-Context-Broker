@@ -34,6 +34,7 @@ pub struct Double {
     rows_read: AtomicUsize,
     registration_reads: AtomicUsize,
     tenant_probes: AtomicUsize,
+    size_scan_fails: AtomicBool,
 }
 
 impl Double {
@@ -56,6 +57,7 @@ impl Double {
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
+            size_scan_fails: AtomicBool::new(false),
         }
     }
 
@@ -79,6 +81,7 @@ impl Double {
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
+            size_scan_fails: AtomicBool::new(false),
         }
     }
 
@@ -102,6 +105,7 @@ impl Double {
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
+            size_scan_fails: AtomicBool::new(false),
         }
     }
 
@@ -127,6 +131,7 @@ impl Double {
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
+            size_scan_fails: AtomicBool::new(false),
         }
     }
 
@@ -164,6 +169,7 @@ impl Double {
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
+            size_scan_fails: AtomicBool::new(false),
         }
     }
 
@@ -187,6 +193,7 @@ impl Double {
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
+            size_scan_fails: AtomicBool::new(false),
         }
     }
 
@@ -210,6 +217,7 @@ impl Double {
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
+            size_scan_fails: AtomicBool::new(false),
         }
     }
 
@@ -241,6 +249,13 @@ impl Double {
     /// registration mirror is installed (T-5499).
     pub fn registration_reads(&self) -> usize {
         self.registration_reads.load(Ordering::SeqCst)
+    }
+
+    /// The exact size scan of a tenant fails from now on, as a Postgres scan
+    /// past its statement timeout does on a big tenant (T-6159); the
+    /// statistics' guess still answers.
+    pub fn fail_size_scan(&self) {
+        self.size_scan_fails.store(true, Ordering::SeqCst);
     }
 
     /// How many times a caller asked whether a Tenant exists.
@@ -548,6 +563,23 @@ impl CurrentStateDriver for Double {
         tenant: &TenantId,
     ) -> Result<Option<antares_store::TenantStats>, NgsiError> {
         self.inner.tenant_stats_one(tenant).await
+    }
+    async fn tenant_bytes(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<antares_store::TenantBytes, NgsiError> {
+        if self.size_scan_fails.load(Ordering::SeqCst) {
+            return Err(NgsiError::InternalError(
+                "database statement timeout".into(),
+            ));
+        }
+        self.inner.tenant_bytes(tenant).await
+    }
+    async fn tenant_bytes_estimate(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<antares_store::TenantBytes, NgsiError> {
+        self.inner.tenant_bytes_estimate(tenant).await
     }
     async fn purge_tenant(&self, tenant: &TenantId) -> Result<bool, NgsiError> {
         self.inner.purge_tenant(tenant).await
