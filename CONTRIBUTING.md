@@ -40,11 +40,10 @@ ETSI badges describe `dev`; `:latest` and the versioned images describe
 
 1. Fork, then branch from `dev`: `git switch -c 5.6.6-delete-entity origin/dev`.
 2. Commit under the rules below: one change per commit, signed off.
-   Before the push, run `dev/preflight.sh`: every check CI runs only
-   there (clippy wall, all-features tests, each new test alone, machete,
-   the ledger, module rules, the vanilla gates, the SBOM and the docs
-   gates) on the crates the branch touches, about 5 minutes
-   warm. When `antares-sql`, `-api`, `-broker` or `-ops` is touched and
+   Before the push, run `dev/preflight.sh`: the per-push gate's checks
+   (fmt, the clippy wall, the all-features tests, licence lines, machete,
+   the ledger, module rules, the vanilla tree and the docs gates) on the
+   crates the branch touches, a few minutes warm. When `antares-sql`, `-api`, `-broker` or `-ops` is touched and
    `ANTARES_TEST_DATABASE_URL` is unset, it starts the PostGIS image of
    `workspace.yml` (PostgreSQL 16, the major dev and prod run) in docker
    for the pg tests. A new CI-only check lands in `dev/preflight.sh` in the same
@@ -72,8 +71,14 @@ What a pull request from a fork can and cannot do here:
 - Nothing a `v*` tag publishes is built from a cache.
 
 **As a maintainer.** Commit on `dev` and push a batch. Every push to
-`dev` runs `fast` (the workspace gate, about 15 minutes), which is what a
-review closes on. A green `fast` run starts `ci` on the same commit
+`dev` runs `fast` (the per-push gate: fmt, clippy, the workspace suite
+on the default and on all features, the OData ABNF cases, the
+repository rules that need no build and gitleaks over the pushed
+commits), which is what a review closes on. Everything else of
+`workspace.yml` (each feature alone, binary sizes, MSRV, semver, the
+shared crates, the wasm32 and fuzz builds, the SBOM, cargo-audit and
+cargo-deny) runs in `sweep`: weekly on `dev` when it moved, and on the
+commit a production release pins (T-6151). A green `fast` run starts `ci` on the same commit
 (`workflow_run`): the ETSI matrix and the arm64 build at once, no second
 workspace run, and a green run publishes the `:dev` image. A `fast` run
 that is not green starts nothing (its `ci` run cancels itself). A
