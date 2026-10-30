@@ -1,35 +1,34 @@
 name: fast
 
-# The fast lane (T-3710): the workspace gate alone, on every push to dev,
-# about 15 minutes. A review closes on it (tasks/ci), so a task does not wait
-# for the ETSI matrix and the images. ci.yml is unchanged and still runs per
-# train: the workspace gate again, then the quick ETSI matrix, the arm64
-# build and the :dev image. Nothing moves out of ci.yml; the vanilla checks
-# (rule M3: the committed feature tree, the symbol gate with its --metadata
-# walk, the SBOM) are part of workspace.yml, so they now answer a push in
-# the fast lane too.
+# The fast lane (T-3710): the per-push gate, on every push to dev and every
+# train. Since T-6151 (owner 2026-10-30: push to dev under 5 minutes) it
+# runs workspace.yml at scope `push`: fmt, clippy --all-features, the
+# workspace suite on the default features and on all features, the OData
+# ABNF cases, the repository rules that need no build, and gitleaks over
+# the pushed commits. Each feature alone, the binary sizes, MSRV, semver,
+# the shared crates, the fuzz and wasm32 builds, the SBOM, cargo-audit and
+# cargo-deny moved to sweep.yml (weekly when dev moved, and on the commit a
+# prod release pins); the nightly run here adds the fuzz smoke. The surface
+# subset left too: tasks/train dispatches surfaces-conformance.yml itself
+# when a train touches a surface, so fast ran it twice.
 #
-#   push to dev ──→ fast: workspace.yml            (closes reviews)
-#                         ‖ surfaces-conformance.yml (fast: true) when the
-#                           push touches a surface path (T-3765)
-#   dispatch per train ──→ ci: workspace.yml → ETSI matrix, images
+# A review closes on this run (tasks/ci), so a task does not wait for the
+# ETSI matrix and the images (ci.yml, nightly and on dispatch).
 #
-# The surface subset (build, odata-conformance, odata-compliance-external)
-# runs beside the workspace gate, so a lost conformance pass is red on the
-# push that lost it. A dispatch compares against `base`, or runs the subset
-# when it names none.
+#   push to dev, dispatch per train ──→ fast: workspace.yml (scope push)
+#   nightly ──→ fast: workspace.yml (scope nightly: + fuzz smoke)
+#   weekly when dev moved, prod release ──→ sweep.yml: workspace.yml (scope sweep)
 #
 # A train is tested on train/<stamp> and dev then fast-forwards to that same
 # sha (T-3776): the push to dev finds the green fast run on its sha and skips
 # every job, so one train costs one fast run. A dispatch always runs.
 #
 # T-6035: a dispatch on train/<stamp> without `base` compares against the
-# train's merge base with dev, so the surface subset, the fuzz smoke and
-# the feature-alone shards skip what the train does not reach. The nightly
-# schedule runs everything on dev, and it is the one run that writes the
-# Rust caches every train then reads (workspace.yml, "Caches").
+# train's merge base with dev; gitleaks scans from there. The nightly
+# schedule is the one run that writes the Rust caches every train then
+# reads (workspace.yml, "Caches").
 #
-# Job budget (T-6046). The account runs at most 20 GitHub jobs at once,
+# Job budget (T-6046; T-6151 cut a push from ~45 jobs to ~11). The account runs at most 20 GitHub jobs at once,
 # for every repository together; a job past that waits in the queue. Measured
 # 2026-10-28T10Z..10-29T10Z: Antares 2158 jobs (fast 1421, surfaces 406, ci
 # 246), portal 1523, deployment 275, platform 178, docs 86, conformance 27.
@@ -49,7 +48,7 @@ on:
   workflow_dispatch:
     inputs:
       base:
-        description: the ref the surface paths are compared against (empty runs the subset)
+        description: "the commit the change is measured from (empty on a train/* ref: its merge base with dev)"
         required: false
         default: ""
 
@@ -73,7 +72,36 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # gitleaks below reads the commits of the push, and a train's merge base with dev
+          fetch-depth: 0
       - run: python3 ci/check-workflow-pins.py --selftest && python3 ci/check-workflow-pins.py && ci/suite-written.sh --selftest
+      # T-6151: a secret pushed to this public repository cannot be recalled,
+      # so every push and train scans its own commits: a push from its
+      # previous tip, a train from its merge base with dev, the nightly run
+      # its last commit. The binary is pinned by version and checksum.
+      - name: gitleaks over the commits of this change
+        env:
+          BEFORE: ${{ github.event.before }}
+          V: 8.30.1
+          SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -eu
+          curl -sSfL -o gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${V}/gitleaks_${V}_linux_x64.tar.gz"
+          echo "$SHA256  gitleaks.tgz" | sha256sum -c -
+          tar xzf gitleaks.tgz gitleaks
+          base=
+          case ${BEFORE:-} in ''|0000000000000000000000000000000000000000) ;; *) base=$BEFORE ;; esac
+          if [ -z "$base" ] && [ "$GITHUB_REF_NAME" != dev ]; then
+            base=$(git merge-base origin/dev HEAD) || base=
+          fi
+          if [ -n "$base" ] && git cat-file -e "$base^{commit}" 2>/dev/null; then
+            range="$base..HEAD"
+          else
+            range="-1 HEAD"
+          fi
+          echo "gitleaks range: $range"
+          ./gitleaks git --no-banner --redact --exit-code 1 --log-opts="$range" .
 
   proven:
     name: Already green on this sha
@@ -136,42 +164,6 @@ jobs:
     uses: ./.github/workflows/workspace.yml
     with:
       base: ${{ needs.proven.outputs.base }}
+      # the nightly run adds the fuzz smoke of every target (T-6151)
+      scope: ${{ github.event_name == 'schedule' && 'nightly' || 'push' }}
 
-  changes:
-    name: Surface paths
-    needs: proven
-    if: needs.proven.outputs.green != 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      surfaces: ${{ steps.diff.outputs.surfaces }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - id: diff
-        env:
-          BASE: ${{ needs.proven.outputs.base }}
-        run: |
-          paths='^(crates/(antares-odata|odata-[^/]+|antares-views|antares-ops|antares-ogc|ogc-[^/]+)/|ci/odata-compliance|ci/views/|dev/odata-compliance/|dev/views-rig\.sh$|\.github/workflows/(fast|surfaces-conformance)\.yml$)'
-          if ! git rev-parse -q --verify "${BASE:-none}^{commit}" > /dev/null; then
-            hit=true # no base to compare with (a dispatch, a new branch): run it
-          elif git diff --name-only "$BASE" HEAD | grep -qE "$paths"; then
-            hit=true
-          else
-            hit=false
-          fi
-          echo "surfaces=$hit" | tee -a "$GITHUB_OUTPUT"
-
-  surfaces:
-    name: Surfaces conformance
-    needs: changes
-    if: needs.changes.outputs.surfaces == 'true'
-    # the nightly failure issue step is in the called file; it never runs
-    # on a push, but the job may ask for no more than its caller grants
-    permissions:
-      contents: read
-      issues: write
-    uses: ./.github/workflows/surfaces-conformance.yml
-    with:
-      fast: true

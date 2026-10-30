@@ -30,10 +30,10 @@ on:
         default: d313d87fabd74f67e0d4d1f222ccf0c45239a0a9
   schedule:
     - cron: "17 6 * * 2" # weekly, Tuesday 06:17 UTC, the heavy weekly of Tuesday (T-5639)
-  push:
-    paths:
-      - tests/external/**
-      - .github/workflows/external-suites.yml
+  # No push trigger since T-6151 (owner 2026-10-30): its 680 s per push of
+  # tests/external caught nothing in 7 days; the harness's own unit tests stay
+  # per push (workspace.yml, "External-suites harness self-check"). It used to
+  # run on: push: {paths: [tests/external/**, .github/workflows/external-suites.yml]}
 
 permissions:
   contents: read
@@ -45,7 +45,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 env:
-  SMOKE: ${{ github.event_name == 'push' || inputs.smoke == true }}
+  SMOKE: ${{ inputs.smoke == true }}
   CORAINE_REF: ${{ inputs.coraine_ref || 'd313d87fabd74f67e0d4d1f222ccf0c45239a0a9' }}
   # every surface in one binary (T-3636)
   FULL_FEATURES: full

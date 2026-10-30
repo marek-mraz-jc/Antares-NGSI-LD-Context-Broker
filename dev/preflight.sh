@@ -3,7 +3,12 @@
 # Every CI-only check of the crates a branch touches, in one local run before
 # the push (T-3763): a train then needs one CI cycle, not one per red check.
 # No coverage: the 100 % gate left preflight and CI (owner 2026-10-30,
-# T-6147); dev/coverage-gate.py still measures a crate by hand.
+# T-6147); dev/coverage-gate.py still measures a crate by hand. Since T-6151
+# (owner 2026-10-30, push to dev under 5 minutes) it mirrors the per-push
+# gate only (workspace.yml scope `push`): fmt, clippy, the tests of the
+# touched crates, spdx and the repository rules that need no build. The
+# vanilla symbol gate, config keys, fuzz and new-surface builds, SBOM, docs
+# and each new test alone run in the weekly sweep (sweep.yml).
 # Each step prints `PASS|FAIL <step> <seconds>s`; a failed step prints the
 # tail of its output and the run goes on. A tool that is missing is FAIL with
 # the reason, never a PASS. Exit 1 when a step failed.
@@ -66,50 +71,12 @@ self_test() {
   probe clean "" "--log $tmp/clean.log" ""
   grep -q '^preflight: [0-9]* steps' "$tmp/clean.log" || { echo "FAIL clean: --log holds no verdict"; bad=1; }
   # a lane killed mid-step: that step and the lane read red, the run still ends with a verdict
-  PREFLIGHT_DIE_AT=vanilla-symbols probe dead-lane "vanilla-symbols|lane debug_lane" "" ""
+  PREFLIGHT_DIE_AT="test" probe dead-lane "test|lane debug_lane" "" ""
   probe fmt fmt "" "sed -i '0,/^use /s//use  /' $lib"
   probe unused-dependency machete "" \
     "sed -i '/^axum = /a uuid = { version = \"1\", default-features = false }' crates/odata-axum/Cargo.toml && cargo metadata --format-version 1 > /dev/null"
-  # a dependency fuzz/Cargo.lock does not hold, on a crate a fuzz target uses
-  probe fuzz-lock "machete|fuzz-compile" "" \
-    "sed -i '/^\\[dependencies\\]/a hex = { version = \"0.4\", default-features = false }' crates/odata-url/Cargo.toml && cargo metadata --format-version 1 > /dev/null"
-  probe private-doc-link doc "" "sed -i '0,/^\/\/!/s//\/\/! [crate::preflight_probe_missing]\n\/\/!/' $lib"
-  probe architecture-row spec "" "mkdir -p crates/zz-probe/src && echo '//! probe' > crates/zz-probe/src/lib.rs"
-  probe red-alone "alone odata-axum::probe_b_needs_the_other" "" "cat >> $lib <<'RS'
-
-#[cfg(test)]
-mod preflight_probe {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::{Duration, Instant};
-
-    static SEEN: AtomicBool = AtomicBool::new(false);
-
-    #[test]
-    fn probe_a_sets() {
-        SEEN.store(true, Ordering::SeqCst);
-    }
-
-    #[test]
-    fn probe_b_needs_the_other() {
-        let start = Instant::now();
-        while !SEEN.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(5) {
-            std::thread::yield_now();
-        }
-        assert!(SEEN.load(Ordering::SeqCst));
-    }
-}
-RS"
-  # a test only a build without a feature holds runs alone there, not "no test named"
-  probe feature-off-alone "" "" "sed -i '/^\\[dependencies\\]/i [features]\\nprobe = []\\n' crates/odata-axum/Cargo.toml && cat >> $lib <<'RS'
-
-#[cfg(all(test, not(feature = \"probe\")))]
-mod preflight_probe_off {
-    #[test]
-    fn probe_without_the_feature() {
-        assert_eq!(1 + 1, 2);
-    }
-}
-RS"
+  probe architecture-row spec "" "mkdir -p crates/zz-probe/src && printf '// SPDX-License-Identifier: EUPL-1.2\n//! probe\n' > crates/zz-probe/src/lib.rs"
+  probe licence-line spdx "" "echo '//! probe' > crates/odata-axum/src/preflight_probe.rs"
   return "$bad"
 }
 if ((selftest)); then
@@ -194,56 +161,6 @@ pflags=()
 for c in "${crates[@]}"; do pflags+=(-p "$c"); done
 echo "preflight: base $base (${mb:0:7}), crates: ${crates[*]:-none}"
 
-# tests the diff adds: `crate name` per #[test] / #[tokio::test] fn on a + line
-added_tests() {
-  { git diff -U0 "$mb" -- '*.rs'
-    git ls-files --others --exclude-standard -- '*.rs' | while read -r f; do
-      echo "+++ b/$f"; sed 's/^/+/' "$f"; done
-  } | python3 -c '
-import re, sys
-attr, fn = re.compile(r"^\+\s*#\[(tokio::)?test\b"), re.compile(r"^\+\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)")
-path, pending = None, False
-for line in sys.stdin:
-    if line.startswith("+++ "):
-        path, pending = line[6:].strip(), False
-    elif attr.match(line):
-        pending = True
-    elif pending and (m := fn.match(line)):
-        print(path, m.group(1))
-        pending = False
-'
-}
-
-crate_of() { # <path>: the package whose manifest dir holds it
-  local d
-  d=$(dirname "$1")
-  while [[ $d != . && ! -f $d/Cargo.toml ]]; do d=$(dirname "$d"); done
-  [[ -f $d/Cargo.toml && $d != . ]] && sed -n 's/^name = "\(.*\)"/\1/p' "$d/Cargo.toml" | head -1
-}
-
-# A test behind cfg(not(feature = ...)) is compiled out of --all-features
-# (T-4854, trains 0421 and 0538): the default and the no-default build are
-# asked next, and the test runs in the first build that holds it.
-alone() { # <crate> <fn>: the test by its full path, in a process of its own
-  local feat list full="" i=0
-  for feat in --all-features "" --no-default-features; do
-    i=$((i + 1)) list=$work/list-$1-$i.txt
-    # shellcheck disable=SC2086 # $feat is one flag or none
-    [[ -s $list ]] || cargo test -q --locked -p "$1" $feat --tests -- --list > "$list" 2> /dev/null
-    full=$(sed -n "s/^\(\(.*::\)\{0,1\}$2\): test$/\1/p" "$list")
-    [[ -n $full ]] && break
-  done
-  [[ -n $full ]] || { echo "$1: no test named $2 in --list (all, default or no default features)"; return 1; }
-  local f
-  for f in $full; do
-    echo "== $f ${feat:-(default features)}"
-    # shellcheck disable=SC2086
-    cargo test -q --locked -p "$1" $feat --tests -- --exact "$f" || return 1
-  done
-}
-
-target=$(python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])' <<< "$meta")
-
 # workspace.yml's postgis service, for the crates whose pg tests skip without
 # ANTARES_TEST_DATABASE_URL: the same image (PostgreSQL 16, the major dev and
 # prod run, T-6021) on a port docker picks, removed when the run ends
@@ -274,52 +191,19 @@ if [[ -z ${ANTARES_TEST_DATABASE_URL:-} ]] && printf '%s\n' "${crates[@]}" | gre
   [[ -s $work/pg-url ]] && ANTARES_TEST_DATABASE_URL=$(< "$work/pg-url") && export ANTARES_TEST_DATABASE_URL
 fi
 
-# the debug lane: clippy, the tests, the added tests alone, the debug builds
+# the debug lane: clippy and the tests of the touched crates
 debug_lane() {
   if ((${#crates[@]})); then
     # workspace.yml "cargo clippy" (the touched crates of its --workspace wall)
     step 02 clippy cargo clippy --locked "${pflags[@]}" --all-targets --all-features -- -D warnings
     # workspace.yml "dev/unit-junit.sh all-features"
     step 03 test cargo test --locked "${pflags[@]}" --all-features
-    # strict.yml "Doc warnings + unused deps" (T-5198: a private intra-doc link went red only there)
-    step 18 doc env RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --document-private-items "${pflags[@]}"
-    # ci 38133016763: a test red only when it runs alone (env and order)
-    local k=0 path name c
-    while read -r path name; do
-      c=$(crate_of "$path")
-      [[ -n $c ]] && k=$((k + 1)) && step "04-$(printf %04d "$k")" "alone $c::$name" alone "$c" "$name"
-    done < <(added_tests)
   else
     echo "PASS clippy 0s (no crate touched)" > "$work/res/02"
     echo "PASS test 0s (no crate touched)" > "$work/res/03"
-    echo "PASS doc 0s (no crate touched)" > "$work/res/18"
-  fi
-  # workspace.yml "Vanilla binary links no surface"
-  step 10 vanilla-symbols dev/check-vanilla-symbols.sh
-  # config.rs KNOWN_KEYS (memory: antares-fuzz-outside-workspace) when an
-  # ANTARES_ key or a manifest changed
-  if grep -q 'Cargo.toml$' <<< "$changed" || git diff "$mb" -- '*.rs' | grep -q '^+.*ANTARES_'; then
-    step 12 config-keys cargo test --locked -p antares-broker --bins config_key_tests
   fi
 }
-
-# The binary size per surface feature (ADR-0027 section 6) is fast's own job (workspace.yml
-# "Binary size per surface feature"); preflight ran the same release builds again and took ~16
-# of its 18 minutes on a train (T-4134), so it is left to fast.
 lane debug_lane
-# workspace.yml "The fuzz targets still compile": fuzz/ has a lock of its
-# own, so a new dependency of a crate a target uses is red there only (train
-# 15, T-3821); a target directory of its own beside the debug lane's
-if grep -qE '(^|/)Cargo\.(toml|lock)$|^(crates|fuzz)/' <<< "$changed"; then
-  lane step 06 fuzz-compile bash -c 'CARGO_TARGET_DIR="$1/preflight-fuzz" cargo check --locked --manifest-path fuzz/Cargo.toml --bins || {
-    echo "fix: cargo update --manifest-path fuzz/Cargo.toml -p <the new crate>, and commit fuzz/Cargo.lock (never drop --locked)"; exit 1; }' _ "$target"
-fi
-
-# workspace.yml "New-surface template smoke" (T-5063): the template, or the seam its
-# generated crate calls, changed; it builds in the warm target, after cargo's lock
-if grep -qE '^dev/new-surface|^crates/antares-ops/' <<< "$changed"; then
-  lane step 17 new-surface env CARGO_TARGET_DIR="$target" dev/new-surface.test.sh
-fi
 # workspace.yml "cargo fmt --all --check"
 bg step 01 fmt cargo fmt --all --check
 # workspace.yml "cargo-machete"
@@ -330,8 +214,8 @@ bg step 07 spec bash -c 'python3 dev/spec.py check && python3 dev/spec_test.py'
 bg step 08 module-rules python3 dev/check-module-rules.py
 # workspace.yml "Vanilla feature tree is committed"
 bg step 09 vanilla-tree bash -c 'set -o pipefail; dev/vanilla-tree.sh | diff -u ci/vanilla-tree.txt -'
-# workspace.yml "SBOM (vanilla and full)"
-bg step 11 sbom bash -c 'cargo cyclonedx --version >/dev/null 2>&1 || { echo "missing tool: cargo cyclonedx"; exit 1; }; dev/sbom.sh "$1"' _ "$work/sbom"
+# workspace.yml "Licence headers"
+bg step 13 spdx dev/spdx-check.sh
 # workspace.yml "Route docs check" and "Env-var docs check"
 bg step 14 route-docs dev/check-route-docs.sh
 bg step 15 env-docs dev/check-env-docs.sh
