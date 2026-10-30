@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: EUPL-1.2
 # Every CI-only check of the crates a branch touches, in one local run before
 # the push (T-3763): a train then needs one CI cycle, not one per red check.
+# No coverage: the 100 % gate left preflight and CI (owner 2026-10-30,
+# T-6147); dev/coverage-gate.py still measures a crate by hand.
 # Each step prints `PASS|FAIL <step> <seconds>s`; a failed step prints the
 # tail of its output and the run goes on. A tool that is missing is FAIL with
 # the reason, never a PASS. Exit 1 when a step failed.
 #
-#   dev/preflight.sh [--base REF] [--no-coverage] [--log FILE]
+#   dev/preflight.sh [--base REF] [--log FILE]
 #   dev/preflight.sh --self-test       one deliberate break per step class
 #
 # The touched crates are those of `git diff --name-only $(merge-base REF HEAD)`
@@ -22,14 +24,14 @@ self=$(cd "$(dirname "$0")" && pwd)/preflight.sh
 cd "$(git rev-parse --show-toplevel)" || exit 2
 root=$PWD
 
-base=origin/dev cover=1 log="" selftest=0
+base=origin/dev log="" selftest=0
 while (($#)); do
   case $1 in
     --base) base=${2:?--base needs a ref}; shift 2 ;;
-    --no-coverage) cover=0; shift ;;
+    --no-coverage) shift ;; # accepted for old callers; nothing to skip
     --log) log=${2:?--log needs a file}; shift 2 ;;
     --self-test) selftest=1; shift ;;
-    *) echo "usage: dev/preflight.sh [--base REF] [--no-coverage] [--log FILE] | --self-test" >&2; exit 2 ;;
+    *) echo "usage: dev/preflight.sh [--base REF] [--log FILE] | --self-test" >&2; exit 2 ;;
   esac
 done
 [[ -n $log ]] && exec > >(tee "$log") 2>&1
@@ -64,16 +66,16 @@ self_test() {
   probe clean "" "--log $tmp/clean.log" ""
   grep -q '^preflight: [0-9]* steps' "$tmp/clean.log" || { echo "FAIL clean: --log holds no verdict"; bad=1; }
   # a lane killed mid-step: that step and the lane read red, the run still ends with a verdict
-  PREFLIGHT_DIE_AT=vanilla-symbols probe dead-lane "vanilla-symbols|lane debug_lane" --no-coverage ""
-  probe fmt fmt --no-coverage "sed -i '0,/^use /s//use  /' $lib"
-  probe unused-dependency machete --no-coverage \
+  PREFLIGHT_DIE_AT=vanilla-symbols probe dead-lane "vanilla-symbols|lane debug_lane" "" ""
+  probe fmt fmt "" "sed -i '0,/^use /s//use  /' $lib"
+  probe unused-dependency machete "" \
     "sed -i '/^axum = /a uuid = { version = \"1\", default-features = false }' crates/odata-axum/Cargo.toml && cargo metadata --format-version 1 > /dev/null"
   # a dependency fuzz/Cargo.lock does not hold, on a crate a fuzz target uses
-  probe fuzz-lock "machete|fuzz-compile" --no-coverage \
+  probe fuzz-lock "machete|fuzz-compile" "" \
     "sed -i '/^\\[dependencies\\]/a hex = { version = \"0.4\", default-features = false }' crates/odata-url/Cargo.toml && cargo metadata --format-version 1 > /dev/null"
-  probe private-doc-link doc --no-coverage "sed -i '0,/^\/\/!/s//\/\/! [crate::preflight_probe_missing]\n\/\/!/' $lib"
-  probe architecture-row spec --no-coverage "mkdir -p crates/zz-probe/src && echo '//! probe' > crates/zz-probe/src/lib.rs"
-  probe red-alone "alone odata-axum::probe_b_needs_the_other" --no-coverage "cat >> $lib <<'RS'
+  probe private-doc-link doc "" "sed -i '0,/^\/\/!/s//\/\/! [crate::preflight_probe_missing]\n\/\/!/' $lib"
+  probe architecture-row spec "" "mkdir -p crates/zz-probe/src && echo '//! probe' > crates/zz-probe/src/lib.rs"
+  probe red-alone "alone odata-axum::probe_b_needs_the_other" "" "cat >> $lib <<'RS'
 
 #[cfg(test)]
 mod preflight_probe {
@@ -98,7 +100,7 @@ mod preflight_probe {
 }
 RS"
   # a test only a build without a feature holds runs alone there, not "no test named"
-  probe feature-off-alone "" --no-coverage "sed -i '/^\\[dependencies\\]/i [features]\\nprobe = []\\n' crates/odata-axum/Cargo.toml && cat >> $lib <<'RS'
+  probe feature-off-alone "" "" "sed -i '/^\\[dependencies\\]/i [features]\\nprobe = []\\n' crates/odata-axum/Cargo.toml && cat >> $lib <<'RS'
 
 #[cfg(all(test, not(feature = \"probe\")))]
 mod preflight_probe_off {
@@ -108,9 +110,6 @@ mod preflight_probe_off {
     }
 }
 RS"
-  # before the test module: clippy refuses items after it
-  probe uncovered-line "coverage odata-axum" "" \
-    "perl -0pi -e 's/^#\\[cfg\\(test\\)\\]/\\/\\/\\/ A function no test calls.\\n#[must_use]\\npub fn preflight_probe(n: u8) -> u8 {\\n    n.wrapping_add(1)\\n}\\n\\n#[cfg(test)]/m' $lib"
   return "$bad"
 }
 if ((selftest)); then
@@ -304,40 +303,10 @@ debug_lane() {
   fi
 }
 
-# strict.yml "coverage": dev/coverage-gate.py on each touched crate with a
-# role, one after the other in llvm-cov's own target directory
-coverage_lane() {
-  local c k=0
-  for c in "$@"; do
-    k=$((k + 1))
-    step "16-$(printf %02d "$k")" "coverage $c" bash -c 'cargo +nightly llvm-cov --version >/dev/null 2>&1 || { echo "missing tool: cargo +nightly llvm-cov"; exit 1; }
-      python3 - "$1" <<'"'PY'"'
-import importlib.util, sys
-spec = importlib.util.spec_from_file_location("gate", "dev/coverage-gate.py")
-g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
-c = next(c for c in g.new_crates() if c["name"] == sys.argv[1])
-errors = g.check(c["name"], c["dir"], g.measure(c), [e for e in g.exclusions() if e["crate"] == c["name"]])
-print("\n".join(errors) or "OK")
-sys.exit(1 if errors else 0)
-PY' _ "$c"
-  done
-}
-
 # The binary size per surface feature (ADR-0027 section 6) is fast's own job (workspace.yml
 # "Binary size per surface feature"); preflight ran the same release builds again and took ~16
 # of its 18 minutes on a train (T-4134), so it is left to fast.
 lane debug_lane
-if ((cover)); then
-  roles=$(python3 - "${crates[@]}" <<'PY'
-import importlib.util, sys
-spec = importlib.util.spec_from_file_location("gate", "dev/coverage-gate.py")
-g = importlib.util.module_from_spec(spec); spec.loader.exec_module(g)
-print(" ".join(c["name"] for c in g.new_crates() if c["name"] in sys.argv[1:]))
-PY
-  )
-  # shellcheck disable=SC2086 # one crate name per word
-  [[ -n $roles ]] && lane coverage_lane $roles
-fi
 # workspace.yml "The fuzz targets still compile": fuzz/ has a lock of its
 # own, so a new dependency of a crate a target uses is red there only (train
 # 15, T-3821); a target directory of its own beside the debug lane's
