@@ -945,7 +945,7 @@ pub(crate) async fn stored_attributes(
     let go = async {
         let tenant = antares_model::TenantId::new(&raw)
             .ok()
-            .filter(|_| !crate::router::reserved_tenant(&raw))
+            .filter(|_| !antares_model::TenantId::is_reserved_str(&raw))
             .ok_or_else(|| NgsiError::BadRequestData(format!("invalid tenant: {raw:?}")))?;
         let ctx = crate::repr::policy_context();
         let iri = ctx.expand_key(&type_name);
