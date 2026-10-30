@@ -763,6 +763,15 @@ pub trait CurrentStateDriver: Send + Sync {
         let _ = tenant;
         Err(NgsiError::OperationNotSupported("tenant size".into()))
     }
+    /// The store's statistics' guess at [`Self::tenant_bytes`], for a read
+    /// whose exact scan failed or ran out of time (T-6159); the answer says
+    /// it is estimated. A driver without statistics cannot guess.
+    async fn tenant_bytes_estimate(&self, tenant: &TenantId) -> Result<TenantBytes, NgsiError> {
+        let _ = tenant;
+        Err(NgsiError::OperationNotSupported(
+            "tenant size estimate".into(),
+        ))
+    }
     /// Remove every current-state document of one tenant; `false` when the
     /// tenant did not exist. The default Tenant is emptied but keeps
     /// existing.

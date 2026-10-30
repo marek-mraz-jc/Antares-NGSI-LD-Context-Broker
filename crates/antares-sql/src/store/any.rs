@@ -226,6 +226,39 @@ const HISTORY_STATS: &str = "WITH RECURSIVE tree(oid) AS (
                           AND s.attname = 'tenant_id' AND NOT s.inherited
      WHERE c.relkind = 'r'";
 
+/// The `entities` table's planner row count and its heap and TOAST bytes,
+/// catalog reads only (T-6159).
+#[cfg(feature = "postgres")]
+const ENTITY_TABLE_STATS: &str = "SELECT greatest(c.reltuples, 0)::float8,
+           (pg_relation_size(c.oid)
+             + CASE WHEN c.reltoastrelid = 0 THEN 0
+                    ELSE pg_total_relation_size(c.reltoastrelid) END)::bigint
+      FROM pg_class c WHERE c.oid = 'entities'::regclass";
+
+/// A tenant's Entity bytes by first type from [`ENTITY_TABLE_STATS`] and the
+/// tenant's row count per type: each row weighs the table's average row,
+/// TOAST included; `None` while ANALYZE never counted the table. ponytail: a
+/// tenant whose rows are heavier than the table's average reads low; a
+/// per-type sample would close that.
+#[cfg(feature = "postgres")]
+fn estimate_entities(
+    tuples: f64,
+    size: i64,
+    counts: &[(String, i64)],
+) -> Option<antares_store::TenantBytes> {
+    if tuples < 1.0 {
+        return None;
+    }
+    let per_row = size.max(0) as f64 / tuples;
+    let mut out = antares_store::TenantBytes::default();
+    for (ty, n) in counts {
+        let b = (per_row * (*n).max(0) as f64).round() as u64;
+        out.entities = out.entities.saturating_add(b);
+        out.by_type.insert(ty.clone(), b);
+    }
+    Some(out)
+}
+
 /// One row of [`HISTORY_STATS`].
 #[cfg(feature = "postgres")]
 type HistoryStats = (f64, i64, Option<Vec<String>>, Option<Vec<f64>>, Option<f64>);
@@ -2091,6 +2124,39 @@ impl antares_store::CurrentStateDriver for AnyStore {
             }
         }
     }
+    async fn tenant_bytes_estimate(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<antares_store::TenantBytes, NgsiError> {
+        match self {
+            // exact, and as fast as a guess would be
+            AnyStore::Mem(s) => Ok(s.tenant_bytes(tenant)),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => {
+                let (tuples, size): (f64, i64) = sqlx::query_as(ENTITY_TABLE_STATS)
+                    .fetch_one(p.docs.pool())
+                    .await
+                    .map_err(db)?;
+                let mut tx = tenant_tx(p, tenant).await?;
+                sqlx::query(SIZE_SCAN_TIMEOUT)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db)?;
+                // an index-only count on i_entities_first_type: no row is read
+                let counts: Vec<(String, i64)> = sqlx::query_as(
+                    "SELECT coalesce(types[1], ''), count(*)::bigint
+                       FROM entities WHERE tenant_id = $1 GROUP BY 1",
+                )
+                .bind(tenant.as_str())
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db)?;
+                estimate_entities(tuples, size, &counts).ok_or_else(|| {
+                    NgsiError::InternalError("the entities table was never analyzed".into())
+                })
+            }
+        }
+    }
     async fn purge_tenant(&self, tenant: &TenantId) -> Result<bool, NgsiError> {
         AnyStore::purge_tenant(self, tenant).await
     }
@@ -2543,7 +2609,7 @@ mod temporal_only_tests {
 
 #[cfg(all(test, feature = "postgres"))]
 mod estimate_tests {
-    use super::{estimate_history, HistoryStats};
+    use super::{estimate_entities, estimate_history, HistoryStats};
 
     fn part(tuples: f64, bytes: i64, vals: &[&str], freqs: &[f64], distinct: f64) -> HistoryStats {
         (
@@ -2580,5 +2646,18 @@ mod estimate_tests {
         let listed = part(1000.0, 10_000, &["a", "b"], &[0.5, 0.5], 2.0);
         let never: HistoryStats = (5000.0, 99_000, None, None, None);
         assert_eq!(estimate_history("c", &[listed, never]), (0, 0));
+    }
+
+    /// T-6159: each of the tenant's rows weighs the table's average row, by
+    /// first type, so the types sum to the whole; an unanalyzed table gives
+    /// no guess rather than zero bytes.
+    #[test]
+    fn a_tenants_entities_weigh_the_tables_average_row_by_type() {
+        let counts = [("Room".to_owned(), 3), ("Bridge".to_owned(), 1)];
+        let b = estimate_entities(1000.0, 2_000_000, &counts).expect("analyzed");
+        assert_eq!(b.by_type["Room"], 6_000);
+        assert_eq!(b.by_type["Bridge"], 2_000);
+        assert_eq!(b.entities, 8_000);
+        assert!(estimate_entities(0.0, 2_000_000, &counts).is_none());
     }
 }
