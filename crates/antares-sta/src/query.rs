@@ -20,9 +20,7 @@ pub const PAGE_BYTES: usize = 1 << 20;
 /// The deepest `$expand` path.
 const MAX_EXPAND: usize = 2;
 
-/// A query option this surface cannot honour, by name.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Bad(pub &'static str, pub String);
+pub use crate::residual::Bad;
 
 /// The query options of one request.
 #[derive(Debug, Clone, PartialEq, Eq)]

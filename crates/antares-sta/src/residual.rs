@@ -8,7 +8,9 @@ use std::cmp::Ordering;
 
 use serde_json::Value;
 
-use crate::query::Bad;
+/// A query option this surface cannot honour, by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bad(pub &'static str, pub String);
 
 /// The most resources one request reads to filter or order a collection.
 pub const MAX_SCAN: usize = 1000;
