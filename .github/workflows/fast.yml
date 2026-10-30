@@ -101,7 +101,8 @@ jobs:
             range="-1 HEAD"
           fi
           echo "gitleaks range: $range"
-          ./gitleaks git --no-banner --redact --exit-code 1 --log-opts="$range" .
+          # .gitleaks.toml: the default rules less this repository's public test literals
+          ./gitleaks git --no-banner --redact --exit-code 1 --config .gitleaks.toml --log-opts="$range" .
 
   proven:
     name: Already green on this sha

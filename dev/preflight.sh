@@ -71,7 +71,7 @@ self_test() {
   probe clean "" "--log $tmp/clean.log" ""
   grep -q '^preflight: [0-9]* steps' "$tmp/clean.log" || { echo "FAIL clean: --log holds no verdict"; bad=1; }
   # a lane killed mid-step: that step and the lane read red, the run still ends with a verdict
-  PREFLIGHT_DIE_AT="test" probe dead-lane "test|lane debug_lane" "" ""
+  PREFLIGHT_DIE_AT="test" probe dead-lane "test|lane debug_lane" "" "echo '// probe' >> $lib"
   probe fmt fmt "" "sed -i '0,/^use /s//use  /' $lib"
   probe unused-dependency machete "" \
     "sed -i '/^axum = /a uuid = { version = \"1\", default-features = false }' crates/odata-axum/Cargo.toml && cargo metadata --format-version 1 > /dev/null"
