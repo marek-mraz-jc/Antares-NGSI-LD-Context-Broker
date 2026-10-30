@@ -110,8 +110,12 @@ jobs:
     # pg/mqtt/nats integration tests count instead of skipping vacuously),
     # one floor per test source. dev/etsi-coverage.sh reports the same split
     # per store, with the ETSI cells as further columns.
+    # A report since T-6147 (owner 2026-10-30: the broker does not need
+    # its coverage gated): a floor under its figure marks the job red in
+    # the run, but the run and the alarm stay green.
     name: Coverage floor (daily)
     if: github.event.schedule != '41 7 * * 0'
+    continue-on-error: true
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     env:

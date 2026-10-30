@@ -6,7 +6,7 @@ Every crate whose `[package.metadata.antares] role` is `ops`, `surface`, `protoc
 function with the uncovered line and branch counts and a reason. The list cannot rot: an entry
 whose function is gone, or whose counts no longer match what is uncovered there, is red too.
 
-    dev/coverage-gate.py                     measure and check every such crate (CI job coverage-surfaces)
+    dev/coverage-gate.py                     measure and check every such crate (by hand; no CI job since T-6147)
     dev/coverage-gate.py --shard K/N         only the K-th of N shards of them (one CI runner each, T-6035)
     dev/coverage-gate.py --check CRATE JSON  check one `cargo llvm-cov report --json` export
     dev/coverage-gate.py --self-test         one synthetic report per red condition, and a green one

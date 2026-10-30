@@ -39,8 +39,8 @@ line; when an anchor has moved the script stops before writing anything.
 2. Tests of that format beside the generated ones, and their rows in
    `tests/NAME/README.md` with the clause each proves.
 3. `cargo test -p antares-NAME`, `cargo clippy -p antares-NAME --all-targets
-   -- -D warnings` and the coverage gate (`dev/coverage-gate.py`): a
-   surface crate covers every line and branch.
+   -- -D warnings`. `dev/coverage-gate.py` (by hand) lists the
+   lines and branches no test reaches; since T-6147 no gate requires 100 %.
 
 `crates/antares-geojson` is the first surface made this way; the lines it
 took are in `docs/analysis/coraine-architecture.md` section 3.1.

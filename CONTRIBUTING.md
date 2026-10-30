@@ -42,8 +42,8 @@ ETSI badges describe `dev`; `:latest` and the versioned images describe
 2. Commit under the rules below: one change per commit, signed off.
    Before the push, run `dev/preflight.sh`: every check CI runs only
    there (clippy wall, all-features tests, each new test alone, machete,
-   the ledger, module rules, the vanilla gates, the SBOM, the docs gates,
-   the coverage gate) on the crates the branch touches, about 5 minutes
+   the ledger, module rules, the vanilla gates, the SBOM and the docs
+   gates) on the crates the branch touches, about 5 minutes
    warm. When `antares-sql`, `-api`, `-broker` or `-ops` is touched and
    `ANTARES_TEST_DATABASE_URL` is unset, it starts the PostGIS image of
    `workspace.yml` (PostgreSQL 16, the major dev and prod run) in docker
