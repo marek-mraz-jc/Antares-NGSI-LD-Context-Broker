@@ -264,51 +264,60 @@ const SIZE_SCAN_TIMEOUT: &str = "SET LOCAL statement_timeout = '5s'";
 /// parents, a hypertable's chunks: all inherit), with the planner's row
 /// count, its heap and TOAST bytes and the `tenant_id` statistics ANALYZE
 /// left: `(rows, bytes, most common tenants, their frequencies, n_distinct)`.
-/// Catalog reads only, so it answers in milliseconds at any history size.
+/// Catalog reads only (`pg_class` pages, no relation opened), so it answers
+/// in milliseconds at any history size and behind any lock.
 #[cfg(feature = "postgres")]
 const HISTORY_STATS: &str = "WITH RECURSIVE tree(oid) AS (
         SELECT 'attr_instances'::regclass::oid
         UNION ALL SELECT 'attr_rows'::regclass::oid
         UNION ALL SELECT i.inhrelid FROM pg_inherits i JOIN tree t ON i.inhparent = t.oid)
     SELECT greatest(c.reltuples, 0)::float8,
-           (pg_relation_size(c.oid)
-             + CASE WHEN c.reltoastrelid = 0 THEN 0
-                    ELSE pg_total_relation_size(c.reltoastrelid) END)::bigint,
+           ((c.relpages + coalesce(toast.relpages, 0))::bigint
+             * current_setting('block_size')::bigint),
            s.most_common_vals::text::text[],
            s.most_common_freqs::float8[],
            s.n_distinct::float8
       FROM tree t
       JOIN pg_class c ON c.oid = t.oid
       JOIN pg_namespace n ON n.oid = c.relnamespace
+      LEFT JOIN pg_class toast ON toast.oid = c.reltoastrelid
       LEFT JOIN pg_stats s ON s.schemaname = n.nspname AND s.tablename = c.relname
                           AND s.attname = 'tenant_id' AND NOT s.inherited
      WHERE c.relkind = 'r'";
 
-/// The `entities` table's planner row count and its heap and TOAST bytes,
-/// catalog reads only (T-6159).
+/// The `entities` table's planner row count and its heap and TOAST bytes as
+/// the last VACUUM or ANALYZE left them in `pg_class`: catalog reads only,
+/// so no lock on the table holds it up (T-6159, T-6204).
 #[cfg(feature = "postgres")]
 const ENTITY_TABLE_STATS: &str = "SELECT greatest(c.reltuples, 0)::float8,
-           (pg_relation_size(c.oid)
-             + CASE WHEN c.reltoastrelid = 0 THEN 0
-                    ELSE pg_total_relation_size(c.reltoastrelid) END)::bigint
-      FROM pg_class c WHERE c.oid = 'entities'::regclass";
+           ((c.relpages + coalesce(t.relpages, 0))::bigint
+             * current_setting('block_size')::bigint)
+      FROM pg_class c LEFT JOIN pg_class t ON t.oid = c.reltoastrelid
+     WHERE c.oid = 'entities'::regclass";
 
 /// A tenant's Entity bytes by first type from [`ENTITY_TABLE_STATS`] and the
 /// tenant's row count per type: each row weighs the table's average row,
-/// TOAST included; `None` while ANALYZE never counted the table. ponytail: a
-/// tenant whose rows are heavier than the table's average reads low; a
-/// per-type sample would close that.
+/// TOAST included; `None` while ANALYZE never counted the table. Without the
+/// per-type counts (`None`: their count passed its bound) the tenant's
+/// `entities` rows weigh the same and `by_type` stays empty (T-6204).
+/// ponytail: a tenant whose rows are heavier than the table's average reads
+/// low; a per-type sample would close that.
 #[cfg(feature = "postgres")]
 fn estimate_entities(
     tuples: f64,
     size: i64,
-    counts: &[(String, i64)],
+    counts: Option<&[(String, i64)]>,
+    entities: u64,
 ) -> Option<antares_store::TenantBytes> {
     if tuples < 1.0 {
         return None;
     }
     let per_row = size.max(0) as f64 / tuples;
     let mut out = antares_store::TenantBytes::default();
+    let Some(counts) = counts else {
+        out.entities = (per_row * entities as f64).round() as u64;
+        return Some(out);
+    };
     for (ty, n) in counts {
         let b = (per_row * (*n).max(0) as f64).round() as u64;
         out.entities = out.entities.saturating_add(b);
@@ -2217,6 +2226,7 @@ impl antares_store::CurrentStateDriver for AnyStore {
     async fn tenant_bytes_estimate(
         &self,
         tenant: &TenantId,
+        entities: u64,
     ) -> Result<antares_store::TenantBytes, NgsiError> {
         match self {
             // exact, and as fast as a guess would be
@@ -2227,21 +2237,31 @@ impl antares_store::CurrentStateDriver for AnyStore {
                     .fetch_one(p.docs.pool())
                     .await
                     .map_err(db)?;
-                let mut tx = tenant_tx(p, tenant).await?;
-                sqlx::query(SIZE_SCAN_TIMEOUT)
-                    .execute(&mut *tx)
+                // the split by first type, bounded: under forced RLS no
+                // index-only count, so a big tenant's passes the bound and
+                // the size comes from `entities` alone (T-6204)
+                let counts = async {
+                    let mut tx = tenant_tx(p, tenant).await?;
+                    sqlx::query(SIZE_SCAN_TIMEOUT)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db)?;
+                    sqlx::query_as::<_, (String, i64)>(
+                        "SELECT coalesce(types[1], ''), count(*)::bigint
+                           FROM entities WHERE tenant_id = $1 GROUP BY 1",
+                    )
+                    .bind(tenant.as_str())
+                    .fetch_all(&mut *tx)
                     .await
-                    .map_err(db)?;
-                // an index-only count on i_entities_first_type: no row is read
-                let counts: Vec<(String, i64)> = sqlx::query_as(
-                    "SELECT coalesce(types[1], ''), count(*)::bigint
-                       FROM entities WHERE tenant_id = $1 GROUP BY 1",
-                )
-                .bind(tenant.as_str())
-                .fetch_all(&mut *tx)
+                    .map_err(db)
+                }
                 .await
-                .map_err(db)?;
-                estimate_entities(tuples, size, &counts).ok_or_else(|| {
+                .inspect_err(|e| {
+                    tracing::warn!(tenant = tenant.as_str(), error = %e,
+                        "tenant size by type not counted, sizing the whole tenant");
+                })
+                .ok();
+                estimate_entities(tuples, size, counts.as_deref(), entities).ok_or_else(|| {
                     NgsiError::InternalError("the entities table was never analyzed".into())
                 })
             }
@@ -2744,10 +2764,20 @@ mod estimate_tests {
     #[test]
     fn a_tenants_entities_weigh_the_tables_average_row_by_type() {
         let counts = [("Room".to_owned(), 3), ("Bridge".to_owned(), 1)];
-        let b = estimate_entities(1000.0, 2_000_000, &counts).expect("analyzed");
+        let b = estimate_entities(1000.0, 2_000_000, Some(&counts), 4).expect("analyzed");
         assert_eq!(b.by_type["Room"], 6_000);
         assert_eq!(b.by_type["Bridge"], 2_000);
         assert_eq!(b.entities, 8_000);
-        assert!(estimate_entities(0.0, 2_000_000, &counts).is_none());
+        assert!(estimate_entities(0.0, 2_000_000, Some(&counts), 4).is_none());
+    }
+
+    /// T-6204: a split by type that passed its bound still sizes the tenant
+    /// from its Entity count, with no types.
+    #[test]
+    fn a_tenant_without_a_split_by_type_is_sized_from_its_entity_count() {
+        let b = estimate_entities(1000.0, 2_000_000, None, 791_784).expect("analyzed");
+        assert_eq!(b.entities, 1_583_568_000);
+        assert!(b.by_type.is_empty());
+        assert!(estimate_entities(0.0, 2_000_000, None, 5).is_none());
     }
 }

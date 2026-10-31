@@ -519,7 +519,7 @@ pub(super) async fn tenant_get(
         }
         Err(e) => return ApiError::from(e).into_response(),
     };
-    let usage = tenant_usage(&st, &tenant).await;
+    let usage = tenant_usage(&st, &tenant, stats.entities).await;
     let mut row = serde_json::json!({
         "tenant": stats.tenant,
         "counts": {
@@ -600,7 +600,11 @@ pub(super) fn bytes_cached_or_claim(
 /// true, as it is when the Entities' exact size scan fails and their size
 /// is estimated too (T-6159). `None` when nothing could be measured or another read is
 /// measuring: the counts still answer, without these.
-pub(super) async fn tenant_usage(st: &AppState, tenant: &TenantId) -> Option<serde_json::Value> {
+pub(super) async fn tenant_usage(
+    st: &AppState,
+    tenant: &TenantId,
+    entities: u64,
+) -> Option<serde_json::Value> {
     let cache = || {
         st.tenant_bytes
             .lock()
@@ -636,7 +640,7 @@ pub(super) async fn tenant_usage(st: &AppState, tenant: &TenantId) -> Option<ser
         Err(e) => {
             // a big tenant's exact scan passes its bound (T-6159)
             tracing::warn!(tenant = t, error = %e, "tenant size not measured, estimating");
-            match st.store.tenant_bytes_estimate(tenant).await {
+            match st.store.tenant_bytes_estimate(tenant, entities).await {
                 Ok(b) => Some((b, true)),
                 Err(e) => {
                     tracing::warn!(tenant = t, error = %e, "tenant size not estimated");

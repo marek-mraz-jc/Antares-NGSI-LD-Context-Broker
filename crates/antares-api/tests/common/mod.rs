@@ -595,8 +595,9 @@ impl CurrentStateDriver for Double {
     async fn tenant_bytes_estimate(
         &self,
         tenant: &TenantId,
+        entities: u64,
     ) -> Result<antares_store::TenantBytes, NgsiError> {
-        self.inner.tenant_bytes_estimate(tenant).await
+        self.inner.tenant_bytes_estimate(tenant, entities).await
     }
     async fn purge_tenant(&self, tenant: &TenantId) -> Result<bool, NgsiError> {
         self.inner.purge_tenant(tenant).await
