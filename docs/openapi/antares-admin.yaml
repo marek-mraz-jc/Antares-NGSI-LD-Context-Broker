@@ -71,7 +71,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Health'
         '503':
-          description: The instance is draining; `status` is `DRAINING`.
+          description: The instance is draining (`status` `DRAINING`), or its Postgres pool has held every slot for 5 minutes while the database answers a fresh connection (`status` `STORE_WEDGED`), so the liveness probe restarts it.
           content:
             application/json:
               schema:
@@ -581,7 +581,7 @@ components:
       properties:
         status:
           type: string
-          enum: [UP, DRAINING]
+          enum: [UP, DRAINING, STORE_WEDGED]
         store:
           type: string
           description: The current-state backend.

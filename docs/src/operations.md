@@ -44,7 +44,7 @@ kind smoke (dispatch): apply + every `rollout status` green.
 
 | Endpoint | Meaning |
 |---|---|
-| `/q/health` | Liveness + store mode and the temporal backend (`temporal`: `memory`, `file`, `postgres`, `timescale` or `none`), file-mode commit queue, resource limits + rejection counters, jemalloc heap, and under `bus=nats` the bus state `{mode, connected, reconnects}`. 503 = DRAINING (a roll in progress). |
+| `/q/health` | Liveness + store mode and the temporal backend (`temporal`: `memory`, `file`, `postgres`, `timescale` or `none`), file-mode commit queue, resource limits + rejection counters, jemalloc heap, and under `bus=nats` the bus state `{mode, connected, reconnects}`. 503 = DRAINING (a roll in progress) or STORE_WEDGED (every Postgres pool slot held for 5 min while the database answers a fresh connection: a leaked pool, so liveness restarts the pod; a lost database keeps liveness 200). |
 | `/q/ready` | Readiness: not draining ∧ store answers (`SELECT 1` on Pg) ∧ bus connected. The k8s `readinessProbe` polls this; liveness stays on `/q/health` (a restart does not fix a lost DB). |
 | `/q/metrics` | Prometheus text (`antares_` prefix; every metric in the [admin API](admin-api.md#get-qmetrics)). |
 
