@@ -179,10 +179,20 @@ impl Server {
             .iter()
             .filter_map(|v| v.to_str().ok())
             .any(|v| v.contains("rel=\"interval"));
-        let body = match axum::body::to_bytes(response.into_body(), MAX_INNER_BYTES).await {
+        // Through the answer pool, as every other surface reads: a tool
+        // call's buffer counts against the memory budget (T-5895).
+        let body = match self.view.read_answer(response.into_body(), "mcp").await {
             // an empty body (a 204) is no JSON: `null`
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-            Err(_) => {
+            Ok(held) if held.bytes().len() <= MAX_INNER_BYTES => {
+                serde_json::from_slice(held.bytes()).unwrap_or(Value::Null)
+            }
+            Err(antares_ops::Refusal::Overloaded { .. }) => {
+                return Answer {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    ..Answer::default()
+                }
+            }
+            Ok(_) | Err(_) => {
                 return Answer {
                     status: StatusCode::PAYLOAD_TOO_LARGE,
                     ..Answer::default()

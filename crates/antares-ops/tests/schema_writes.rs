@@ -97,3 +97,71 @@ async fn a_registered_check_refuses_a_write_to_a_tenant_with_a_schema() {
     let (s, body) = send(&app, "POST", "/ngsi-ld/v1/entities", "free", &bad).await;
     assert_eq!(s, StatusCode::CREATED, "a Tenant without a schema: {body}");
 }
+
+/// Refuses a whole Entity without `n`, as a schema with a required slot does; a fragment
+/// passes.
+fn needs_n(_: u64, _: &Arc<[u8]>, doc: &Value, whole: bool) -> Result<(), String> {
+    if whole && !doc.to_string().contains("/n\"") {
+        Err("the Entity lacks the required attribute n".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// F-R2ANT1-009: an upsert with options=update creates a member whose Entity is absent, and
+/// a created Entity is held to the whole-Entity rules, not the fragment ones.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_upsert_creating_an_entity_is_held_to_the_whole_entity_rules() {
+    std::env::set_var(SCHEMA_MAX_ENV, "65536");
+    std::env::set_var(SCHEMA_WRITES_ENV, "enforce");
+    let b = TestBroker::new()
+        .await
+        .unwrap_or_else(|e| unreachable!("{e}"))
+        .with_forward_transport(|ops| {
+            ops.check_writes(needs_n);
+            Arc::new(Http)
+        })
+        .unwrap_or_else(|e| unreachable!("{e}"));
+    let app = b.router();
+    let schema = json!({"id": "https://e.org/", "name": "s"});
+    let (s, body) = send(&app, "PUT", "/q/schemas/whole", "whole", &schema).await;
+    assert!(s.is_success(), "{s} {body}");
+    let partial =
+        json!([{"id": "urn:ngsi-ld:T:2", "type": "T", "m": {"type": "Property", "value": 1}}]);
+    let (s, body) = send(
+        &app,
+        "POST",
+        "/ngsi-ld/v1/entityOperations/upsert?options=update",
+        "whole",
+        &partial,
+    )
+    .await;
+    assert!(
+        matches!(s, StatusCode::MULTI_STATUS | StatusCode::BAD_REQUEST),
+        "{s} {body}"
+    );
+    assert_eq!(
+        body.pointer("/errors/0/error/detail"),
+        Some(&json!("the Entity lacks the required attribute n")),
+        "{body}"
+    );
+    let (s, body) = send(
+        &app,
+        "POST",
+        "/ngsi-ld/v1/entityOperations/upsert?options=update",
+        "whole",
+        &json!([{"id": "urn:ngsi-ld:T:2", "type": "T", "n": {"type": "Property", "value": 1}}]),
+    )
+    .await;
+    assert!(s.is_success(), "a whole member is created: {s} {body}");
+    // a stored Entity is updated by a fragment
+    let (s, body) = send(
+        &app,
+        "POST",
+        "/ngsi-ld/v1/entityOperations/upsert?options=update",
+        "whole",
+        &partial,
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{body}");
+}

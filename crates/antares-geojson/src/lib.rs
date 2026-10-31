@@ -399,24 +399,20 @@ async fn csv(
         .limit
         .map_or(MAX_ROWS, |n| usize::try_from(n).unwrap_or(MAX_ROWS))
         .min(MAX_ROWS);
-    let mut all = Vec::new();
-    let mut start = Some(0);
-    while let Some(at) = start.filter(|_| all.len() < rows) {
-        let size = rows.saturating_sub(all.len()).min(MAX_LIMIT);
-        let (entities, next) = scan(
-            &view,
-            caller,
-            &pushdown,
-            Page {
-                start: at,
-                size,
-                whole: false,
-            },
-        )
-        .await?;
-        all.extend(entities);
-        start = next;
-    }
+    // One scan for every row: it reads upstream pages of the broker's
+    // max_limit itself, where pages of MAX_LIMIT made 100 offset reads, each
+    // walking the store from its offset, for a 10 000-row file.
+    let (all, _) = scan(
+        &view,
+        caller,
+        &pushdown,
+        Page {
+            start: 0,
+            size: rows,
+            whole: false,
+        },
+    )
+    .await?;
     let mut columns: Vec<String> = Vec::new();
     if output.sources.len() > 1 {
         columns.push("type".into());

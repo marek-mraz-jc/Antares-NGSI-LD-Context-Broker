@@ -76,10 +76,9 @@ impl JoinedcontextPolicy {
         self.tables.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The types of the Entities a notification carries, expanded: what
-    /// the query it answers named (README 3.8).
-    fn notified_types(notification: &Value) -> Vec<String> {
-        let ctx = document::context();
+    /// The types of the Entities a notification carries, expanded with `ctx`, the
+    /// `@context` the data is compacted with: what the query it answers named (README 3.8).
+    fn notified_types(notification: &Value, ctx: &antares_jsonld::Context) -> Vec<String> {
         let mut out: Vec<String> = notification
             .get("data")
             .and_then(Value::as_array)
@@ -141,10 +140,23 @@ impl PolicyEngine for JoinedcontextPolicy {
     fn pre_notify(
         &self,
         subject: &Subject,
-        _sub: &Value,
+        sub: &Value,
         notification: &mut Value,
     ) -> NotifyDecision {
-        let types = Self::notified_types(notification);
+        self.pre_notify_in(subject, sub, notification, document::context())
+    }
+
+    /// A subscriber's `@context` can alias a prohibited type's IRI with another short name,
+    /// so the notified types are expanded with that context, never the core one
+    /// (F-R2ANT1-002).
+    fn pre_notify_in(
+        &self,
+        subject: &Subject,
+        _sub: &Value,
+        notification: &mut Value,
+        ctx: &antares_jsonld::Context,
+    ) -> NotifyDecision {
+        let types = Self::notified_types(notification, ctx);
         let op = Operation {
             types: &types,
             ..Operation::new("5.7.2")

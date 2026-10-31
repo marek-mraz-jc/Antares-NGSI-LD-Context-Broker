@@ -3,6 +3,10 @@
 
 use super::*;
 
+/// The pages of one sweep waiting to be delivered at once (F-R2ANT1-010).
+#[cfg(not(target_arch = "wasm32"))]
+const PAGES_IN_FLIGHT: usize = 4;
+
 /// When an interval subscription is next due, in epoch millis: one
 /// `timeInterval` after the last Notification it sent (Table 5.2.14.2-1
 /// `lastNotification`), or after its creation while it has sent none. Without
@@ -235,7 +239,9 @@ pub async fn interval_tick(st: &AppState) {
             // selector over a large tenant never holds its whole set; a store
             // that cannot decide the filter answers it whole, once.
             let page_size = st.max_limit.max(1);
-            let mut offset = 0usize;
+            // keyset (F-R2ANT1-011, as T-4683): each page seeks past the last id read, so a
+            // walk reads every row once instead of re-reading each skipped one
+            let mut after: Option<String> = None;
             let mut sent = false;
             loop {
                 let (rows, last) = {
@@ -262,10 +268,11 @@ pub async fn interval_tick(st: &AppState) {
                         geo: geo_spec.as_slice(),
                         expand: &expand,
                         page: Some(antares_store::filter::Page {
-                            offset: i64::try_from(offset).unwrap_or(i64::MAX),
+                            offset: 0,
                             limit: i64::try_from(page_size).unwrap_or(i64::MAX),
                             count: false,
                         }),
+                        after_id: after.as_deref(),
                         ..Default::default()
                     };
                     match st.store.query_entities(&tenant, &filter).await {
@@ -279,7 +286,11 @@ pub async fn interval_tick(st: &AppState) {
                         }
                     }
                 };
-                offset = offset.saturating_add(rows.len());
+                after = rows
+                    .last()
+                    .and_then(|d| d.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 let mut matching: Vec<Value> = Vec::new();
                 for d in rows {
                     if !selector_match(&sub, &d, &ctx)
@@ -296,6 +307,13 @@ pub async fn interval_tick(st: &AppState) {
                     sent = true;
                     #[cfg(not(target_arch = "wasm32"))]
                     {
+                        // F-R2ANT1-010: a page waits for an earlier one to leave before the
+                        // next is read, so a slow receiver holds a few pages, not the set
+                        while sending.len() >= PAGES_IN_FLIGHT {
+                            if let Some(Err(_)) = sending.join_next().await {
+                                note_panic();
+                            }
+                        }
                         let (st, tenant, ctx, sub) =
                             (st.clone(), tenant.clone(), Arc::clone(&ctx), sub.clone());
                         sending.spawn(async move {

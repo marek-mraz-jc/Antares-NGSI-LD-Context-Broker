@@ -134,3 +134,66 @@ async fn a_notification_falls_back_to_the_context_the_subscription_was_made_with
          it: {n}"
     );
 }
+
+async fn get(st: &AppState, path: &str) -> Value {
+    let req = Request::builder()
+        .uri(format!("/ngsi-ld/v1/{path}"))
+        .body(Body::empty())
+        .expect("req");
+    let resp = antares_api::router(st.clone())
+        .oneshot(req)
+        .await
+        .expect("resp");
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+}
+
+/// F-R2ANT2-007: an inline @context a Subscription is made with is one
+/// content-addressed ImplicitlyCreated row however many Subscriptions use
+/// it, and past the Tenant's budget the create is refused, not hosted.
+#[tokio::test]
+async fn an_inline_subscription_context_is_hosted_once_and_within_the_budget() {
+    let mut st = AppState::new("test-implicit-sub".into());
+    antares_api::wire(&mut st).await;
+    let sub = |n: u32| {
+        json!({
+            "id": format!("urn:ngsi-ld:Subscription:inline-{n}"),
+            "type": "Subscription",
+            "entities": [{"type": "Vehicle"}],
+            "notification": {"endpoint": {"uri": "http://127.0.0.1:9/notify"}},
+            "@context": {"velocity": SPEED_IRI}
+        })
+        .to_string()
+    };
+    let mut urls = Vec::new();
+    for n in 0..2 {
+        let (status, body) = call(&st, "subscriptions", "application/ld+json", &sub(n)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let stored = get(
+            &st,
+            &format!("subscriptions/urn:ngsi-ld:Subscription:inline-{n}"),
+        )
+        .await;
+        urls.push(
+            stored["jsonldContext"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        );
+    }
+    assert!(!urls[0].is_empty(), "jsonldContext is set: {urls:?}");
+    assert_eq!(urls[0], urls[1], "one row behind one URL");
+
+    st.implicit_context_bytes = 0;
+    let (status, body) = call(
+        &st,
+        "subscriptions",
+        "application/ld+json",
+        &json!({"type": "Subscription", "entities": [{"type": "Vehicle"}],
+                "notification": {"endpoint": {"uri": "http://127.0.0.1:9/notify"}},
+                "@context": {"other": SPEED_IRI}})
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
