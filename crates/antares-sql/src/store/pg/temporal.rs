@@ -1858,12 +1858,12 @@ impl PgTemporalStore {
             },
         };
         binds.extend(extra.into_iter().map(B::Text));
-        let mut select_total = String::new();
+        let mut windowed = false;
         let mut tail = " ORDER BY m.id".to_owned();
         // `paged` is set only inside `if f.page.is_some()`, so binding the
         // two together says that in the type system instead of in a comment.
         if let (true, Some(page)) = (paged, f.page.as_ref()) {
-            select_total = ", count(*) OVER () AS total".into();
+            windowed = true;
             binds.push(B::Num(page.limit));
             tail.push_str(&format!(" LIMIT ${}", binds.len()));
             binds.push(B::Num(page.offset));
@@ -1876,10 +1876,20 @@ impl PgTemporalStore {
             binds.push(B::Num(super::entity::MAX_UNDECIDED_ROWS));
             tail.push_str(&format!(" LIMIT ${}", binds.len()));
         }
-        let sql = format!(
-            "SELECT m.meta || {attr_expr}{select_total} FROM temporal_entities m \
-             WHERE {where_sql}{tail}"
-        );
+        // A page is cut over ids first and only its rows rebuild their
+        // history: in one SELECT the window count makes every OFFSET row pass
+        // through the projection, so a deep page rebuilt each skipped
+        // Entity's history (F-R2ANT4-009; entities do the same, T-4907).
+        let sql = if windowed {
+            format!(
+                "SELECT m.meta || {attr_expr}, p.total FROM (SELECT m.tenant_id, m.id, \
+                 count(*) OVER () AS total FROM temporal_entities m WHERE {where_sql}{tail}) AS p \
+                 JOIN temporal_entities m ON m.tenant_id = p.tenant_id AND m.id = p.id \
+                 ORDER BY m.id"
+            )
+        } else {
+            format!("SELECT m.meta || {attr_expr} FROM temporal_entities m WHERE {where_sql}{tail}")
+        };
         let first: Result<Option<TemporalOutcome>, sqlx::Error> = async {
             let mut tx = super::begin(&self.pool).await?;
             crate::store::pg::set_tenant(&mut tx, tenant).await?;

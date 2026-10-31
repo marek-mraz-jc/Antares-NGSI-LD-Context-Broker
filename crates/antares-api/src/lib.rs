@@ -985,6 +985,13 @@ mod clause_5_2_15 {
             StatusCode::BAD_REQUEST,
             "notifierInfo entries must be {{key, value}} pairs"
         );
+        assert_eq!(
+            post_ep(json!({"uri": uri,
+                "receiverInfo": [{"key": "Authorization", "value": "enc:v1:x"}]}))
+            .await,
+            StatusCode::BAD_REQUEST,
+            "a value carrying the seal marker is refused (F-R2ANT4-002)"
+        );
     }
 }
 

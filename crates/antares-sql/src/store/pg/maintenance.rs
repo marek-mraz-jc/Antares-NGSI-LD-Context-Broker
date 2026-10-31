@@ -416,13 +416,44 @@ async fn default_partition_load(pool: &PgPool) -> Result<Option<String>, sqlx::E
 /// its history with it (DM-97, owner 2026-10-18), in the same transaction:
 /// its instances under the service role, its temporal row under its own
 /// Tenant, as `temporal_entities` keeps the plain tenant policy.
+///
+/// Bounded: one statement over every expired Entity of the deployment ran up
+/// to the 30 s statement_timeout on dev (5.5M reaped, 29.9 s max, T-6214), and
+/// a reap that times out reaps nothing. Each batch of [`REAP_BATCH`], earliest
+/// expiry first, is its own transaction; a tick runs at most
+/// [`REAP_BATCHES`] of them and the rest wait for the next tick.
 async fn reap_expired_entities(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let mut reaped = 0u64;
+    for _ in 0..REAP_BATCHES {
+        let n = reap_expired_entity_batch(pool, REAP_BATCH).await?;
+        reaped = reaped.saturating_add(n);
+        if n < REAP_BATCH.unsigned_abs() {
+            break;
+        }
+    }
+    Ok(reaped)
+}
+
+/// Expired Entities one reap transaction deletes at most.
+const REAP_BATCH: i64 = 5000;
+
+/// Reap transactions one maintenance tick runs at most.
+const REAP_BATCHES: usize = 50;
+
+/// One batch of [`reap_expired_entities`]: at most `limit` Entities and their
+/// history. How many went.
+pub async fn reap_expired_entity_batch(pool: &PgPool, limit: i64) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
     crate::store::pg::set_service(&mut tx).await?;
     let gone: Vec<(String, String)> = sqlx::query_as(
-        "DELETE FROM entities WHERE expires_at IS NOT NULL AND expires_at < now()
+        "DELETE FROM entities WHERE (tenant_id, id) IN (
+           SELECT tenant_id, id FROM entities
+            WHERE expires_at IS NOT NULL AND expires_at < now()
+            ORDER BY expires_at LIMIT $1
+            FOR UPDATE SKIP LOCKED)
          RETURNING tenant_id, id",
     )
+    .bind(limit)
     .fetch_all(&mut *tx)
     .await?;
     let mut by_tenant: std::collections::BTreeMap<&str, Vec<String>> =

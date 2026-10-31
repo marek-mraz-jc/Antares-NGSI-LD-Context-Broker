@@ -1385,3 +1385,92 @@ async fn an_unchanged_append_records_no_new_instance() {
             .expect("cleanup");
     }
 }
+
+/// F-R2ANT4-007: one 4.22 entity reap transaction deletes at most its batch,
+/// earliest expiry first, so a mass expiry cannot outrun statement_timeout and
+/// reap nothing; the rest go in the next batch.
+#[tokio::test]
+async fn clause_4_22_an_entity_reap_batch_is_bounded() {
+    let url = require_db!();
+    let _ddl = PARTITION_DDL.lock().await;
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let t = TenantId::new("pgreapbatch").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    for i in 0..3 {
+        sqlx::query(
+            "INSERT INTO entities (tenant_id, id, entity, types, created_at, modified_at, expires_at)
+             VALUES ($1, $2, jsonb_build_object('id', $2::text), ARRAY['T'], now(), now(),
+                     '1970-01-01T00:00:00Z')
+             ON CONFLICT (tenant_id, id) DO UPDATE SET expires_at = EXCLUDED.expires_at",
+        )
+        .bind(t.as_str())
+        .bind(format!("urn:t:reap{i}"))
+        .execute(&pool)
+        .await
+        .expect("expired entity");
+    }
+    let n = antares_sql::store::pg::maintenance::reap_expired_entity_batch(&pool, 2)
+        .await
+        .expect("reap");
+    assert_eq!(n, 2, "one batch reaps its limit, not every expired Entity");
+    let n = antares_sql::store::pg::maintenance::reap_expired_entity_batch(&pool, 2)
+        .await
+        .expect("reap");
+    assert!(n >= 1, "the next batch takes the rest");
+}
+
+/// F-R2ANT4-009: a paged temporal query cuts its page over ids and rebuilds
+/// only the page's history; the page, its order and the total stay what one
+/// SELECT answered, an offset past the end included.
+#[tokio::test]
+async fn a_deep_temporal_page_reads_its_rows_and_total() {
+    use antares_store::filter::{Page, TemporalFilter};
+    let url = require_db!();
+    let _ddl = PARTITION_DDL.lock().await;
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let t = TenantId::new("pgtemppage").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    for table in ["attr_instances", "temporal_entities", "entities"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE tenant_id = 'pgtemppage'"
+        )))
+        .execute(&pool)
+        .await
+        .expect("clean");
+    }
+    let s = PgTemporalStore::new(pool.clone());
+    let attr = "https://uri.etsi.org/ngsi-ld/default-context/speed";
+    for i in 0..5 {
+        let id = format!("urn:t:page{i}");
+        ensure_entity(&pool, &t, &id).await;
+        let doc = json!({"id": id, "type": ["https://x/P"],
+            "createdAt": "2026-08-04T09:00:00Z", "modifiedAt": "2026-08-04T09:00:00Z",
+            attr: [{"type": "Property", "value": i, "observedAt": "2026-08-04T09:00:00Z",
+                    "instanceId": format!("urn:ngsi-ld:Instance:page{i}")}]});
+        assert!(s.create(&t, &id, &doc).await.expect("create"));
+    }
+    let types = ["https://x/P".to_owned()];
+    let expand = |t: &str| t.to_owned();
+    let page = |offset| TemporalFilter {
+        types: Some(&types),
+        expand: &expand,
+        page: Some(Page {
+            offset,
+            limit: 2,
+            count: true,
+        }),
+        ..TemporalFilter::default()
+    };
+    let got = s.query(&t, &page(2)).await.expect("page");
+    assert!(got.paged, "the page ran in SQL");
+    let ids: Vec<&str> = got.rows.iter().filter_map(|d| d["id"].as_str()).collect();
+    assert_eq!(ids, ["urn:t:page2", "urn:t:page3"]);
+    assert_eq!(
+        got.rows[0][attr][0]["value"], 2,
+        "the page's history is rebuilt"
+    );
+    assert_eq!(got.total, Some(5));
+    let past = s.query(&t, &page(10)).await.expect("past the end");
+    assert!(past.rows.is_empty());
+    assert_eq!(past.total, Some(5));
+}

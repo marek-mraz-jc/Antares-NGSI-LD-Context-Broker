@@ -218,14 +218,23 @@ impl<'m, M: Model> Query<'_, '_, '_, 'm, M> {
     /// one.
     fn find(&mut self, name: Name) -> bool {
         let base = self.c.pos();
-        // a raw `&` ends an option: inside a value it is percent-encoded
+        // a raw `&` ends an option, but a string literal may hold one
+        // (`pchar-no-SQUOTE`): one inside quotes starts nothing, so
+        // `$filter=n eq 'a&$apply=...'` stays a filter (F-R2ANT4-016). An
+        // escaped quote `''` toggles twice and keeps the literal open; `%27`
+        // is a quote as well.
+        let rest = self.c.rest().as_bytes();
+        let mut quoted = false;
         let starts: Vec<usize> = std::iter::once(0)
-            .chain(
-                self.c
-                    .rest()
-                    .match_indices('&')
-                    .map(|(at, _)| at.saturating_add(1)),
-            )
+            .chain((0..rest.len()).filter_map(|at| {
+                let b = rest.get(at).copied();
+                let quote = b == Some(b'\'')
+                    || rest
+                        .get(at..at.saturating_add(3))
+                        .is_some_and(|t| t.eq_ignore_ascii_case(b"%27"));
+                quoted ^= quote;
+                (b == Some(b'&') && !quoted).then_some(at.saturating_add(1))
+            }))
             .collect();
         for at in starts {
             self.c.reset(base.saturating_add(at));

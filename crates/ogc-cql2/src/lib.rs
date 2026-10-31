@@ -12,7 +12,9 @@
 //! expressions and [`MAX_NODES`] tree nodes (geometry positions included); past any bound the
 //! parse stops with an [`Error`] instead of recursing or allocating further.
 //!
-//! [`Expr`] writes itself as `cql2-text` ([`std::fmt::Display`]), which parses to the same tree.
+//! [`Expr`] writes itself as `cql2-text` ([`std::fmt::Display`]), which parses to the same tree,
+//! but for a one-element array outside `IN` and the `A_*` functions (a `cql2-json` argument
+//! `[1]`): `cql2-text` writes it `(1)`, the same text as a parenthesised value.
 //!
 //! ```
 //! use ogc_cql2::{parse, Expr, Lang, Op};

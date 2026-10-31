@@ -11,14 +11,14 @@
 //! timestamps embedded (`createdAt`/`modifiedAt` at entity level and inside
 //! each attribute instance) — output layers strip them unless sysAttrs.
 
-use ::redb::{Database, Durability, ReadableDatabase, ReadableTableMetadata, TableDefinition};
+use ::redb::{Database, Durability, ReadableDatabase, ReadableTableMetadata};
 use antares_model::{NgsiError, TenantId};
 use antares_store::{context_row_owner, context_row_visible, filter, ChangeHook, Kind};
 
 mod redb;
 use self::redb::{
-    key_bytes, split_key, table_for, Shadow, FORMAT_VERSION, T_ENTITIES, T_JSONLD_CONTEXTS, T_META,
-    T_TEMPORAL_ENTITIES,
+    key_bytes, split_key, table_for, Shadow, Table, FORMAT_VERSION, T_ENTITIES, T_JSONLD_CONTEXTS,
+    T_META, T_TEMPORAL_ENTITIES,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -66,33 +66,6 @@ fn attribute_names(obj: &serde_json::Map<String, Value>) -> Vec<String> {
         .filter(|k| !antares_model::ENTITY_META_KEYS.contains(&k.as_str()))
         .cloned()
         .collect()
-}
-
-/// Drop attribute instances whose `expiresAt` passed (4.22) from an internal
-/// entity or temporal doc; an attribute whose last instance expired is
-/// removed entirely. Returns whether the doc changed.
-pub(crate) fn prune_expired_instances(doc: &mut Value, now: &str) -> bool {
-    let Some(obj) = doc.as_object_mut() else {
-        return false;
-    };
-    let mut changed = false;
-    for k in attribute_names(obj) {
-        let Some(arr) = obj.get_mut(&k).and_then(Value::as_array_mut) else {
-            continue;
-        };
-        let before = arr.len();
-        // 4.6.3 leaves the seconds-fraction separator open, so the two
-        // stamps have to be compared as instants and not as bytes — the rule
-        // lives in `filter::expired_at`, which the read boundary uses too.
-        arr.retain(|inst| !filter::expired_at(inst, now));
-        if arr.len() != before {
-            changed = true;
-            if arr.is_empty() {
-                obj.remove(&k);
-            }
-        }
-    }
-    changed
 }
 
 /// Whether an internal doc's types include `type_iri` (retention, T-3900).
@@ -361,7 +334,7 @@ impl Store {
 
     /// Write-through for one doc (must be called inside the write-critical
     /// section so redb order equals memory order).
-    fn persist(&self, table: TableDefinition<&[u8], &[u8]>, key: &[u8], doc: Option<&Value>) {
+    fn persist(&self, table: Table, key: &[u8], doc: Option<&Value>) {
         if let Some(shadow) = &self.shadow {
             // None means DELETE the key, so a document that will not encode
             // must skip the write rather than collapse into one.
@@ -374,6 +347,25 @@ impl Store {
             };
             shadow.write(table, key, bytes.as_deref());
         }
+    }
+
+    /// [`Self::persist`] of many keys in one commit (`file` mode): what a
+    /// purge or a sweep deleted (`None`) or rewrote. A document that will not
+    /// encode is skipped, as `persist` skips it.
+    fn persist_many(&self, writes: &[(Table, Vec<u8>, Option<&Value>)]) {
+        let Some(shadow) = &self.shadow else {
+            return;
+        };
+        let encoded: Vec<(Table, &[u8], Option<Vec<u8>>)> = writes
+            .iter()
+            .filter_map(|(table, key, doc)| match doc {
+                Some(d) => serde_json::to_vec(d)
+                    .ok()
+                    .map(|b| (*table, key.as_slice(), Some(b))),
+                None => Some((*table, key.as_slice(), None)),
+            })
+            .collect();
+        shadow.write_many(encoded.iter().map(|(t, k, v)| (*t, *k, v.as_deref())));
     }
 
     /// Acquire the write-critical section, counting queued writers.
@@ -468,16 +460,17 @@ impl Store {
                 }
             }
         }
+        let mut gone: Vec<(Table, Vec<u8>, Option<&Value>)> = Vec::new();
         for (tenant, id) in dead {
             if let Some(docs) = inner.entities.get_mut(&tenant) {
-                self.persist(T_ENTITIES, &key_bytes(&tenant, &id), None);
+                gone.push((T_ENTITIES, key_bytes(&tenant, &id), None));
                 docs.remove(&id);
                 reaped = reaped.saturating_add(1);
             }
             // Its history goes with it (DM-97, owner 2026-10-18).
             if let Some(docs) = inner.temporal.get_mut(&tenant) {
                 if docs.remove(&id).is_some() {
-                    self.persist(T_TEMPORAL_ENTITIES, &key_bytes(&tenant, &id), None);
+                    gone.push((T_TEMPORAL_ENTITIES, key_bytes(&tenant, &id), None));
                 }
             }
         }
@@ -493,13 +486,14 @@ impl Store {
         ] {
             for (tenant, docs) in map.iter_mut() {
                 for (id, doc) in docs.iter_mut() {
-                    if prune_expired_instances(doc, now) {
+                    if filter::prune_expired(doc, now) {
                         reaped = reaped.saturating_add(1);
-                        self.persist(table, &key_bytes(tenant, id), Some(doc));
+                        gone.push((table, key_bytes(tenant, id), Some(doc)));
                     }
                 }
             }
         }
+        self.persist_many(&gone);
         reaped
     }
 
@@ -806,19 +800,22 @@ impl Store {
     }
 
     /// Drop every document of the given kinds for one tenant; `true` when
-    /// the tenant held any of them. Persisted per key in `file` mode.
+    /// the tenant held any of them. Persisted in one commit in `file` mode.
     pub fn purge_kinds(&self, tenant: &TenantId, kinds: &[Kind]) -> bool {
         on_blocking(true, || {
             let mut inner = self.write_inner();
             let mut hit = false;
+            let mut gone: Vec<(Table, Vec<u8>, Option<&Value>)> = Vec::new();
             for kind in kinds {
                 if let Some(docs) = Self::map_mut(&mut inner, *kind).remove(tenant.as_str()) {
                     hit = true;
-                    for id in docs.keys() {
-                        self.persist(table_for(*kind), &key_bytes(tenant.as_str(), id), None);
-                    }
+                    gone.extend(
+                        docs.keys()
+                            .map(|id| (table_for(*kind), key_bytes(tenant.as_str(), id), None)),
+                    );
                 }
             }
+            self.persist_many(&gone);
             hit
         })
     }
@@ -838,8 +835,12 @@ impl Store {
                 .filter(|(_, row)| context_row_owner(row) == Some(tenant.as_str()))
                 .map(|(id, _)| id.clone())
                 .collect();
+            let gone: Vec<(Table, Vec<u8>, Option<&Value>)> = dead
+                .iter()
+                .map(|id| (T_JSONLD_CONTEXTS, id.as_bytes().to_vec(), None))
+                .collect();
+            self.persist_many(&gone);
             for id in dead {
-                self.persist(T_JSONLD_CONTEXTS, id.as_bytes(), None);
                 inner.contexts.remove(&id);
             }
         });
@@ -1663,10 +1664,7 @@ mod tests {
             "id": "urn:x", "type": ["T"],
             "https://a/attr": [{"value": 1, "expiresAt": "2026-09-01T12:00:00,500Z"}]
         });
-        assert!(
-            !prune_expired_instances(&mut live, now),
-            "live instance kept"
-        );
+        assert!(!filter::prune_expired(&mut live, now), "live instance kept");
         assert_eq!(live["https://a/attr"].as_array().map(Vec::len), Some(1));
 
         // one that HAS expired still goes, comma form included, and takes the
@@ -1675,7 +1673,7 @@ mod tests {
             "id": "urn:x", "type": ["T"],
             "https://a/attr": [{"value": 1, "expiresAt": "2026-09-01T11:59:59,500Z"}]
         });
-        assert!(prune_expired_instances(&mut gone, now));
+        assert!(filter::prune_expired(&mut gone, now));
         assert!(gone.get("https://a/attr").is_none());
 
         // the entity-level sweep reads the same stamp the same way
@@ -2214,10 +2212,10 @@ mod tests {
             Kind::Entity,
             "urn:e",
             json!({"id": "urn:e", "type": ["T"],
-                "attr": [
+                "https://a/attr": [
                     {"type": "Property", "value": 1, "expiresAt": "2000-01-01T00:00:00Z"},
                     {"type": "Property", "value": 2, "expiresAt": "2999-01-01T00:00:00Z"}],
-                "gone": [
+                "https://a/gone": [
                     {"type": "Property", "value": 3, "expiresAt": "2000-01-01T00:00:00Z"}]}),
         )
         .await;
@@ -2226,7 +2224,7 @@ mod tests {
             Kind::Temporal,
             "urn:e",
             json!({"id": "urn:e", "type": ["T"],
-                "attr": [
+                "https://a/attr": [
                     {"value": 1, "expiresAt": "2000-01-01T00:00:00Z"},
                     {"value": 2, "expiresAt": "2999-01-01T00:00:00Z"},
                     {"value": 3}]}),
@@ -2234,13 +2232,16 @@ mod tests {
         .await;
         assert_eq!(s.sweep_expired("2026-01-01T00:00:00Z"), 2);
         let e = s.get(&t, Kind::Entity, "urn:e").expect("entity survives");
-        assert_eq!(e["attr"].as_array().expect("attr").len(), 1);
-        assert_eq!(e["attr"][0]["value"], 2);
-        assert!(e.get("gone").is_none(), "fully-expired attribute removed");
+        assert_eq!(e["https://a/attr"].as_array().expect("attr").len(), 1);
+        assert_eq!(e["https://a/attr"][0]["value"], 2);
+        assert!(
+            e.get("https://a/gone").is_none(),
+            "fully-expired attribute removed"
+        );
         let tp = s
             .get(&t, Kind::Temporal, "urn:e")
             .expect("temporal survives");
-        let vals: Vec<i64> = tp["attr"]
+        let vals: Vec<i64> = tp["https://a/attr"]
             .as_array()
             .expect("instances")
             .iter()

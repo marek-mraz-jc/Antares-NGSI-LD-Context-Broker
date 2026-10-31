@@ -313,6 +313,17 @@ fn check_endpoint_params(ep: &Map<String, Value>) -> Result<(), NgsiError> {
                      (RFC 7230, 6.3.8)"
                 )));
             }
+            // The Postgres store marks a sealed credential with this prefix
+            // (antares-sql seal::PREFIX) and opens every value carrying it
+            // on read: a client text with it stored without a key could
+            // never open again and fails the tenant's whole listing.
+            if v.is_some_and(|v| v.starts_with("enc:v1:")) {
+                return Err(bad(
+                    "endpoint.receiverInfo values may not start with \"enc:v1:\", \
+                     the broker's marker for a sealed credential"
+                        .into(),
+                ));
+            }
         }
     }
     // Table 5.2.15-1: cooldown and timeout are Numbers "Greater

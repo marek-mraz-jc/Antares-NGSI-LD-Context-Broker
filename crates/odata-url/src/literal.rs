@@ -170,6 +170,27 @@ pub(crate) fn is_duration(text: &str) -> bool {
     days_ok && time_ok && (!days.is_empty() || time.is_some())
 }
 
+/// Whether the JSON string `text` is a value of primitive type `name` in its
+/// ABNF form (OData JSON 7.1: Edm.Date, DateTimeOffset, TimeOfDay, Duration,
+/// Guid and Binary are strings, each in the lexical form its literal has);
+/// `true` for every other type. A body holds JSON text, so the `%3A`/`%2B`
+/// spellings a URL literal may use are refused here.
+pub fn is_primitive_text(name: &str, text: &str) -> bool {
+    let whole = |rule: fn(&mut Cursor<'_>) -> bool| {
+        let mut c = Cursor::new(text);
+        !text.contains('%') && rule(&mut c) && c.at_end()
+    };
+    match name {
+        "Edm.Date" => whole(|c| date(c).is_some()),
+        "Edm.DateTimeOffset" => whole(|c| date_time_offset(c).is_some()),
+        "Edm.TimeOfDay" => whole(|c| time_of_day(c).is_some()),
+        "Edm.Duration" => is_duration(text.strip_prefix('-').unwrap_or(text)),
+        "Edm.Guid" => whole(guid),
+        "Edm.Binary" => is_base64url(text),
+        _ => true,
+    }
+}
+
 /// `binaryValue` (ABNF): base64url (`A-Z a-z 0-9 - _`), padded with `=` to a multiple of four
 /// or unpadded; a length of one past a multiple of four encodes no whole byte.
 pub(crate) fn is_base64url(text: &str) -> bool {
@@ -888,6 +909,28 @@ mod tests {
         assert_eq!(number(&mut c), Some(Literal::Int(1)));
         assert_eq!(c.rest(), "foo");
         assert_eq!(read("INFf").unwrap(), None);
+    }
+
+    /// F-R2ANT4-012: a body string of a temporal, Guid or Binary type is
+    /// held to the literal's lexical form.
+    #[test]
+    fn a_body_string_holds_its_primitive_form() {
+        for (ty, good, bad) in [
+            ("Edm.Date", "2026-10-10", "yesterday"),
+            (
+                "Edm.DateTimeOffset",
+                "2026-10-10T10:00:00.5+02:00",
+                "2026-10-10",
+            ),
+            ("Edm.TimeOfDay", "23:59:60", "24:00"),
+            ("Edm.Duration", "-P1DT2H", "P"),
+            ("Edm.Guid", "01234567-89ab-cdef-0123-456789abcdef", "0123"),
+            ("Edm.Binary", "AQID", "A"),
+        ] {
+            assert!(is_primitive_text(ty, good), "{ty} {good}");
+            assert!(!is_primitive_text(ty, bad), "{ty} {bad}");
+        }
+        assert!(is_primitive_text("Edm.String", "anything"));
     }
 
     #[test]

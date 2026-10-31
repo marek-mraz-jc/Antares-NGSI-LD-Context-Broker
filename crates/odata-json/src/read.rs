@@ -290,8 +290,11 @@ impl<'m> Reader<'_, 'm> {
     fn single(&self, path: &str, name: &str, value: &Value) -> Result<(), BodyError> {
         let integer = |min: i64, max: i64| value.as_i64().is_some_and(|v| (min..=max).contains(&v));
         let fits = match name {
-            "Edm.String" | "Edm.Date" | "Edm.DateTimeOffset" | "Edm.TimeOfDay" | "Edm.Duration"
-            | "Edm.Guid" | "Edm.Binary" => value.is_string(),
+            "Edm.String" => value.is_string(),
+            "Edm.Date" | "Edm.DateTimeOffset" | "Edm.TimeOfDay" | "Edm.Duration" | "Edm.Guid"
+            | "Edm.Binary" => value
+                .as_str()
+                .is_some_and(|text| odata_url::is_primitive_text(name, text)),
             "Edm.Boolean" => value.is_boolean(),
             "Edm.Byte" => integer(0, 255),
             "Edm.SByte" => integer(-128, 127),

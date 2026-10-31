@@ -64,6 +64,7 @@ pub use ast::{
 pub use edm::EdmModel;
 pub use error::{Feature, LimitKind, UrlError, UrlErrorKind};
 pub use limits::Limits;
+pub use literal::is_primitive_text;
 pub use model::{Member, Model};
 pub use search::Search;
 
@@ -113,13 +114,20 @@ pub fn parse<M: Model>(uri: &str, model: &M, limits: &Limits) -> Result<ODataUri
                 .saturating_add(limits.max_query_len),
         });
     }
-    let normalized = normalize(uri);
+    let (normalized, decoded) = normalized(uri);
     let mut c = Cursor::new(&normalized);
-    let uri = relative_uri(&mut c, model, limits)?;
+    // the offset a caller reads is into the `uri` it passed, not into its
+    // normalized form: each decoded escape there is three bytes for one
+    let raw = |mut e: UrlError| {
+        let before = decoded.iter().take_while(|at| **at < e.offset).count();
+        e.offset = e.offset.saturating_add(before.saturating_mul(2));
+        e
+    };
+    let parsed = relative_uri(&mut c, model, limits).map_err(raw)?;
     if !c.at_end() {
-        return Err(c.syntax("end of URL"));
+        return Err(raw(c.syntax("end of URL")));
     }
-    Ok(uri)
+    Ok(parsed)
 }
 
 /// `odataRelativeUri`.
@@ -185,7 +193,13 @@ fn optional_query<'m, M: Model>(
 }
 
 /// RFC 3986 6.2.2.2: percent-encoded unreserved characters decoded, everything else kept.
+#[cfg(test)]
 fn normalize(uri: &str) -> Cow<'_, str> {
+    normalized(uri).0
+}
+
+/// [`normalize`]d `uri` and the offsets in it where an escape was decoded, ascending.
+fn normalized(uri: &str) -> (Cow<'_, str>, Vec<usize>) {
     let bytes = uri.as_bytes();
     let decoded = |i: usize| -> Option<u8> {
         let (Some(b'%'), Some(&hi), Some(&lo)) = (
@@ -203,12 +217,14 @@ fn normalize(uri: &str) -> Cow<'_, str> {
         (byte.is_ascii_alphanumeric() || b"-._~".contains(&byte)).then_some(byte)
     };
     if !(0..bytes.len()).any(|i| decoded(i).is_some()) {
-        return Cow::Borrowed(uri);
+        return (Cow::Borrowed(uri), Vec::new());
     }
     let mut out = String::with_capacity(uri.len());
+    let mut at = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         if let Some(plain) = decoded(i).filter(|plain| !escapes(&out, *plain)) {
+            at.push(out.len());
             out.push(char::from(plain));
             i = i.saturating_add(3);
         } else {
@@ -221,7 +237,7 @@ fn normalize(uri: &str) -> Cow<'_, str> {
             i = i.saturating_add(next.len_utf8());
         }
     }
-    Cow::Owned(out)
+    (Cow::Owned(out), at)
 }
 
 /// Whether `plain` after `out` would spell a new `%XX` (`%6%65` is not `%6e`): a hex digit after
