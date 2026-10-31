@@ -319,6 +319,14 @@ async fn lift_orphans(
             .filter(|(rt, _)| *rt == t)
             .flat_map(|(_, list)| list.iter().map(|r| r.name.as_str()))
             .collect();
+        // A Tenant whose attribute catalogue never listed the mark holds
+        // none: no scan, which under forced RLS reads every Entity of the
+        // Tenant (F-R2ANT3-008). A backend without a catalogue scans.
+        if let Ok(Some(pairs)) = state.store.entity_attr_pairs(&t).await {
+            if !pairs.iter().any(|(_, a)| a == QUARANTINE_RULES) {
+                continue;
+            }
+        }
         let lifted = match lift_in(state, &t, &current, &ts).await {
             Ok(lifted) => lifted,
             Err(e) => {

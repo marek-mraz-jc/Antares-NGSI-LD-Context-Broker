@@ -624,6 +624,12 @@ impl Reloader {
             .filter(|(id, d)| cache.get(id).is_none_or(|h| h.digest != *d))
             .map(|(id, _)| id.as_str())
             .collect();
+        // Nothing moved and nothing went: every table already holds what
+        // the store holds, so none is rebuilt (F-R2ANT3-015).
+        if stale.is_empty() && listed.len() == cache.len() {
+            drop(cache);
+            return rule_documents::reload(&self.state, &mut *self.policy.lock().await).await;
+        }
         // Only the bodies whose digest moved, the first reload's being all of them. A body
         // written between the two reads is held under the older digest and fetched again on
         // the next reload; one deleted between them is in neither, and goes.
@@ -1646,8 +1652,14 @@ mod tests {
         r.reload().await.expect("first");
         assert_eq!(fetched(), 2);
         let held = r.state.views.schema("city").expect("schema").bytes;
+        let table = r.state.views.snapshot();
         r.reload().await.expect("unchanged");
         assert_eq!(fetched(), 2, "an unchanged reload fetches nothing");
+        // F-R2ANT3-015: and rebuilds no table
+        assert!(
+            Arc::ptr_eq(&table, &r.state.views.snapshot()),
+            "the view table is kept"
+        );
         let kept = r.state.views.schema("city").expect("schema").bytes;
         assert!(Arc::ptr_eq(&held, &kept), "the schema read once is kept");
         let mut changed = base();

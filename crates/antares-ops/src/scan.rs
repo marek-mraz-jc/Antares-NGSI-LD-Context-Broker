@@ -372,7 +372,10 @@ pub fn pickable(name: &str) -> bool {
 
 /// Comma-joined and percent-encoded but for RFC 3986 unreserved characters.
 fn join<'a>(names: impl Iterator<Item = &'a str>) -> String {
-    names.map(crate::percent::encode).collect::<Vec<_>>().join(",")
+    names
+        .map(crate::percent::encode)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The Entities of a successful Query Entities answer, its `NGSILD-Results-Count` and whether

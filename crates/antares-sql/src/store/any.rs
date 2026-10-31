@@ -383,6 +383,20 @@ async fn count_instances(
     Ok(n.max(0) as u64)
 }
 
+/// How often an upsert runs its replace-then-create pair while concurrent
+/// creates and deletes of the same id keep taking the row from under it.
+#[cfg(feature = "postgres")]
+const UPSERT_ROUNDS: usize = 3;
+
+/// The refusal of an upsert that lost [`UPSERT_ROUNDS`] races: nothing was
+/// stored, so it never answers success.
+#[cfg(feature = "postgres")]
+fn upsert_raced() -> NgsiError {
+    NgsiError::InternalError(
+        "the entity was created and deleted concurrently; nothing was stored, try again".into(),
+    )
+}
+
 /// The longest the readiness ping waits for the database (see
 /// [`AnyStore::ping`]).
 #[cfg(feature = "postgres")]
@@ -693,50 +707,54 @@ impl AnyStore {
                 Kind::Entity => {
                     // replace-or-create without a pre-read: try the replace
                     // first (captures the true before-image under the row
-                    // lock), fall back to create, and on a lost create race
-                    // replace after all.
+                    // lock), else the create; a create that lost its race to
+                    // a writer whose row a delete took again finds nothing to
+                    // replace either, so the pair runs again (F-R2ANT3-003)
                     let mut prev: Option<Value> = None;
-                    // one shape, two places: a closure cannot hold the await
-                    // and an async closure is not a stable language feature,
-                    // so the replace is written once and expanded twice
-                    macro_rules! replace {
-                        () => {
-                            p.entities
-                                .mutate(tenant, id, |d| {
-                                    prev = Some(d.clone());
-                                    *d = doc.clone();
-                                    Ok::<(), std::convert::Infallible>(())
-                                })
-                                .await
-                                .map_err(db)?
-                                .is_some()
-                        };
-                    }
-                    let mut existed = replace!();
-                    if !existed {
+                    let mut existed = None;
+                    for _ in 0..UPSERT_ROUNDS {
+                        let replaced = p
+                            .entities
+                            .mutate(tenant, id, |d| {
+                                prev = Some(d.clone());
+                                *d = doc.clone();
+                                Ok::<(), std::convert::Infallible>(())
+                            })
+                            .await
+                            .map_err(db)?
+                            .is_some();
+                        if replaced {
+                            existed = Some(true);
+                            break;
+                        }
                         if p.entities.create(tenant, id, &doc).await.map_err(db)? {
-                            existed = false;
-                        } else {
-                            // lost the create race — replace instead
-                            existed = replace!();
+                            existed = Some(false);
+                            break;
                         }
                     }
+                    let existed = existed.ok_or_else(upsert_raced)?;
                     p.emit(tenant, prev, Some(doc)).await;
                     Ok(existed)
                 }
                 Kind::Temporal => {
-                    if p.temporal.create(tenant, id, &doc).await.map_err(db)? {
-                        Ok(false)
-                    } else {
-                        p.temporal
+                    for _ in 0..UPSERT_ROUNDS {
+                        if p.temporal.create(tenant, id, &doc).await.map_err(db)? {
+                            return Ok(false);
+                        }
+                        let replaced = p
+                            .temporal
                             .mutate(tenant, id, |d| {
                                 *d = doc.clone();
                                 Ok::<(), std::convert::Infallible>(())
                             })
                             .await
-                            .map_err(db)?;
-                        Ok(true)
+                            .map_err(db)?
+                            .is_some();
+                        if replaced {
+                            return Ok(true);
+                        }
                     }
+                    Err(upsert_raced())
                 }
                 _ => {
                     let dk = doc_kind(kind)?;
