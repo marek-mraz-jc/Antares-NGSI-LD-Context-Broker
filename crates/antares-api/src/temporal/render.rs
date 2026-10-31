@@ -205,13 +205,12 @@ pub(super) fn window(
         if scope_instances {
             carry_scope(&mut instances, v, tq);
         }
-        instances.sort_by(|a, b| {
-            // Canonicalize before comparing: '.' sorts before 'Z', so a raw
-            // string compare puts "…00.5Z" ahead of "…00Z" and lastN keeps the
-            // wrong instant. 4.6.3 allows both fraction spellings.
-            let ta = a.get(timeprop).and_then(Value::as_str).unwrap_or("");
-            let tb = b.get(timeprop).and_then(Value::as_str).unwrap_or("");
-            dt_key(ta).cmp(&dt_key(tb))
+        // Canonicalize before comparing: '.' sorts before 'Z', so a raw
+        // string compare puts "…00.5Z" ahead of "…00Z" and lastN keeps the
+        // wrong instant. 4.6.3 allows both fraction spellings. Cached: one
+        // key per instance, not two per comparison.
+        instances.sort_by_cached_key(|i| {
+            dt_key(i.get(timeprop).and_then(Value::as_str).unwrap_or(""))
         });
         w.more |= page_instances(&mut instances, page);
         if instances.is_empty() {
@@ -698,6 +697,12 @@ fn normalized_instance(inst: &Value, ctx: &Context, sys: bool) -> Value {
 
 pub(crate) fn parse_aggr_period(s: &str) -> Option<AggrPeriod> {
     let d = antares_model::parse_iso_duration(s)?;
+    // Buckets are whole seconds and whole months: a fraction (PT0.5S, P1.5M)
+    // would be truncated, and PT0.5S would turn into one bucket for the whole
+    // range. Refused instead of answered with other buckets than asked.
+    if !d.whole {
+        return None;
+    }
     // saturating: an absurd magnitude must not panic (debug) or wrap
     // (release) — f64→int `as` casts already saturate, guard the ops.
     let months = (d.years as u32)

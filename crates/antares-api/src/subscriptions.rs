@@ -119,6 +119,21 @@ fn norm_entity_selectors(v: &Value, ctx: &Context) -> Result<Value, NgsiError> {
 /// Subscription (5.2.12). Output-only members are dropped, every other
 /// member is held to its value space, and the Endpoint is checked by
 /// `check_endpoint_params`.
+/// Headers the notification client writes itself (RFC 7230 3.3, 5.4, 6.1),
+/// which a `receiverInfo` pair may not name.
+const CLIENT_OWNED_HEADERS: [&str; 10] = [
+    "Host",
+    "Content-Length",
+    "Transfer-Encoding",
+    "Connection",
+    "Keep-Alive",
+    "Proxy-Connection",
+    "TE",
+    "Trailer",
+    "Upgrade",
+    "Expect",
+];
+
 fn norm_notification(v: &Value, ctx: &Context) -> Result<Value, NgsiError> {
     let bad = NgsiError::BadRequestData;
     let n = v
@@ -181,6 +196,16 @@ fn norm_notification(v: &Value, ctx: &Context) -> Result<Value, NgsiError> {
         if n.get(key).is_some_and(|v| !v.is_boolean()) {
             return Err(bad(format!(
                 "notification.{key} must be a boolean (5.2.14)"
+            )));
+        }
+    }
+    // Table 5.2.14.1-1: all three are Arrays of String. Any other shape would
+    // be stored, skipped by the checks below and ignored at delivery, so an
+    // `omit: "secret"` would deliver the very Attribute it names.
+    for key in ["attributes", "pick", "omit"] {
+        if n.get(key).is_some_and(|v| !v.is_array() && !v.is_null()) {
+            return Err(bad(format!(
+                "notification.{key} must be an array of strings (5.2.14)"
             )));
         }
     }
@@ -311,6 +336,17 @@ fn check_endpoint_params(ep: &Map<String, Value>) -> Result<(), NgsiError> {
                 return Err(bad(format!(
                     "endpoint.receiverInfo entry {kv} is not a valid HTTP header \
                      (RFC 7230, 6.3.8)"
+                )));
+            }
+            // The HTTP client owns framing and connection headers (RFC 7230
+            // 3.3, 5.4, 6.1): a subscriber's Content-Length or
+            // Transfer-Encoding beside the client's own would desync any
+            // proxy on the way, and Host would aim the POST at another
+            // virtual host than endpoint.uri names.
+            if let Some(k) = k.filter(|k| CLIENT_OWNED_HEADERS.iter().any(|o| o.eq_ignore_ascii_case(k))) {
+                return Err(bad(format!(
+                    "endpoint.receiverInfo may not set the {k} header: the HTTP client sets \
+                     it (RFC 7230, 6.3.8)"
                 )));
             }
         }
@@ -1132,27 +1168,18 @@ pub async fn create(
         if let Some(url) = one_url {
             norm.insert("jsonldContext".into(), Value::String(url));
         } else {
-            // 5.13.2.4: "a locally unique identifier (URI)"
-            let local_id = format!("urn:uuid:{}", uuid::Uuid::new_v4());
-            let url = format!("{}/{local_id}", crate::contexts::base_url(headers));
-            st.store
-                .context_put(
-                    Some(&tenant),
-                    &local_id,
-                    serde_json::json!({
-                        "url": url,
-                        "localId": local_id,
-                        "kind": "ImplicitlyCreated",
-                        "createdAt": ts,
-                        // owned by the tenant whose subscription created it
-                        "owner": tenant.as_str(),
-                        "body": {"@context": parsed.ctx.source.clone()},
-                    }),
-                )
-                .await?;
-            st.loader
-                .put_local_for(&tenant, url.clone(), parsed.ctx.source.clone())
-                .await;
+            // Content-addressed and charged like every ImplicitlyCreated
+            // @context (contexts::host_implicit): a fresh row per
+            // Subscription grew the store without bound and outlived it.
+            let url = crate::contexts::host_implicit(st, &tenant, headers, &parsed.ctx.source)
+                .await?
+                .ok_or_else(|| {
+                    NgsiError::Conflict(
+                        "the tenant holds as many ImplicitlyCreated @contexts as it may \
+                         (13.1): name the @context of this Subscription by URL"
+                            .into(),
+                    )
+                })?;
             norm.insert("jsonldContext".into(), Value::String(url));
         }
     }
@@ -1805,6 +1832,49 @@ mod tests {
                 .is_ok(),
             "showChanges+normalized is fine"
         );
+    }
+
+    /// F-R2ANT2-003: a receiverInfo pair naming a framing or connection
+    /// header is refused; an ordinary custom header still passes.
+    #[test]
+    fn receiver_info_may_not_set_client_owned_headers() {
+        let ctx = Loader::new().core();
+        let sub = |key: &str| {
+            json!({
+                "type": "Subscription",
+                "entities": [{"type": "Building"}],
+                "notification": {"endpoint": {"uri": "http://localhost:1111/notify",
+                    "receiverInfo": [{"key": key, "value": "1"}]}}
+            })
+        };
+        for key in ["Host", "content-length", "Transfer-Encoding", "Connection"] {
+            assert!(
+                normalize_subscription(sub(key).as_object().unwrap(), &ctx, false).is_err(),
+                "receiverInfo {key} must be rejected"
+            );
+        }
+        assert!(normalize_subscription(sub("X-Api-Key").as_object().unwrap(), &ctx, false).is_ok());
+    }
+
+    /// F-R2ANT2-008: a projection member that is not an array is refused,
+    /// never stored to be ignored at delivery.
+    #[test]
+    fn non_array_projection_members_are_rejected() {
+        let ctx = Loader::new().core();
+        for key in ["attributes", "pick", "omit"] {
+            let doc = json!({
+                "type": "Subscription",
+                "entities": [{"type": "Building"}],
+                "notification": {
+                    key: "secret",
+                    "endpoint": {"uri": "http://localhost:1111/notify"}
+                }
+            });
+            assert!(
+                normalize_subscription(doc.as_object().unwrap(), &ctx, false).is_err(),
+                "notification.{key}: \"secret\" must be rejected"
+            );
+        }
     }
 
     /// Table 5.2.14.1-1 p.119: "Empty array (0 length) is not allowed" on

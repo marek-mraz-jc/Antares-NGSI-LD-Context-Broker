@@ -766,6 +766,9 @@ mod clause_4_5_19 {
             Some(AggrPeriod::Months(1, 3600))
         );
         // the pure forms are unchanged
+        // F-R2ANT2-015: a fraction is refused, never truncated
+        assert_eq!(parse_aggr_period("PT0.5S"), None);
+        assert_eq!(parse_aggr_period("P1.5M"), None);
         assert_eq!(parse_aggr_period("PT0S"), Some(AggrPeriod::Whole));
         assert_eq!(parse_aggr_period("P0D"), Some(AggrPeriod::Whole));
         assert_eq!(parse_aggr_period("P1M"), Some(AggrPeriod::Months(1, 0)));

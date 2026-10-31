@@ -197,6 +197,78 @@ const MAX_IMPLICIT_CONTEXTS: usize = 1_000;
 /// ~390 KB; T-5895). The count cap alone let 1 000 of them hold ~390 MB.
 const IMPLICIT_HEAP_PER_TEXT_BYTE: u64 = 4;
 
+/// Host the inline @context `source` as Tenant `tenant`'s ImplicitlyCreated
+/// @context (TS 104 175 13.1) and answer its URL; `None` past
+/// [`MAX_IMPLICIT_CONTEXTS`] or past the Tenant's share of the memory budget
+/// in bytes. The local id is content-addressed per Tenant, so the same
+/// @context is one row behind one URL whoever asks for it.
+pub(crate) async fn host_implicit(
+    st: &AppState,
+    tenant: &TenantId,
+    headers: &HeaderMap,
+    source: &Value,
+) -> ApiResult<Option<String>> {
+    let body = serde_json::to_vec(source)
+        .map_err(|e| NgsiError::InternalError(format!("@context not serializable: {e}")))?;
+    let mut h = Sha256::new();
+    h.update(tenant.as_str().as_bytes());
+    h.update([0]);
+    h.update(&body);
+    let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let local_id = format!("urn:ngsi-ld:Context:v{hex}");
+    Ok(match st.store.context_get(Some(tenant), &local_id).await? {
+        Some(row) if row_visible(&row, tenant) => {
+            row.get("url").and_then(Value::as_str).map(str::to_owned)
+        }
+        Some(_) => None,
+        None => {
+            let rows = st.store.context_list_meta(Some(tenant)).await?;
+            let implicit = rows.iter().filter(|r| {
+                r.get("kind").and_then(Value::as_str) == Some("ImplicitlyCreated")
+                    && row_visible(r, tenant)
+            });
+            let (held, held_bytes) = implicit.fold((0usize, 0u64), |(n, b), r| {
+                let bytes = r.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+                (n.saturating_add(1), b.saturating_add(bytes))
+            });
+            let charge = u64::try_from(body.len()).unwrap_or(u64::MAX);
+            let over_bytes = held_bytes
+                .saturating_add(charge)
+                .saturating_mul(IMPLICIT_HEAP_PER_TEXT_BYTE)
+                > st.implicit_context_bytes;
+            if held >= MAX_IMPLICIT_CONTEXTS || over_bytes {
+                tracing::warn!(
+                    tenant = tenant.as_str(),
+                    "ImplicitlyCreated @context cap reached"
+                );
+                None
+            } else {
+                let url = format!("{}/{local_id}", base_url(headers));
+                st.store
+                    .context_put(
+                        Some(tenant),
+                        &local_id,
+                        json!({
+                            "url": url,
+                            "localId": local_id,
+                            "kind": "ImplicitlyCreated",
+                            "createdAt": now_iso(),
+                            "owner": tenant.as_str(),
+                            // its charge against the Tenant's byte cap
+                            "bytes": charge,
+                            "body": {"@context": source.clone()},
+                        }),
+                    )
+                    .await?;
+                st.loader
+                    .put_local_for(tenant, url.clone(), source.clone())
+                    .await;
+                Some(url)
+            }
+        }
+    })
+}
+
 /// 6.3.6: an "application/json" response "shall include a Link to the
 /// associated JSON-LD @context", and a Link carries a URL. An inline @context
 /// (an object, or an array of more than one entry) has none, so the broker
@@ -221,65 +293,7 @@ pub(crate) async fn linkable(
     if accept != Accept::Json || !inline {
         return Ok(Arc::clone(ctx));
     }
-    let body = serde_json::to_vec(&ctx.source)
-        .map_err(|e| NgsiError::InternalError(format!("@context not serializable: {e}")))?;
-    let mut h = Sha256::new();
-    h.update(tenant.as_str().as_bytes());
-    h.update([0]);
-    h.update(&body);
-    let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    let local_id = format!("urn:ngsi-ld:Context:v{hex}");
-    let url = match st.store.context_get(Some(tenant), &local_id).await? {
-        Some(row) if row_visible(&row, tenant) => {
-            row.get("url").and_then(Value::as_str).map(str::to_owned)
-        }
-        Some(_) => None,
-        None => {
-            let rows = st.store.context_list_meta(Some(tenant)).await?;
-            let implicit = rows.iter().filter(|r| {
-                r.get("kind").and_then(Value::as_str) == Some("ImplicitlyCreated")
-                    && row_visible(r, tenant)
-            });
-            let (held, held_bytes) = implicit.fold((0usize, 0u64), |(n, b), r| {
-                let bytes = r.get("bytes").and_then(Value::as_u64).unwrap_or(0);
-                (n.saturating_add(1), b.saturating_add(bytes))
-            });
-            let charge = u64::try_from(body.len()).unwrap_or(u64::MAX);
-            let over_bytes = held_bytes
-                .saturating_add(charge)
-                .saturating_mul(IMPLICIT_HEAP_PER_TEXT_BYTE)
-                > st.implicit_context_bytes;
-            if held >= MAX_IMPLICIT_CONTEXTS || over_bytes {
-                tracing::warn!(
-                    tenant = tenant.as_str(),
-                    "ImplicitlyCreated @context cap reached; Link names the Core @context"
-                );
-                None
-            } else {
-                let url = format!("{}/{local_id}", base_url(headers));
-                st.store
-                    .context_put(
-                        Some(tenant),
-                        &local_id,
-                        json!({
-                            "url": url,
-                            "localId": local_id,
-                            "kind": "ImplicitlyCreated",
-                            "createdAt": now_iso(),
-                            "owner": tenant.as_str(),
-                            // its charge against the Tenant's byte cap
-                            "bytes": charge,
-                            "body": {"@context": ctx.source.clone()},
-                        }),
-                    )
-                    .await?;
-                st.loader
-                    .put_local_for(tenant, url.clone(), ctx.source.clone())
-                    .await;
-                Some(url)
-            }
-        }
-    };
+    let url = host_implicit(st, tenant, headers, &ctx.source).await?;
     Ok(match url {
         Some(url) => {
             let mut linked = Context::clone(ctx);

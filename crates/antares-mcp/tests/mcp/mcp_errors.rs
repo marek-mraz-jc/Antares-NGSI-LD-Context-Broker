@@ -60,3 +60,35 @@ async fn errors_carry_no_hidden_name_and_no_inner_detail() -> Result<(), String>
     assert!(!out_of_view.text.contains("Car:3"), "{}", out_of_view.text);
     Ok(())
 }
+
+/// F-R2ANT2-010: a tool call reads its inner answer through the broker's
+/// answer bound and pool, as every other surface does: past the bound the
+/// call fails with 413 instead of buffering on the side.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tool_call_reads_its_answer_under_the_answer_bound() -> Result<(), String> {
+    let broker = antares_ops::test_kit::TestBroker::with_max_answer_bytes(4096).await?;
+    let app = broker.serve(antares_mcp::Mcp)?;
+    crate::common::create(
+        &app,
+        "small",
+        &json!({"id": "urn:ngsi-ld:Car:long", "type": "Car",
+                "note": crate::common::prop(&json!("n".repeat(10_000)))}),
+    )
+    .await?;
+    crate::common::put_view(
+        &app,
+        &json!({"id": "small", "tenant": "small", "selector": ["Car"],
+                "rules": [{"types": ["Car"], "attributes": ["note"]}],
+                "operations": ["query_entities"]}),
+    )
+    .await?;
+    let answer = call(&app, "small", "query_entities", json!({"type": ["Car"]})).await;
+    assert!(answer.is_error(), "{}", answer.text);
+    assert_eq!(
+        answer.structured().pointer("/error/status"),
+        Some(&json!(413)),
+        "{}",
+        answer.text
+    );
+    Ok(())
+}

@@ -355,3 +355,36 @@ async fn an_export_in_one_byte_chunks_imports_like_one_piece() {
         read(&source, "/q/tenants/air/digest", None).await
     );
 }
+
+/// F-R2ANT2-009: an Entity exported without history (retained away at the
+/// source) arrives without history, so both sides digest alike.
+#[tokio::test]
+async fn an_entity_without_history_imports_without_history() {
+    let (source, target) = (state().await, state().await);
+    seeded(&source, "bare").await;
+    let tenant = antares_model::TenantId::new("bare").expect("tenant");
+    assert!(source
+        .temporal
+        .delete(&tenant, "urn:ngsi-ld:Room:2")
+        .await
+        .expect("delete history"));
+    let before = read(&source, "/q/tenants/bare/digest", None).await;
+
+    let (status, why) = import(&target, "bare", export(&source, "bare").await).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{why}");
+    assert_eq!(read(&target, "/q/tenants/bare/digest", None).await, before);
+}
+
+/// F-R2ANT2-002: with ANTARES_TEMPORAL naming a second backend the history
+/// is not in the store the export pages, so it refuses rather than drop it.
+#[tokio::test]
+async fn an_export_refuses_history_held_by_a_second_backend() {
+    let mut st = AppState::new("antares-test".into());
+    st.temporal = AppState::new("second".into()).temporal.clone();
+    st.temporal_name = Some("second".into());
+    antares_api::wire(&mut st).await;
+    seeded(&st, "split").await;
+    let (status, body) = call(&st, "GET", "/q/tenants/split/export", "", None, false).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(String::from_utf8_lossy(&body).contains("ANTARES_TEMPORAL=second"));
+}
