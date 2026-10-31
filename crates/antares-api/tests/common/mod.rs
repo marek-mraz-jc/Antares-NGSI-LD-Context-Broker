@@ -34,6 +34,7 @@ pub struct Double {
     rows_read: AtomicUsize,
     registration_reads: AtomicUsize,
     tenant_probes: AtomicUsize,
+    wedged: AtomicBool,
 }
 
 impl Double {
@@ -56,6 +57,7 @@ impl Double {
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
+            wedged: AtomicBool::new(false),
         }
     }
 
@@ -79,6 +81,7 @@ impl Double {
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
+            wedged: AtomicBool::new(false),
         }
     }
 
@@ -102,6 +105,7 @@ impl Double {
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
+            wedged: AtomicBool::new(false),
         }
     }
 
@@ -127,6 +131,7 @@ impl Double {
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
+            wedged: AtomicBool::new(false),
         }
     }
 
@@ -164,6 +169,7 @@ impl Double {
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
+            wedged: AtomicBool::new(false),
         }
     }
 
@@ -187,6 +193,7 @@ impl Double {
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
+            wedged: AtomicBool::new(false),
         }
     }
 
@@ -210,6 +217,7 @@ impl Double {
             rows_read: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
+            wedged: AtomicBool::new(false),
         }
     }
 
@@ -217,6 +225,12 @@ impl Double {
     /// a bound is asserted from.
     pub fn passthrough(inner: Arc<dyn CurrentStateDriver>) -> Self {
         Self::flaky_list(inner, 0)
+    }
+
+    /// From now on the store reports itself wedged, as a Postgres store does
+    /// whose pool leaked every slot (T-6182); `false` undoes it.
+    pub fn set_wedged(&self, wedged: bool) {
+        self.wedged.store(wedged, Ordering::SeqCst);
     }
 
     /// How many `query_entities` calls arrived with no page — reads the store
@@ -333,6 +347,9 @@ impl CurrentStateDriver for Double {
 
     async fn ping(&self) -> Result<(), NgsiError> {
         self.inner.ping().await
+    }
+    async fn wedged(&self) -> bool {
+        self.wedged.load(Ordering::SeqCst)
     }
     async fn close(&self) {
         self.inner.close().await;

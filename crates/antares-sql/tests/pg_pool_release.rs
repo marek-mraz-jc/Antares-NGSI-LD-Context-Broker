@@ -345,3 +345,116 @@ async fn a_statement_failing_after_its_request_left_gives_the_slot_back() {
         );
     }
 }
+
+/// T-6182: N requests dropped at once while their statements run (and then
+/// fail), and right after, N requests at once each get a slot within the
+/// pool's acquire timeout. Prod (2026-10-30, an image without T-6000's
+/// release fix) held 13 of 13 slots for 16 h this way. Run it with ssl=on:
+/// without TLS the close hang cannot occur and it passes either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn n_requests_dropped_mid_statement_leave_n_slots_to_acquire() {
+    const N: u32 = 4;
+    let url = require_db!();
+    let pool = antares_sql::store::pg::connect_with(&url, N, Duration::from_secs(30))
+        .await
+        .expect("pool");
+    let acquire = pool.options().get_acquire_timeout();
+    // The hang shows from the second drop on a reused connection.
+    for round in 0..3 {
+        let dropped: Vec<_> = (0..N)
+            .map(|_| {
+                let p = pool.clone();
+                tokio::spawn(tokio::time::timeout(
+                    Duration::from_millis(50),
+                    async move {
+                        let mut tx = p.begin().await?;
+                        sqlx::query(
+                            "SELECT n / 0 FROM (SELECT count(*)::int AS n FROM pg_sleep(0.2)) s",
+                        )
+                        .execute(&mut *tx)
+                        .await?;
+                        tx.commit().await
+                    },
+                ))
+            })
+            .collect();
+        for d in dropped {
+            assert!(
+                d.await.expect("joined").is_err(),
+                "round {round}: a request finished inside 50 ms"
+            );
+        }
+        let started = std::time::Instant::now();
+        let fresh: Vec<_> = (0..N)
+            .map(|_| {
+                let p = pool.clone();
+                tokio::spawn(async move {
+                    let mut tx = p.begin().await?;
+                    sqlx::query("SELECT 1").execute(&mut *tx).await?;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    tx.commit().await
+                })
+            })
+            .collect();
+        for f in fresh {
+            f.await
+                .expect("joined")
+                .unwrap_or_else(|e| panic!("round {round}: a fresh acquire after the drops: {e}"));
+        }
+        assert!(
+            started.elapsed() < acquire,
+            "round {round}: {N} acquires took {:?}, past the {acquire:?} acquire timeout",
+            started.elapsed()
+        );
+    }
+}
+
+/// T-6182: liveness fails only for a leaked pool. With every slot held past
+/// the bound and the database answering a fresh connection, the store is
+/// wedged; once a slot is back, readiness and liveness recover.
+#[tokio::test]
+async fn a_pool_held_past_the_bound_is_wedged_until_a_slot_returns() {
+    use antares_sql::store::any::{AnyStore, PgBackend};
+    let url = require_db!();
+    let pool = antares_sql::store::pg::connect_with(&url, 1, Duration::from_secs(30))
+        .await
+        .expect("pool");
+    let store = AnyStore::Pg(PgBackend::new(pool.clone()).with_wedged_after(Duration::ZERO));
+    store.ping().await.expect("ready with a free slot");
+    assert!(!store.wedged().await, "a serving pool is not wedged");
+    let held = pool.acquire().await.expect("the only slot");
+    assert!(store.ping().await.is_err(), "not ready without a slot");
+    assert!(store.wedged().await, "every slot held past the bound");
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while store.ping().await.is_err() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("ready again once the slot returns");
+    assert!(!store.wedged().await, "a slot came back: not wedged");
+}
+
+/// A lost database is not a leak: a restart fixes nothing, so liveness
+/// stays green however long readiness fails. Needs no database.
+#[tokio::test]
+async fn a_lost_database_never_reads_as_wedged() {
+    use antares_sql::store::any::{AnyStore, PgBackend};
+    // Bound and never listening: every connect is refused.
+    let sock = tokio::net::TcpSocket::new_v4().expect("socket");
+    sock.bind("127.0.0.1:0".parse().expect("addr"))
+        .expect("bind");
+    let port = sock.local_addr().expect("addr").port();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect_lazy(&format!("postgres://antares@127.0.0.1:{port}/antares"))
+        .expect("lazy pool");
+    let store = AnyStore::Pg(PgBackend::new(pool).with_wedged_after(Duration::ZERO));
+    for _ in 0..3 {
+        assert!(store.ping().await.is_err(), "no database, not ready");
+        assert!(!store.wedged().await, "no database, still live");
+    }
+    drop(sock);
+}

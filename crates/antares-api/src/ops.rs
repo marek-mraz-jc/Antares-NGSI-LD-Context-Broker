@@ -131,7 +131,8 @@ pub const GIT_HASH: &str = env!("ANTARES_GIT_HASH");
 /// running, what they are, every configured cap with its rejection counters,
 /// the mounted surfaces and the notification schemes they can deliver to.
 /// 503 while draining, so a load balancer stops routing here before the
-/// listener stops accepting.
+/// listener stops accepting, and 503 while the store is wedged
+/// ([`antares_store::CurrentStateDriver::wedged`]), so the liveness probe restarts the pod.
 pub(super) async fn health(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: axum::http::HeaderMap,
@@ -141,7 +142,11 @@ pub(super) async fn health(
     // This flips BEFORE the listener stops accepting, which is the whole point
     // of the ordering: the LB must stop routing while the socket still works.
     let draining = state.draining.load(std::sync::atomic::Ordering::Relaxed);
-    let code = if draining {
+    // A store that can no longer serve until the process restarts (a leaked
+    // pool, T-6182) fails liveness, so the kubelet restarts the pod instead
+    // of leaving it not-ready for hours.
+    let wedged = !draining && state.store.wedged().await;
+    let code = if draining || wedged {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::OK
@@ -149,7 +154,14 @@ pub(super) async fn health(
     let mut body = serde_json::Map::new();
     body.insert(
         "status".into(),
-        (if draining { "DRAINING" } else { "UP" }).into(),
+        (if draining {
+            "DRAINING"
+        } else if wedged {
+            "STORE_WEDGED"
+        } else {
+            "UP"
+        })
+        .into(),
     );
     body.insert("store".into(), state.store_name.clone().into());
     body.insert(

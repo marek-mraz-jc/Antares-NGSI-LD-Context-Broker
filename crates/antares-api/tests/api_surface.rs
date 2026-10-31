@@ -69,6 +69,24 @@ async fn admin_is_mounted_by_default_and_survives_a_second_surface() {
     assert_eq!(get_path(&st, "/x/ping").await.0, StatusCode::OK);
 }
 
+/// T-6182: a store wedged for good (a leaked pool) fails liveness, so the
+/// kubelet restarts the pod; readiness alone left prod not-ready for 16 h.
+/// Once the store serves again, liveness is green again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wedged_store_fails_liveness_until_it_serves_again() {
+    let mut st = AppState::new("surfaces".into());
+    let store = std::sync::Arc::new(crate::common::Double::passthrough(st.store.clone()));
+    st.store = store.clone();
+    assert_eq!(get_path(&st, "/q/health").await.0, StatusCode::OK);
+    store.set_wedged(true);
+    let (code, body) = get_path(&st, "/q/health").await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let body: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(body["status"], "STORE_WEDGED");
+    store.set_wedged(false);
+    assert_eq!(get_path(&st, "/q/health").await.0, StatusCode::OK);
+}
+
 /// The NGSI-LD API root belongs to the spec: a surface may not mount there,
 /// nor anywhere outside the reserved prefixes.
 #[tokio::test(flavor = "multi_thread")]
