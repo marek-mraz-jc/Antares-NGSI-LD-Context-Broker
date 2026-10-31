@@ -283,15 +283,18 @@ async fn forward_deletes(
             );
         } else if reg.supports("deleteEntity") {
             // F-R2ANT1-014: one request per Entity, as many at once as a fan-out sends
-            let ctx_url = &ctx_url;
-            let answers = crate::federation::fan_out(sent_ids.iter().collect(), |id| async move {
-                (
-                    id,
-                    forward_delete(st, tenant, headers, reg, ctx_url, id).await,
-                )
-            })
-            .await;
-            for (id, status) in answers {
+            let mut statuses = Vec::with_capacity(sent_ids.len());
+            for chunk in sent_ids.chunks((*crate::bounds::MAX_FED_FANOUT).max(1)) {
+                statuses.extend(
+                    futures_util::future::join_all(
+                        chunk
+                            .iter()
+                            .map(|id| forward_delete(st, tenant, headers, reg, &ctx_url, id)),
+                    )
+                    .await,
+                );
+            }
+            for (id, status) in sent_ids.iter().zip(statuses) {
                 if (200..300).contains(&status) && status != 207 {
                     remote.ok.push((id.clone(), false));
                 } else {
