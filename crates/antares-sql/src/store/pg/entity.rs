@@ -136,15 +136,28 @@ fn extract(doc: &Value) -> Extracted {
     }
 }
 
-/// The earliest instance `expiresAt` of an internal doc's Attributes,
-/// canonicalised for the `::timestamptz` cast; an Entity member never counts.
+/// The earliest instance `expiresAt` of an internal doc's Attributes at any
+/// depth (a sub-Attribute expires too, 4.22), canonicalised for the
+/// `::timestamptz` cast; an Entity member never counts.
 fn first_instance_expiry(doc: &Value) -> Option<String> {
-    doc.as_object()?
-        .iter()
-        .filter(|(k, _)| !antares_model::ENTITY_META_KEYS.contains(&k.as_str()))
-        .filter_map(|(_, v)| v.as_array())
-        .flatten()
-        .filter_map(|inst| inst.get("expiresAt").and_then(Value::as_str))
+    fn instances<'a>(doc: &'a Value, out: &mut Vec<&'a str>) {
+        let Some(obj) = doc.as_object() else {
+            return;
+        };
+        for inst in obj
+            .iter()
+            .filter(|(k, _)| k.contains(':'))
+            .filter_map(|(_, v)| v.as_array())
+            .flatten()
+        {
+            out.extend(inst.get("expiresAt").and_then(Value::as_str));
+            instances(inst, out);
+        }
+    }
+    let mut stamps = Vec::new();
+    instances(doc, &mut stamps);
+    stamps
+        .into_iter()
         .min_by_key(|s| antares_model::dt_key(s))
         .map(|s| antares_store::filter::canonical_datetime(s).into_owned())
 }
@@ -223,6 +236,10 @@ pub const MAX_UNDECIDED_ROWS: i64 = 10_000;
 /// top-level instances dropped, an Attribute left with none removed, as
 /// `filter::strip_expired` does in memory (F-ANT1-007). A live row pays
 /// only the CASE test.
+// ponytail: only top-level instances are stripped here; a sub-Attribute past
+// its expiresAt still matches a `q` until the sweep, which reaches the row
+// through `attrs_expire_at`, rewrites it (one maintenance tick). Recurse here
+// if that lag ever matters.
 const LIVE_ENTITY: &str = "(CASE WHEN attrs_expire_at IS NULL OR attrs_expire_at >= now() \
      THEN entity ELSE (SELECT coalesce(jsonb_object_agg(l.k, l.v), '{}'::jsonb) FROM \
       (SELECT x.k, CASE WHEN jsonb_typeof(x.v) = 'array' AND strpos(x.k, ':') > 0 \
@@ -2227,7 +2244,7 @@ pub(super) async fn prune_expired_current(
             let id: String = r.get(0);
             let mut doc: Value = r.get(1);
             let now: String = r.get(2);
-            crate::store::mem::prune_expired_instances(&mut doc, &now);
+            antares_store::filter::prune_expired(&mut doc, &now);
             let e = extract(&doc);
             let rewritten = sqlx::query(
                 "UPDATE entities SET entity = $3,
@@ -2512,6 +2529,16 @@ mod tests {
             !e.location_ambiguous,
             "a row without a location must stay excludable in SQL"
         );
+    }
+
+    /// F-R2ANT4-008: a sub-Attribute's `expiresAt` counts for
+    /// `attrs_expire_at`, so the sweep and LIVE_ENTITY reach the row.
+    #[test]
+    fn extract_reads_the_earliest_expiry_at_any_depth() {
+        let e = extract(&json!({"id": "urn:x", "https://a/attr": [{"value": 1,
+            "expiresAt": "2030-01-01T00:00:00Z",
+            "https://a/sub": [{"value": 3, "expiresAt": "2029-01-01T00:00:00Z"}]}]}));
+        assert_eq!(e.attrs_expire.as_deref(), Some("2029-01-01T00:00:00Z"));
     }
 
     /// The rest of `extract`: `type`/`scope` accept the string form and the

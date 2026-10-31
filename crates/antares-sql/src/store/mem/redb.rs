@@ -17,6 +17,9 @@ use antares_store::Kind;
 // Table per resource family, named after the spec resource, snake_cased.
 // The v0 memory store keeps one temporal doc per entity, so `attr_instances`
 // has no separate table; entityMaps are TTL-ephemeral and not durable state.
+/// A table of the shadow file: byte keys to byte values.
+pub(super) type Table = TableDefinition<'static, &'static [u8], &'static [u8]>;
+
 pub(super) const T_ENTITIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("entities");
 pub(super) const T_SUBSCRIPTIONS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("subscriptions");
@@ -40,7 +43,7 @@ pub(super) const T_META: TableDefinition<&str, &str> = TableDefinition::new("met
 /// or newer file refuses to load rather than being misread as valid data.
 pub(super) const FORMAT_VERSION: &str = "1";
 
-pub(super) fn table_for(kind: Kind) -> TableDefinition<'static, &'static [u8], &'static [u8]> {
+pub(super) fn table_for(kind: Kind) -> Table {
     match kind {
         Kind::Entity => T_ENTITIES,
         Kind::Subscription => T_SUBSCRIPTIONS,
@@ -86,17 +89,22 @@ impl Shadow {
     /// hold, which is the one lie a durable store must never tell.
     /// (Deliberately abort-on-commit-failure; per-request error plumbing only
     /// if a recoverable commit failure mode ever shows up in practice.)
-    pub(super) fn write(
+    pub(super) fn write(&self, table: Table, key: &[u8], value: Option<&[u8]>) {
+        self.write_many(std::iter::once((table, key, value)));
+    }
+
+    /// Every `(table, key, value)` of `writes` in one txn, fsynced once: a
+    /// purge or a sweep holds the write lock for one commit, not one per key
+    /// (F-R2ANT4-011). `None` deletes the key.
+    pub(super) fn write_many<'a>(
         &self,
-        table: TableDefinition<&[u8], &[u8]>,
-        key: &[u8],
-        value: Option<&[u8]>,
+        writes: impl IntoIterator<Item = (Table, &'a [u8], Option<&'a [u8]>)>,
     ) {
         let result = (|| -> Result<(), String> {
             let mut tx = self.db.begin_write().map_err(|e| e.to_string())?;
             tx.set_durability(Durability::Immediate)
                 .map_err(|e| e.to_string())?;
-            {
+            for (table, key, value) in writes {
                 let mut t = tx.open_table(table).map_err(|e| e.to_string())?;
                 match value {
                     Some(v) => {

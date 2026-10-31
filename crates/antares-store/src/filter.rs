@@ -285,23 +285,44 @@ pub fn strip_expired(doc: &mut Value, now: &str) -> bool {
     if expired_at(doc, now) {
         return true;
     }
-    if let Some(obj) = doc.as_object_mut() {
-        let mut empty: Vec<String> = Vec::new();
-        for (k, v) in obj.iter_mut() {
-            let Some(arr) = v.as_array_mut().filter(|_| k.contains(':')) else {
-                continue;
-            };
-            let before = arr.len();
-            arr.retain_mut(|inst| !strip_expired(inst, now));
-            if before > 0 && arr.is_empty() {
+    prune_expired(doc, now);
+    false
+}
+
+/// The stored half of [`strip_expired`]: drop the expired instances of every
+/// Attribute of `doc` at every depth, an Attribute left with none removed,
+/// without judging `doc`'s own `expiresAt` (the Entity reap owns that).
+/// Whether `doc` changed. Both store arms sweep with it (4.22 "should be
+/// deleted"), so a sweep removes what a read hides.
+pub fn prune_expired(doc: &mut Value, now: &str) -> bool {
+    let Some(obj) = doc.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    let mut empty: Vec<String> = Vec::new();
+    for (k, v) in obj.iter_mut() {
+        let Some(arr) = v.as_array_mut().filter(|_| k.contains(':')) else {
+            continue;
+        };
+        let before = arr.len();
+        arr.retain_mut(|inst| {
+            if expired_at(inst, now) {
+                return false;
+            }
+            changed |= prune_expired(inst, now);
+            true
+        });
+        if arr.len() != before {
+            changed = true;
+            if arr.is_empty() {
                 empty.push(k.clone());
             }
         }
-        for k in empty {
-            obj.remove(&k);
-        }
     }
-    false
+    for k in empty {
+        obj.remove(&k);
+    }
+    changed
 }
 
 /// What a temporal query produced. `paged` = LIMIT/OFFSET (and the
@@ -322,6 +343,20 @@ pub struct TemporalOutcome {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// F-R2ANT4-008: an expired sub-Attribute goes from the stored doc too,
+    /// and the doc reports the change, so a sweep rewrites the row.
+    #[test]
+    fn a_sweep_prunes_an_expired_sub_attribute() {
+        let now = "2026-09-01T12:00:00Z";
+        let mut doc = json!({"id": "urn:x", "type": ["T"],
+            "https://a/attr": [{"value": 1,
+                "https://a/sub": [{"value": 3, "expiresAt": "2026-09-01T11:00:00Z"}]}]});
+        assert!(prune_expired(&mut doc, now));
+        assert!(doc["https://a/attr"][0].get("https://a/sub").is_none());
+        assert_eq!(doc["https://a/attr"][0]["value"], 1);
+        assert!(!prune_expired(&mut doc, now), "nothing left to prune");
+    }
 
     const NOW: &str = "2026-08-08T12:00:00.000Z";
 

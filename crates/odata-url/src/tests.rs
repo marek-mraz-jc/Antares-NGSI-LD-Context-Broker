@@ -834,6 +834,34 @@ fn normalisation() {
     refused("B%C3%A4ume", Feature::NonAsciiIdentifier, 1);
 }
 
+/// F-R2ANT4-016: an `&` inside a string literal starts no option, so the
+/// `$apply` pre-scan does not read one out of a filter's text.
+#[test]
+fn an_ampersand_in_a_literal_starts_no_option() {
+    for uri in [
+        "Buildings?$filter=name%20eq%20'x&$apply=aggregate($count%20as%20n)'",
+        "Buildings?$filter=name%20eq%20%27x&$apply=aggregate($count%20as%20n)%27",
+    ] {
+        let o = options(uri);
+        assert!(o.apply.is_none(), "{uri}: {:?}", o.apply);
+        assert!(o.filter.is_some(), "{uri}");
+    }
+}
+
+/// F-R2ANT4-015: an offset is into the URL as given, so a name after decoded
+/// escapes is placed past the path, not inside it (odata-axum answers 404 or
+/// 400 by that offset).
+#[test]
+fn an_offset_counts_the_escapes_before_it() {
+    let plain =
+        parse("Sensors?$filter=nope eq 1", &Service, &Limits::strict()).expect_err("unknown name");
+    let escaped = parse("%53%65nsors?$filter=nope eq 1", &Service, &Limits::strict())
+        .expect_err("unknown name");
+    assert_eq!(escaped.kind, plain.kind);
+    assert_eq!(plain.offset, 16);
+    assert_eq!(escaped.offset, 20, "{escaped:?}");
+}
+
 #[test]
 fn a_form_encoded_query_reads_as_written_plain() {
     // T-3719: `%24` names a system option, `+` is whitespace where `RWS` stands, `%2F` and

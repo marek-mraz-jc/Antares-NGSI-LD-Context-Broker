@@ -57,8 +57,9 @@ const MEMBERS: usize = 100;
 /// notifications publishes the newest ten.
 const NEWEST: usize = 10;
 
-/// The most resources one topic remembers; past it the memory starts over, and the next change
-/// of each resource is published once more than needed.
+/// The most digests one connection remembers over all its topics (a resource is one, a
+/// collection one per member); past it the memory starts over, and the next change of each
+/// resource is published once more than needed.
 const MAX_SEEN: usize = 10_000;
 
 /// The most Entity types a Subscription of a view lists.
@@ -66,6 +67,10 @@ const MAX_TYPES: usize = 64;
 
 /// The most Entities of one notification a set topic re-reads.
 const MAX_ENTITIES: usize = 100;
+
+/// The most reads one notification makes, pages and members together. A changed member past it
+/// is left unremembered, so the next notification of its topic reads and publishes it.
+const MAX_READS: usize = 100;
 
 /// What a topic names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,6 +274,55 @@ enum Seen {
     Members(HashMap<String, u64>),
 }
 
+impl Seen {
+    /// The digests it holds.
+    fn weight(&self) -> usize {
+        match self {
+            Self::One(_) => 1,
+            Self::Members(m) => m.len().max(1),
+        }
+    }
+}
+
+/// What every topic of one connection last published, keyed by Subscription and probe path,
+/// held to [`MAX_SEEN`] digests.
+#[derive(Default)]
+struct Memory {
+    probes: HashMap<String, Seen>,
+    digests: usize,
+}
+
+impl Memory {
+    fn key(sub: &str, path: &str) -> String {
+        format!("{sub}\0{path}")
+    }
+
+    fn get(&self, sub: &str, path: &str) -> Option<&Seen> {
+        self.probes.get(&Self::key(sub, path))
+    }
+
+    /// Keep what `path` of `sub` read last, starting over past [`MAX_SEEN`] digests.
+    fn remember(&mut self, sub: &str, path: &str, seen: Seen) {
+        let key = Self::key(sub, path);
+        if let Some(old) = self.probes.remove(&key) {
+            self.digests = self.digests.saturating_sub(old.weight());
+        }
+        if self.digests.saturating_add(seen.weight()) > MAX_SEEN {
+            self.probes.clear();
+            self.digests = 0;
+        }
+        self.digests = self.digests.saturating_add(seen.weight());
+        self.probes.insert(key, seen);
+    }
+
+    /// Drop what `sub` remembered: its topic is gone.
+    fn forget(&mut self, sub: &str) {
+        let prefix = Self::key(sub, "");
+        self.probes.retain(|k, _| !k.starts_with(&prefix));
+        self.digests = self.probes.values().map(Seen::weight).sum();
+    }
+}
+
 /// One subscribed topic.
 struct Watch {
     /// As the client subscribed: the topic every message of it is published on.
@@ -276,7 +330,6 @@ struct Watch {
     parsed: Topic,
     /// Its NGSI-LD Subscription.
     sub: String,
-    seen: HashMap<String, Seen>,
 }
 
 fn digest(bytes: &[u8]) -> u64 {
@@ -310,8 +363,10 @@ struct Reader {
 }
 
 impl Reader {
-    /// The body of a `200` read of `rest` below the root; `None` for any other answer.
-    async fn get(&self, rest: &str) -> Option<axum::body::Bytes> {
+    /// The body of a `200` read of `rest` below the root; `None` for any other answer, and
+    /// without a read when `reads` is spent.
+    async fn get(&self, rest: &str, reads: &mut usize) -> Option<axum::body::Bytes> {
+        *reads = reads.checked_sub(1)?;
         let path = if rest.is_empty() {
             self.root.clone()
         } else {
@@ -323,24 +378,27 @@ impl Reader {
     }
 }
 
-/// Re-read `probe` for `watch` and remember it: what changed since the last read, each the
-/// read of one resource (none when `publish` is false); `None` when the probe cannot be read.
+/// Re-read `probe` for `watch` and remember it in `memory`: what changed since the last read,
+/// each the read of one resource (none when `publish` is false), at most `reads` reads; `None`
+/// when the probe cannot be read.
 async fn reread(
     reader: &Reader,
-    watch: &mut Watch,
+    watch: &Watch,
+    memory: &mut Memory,
     probe: &Probe,
     publish: bool,
+    reads: &mut usize,
 ) -> Option<Vec<axum::body::Bytes>> {
-    let select = watch.parsed.select.clone();
+    let select = watch.parsed.select.as_deref();
     let (seen, mut out) = if probe.collection {
         let page: Value =
-            serde_json::from_slice(&reader.get(&probe.page()).await?).unwrap_or_default();
-        let before = match watch.seen.get(&probe.path) {
+            serde_json::from_slice(&reader.get(&probe.page(), reads).await?).unwrap_or_default();
+        let before = match memory.get(&watch.sub, &probe.path) {
             Some(Seen::Members(m)) => m.clone(),
             _ => HashMap::new(),
         };
         let mut now = HashMap::new();
-        let mut changed = Vec::new();
+        let mut out = Vec::new();
         for member in page
             .get("value")
             .and_then(Value::as_array)
@@ -352,22 +410,24 @@ async fn reread(
                 .map(Value::to_string)
                 .unwrap_or_default();
             let h = digest(member.to_string().as_bytes());
-            if before.get(&id) != Some(&h) {
-                changed.extend(member_path(member).map(|p| selected(p, select.as_deref())));
+            if publish && before.get(&id) != Some(&h) {
+                let Some(path) = member_path(member) else {
+                    now.insert(id, h);
+                    continue;
+                };
+                if *reads == 0 {
+                    // read by the next notification of this topic
+                    continue;
+                }
+                out.extend(reader.get(&selected(path, select), reads).await);
             }
             now.insert(id, h);
         }
-        let mut out = Vec::new();
-        for path in changed.iter().filter(|_| publish) {
-            out.extend(reader.get(path).await);
-        }
         (Seen::Members(now), out)
     } else {
-        let body = reader
-            .get(&selected(&probe.path, select.as_deref()))
-            .await?;
+        let body = reader.get(&selected(&probe.path, select), reads).await?;
         let h = digest(&body);
-        let same = matches!(watch.seen.get(&probe.path), Some(Seen::One(o)) if *o == h);
+        let same = matches!(memory.get(&watch.sub, &probe.path), Some(Seen::One(o)) if *o == h);
         (
             Seen::One(h),
             vec![body].into_iter().filter(|_| !same).collect(),
@@ -376,16 +436,8 @@ async fn reread(
     if !publish {
         out.clear();
     }
-    remember(&mut watch.seen, &probe.path, seen);
+    memory.remember(&watch.sub, &probe.path, seen);
     Some(out)
-}
-
-/// Keep what `path` read last, starting over past [`MAX_SEEN`] paths.
-fn remember(memory: &mut HashMap<String, Seen>, path: &str, seen: Seen) {
-    if memory.len() >= MAX_SEEN && !memory.contains_key(path) {
-        memory.clear();
-    }
-    memory.insert(path.to_owned(), seen);
 }
 
 /// Why a connection ended.
@@ -409,6 +461,7 @@ struct Session {
     rate: Rate,
     generation: u64,
     watches: Vec<Watch>,
+    seen: Memory,
 }
 
 impl Session {
@@ -454,7 +507,11 @@ impl Session {
         };
         // the set or the resource must be one the caller reads now
         let visible = match &parsed.target {
-            Target::Set(set) => self.reader.get(&format!("{set}?$top=1")).await.is_some(),
+            Target::Set(set) => self
+                .reader
+                .get(&format!("{set}?$top=1"), &mut 1)
+                .await
+                .is_some(),
             Target::Resource { .. } => true,
         };
         let types = view.watched_types().await;
@@ -485,17 +542,18 @@ impl Session {
         }
         let probe = parsed.target.probe(urn.as_deref().unwrap_or_default());
         let resource = matches!(parsed.target, Target::Resource { .. });
-        let mut watch = Watch {
+        let watch = Watch {
             topic: text.to_owned(),
             parsed,
             sub: id.clone(),
-            seen: HashMap::new(),
         };
         // subscribed before it is read, so no change between the two is lost
         if resource
-            && reread(&self.reader, &mut watch, &probe, false)
-                .await
-                .is_none()
+            && reread(&self.reader, &watch, &mut self.seen, &probe, false, &mut {
+                MAX_READS
+            })
+            .await
+            .is_none()
         {
             let _deleted = socket::unsubscribe(&self.conn, &id).await;
             return mqtt::SUBACK_FAILURE;
@@ -507,6 +565,7 @@ impl Session {
     async fn unwatch(&mut self, text: &str) {
         if let Some(at) = self.watches.iter().position(|w| w.topic == text) {
             let w = self.watches.remove(at);
+            self.seen.forget(&w.sub);
             let _deleted = socket::unsubscribe(&self.conn, &w.sub).await;
         }
     }
@@ -520,7 +579,7 @@ impl Session {
             .unwrap_or_default();
         let reader = self.reader.clone();
         // a notification of a topic unsubscribed meanwhile finds none
-        let watch = self.watches.iter_mut().find(|w| w.sub == sub)?;
+        let watch = self.watches.iter().find(|w| w.sub == sub)?;
         let probes: Vec<Probe> = match &watch.parsed.target {
             t @ Target::Resource { .. } => vec![t.probe("")],
             t @ Target::Set(_) => message
@@ -534,9 +593,13 @@ impl Session {
                 .collect(),
         };
         let mut bodies = Vec::new();
+        let mut reads = MAX_READS;
         for probe in &probes {
+            if reads == 0 {
+                break;
+            }
             bodies.extend(
-                reread(&reader, watch, probe, true)
+                reread(&reader, watch, &mut self.seen, probe, true, &mut reads)
                     .await
                     .into_iter()
                     .flatten(),
@@ -574,7 +637,7 @@ impl Session {
                     keep_alive,
                     ..
                 } => {
-                    if self.reader.get("").await.is_none() {
+                    if self.reader.get("", &mut 1).await.is_none() {
                         let _sent = self.write(mqtt::connack(mqtt::rc::NOT_AUTHORIZED)).await;
                         return Some(self.close("not authorized").await);
                     }
@@ -727,6 +790,7 @@ pub(crate) async fn serve(
         renewed: now,
         generation,
         watches: Vec::new(),
+        seen: Memory::default(),
     };
     tracing::info!(connection = %session.conn.id, view = %session.view, "sta mqtt opened");
     let reason = match session.run().await {
@@ -844,14 +908,48 @@ mod tests {
 
     #[test]
     fn the_memory_of_a_topic_starts_over_past_its_bound() {
-        let mut memory = HashMap::new();
+        let mut memory = Memory::default();
         for i in 0..MAX_SEEN {
-            remember(&mut memory, &i.to_string(), Seen::One(0));
+            memory.remember("s", &i.to_string(), Seen::One(0));
         }
-        remember(&mut memory, "0", Seen::One(1));
-        assert_eq!(memory.len(), MAX_SEEN, "a known path is replaced");
-        remember(&mut memory, "new", Seen::One(1));
-        assert_eq!(memory.len(), 1, "a new path past the bound starts over");
+        memory.remember("s", "0", Seen::One(1));
+        assert_eq!(memory.probes.len(), MAX_SEEN, "a known path is replaced");
+        memory.remember("s", "new", Seen::One(1));
+        assert_eq!(
+            memory.probes.len(),
+            1,
+            "a new path past the bound starts over"
+        );
+    }
+
+    /// F-R2ANT4-001: a collection weighs one digest per member, and every topic of the
+    /// connection shares the bound, so 100 Things of 100 Datastreams on each of two topics hold
+    /// at most `MAX_SEEN` digests, not two times 100 paths of 100 members.
+    #[test]
+    fn the_memory_of_a_connection_counts_members_over_all_its_topics() {
+        let members = |n: usize| Seen::Members((0..n).map(|i| (i.to_string(), 0)).collect());
+        let mut memory = Memory::default();
+        for sub in ["a", "b"] {
+            for thing in 0..MAX_SEEN / MEMBERS {
+                memory.remember(sub, &thing.to_string(), members(MEMBERS));
+            }
+        }
+        let held: usize = memory
+            .probes
+            .values()
+            .map(|s| match s {
+                Seen::One(_) => 1,
+                Seen::Members(m) => m.len(),
+            })
+            .sum();
+        assert!(held <= MAX_SEEN, "{held} digests held");
+        assert_eq!(held, memory.digests);
+        memory.forget("b");
+        assert!(memory.probes.keys().all(|k| k.starts_with("a\0")));
+        assert_eq!(
+            memory.digests,
+            memory.probes.values().map(Seen::weight).sum::<usize>()
+        );
     }
 
     #[test]

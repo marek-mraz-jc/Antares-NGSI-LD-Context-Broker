@@ -422,3 +422,47 @@ async fn sta_mqtt_a_connection_without_connect_closes() -> Result<(), String> {
     );
     Ok(())
 }
+
+/// F-R2ANT4-005: one notification makes at most 100 reads, its page and members together; a
+/// changed member past them is published by the next notification of its topic, not lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn sta_mqtt_one_notification_reads_a_bounded_number_of_resources() -> Result<(), String> {
+    let b = broker(Limits::default()).await?;
+    view(&b, "m8", &READS).await?;
+    car(&b, "urn:ngsi-ld:Car:1", 1).await?;
+    let link = |id: &str| format!("http://h/x/views/m8/sta/v1.1/Datastreams('{id}')");
+    let members: Vec<Value> = (0..100)
+        .map(|i| {
+            let id = format!("d{i}");
+            sta(
+                &format!("m8/Datastreams('{id}')"),
+                200,
+                &json!({"name": id}),
+            );
+            json!({"@iot.id": id, "@iot.selfLink": link(&id)})
+        })
+        .collect();
+    sta(
+        "m8/Things('urn:ngsi-ld:Car:1')/Datastreams?$top=100",
+        200,
+        &json!({"value": members}),
+    );
+    sta("m8/Datastreams?$top=1", 200, &json!({"value": []}));
+    let mut ws = connected(&b, "m8", 0).await?;
+    send(&mut ws, subscribe(1, &["v1.1/Datastreams"])).await?;
+    assert_eq!(next(&mut ws, WAIT).await?, Some(vec![0x90, 3, 0, 1, 0]));
+    speed(&b, "urn:ngsi-ld:Car:1", 2).await?;
+    assert_eq!(drained(&mut ws).await, 99, "the page took one of 100 reads");
+    speed(&b, "urn:ngsi-ld:Car:1", 3).await?;
+    assert_eq!(drained(&mut ws).await, 1, "the member left over comes next");
+    Ok(())
+}
+
+/// How many messages arrive before two seconds of silence.
+async fn drained(ws: &mut Socket) -> usize {
+    let mut n = 0_usize;
+    while let Ok(Some(_)) = next(ws, Duration::from_secs(2)).await {
+        n = n.saturating_add(1);
+    }
+    n
+}

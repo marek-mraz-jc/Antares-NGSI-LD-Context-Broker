@@ -164,6 +164,14 @@ mod w1_to_w20 {
             (json!({"area": "x"}), invalid("area")),
             (json!({"price": "1"}), invalid("price")),
             (json!({"built": 1}), invalid("built")),
+            // F-R2ANT4-012: a string typed clients cannot read back
+            (json!({"built": "yesterday"}), invalid("built")),
+            (json!({"built": "2026-13-01"}), invalid("built")),
+            (json!({"createdAt": "2026-10-10"}), invalid("createdAt")),
+            (
+                json!({"createdAt": "2026-10-10T10%3A00Z"}),
+                invalid("createdAt"),
+            ),
             (json!({"active": "true"}), invalid("active")),
             (json!({"shape": "x"}), invalid("shape")),
             (json!({"odd": 1}), invalid("odd")),

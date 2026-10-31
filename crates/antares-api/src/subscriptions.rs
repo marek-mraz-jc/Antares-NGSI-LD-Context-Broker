@@ -338,6 +338,17 @@ fn check_endpoint_params(ep: &Map<String, Value>) -> Result<(), NgsiError> {
                      (RFC 7230, 6.3.8)"
                 )));
             }
+            // The Postgres store marks a sealed credential with this prefix
+            // (antares-sql seal::PREFIX) and opens every value carrying it
+            // on read: a client text with it stored without a key could
+            // never open again and fails the tenant's whole listing.
+            if v.is_some_and(|v| v.starts_with("enc:v1:")) {
+                return Err(bad(
+                    "endpoint.receiverInfo values may not start with \"enc:v1:\", \
+                     the broker's marker for a sealed credential"
+                        .into(),
+                ));
+            }
             // The HTTP client owns framing and connection headers (RFC 7230
             // 3.3, 5.4, 6.1): a subscriber's Content-Length or
             // Transfer-Encoding beside the client's own would desync any
