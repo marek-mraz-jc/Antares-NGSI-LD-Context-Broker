@@ -120,9 +120,12 @@ fn in_scope(id: &str, doc: &Value, scope: antares_store::HistoryScope<'_>) -> bo
     }
 }
 
+/// The instant of an attribute instance that carries no timestamp at all.
+pub(crate) const EPOCH: &str = "1970-01-01T00:00:00Z";
+
 /// The instant an attribute instance is kept by, the same fallback the
-/// Postgres arm's `observed_at` column takes.
-fn instance_instant(inst: &Value) -> Option<&str> {
+/// Postgres arm's `observed_at` column takes (`None`: [`EPOCH`] there).
+pub(crate) fn instance_instant(inst: &Value) -> Option<&str> {
     ["observedAt", "modifiedAt", "deletedAt", "createdAt"]
         .iter()
         .find_map(|k| inst.get(*k).and_then(Value::as_str))

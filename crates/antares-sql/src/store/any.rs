@@ -2344,16 +2344,19 @@ impl antares_store::TemporalDriver for AnyStore {
                     )
                     .ok()
                 };
-                // an instance goes when it was observed at or before the cut;
-                // a cut that is no DateTime erases nothing
+                // an instance goes when it was observed at or before the cut,
+                // timed as the Postgres arm's `observed_at` column times it
+                // (F-R2ANT3-006: one recorded without observedAt survived the
+                // start-up re-apply here); a cut that is no DateTime erases
+                // nothing
                 let cut = before.map(instant);
                 let goes = |i: &Value| match cut {
                     None => true,
                     Some(cut) => {
-                        let at = i
-                            .get("observedAt")
-                            .and_then(Value::as_str)
-                            .and_then(instant);
+                        let at = instant(
+                            crate::store::mem::instance_instant(i)
+                                .unwrap_or(crate::store::mem::EPOCH),
+                        );
                         cut.zip(at).is_some_and(|(cut, at)| at <= cut)
                     }
                 };
@@ -2714,6 +2717,45 @@ mod temporal_only_tests {
             .await
             .expect("recorded");
         assert_eq!(doc["speed"][0]["value"], 1);
+    }
+
+    /// F-R2ANT3-006: an erasure cut times an instance without observedAt
+    /// by its other stamps, as the Postgres arm's `observed_at` does, and
+    /// one with no stamp at all by the epoch.
+    #[tokio::test]
+    async fn an_erasure_cut_times_an_instance_without_observed_at() {
+        use antares_store::TemporalDriver;
+        let store = AnyStore::Mem(Store::default()).temporal_only();
+        let t = TenantId::new("erase").expect("tenant");
+        let shell = serde_json::json!({"id": "urn:a", "type": ["T"]});
+        let adds = serde_json::json!({"speed": [
+            {"instanceId": "urn:i:1", "value": 1, "createdAt": "2026-01-01T00:00:00Z"},
+            {"instanceId": "urn:i:2", "value": 2, "modifiedAt": "2026-03-01T00:00:00Z"},
+            {"instanceId": "urn:i:3", "value": 3},
+            {"instanceId": "urn:i:4", "value": 4, "observedAt": "2026-03-01T00:00:00Z",
+             "createdAt": "2026-01-01T00:00:00Z"},
+        ]});
+        store
+            .temporal_append(&t, "urn:a", &shell, &adds)
+            .await
+            .expect("append");
+        let gone = store
+            .erase(&t, "urn:a", None, Some("2026-02-01T00:00:00Z"))
+            .await
+            .expect("erase");
+        assert_eq!(gone, 2, "the createdAt one and the unstamped one");
+        let doc = store.get(&t, Kind::Temporal, "urn:a").await.expect("get");
+        let left: Vec<_> = doc
+            .as_ref()
+            .and_then(|d| d["speed"].as_array())
+            .map_or(Vec::new(), |l| {
+                l.iter().map(|i| i["value"].clone()).collect()
+            });
+        assert_eq!(
+            left,
+            [serde_json::json!(2), serde_json::json!(4)],
+            "{doc:?}"
+        );
     }
 }
 
