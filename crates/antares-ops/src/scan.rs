@@ -5,8 +5,6 @@
 //! upstream cursor within [`RESIDUAL_SCAN`]; a count or a residual sort reads the whole answer
 //! when it fits the budget and is refused before any evaluation when it does not.
 
-use std::fmt::Write as _;
-
 use axum::http::Method;
 use axum::response::Response;
 use serde_json::Value;
@@ -374,20 +372,10 @@ pub fn pickable(name: &str) -> bool {
 
 /// Comma-joined and percent-encoded but for RFC 3986 unreserved characters.
 fn join<'a>(names: impl Iterator<Item = &'a str>) -> String {
-    let mut out = String::new();
-    for (i, name) in names.enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        for b in name.bytes() {
-            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-                out.push(char::from(b));
-            } else {
-                let _ = write!(out, "%{b:02X}");
-            }
-        }
-    }
-    out
+    names
+        .map(crate::percent::encode)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The Entities of a successful Query Entities answer, its `NGSILD-Results-Count` and whether

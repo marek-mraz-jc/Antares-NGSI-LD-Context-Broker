@@ -19,18 +19,15 @@
 //! The generated regex is OURS; the only client-supplied text inside it is a
 //! literal segment, which is regex-escaped and then travels as a bind.
 
+use antares_ql::scope::MAX_SCOPE_Q_BYTES;
 use antares_ql::sql::CompiledSql;
-
-/// Longest `scopeQ` compiled. One pattern is one bind and the whole thing is
-/// unbounded upstream (a POST query body carries it too), so past this ceiling
-/// the statement could ask for more placeholders than the wire protocol has —
-/// and a refusal only means the matcher does the work.
-const MAX_SCOPE_Q_BYTES: usize = 4096;
 
 /// Compile `scope_q` into a predicate over `col` (a `text[]`).
 /// `None` = outside the exact subset; the caller filters in memory.
 pub fn compile_scope_q(scope_q: &str, col: &'static str, first_bind: usize) -> Option<CompiledSql> {
-    // A NUL has no representation in a `text` value, so binding one raises in
+    // Past the bound the API refuses (one pattern is one bind, and a longer
+    // one could ask for more placeholders than the wire protocol has) the
+    // matcher does the work. A NUL has no representation in a `text` value, so binding one raises in
     // the database — a 500 in `postgres` mode for a query `memory` mode
     // answers (`antares_ql::sql::literal` refuses one for the same reason).
     if scope_q.len() > MAX_SCOPE_Q_BYTES || scope_q.contains('\0') {

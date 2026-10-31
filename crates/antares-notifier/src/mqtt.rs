@@ -66,15 +66,32 @@ impl MqttEndpoint {
         if topic.is_empty() {
             return Err(bad(format!("mqtt endpoint {safe:?} has no topic")));
         }
+        // MQTT 3.1.1 4.7.1 and 5.0 4.7.3: a PUBLISH topic holds no wildcard,
+        // and 1.5.3 / 1.5.4: no U+0000 and at most 65 535 bytes. A topic
+        // past those fails every delivery, so the Subscription is refused.
+        if topic.contains(['+', '#', '\0']) || topic.len() > usize::from(u16::MAX) {
+            return Err(bad(format!(
+                "mqtt endpoint {safe:?}: the topic may hold no '+', '#' or NUL and at most 65535 bytes"
+            )));
+        }
         let (userinfo, hostport) = match authority.rsplit_once('@') {
             Some((u, h)) => (Some(u), h),
             None => (None, authority),
         };
+        // RFC 3986 3.2.1: the userinfo is percent-encoded, so a password
+        // holding `@`, `:` or `/` reaches the broker decoded.
+        let decode = |part: &str| {
+            percent_decoded(part).ok_or_else(|| {
+                bad(format!(
+                    "mqtt endpoint {safe:?}: broken percent-encoding in the userinfo"
+                ))
+            })
+        };
         let (username, password) = match userinfo {
             None => (None, None),
             Some(u) => match u.split_once(':') {
-                Some((user, pass)) => (Some(user.to_owned()), Some(pass.to_owned())),
-                None => (Some(u.to_owned()), None),
+                Some((user, pass)) => (Some(decode(user)?), Some(decode(pass)?)),
+                None => (Some(decode(u)?), None),
             },
         };
         // Deliberately no IPv6-literal hosts — the binding's URI convention
@@ -100,6 +117,22 @@ impl MqttEndpoint {
             topic: topic.to_owned(),
         })
     }
+}
+
+/// `text` with each `%XX` decoded; `None` for a broken escape or bytes that
+/// are no UTF-8.
+fn percent_decoded(text: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut bytes = text.bytes();
+    while let Some(b) = bytes.next() {
+        out.push(if b == b'%' {
+            let hex = [bytes.next()?, bytes.next()?];
+            u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?
+        } else {
+            b
+        });
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Table 7.2-1 protocol parameters from `notification.endpoint.notifierInfo`.
@@ -154,17 +187,19 @@ impl MqttParams {
 /// reuse one another's authenticated connection. Keys are map keys only:
 /// never log them.
 fn pool_key(ep: &MqttEndpoint, params: MqttParams) -> String {
-    // The password participates via a one-way hash so the plaintext never
-    // sits in a map key. DefaultHasher collisions are acceptable here — a
-    // collision only merges two pool slots, it does not skip broker-side
-    // authentication.
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    ep.password.hash(&mut h);
+    // The password participates via a hash so the plaintext never sits in a
+    // map key, keyed per process: nobody outside can aim a password at
+    // another one's hash, and a collision would hand one principal's
+    // authenticated connection to another (F-R2ANT3-011). The username goes
+    // in length-prefixed, since a decoded one may hold any character.
+    static KEY: std::sync::OnceLock<std::collections::hash_map::RandomState> =
+        std::sync::OnceLock::new();
+    use std::hash::BuildHasher;
+    let user = ep.username.as_deref().unwrap_or("");
     format!(
-        "{}:{:016x}:{}@{}:{}/v{}",
-        ep.username.as_deref().unwrap_or(""),
-        h.finish(),
+        "{}:{user}:{:016x}:{}@{}:{}/v{}",
+        user.len(),
+        KEY.get_or_init(Default::default).hash_one(&ep.password),
         ep.secure,
         ep.host,
         ep.port,
@@ -821,6 +856,43 @@ mod tests {
         // no password vs some password are different principals too
         let none = MqttEndpoint::parse("mqtt://u@host/t").expect("none");
         assert_ne!(pool_key(&a, p), pool_key(&none, p));
+        // a decoded username may hold `:`: it never reads as another split
+        let colon = MqttEndpoint::parse("mqtt://u%3Asecret-one@host/t").expect("colon");
+        assert_ne!(pool_key(&a, p), pool_key(&colon, p));
+    }
+
+    /// F-R2ANT3-012: the userinfo is percent-decoded (RFC 3986 3.2.1), and a
+    /// broken escape is refused.
+    #[test]
+    fn the_userinfo_is_percent_decoded() {
+        let e = MqttEndpoint::parse("mqtt://us%3Aer:p%40ss%2Fw@host/t").expect("encoded");
+        assert_eq!(e.username.as_deref(), Some("us:er"));
+        assert_eq!(e.password.as_deref(), Some("p@ss/w"));
+        for broken in [
+            "mqtt://u:p%4@host/t",
+            "mqtt://u%zz@host/t",
+            "mqtt://u:%ff@host/t",
+        ] {
+            assert!(MqttEndpoint::parse(broken).is_err(), "{broken}");
+        }
+    }
+
+    /// F-R2ANT3-007: a topic no PUBLISH may carry is refused at parse.
+    #[test]
+    fn a_topic_no_publish_may_carry_is_refused() {
+        let long = format!("mqtt://h/{}", "a".repeat(65_536));
+        for uri in [
+            "mqtt://h/a/+/b",
+            "mqtt://h/a/#",
+            "mqtt://h/a\0b",
+            long.as_str(),
+        ] {
+            assert!(MqttEndpoint::parse(uri).is_err(), "{:.40}", uri);
+        }
+        assert!(
+            MqttEndpoint::parse("mqtt://h/a/b?x=1").is_ok(),
+            "`?` is a topic character"
+        );
     }
 
     /// The mqtts trust store is loaded once and the same shared rustls

@@ -216,17 +216,7 @@ fn empty_page(headers: &HeaderMap, pairs: &[(String, String)]) -> Response {
 /// A query string from decoded pairs: every byte outside RFC 3986's
 /// unreserved set percent-encoded.
 fn encode(pairs: &[(String, String)]) -> String {
-    let one = |s: &str| {
-        s.bytes()
-            .map(|b| {
-                if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-                    char::from(b).to_string()
-                } else {
-                    format!("%{b:02X}")
-                }
-            })
-            .collect::<String>()
-    };
+    use crate::percent::encode as one;
     pairs
         .iter()
         .map(|(k, v)| format!("{}={}", one(k), one(v)))

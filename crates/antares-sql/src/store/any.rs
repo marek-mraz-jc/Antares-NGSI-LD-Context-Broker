@@ -383,6 +383,46 @@ async fn count_instances(
     Ok(n.max(0) as u64)
 }
 
+/// How often an upsert runs its replace-then-create pair while concurrent
+/// creates and deletes of the same id keep taking the row from under it.
+#[cfg(feature = "postgres")]
+const UPSERT_ROUNDS: usize = 3;
+
+/// The refusal of an upsert that lost [`UPSERT_ROUNDS`] races: nothing was
+/// stored, so it never answers success.
+#[cfg(feature = "postgres")]
+fn upsert_raced() -> NgsiError {
+    NgsiError::InternalError(
+        "the entity was created and deleted concurrently; nothing was stored, try again".into(),
+    )
+}
+
+/// An upsert's two steps, `first` then `second` (each an expression that
+/// awaits whether it took the row), until one of them took it: whether
+/// `first` did. A create that lost its race to a writer whose row a delete
+/// took again finds nothing to replace either, so the pair runs again, and
+/// after [`UPSERT_ROUNDS`] the upsert is refused: it never answers success
+/// for a write that stored nothing (F-R2ANT3-003). A macro, not an async
+/// fn over closures: the steps' futures stay concrete, so the caller's
+/// stays `Send`.
+#[cfg(feature = "postgres")]
+macro_rules! upsert_rounds {
+    ($first:expr, $second:expr) => {{
+        let mut took = Err(upsert_raced());
+        for _ in 0..UPSERT_ROUNDS {
+            if $first {
+                took = Ok(true);
+                break;
+            }
+            if $second {
+                took = Ok(false);
+                break;
+            }
+        }
+        took
+    }};
+}
+
 /// The longest the readiness ping waits for the database (see
 /// [`AnyStore::ping`]).
 #[cfg(feature = "postgres")]
@@ -691,53 +731,37 @@ impl AnyStore {
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => match kind {
                 Kind::Entity => {
-                    // replace-or-create without a pre-read: try the replace
-                    // first (captures the true before-image under the row
-                    // lock), fall back to create, and on a lost create race
-                    // replace after all.
+                    // replace-or-create without a pre-read: the replace first
+                    // (it captures the true before-image under the row lock),
+                    // else the create
                     let mut prev: Option<Value> = None;
-                    // one shape, two places: a closure cannot hold the await
-                    // and an async closure is not a stable language feature,
-                    // so the replace is written once and expanded twice
-                    macro_rules! replace {
-                        () => {
-                            p.entities
-                                .mutate(tenant, id, |d| {
-                                    prev = Some(d.clone());
-                                    *d = doc.clone();
-                                    Ok::<(), std::convert::Infallible>(())
-                                })
-                                .await
-                                .map_err(db)?
-                                .is_some()
-                        };
-                    }
-                    let mut existed = replace!();
-                    if !existed {
-                        if p.entities.create(tenant, id, &doc).await.map_err(db)? {
-                            existed = false;
-                        } else {
-                            // lost the create race — replace instead
-                            existed = replace!();
-                        }
-                    }
-                    p.emit(tenant, prev, Some(doc)).await;
-                    Ok(existed)
-                }
-                Kind::Temporal => {
-                    if p.temporal.create(tenant, id, &doc).await.map_err(db)? {
-                        Ok(false)
-                    } else {
-                        p.temporal
+                    let existed = upsert_rounds!(
+                        p.entities
                             .mutate(tenant, id, |d| {
+                                prev = Some(d.clone());
                                 *d = doc.clone();
                                 Ok::<(), std::convert::Infallible>(())
                             })
                             .await
-                            .map_err(db)?;
-                        Ok(true)
-                    }
+                            .map_err(db)?
+                            .is_some(),
+                        p.entities.create(tenant, id, &doc).await.map_err(db)?
+                    )?;
+                    p.emit(tenant, prev, Some(doc)).await;
+                    Ok(existed)
                 }
+                Kind::Temporal => upsert_rounds!(
+                    p.temporal.create(tenant, id, &doc).await.map_err(db)?,
+                    p.temporal
+                        .mutate(tenant, id, |d| {
+                            *d = doc.clone();
+                            Ok::<(), std::convert::Infallible>(())
+                        })
+                        .await
+                        .map_err(db)?
+                        .is_some()
+                )
+                .map(|created: bool| !created),
                 _ => {
                     let dk = doc_kind(kind)?;
                     p.docs.upsert(tenant, dk, id, &doc).await.map_err(db)
@@ -2344,16 +2368,19 @@ impl antares_store::TemporalDriver for AnyStore {
                     )
                     .ok()
                 };
-                // an instance goes when it was observed at or before the cut;
-                // a cut that is no DateTime erases nothing
+                // an instance goes when it was observed at or before the cut,
+                // timed as the Postgres arm's `observed_at` column times it
+                // (F-R2ANT3-006: one recorded without observedAt survived the
+                // start-up re-apply here); a cut that is no DateTime erases
+                // nothing
                 let cut = before.map(instant);
                 let goes = |i: &Value| match cut {
                     None => true,
                     Some(cut) => {
-                        let at = i
-                            .get("observedAt")
-                            .and_then(Value::as_str)
-                            .and_then(instant);
+                        let at = instant(
+                            crate::store::mem::instance_instant(i)
+                                .unwrap_or(crate::store::mem::EPOCH),
+                        );
                         cut.zip(at).is_some_and(|(cut, at)| at <= cut)
                     }
                 };
@@ -2715,6 +2742,45 @@ mod temporal_only_tests {
             .expect("recorded");
         assert_eq!(doc["speed"][0]["value"], 1);
     }
+
+    /// F-R2ANT3-006: an erasure cut times an instance without observedAt
+    /// by its other stamps, as the Postgres arm's `observed_at` does, and
+    /// one with no stamp at all by the epoch.
+    #[tokio::test]
+    async fn an_erasure_cut_times_an_instance_without_observed_at() {
+        use antares_store::TemporalDriver;
+        let store = AnyStore::Mem(Store::default()).temporal_only();
+        let t = TenantId::new("erase").expect("tenant");
+        let shell = serde_json::json!({"id": "urn:a", "type": ["T"]});
+        let adds = serde_json::json!({"speed": [
+            {"instanceId": "urn:i:1", "value": 1, "createdAt": "2026-01-01T00:00:00Z"},
+            {"instanceId": "urn:i:2", "value": 2, "modifiedAt": "2026-03-01T00:00:00Z"},
+            {"instanceId": "urn:i:3", "value": 3},
+            {"instanceId": "urn:i:4", "value": 4, "observedAt": "2026-03-01T00:00:00Z",
+             "createdAt": "2026-01-01T00:00:00Z"},
+        ]});
+        store
+            .temporal_append(&t, "urn:a", &shell, &adds)
+            .await
+            .expect("append");
+        let gone = store
+            .erase(&t, "urn:a", None, Some("2026-02-01T00:00:00Z"))
+            .await
+            .expect("erase");
+        assert_eq!(gone, 2, "the createdAt one and the unstamped one");
+        let doc = store.get(&t, Kind::Temporal, "urn:a").await.expect("get");
+        let left: Vec<_> = doc
+            .as_ref()
+            .and_then(|d| d["speed"].as_array())
+            .map_or(Vec::new(), |l| {
+                l.iter().map(|i| i["value"].clone()).collect()
+            });
+        assert_eq!(
+            left,
+            [serde_json::json!(2), serde_json::json!(4)],
+            "{doc:?}"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "postgres"))]
@@ -2729,6 +2795,29 @@ mod estimate_tests {
             Some(freqs.to_vec()),
             Some(distinct),
         )
+    }
+
+    /// F-R2ANT3-003: replace None, create false (lost the race), replace
+    /// None again (a delete took the row): the pair runs again, and a pair
+    /// that never takes the row is refused, never answered as stored.
+    #[test]
+    fn an_upsert_racing_create_and_delete_runs_again_and_never_fakes_a_write() {
+        use super::{upsert_raced, UPSERT_ROUNDS};
+        // each step answers its script in turn, then false
+        fn rounds(first: &[bool], second: &[bool]) -> Result<bool, antares_model::NgsiError> {
+            let (mut f, mut s) = (first.iter().copied(), second.iter().copied());
+            upsert_rounds!(f.next().unwrap_or(false), s.next().unwrap_or(false))
+        }
+        // replace, create, replace, create: the second create takes it
+        assert_eq!(rounds(&[false, false], &[false, true]).ok(), Some(false));
+        // the row came back between the steps: the second replace takes it
+        assert_eq!(rounds(&[false, true], &[false]).ok(), Some(true));
+        // never taken: refused, never answered as stored
+        let got = rounds(&[], &[]);
+        assert!(
+            matches!(got, Err(antares_model::NgsiError::InternalError(_))),
+            "{got:?}"
+        );
     }
 
     #[test]

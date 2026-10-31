@@ -376,7 +376,7 @@ fn in_range(x0: f64, y0: f64, x1: f64, y1: f64) -> bool {
 /// `coordinates`, widened as `predicate` widens the radius; `None` around
 /// a pole.
 fn near_box(coordinates: &Value, m: f64) -> Option<(f64, f64, f64, f64)> {
-    let [x, y] = coordinates.as_array().map(Vec::as_slice)? else {
+    let [x, y, ..] = coordinates.as_array().map(Vec::as_slice)? else {
         return None;
     };
     let (x, y) = (x.as_f64()?, y.as_f64()?);
@@ -615,6 +615,28 @@ mod tests {
         assert!(!c.sql.contains("ST_MakeEnvelope"), "{}", c.sql);
         assert_eq!(c.num_binds.len(), 1, "the radius alone");
         assert!(c.cell_binds.is_empty(), "no cover: {}", c.sql);
+    }
+
+    /// F-R2ANT3-017: a Point with an altitude (GeoJSON allows a third
+    /// position element) keeps the box and the cover a 2D one gets.
+    #[test]
+    fn a_near_around_a_point_with_altitude_keeps_its_box_and_cover() {
+        let c = compile_geo(
+            &spec(
+                Rel::Near {
+                    max: Some(2000.0),
+                    min: None,
+                },
+                "Point",
+                &json!([13.4, 52.5, 34.0]),
+                "",
+            ),
+            "location",
+            1,
+        )
+        .expect("compiles");
+        assert!(c.sql.contains("ST_MakeEnvelope"), "{}", c.sql);
+        assert!(!c.cell_binds.is_empty(), "a cover: {}", c.sql);
     }
 
     /// Both `near` bounds in one predicate: the geometry keeps the offset and

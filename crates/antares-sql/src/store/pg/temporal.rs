@@ -267,7 +267,7 @@ fn decompose(doc: &Value) -> Vec<Value> {
                     .or_else(|| ts("modifiedAt"))
                     .or_else(|| ts("deletedAt"))
                     .or_else(|| ts("createdAt"))
-                    .unwrap_or(std::borrow::Cow::Borrowed("1970-01-01T00:00:00Z"));
+                    .unwrap_or(std::borrow::Cow::Borrowed(crate::store::mem::EPOCH));
                 // Provenance is a column, never data (T-4665).
                 let mut data = i.clone();
                 let provenance = antares_store::take_provenance(&mut data);
