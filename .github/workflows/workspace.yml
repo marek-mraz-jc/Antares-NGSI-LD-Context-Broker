@@ -297,6 +297,18 @@ jobs:
       # (dev/test-cell.sh), because its plan and partition tests lean on what
       # their siblings seed in the cell's database. Every cell builds the same
       # test binaries and they share one rust-cache key.
+      # A sweep of an older pin (inputs.ref) can predate dev/test-cell.sh
+      # (052a3b32): take the cell script from the workflow's own commit then,
+      # or every cell exits 127 (sweep 41190274665 of 7375b1c2, T-6151).
+      - &cell-script
+        name: The cell script from the workflow's commit when the tested tree lacks it
+        if: ${{ hashFiles('dev/test-cell.sh') == '' }}
+        env:
+          OWN: ${{ github.sha }}
+        run: |
+          git fetch --no-tags --depth 1 origin "$OWN"
+          git show FETCH_HEAD:dev/test-cell.sh > dev/test-cell.sh
+          chmod +x dev/test-cell.sh
       - name: The workspace suite, part ${{ matrix.part }} of 4
         run: dev/test-cell.sh default-${{ matrix.part }} ${{ matrix.part }} 4 --workspace
       # nextest cannot execute doctests. They stay gated here (a broken doc
@@ -631,6 +643,7 @@ jobs:
       - name: The workspace suite without default features
         if: matrix.set == 'no-default-features'
         run: dev/unit-junit.sh no-default-features --workspace --no-default-features
+      - *cell-script
       - name: The workspace suite with every feature
         if: matrix.set == 'all-features'
         run: dev/test-cell.sh all-features-${{ matrix.part }} ${{ matrix.part }} 2 --workspace --all-features
