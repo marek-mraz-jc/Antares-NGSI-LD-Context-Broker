@@ -744,6 +744,13 @@ mod clause_4_5_19 {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn a_fractional_period_is_refused_never_truncated() {
+        // F-R2ANT2-015: PT0.5S summed to 0 s and read as one bucket
+        assert_eq!(parse_aggr_period("PT0.5S"), None);
+        assert_eq!(parse_aggr_period("P1.5M"), None);
+    }
+
     /// 4.5.19.1: "The duration shall be a string in the format
     /// `P[n]Y[n]M[n]DT[n]H[n]M[n]S` or `P[n]W` … For example,
     /// `"P3Y6M4DT12H30M5S"` represents a duration of "three years, six
@@ -766,9 +773,6 @@ mod clause_4_5_19 {
             Some(AggrPeriod::Months(1, 3600))
         );
         // the pure forms are unchanged
-        // F-R2ANT2-015: a fraction is refused, never truncated
-        assert_eq!(parse_aggr_period("PT0.5S"), None);
-        assert_eq!(parse_aggr_period("P1.5M"), None);
         assert_eq!(parse_aggr_period("PT0S"), Some(AggrPeriod::Whole));
         assert_eq!(parse_aggr_period("P0D"), Some(AggrPeriod::Whole));
         assert_eq!(parse_aggr_period("P1M"), Some(AggrPeriod::Months(1, 0)));

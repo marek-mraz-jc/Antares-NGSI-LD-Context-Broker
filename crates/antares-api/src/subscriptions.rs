@@ -343,7 +343,11 @@ fn check_endpoint_params(ep: &Map<String, Value>) -> Result<(), NgsiError> {
             // Transfer-Encoding beside the client's own would desync any
             // proxy on the way, and Host would aim the POST at another
             // virtual host than endpoint.uri names.
-            if let Some(k) = k.filter(|k| CLIENT_OWNED_HEADERS.iter().any(|o| o.eq_ignore_ascii_case(k))) {
+            if let Some(k) = k.filter(|k| {
+                CLIENT_OWNED_HEADERS
+                    .iter()
+                    .any(|o| o.eq_ignore_ascii_case(k))
+            }) {
                 return Err(bad(format!(
                     "endpoint.receiverInfo may not set the {k} header: the HTTP client sets \
                      it (RFC 7230, 6.3.8)"

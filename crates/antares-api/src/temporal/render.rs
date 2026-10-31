@@ -209,9 +209,8 @@ pub(super) fn window(
         // string compare puts "…00.5Z" ahead of "…00Z" and lastN keeps the
         // wrong instant. 4.6.3 allows both fraction spellings. Cached: one
         // key per instance, not two per comparison.
-        instances.sort_by_cached_key(|i| {
-            dt_key(i.get(timeprop).and_then(Value::as_str).unwrap_or(""))
-        });
+        instances
+            .sort_by_cached_key(|i| dt_key(i.get(timeprop).and_then(Value::as_str).unwrap_or("")));
         w.more |= page_instances(&mut instances, page);
         if instances.is_empty() {
             continue;

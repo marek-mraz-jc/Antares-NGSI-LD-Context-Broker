@@ -169,8 +169,17 @@ async fn an_inline_subscription_context_is_hosted_once_and_within_the_budget() {
     for n in 0..2 {
         let (status, body) = call(&st, "subscriptions", "application/ld+json", &sub(n)).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
-        let stored = get(&st, &format!("subscriptions/urn:ngsi-ld:Subscription:inline-{n}")).await;
-        urls.push(stored["jsonldContext"].as_str().unwrap_or_default().to_owned());
+        let stored = get(
+            &st,
+            &format!("subscriptions/urn:ngsi-ld:Subscription:inline-{n}"),
+        )
+        .await;
+        urls.push(
+            stored["jsonldContext"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        );
     }
     assert!(!urls[0].is_empty(), "jsonldContext is set: {urls:?}");
     assert_eq!(urls[0], urls[1], "one row behind one URL");
