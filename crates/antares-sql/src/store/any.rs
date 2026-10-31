@@ -124,6 +124,11 @@ pub struct PgBackend {
     /// (`with_version`); `/q/health` serves this copy rather than querying
     /// the database on a polled endpoint.
     version: Value,
+    /// Since when every readiness ping found every pool slot taken, `None`
+    /// once one finds a slot (T-6182, see [`AnyStore::wedged`]).
+    exhausted_since: std::sync::Mutex<Option<std::time::Instant>>,
+    /// How long the pool may stay exhausted before liveness fails.
+    wedged_after: std::time::Duration,
 }
 
 #[cfg(feature = "postgres")]
@@ -135,7 +140,60 @@ impl PgBackend {
             docs: PgDocStore::new(pool),
             hook: std::sync::RwLock::new(None),
             version: Value::Object(serde_json::Map::new()),
+            exhausted_since: std::sync::Mutex::new(None),
+            wedged_after: POOL_WEDGED,
         }
+    }
+
+    /// Shorten [`POOL_WEDGED`], for tests that cannot wait five minutes.
+    pub fn with_wedged_after(mut self, after: std::time::Duration) -> Self {
+        self.wedged_after = after;
+        self
+    }
+
+    /// Record a readiness ping: a timeout with every slot checked out
+    /// starts (or keeps) the exhausted clock; any other answer stops it.
+    fn note_ping(&self, res: &Result<sqlx::postgres::PgQueryResult, sqlx::Error>) {
+        let pool = self.docs.pool();
+        let all_held = matches!(res, Err(sqlx::Error::PoolTimedOut))
+            && pool.num_idle() == 0
+            && pool.size() >= pool.options().get_max_connections();
+        let mut since = self
+            .exhausted_since
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *since = match (*since, all_held) {
+            (Some(t), true) => Some(t),
+            (None, true) => Some(std::time::Instant::now()),
+            (_, false) => None,
+        };
+    }
+
+    async fn wedged(&self) -> bool {
+        let since = *self
+            .exhausted_since
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !since.is_some_and(|t| t.elapsed() >= self.wedged_after) {
+            return false;
+        }
+        let opts = self.docs.pool().connect_options();
+        let probe = async {
+            use sqlx::Connection;
+            let mut c = sqlx::PgConnection::connect_with(&opts).await?;
+            // Dropped unclosed: close() over TLS can wait on a read (T-6000).
+            sqlx::query("SELECT 1").execute(&mut c).await.map(|_| ())
+        };
+        let serves = matches!(tokio::time::timeout(WEDGE_PROBE, probe).await, Ok(Ok(())));
+        if serves {
+            tracing::error!(
+                after_secs = self.wedged_after.as_secs(),
+                "every pool slot has been held past the bound while the database \
+                 answers a fresh connection: the pool leaked; failing liveness so \
+                 the pod restarts"
+            );
+        }
+        serves
     }
 
     /// Seal the notification credentials under `ANTARES_SECRET_KEY`
@@ -321,6 +379,19 @@ async fn count_instances(
 #[cfg(feature = "postgres")]
 pub const READY_PING: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How long every readiness ping may find every pool slot taken before
+/// `/q/health` fails liveness (T-6182: prod held 13 of 13 slots for 16 h,
+/// ready failing and liveness green, so nothing restarted it). A loaded
+/// pool still hands a slot to some ping within five minutes; a leaked one
+/// never does.
+#[cfg(feature = "postgres")]
+pub const POOL_WEDGED: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The bound on the fresh connection that tells a leaked pool from a lost
+/// database, inside the liveness probe's 3 s.
+#[cfg(feature = "postgres")]
+const WEDGE_PROBE: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl AnyStore {
     /// Readiness ping: can the store answer a trivial request
     /// RIGHT NOW? Memory/file are in-process (always ready); the Pg arm runs
@@ -335,12 +406,28 @@ impl AnyStore {
             AnyStore::Mem(_) => Ok(()),
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => {
-                tokio::time::timeout(READY_PING, sqlx::query("SELECT 1").execute(p.docs.pool()))
-                    .await
-                    .unwrap_or(Err(sqlx::Error::PoolTimedOut))
-                    .map(|_| ())
-                    .map_err(db)
+                let res = tokio::time::timeout(
+                    READY_PING,
+                    sqlx::query("SELECT 1").execute(p.docs.pool()),
+                )
+                .await
+                .unwrap_or(Err(sqlx::Error::PoolTimedOut));
+                p.note_ping(&res);
+                res.map(|_| ()).map_err(db)
             }
+        }
+    }
+
+    /// Liveness: has the pool stopped serving for good? True only when
+    /// every readiness ping for [`POOL_WEDGED`] found every slot held AND a
+    /// fresh connection beside the pool still reaches the database: then
+    /// the slots leaked and only a restart frees them. A lost database
+    /// answers false here, since a restart fixes nothing (T-6182).
+    pub async fn wedged(&self) -> bool {
+        match self {
+            AnyStore::Mem(_) => false,
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p.wedged().await,
         }
     }
 
@@ -1774,6 +1861,9 @@ const HISTORY_CHUNK: usize = 64;
 impl antares_store::CurrentStateDriver for AnyStore {
     async fn ping(&self) -> Result<(), NgsiError> {
         AnyStore::ping(self).await
+    }
+    async fn wedged(&self) -> bool {
+        AnyStore::wedged(self).await
     }
     fn commit_queue(&self) -> Option<(usize, usize)> {
         AnyStore::commit_queue(self)

@@ -331,6 +331,12 @@ pub fn context_row_visible(row: &Value, tenant: Option<&TenantId>) -> bool {
 pub trait CurrentStateDriver: Send + Sync {
     /// Readiness RIGHT NOW — a lost database flips /q/ready to 503.
     async fn ping(&self) -> Result<(), NgsiError>;
+    /// Liveness: true when the driver can no longer serve and only a
+    /// process restart helps (a leaked connection pool). The default never
+    /// is.
+    async fn wedged(&self) -> bool {
+        false
+    }
     /// (Queued writers, peak) of a single-writer commit section, if the
     /// backend has one.
     fn commit_queue(&self) -> Option<(usize, usize)> {

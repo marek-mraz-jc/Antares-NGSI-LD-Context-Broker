@@ -111,7 +111,7 @@ progress). A memory-store broker answers:
 
 | Field | Meaning |
 |---|---|
-| `status` | `UP`, or `DRAINING` with status 503 once shutdown began. |
+| `status` | `UP`; `DRAINING` with status 503 once shutdown began; `STORE_WEDGED` with status 503 when every Postgres pool slot stayed held for 5 min while the database answers a fresh connection (the liveness probe then restarts the pod). |
 | `store` | The current-state backend: `memory`, `file`, `postgres`, `timescale`. |
 | `temporal` | The history backend: one of the four, or `none` when history is off (`ANTARES_TEMPORAL`). |
 | `storeInfo`, `temporalInfo` | What each driver actually runs on: `{engine}` for the built-in stores (`memory` or `redb`), and on Postgres `{engine, poolSize, poolWriteReserve, poolAcquireTimeoutSeconds, server, postgis?, timescaledb?}` — the pool's own shape always, the server probe read once at startup and omitted if it failed. Absent when a driver has nothing to add to its name (`none` history). Two deployments answering `postgres` are told apart here. |
