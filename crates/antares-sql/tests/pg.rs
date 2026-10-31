@@ -1275,7 +1275,7 @@ async fn a_tenant_size_estimate_counts_its_own_rows_by_first_type() {
         .execute(&pool)
         .await
         .expect("analyze");
-    let est = CurrentStateDriver::tenant_bytes_estimate(&store, &a)
+    let est = CurrentStateDriver::tenant_bytes_estimate(&store, &a, 3)
         .await
         .expect("estimate");
     assert_eq!(
@@ -1295,7 +1295,8 @@ async fn a_tenant_size_estimate_counts_its_own_rows_by_first_type() {
 
 /// T-2890: a size scan is bounded: held behind a lock (as behind a scan of a
 /// history table tens of GB long) it gives up within its statement timeout
-/// instead of holding the connection, and the caller answers without a size.
+/// instead of holding the connection, and the caller answers without a size;
+/// the estimate behind the same lock still sizes the tenant (T-6204).
 /// The lock is taken in a database of the test's own, so the tests sharing
 /// the main one never wait on it.
 #[tokio::test(flavor = "multi_thread")]
@@ -1321,6 +1322,17 @@ async fn a_tenant_size_scan_gives_up_within_its_bound() {
         pool.clone(),
     ));
     let t = TenantId::new("pgszbound").expect("tenant");
+    // a row and ANALYZE, so the catalog holds an average row to estimate by
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let doc = serde_json::json!({"id": "urn:x:1", "type": "Room",
+        "createdAt": "2026-08-04T09:00:00Z", "modifiedAt": "2026-08-04T09:00:00Z"});
+    CurrentStateDriver::create(&store, &t, antares_store::Kind::Entity, "urn:x:1", doc)
+        .await
+        .expect("create");
+    sqlx::query("ANALYZE entities")
+        .execute(&pool)
+        .await
+        .expect("analyze");
     for (table, lock) in [
         ("entities", "LOCK TABLE entities IN ACCESS EXCLUSIVE MODE"),
         (
@@ -1338,9 +1350,21 @@ async fn a_tenant_size_scan_gives_up_within_its_bound() {
                 .await
                 .is_err()
         };
+        let took = started.elapsed();
+        // T-6204: the estimate's split by type gives up behind the same
+        // lock, and the size still comes from the catalog and the count
+        let estimate = if table == "entities" {
+            Some(CurrentStateDriver::tenant_bytes_estimate(&store, &t, 1000).await)
+        } else {
+            None
+        };
         hold.rollback().await.expect("release");
         assert!(failed, "{table}: a scan behind the lock must give up");
-        let took = started.elapsed();
+        if let Some(estimate) = estimate {
+            let b = estimate.expect("an estimate behind the lock");
+            assert!(b.entities > 0, "{b:?}");
+            assert!(b.by_type.is_empty(), "{b:?}");
+        }
         assert!(
             took < std::time::Duration::from_secs(10),
             "{table}: {took:?}"

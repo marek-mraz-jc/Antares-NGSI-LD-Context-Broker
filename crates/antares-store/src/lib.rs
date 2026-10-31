@@ -771,9 +771,15 @@ pub trait CurrentStateDriver: Send + Sync {
     }
     /// The store's statistics' guess at [`Self::tenant_bytes`], for a read
     /// whose exact scan failed or ran out of time (T-6159); the answer says
-    /// it is estimated. A driver without statistics cannot guess.
-    async fn tenant_bytes_estimate(&self, tenant: &TenantId) -> Result<TenantBytes, NgsiError> {
-        let _ = tenant;
+    /// it is estimated. `entities` is the tenant's Entity count the caller
+    /// already holds, the guess's fallback when no split by type can be
+    /// counted in time. A driver without statistics cannot guess.
+    async fn tenant_bytes_estimate(
+        &self,
+        tenant: &TenantId,
+        entities: u64,
+    ) -> Result<TenantBytes, NgsiError> {
+        let _ = (tenant, entities);
         Err(NgsiError::OperationNotSupported(
             "tenant size estimate".into(),
         ))
