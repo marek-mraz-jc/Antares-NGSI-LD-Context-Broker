@@ -1378,6 +1378,15 @@ async fn build_forward<'a>(
         // ask its own engine about. Dropped rather than refused at 5.9.2:
         // which headers a deployment made subject headers is not something
         // a client gets to probe by watching which registrations fail.
+        // F-R2ANT1-005: another Antares believes the mesh identity and the gateway's `jc-*`
+        // grants (provenance.rs `from_gateway`); a registrant never states them for a forward.
+        if lower.starts_with("l5d-") || lower.starts_with("jc-") {
+            tracing::warn!(
+                "registration {} asks for the gateway trust header {k:?}; not forwarded",
+                reg.reg_id
+            );
+            continue;
+        }
         if crate::policy::SUBJECT_HEADERS.contains(&lower) {
             tracing::warn!(
                 "registration {} asks for the policy subject header {k:?}; not forwarded",
@@ -2049,6 +2058,17 @@ pub async fn fed_retrieve(
         // modifiedAt the winner would be arrival order, i.e. indeterminate.
         let mut query: Vec<(String, String)> = vec![("options".into(), "sysAttrs".into())];
         query.extend(scope_attrs(&reg, ctx));
+        // every type the registration names, or any (F-R2ANT1-007): an Entity registered
+        // under its second type is found too
+        let types = if reg.ent_types.is_empty() {
+            "*".to_owned()
+        } else {
+            reg.ent_types
+                .iter()
+                .map(|t| ctx.compact_iri(t))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         let (status, body, peer_warns) = match op {
             "retrieveEntity" => {
                 forward(
@@ -2065,12 +2085,7 @@ pub async fn fed_retrieve(
                 .await
             }
             "queryEntity" => {
-                let t = reg
-                    .ent_types
-                    .first()
-                    .map(|t| ctx.compact_iri(t))
-                    .unwrap_or_else(|| "*".into());
-                query.push(("type".into(), t));
+                query.push(("type".into(), types));
                 query.push(("id".into(), id.to_owned()));
                 forward(
                     st,
@@ -2088,9 +2103,7 @@ pub async fn fed_retrieve(
             _ => {
                 // queryBatch
                 let mut sel = Map::new();
-                if let Some(t) = reg.ent_types.first() {
-                    sel.insert("type".into(), Value::String(ctx.compact_iri(t)));
-                }
+                sel.insert("type".into(), Value::String(types));
                 sel.insert("id".into(), Value::String(id.to_owned()));
                 forward(
                     st,

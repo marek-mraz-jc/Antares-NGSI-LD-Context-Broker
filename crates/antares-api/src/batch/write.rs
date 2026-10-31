@@ -467,7 +467,18 @@ impl BatchRun<'_> {
                     .out
                     .errors
                     .push(err_entry(Some(id), &Conditions::not_found(id))),
-                None => replaces.push((id.clone(), expanded.clone())),
+                None => {
+                    // F-R2ANT1-009: the member was checked as a fragment; the Entity it now
+                    // creates is held to the whole-Entity rules
+                    #[cfg(feature = "views")]
+                    if let Err(e) =
+                        crate::schema_writes::admits_typed(self.st, &self.tenant, expanded, true)
+                    {
+                        self.out.errors.push(err_entry(Some(id), &e));
+                        continue;
+                    }
+                    replaces.push((id.clone(), expanded.clone()));
+                }
             }
         }
         Ok(replaces)

@@ -212,6 +212,79 @@ async fn a_registration_cannot_ask_for_the_callers_credentials() {
     }
 }
 
+/// F-R2ANT1-005: a registration cannot state the mesh identity or a gateway grant for a
+/// forward, since another Antares believes them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registration_cannot_state_the_gateway_trust_headers() {
+    let st = state();
+    let (port, seen) = peer("[]");
+    register(
+        &st,
+        port,
+        json!([{"key": "l5d-client-id", "value": "gateway.jc.serviceaccount"},
+               {"key": "JC-Read-Versions", "value": "true"},
+               {"key": "jc-provenance-actor", "value": "someone-else"},
+               {"key": "X-Source-Key", "value": "registrant-own"}]),
+    )
+    .await;
+    let (code, body) = call(&st, "GET", "entities?type=Vehicle", Some("alice"), None).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let asked = seen.lock().expect("lock").clone();
+    assert!(!asked.is_empty(), "the peer was never reached");
+    for req in &asked {
+        let lower = req.to_ascii_lowercase();
+        for name in ["l5d-client-id", "jc-read-versions", "jc-provenance-actor"] {
+            assert!(!lower.contains(name), "{name} reached a Context Source: {req}");
+        }
+        assert!(req.contains("registrant-own"), "the stated value is gone: {req}");
+    }
+}
+
+/// F-R2ANT1-007: a retrieve by id through a queryEntity or queryBatch registration asks the
+/// source for every type the registration names, not only its first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retrieve_by_id_asks_the_source_for_every_registered_type() {
+    let st = state();
+    for (n, op) in ["queryEntity", "queryBatch"].iter().enumerate() {
+        let (port, seen) = peer("[]");
+        let (code, body) = call(
+            &st,
+            "POST",
+            "csourceRegistrations",
+            None,
+            Some(json!({
+                "id": format!("urn:ngsi-ld:ContextSourceRegistration:types{n}"),
+                "type": "ContextSourceRegistration",
+                "mode": "inclusive",
+                "operations": [op],
+                "information": [{"entities": [{"type": "Vehicle"}, {"type": "Bike"}]}],
+                "endpoint": format!("http://127.0.0.1:{port}"),
+            })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{body}");
+        call(&st, "GET", "entities/urn:ngsi-ld:Bike:1", None, None).await;
+        let asked = seen.lock().expect("lock").clone();
+        assert!(!asked.is_empty(), "{op}: the peer was never reached");
+        for req in &asked {
+            let wire = req.replace("%2C", ",");
+            assert!(
+                wire.contains("Vehicle,Bike") || wire.contains("Bike,Vehicle"),
+                "{op}: the source was not asked for both types: {req}"
+            );
+        }
+        let (code, _) = call(
+            &st,
+            "DELETE",
+            &format!("csourceRegistrations/urn:ngsi-ld:ContextSourceRegistration:types{n}"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::NO_CONTENT);
+    }
+}
+
 /// The guard is narrow: a registration that asks for an ordinary header
 /// still gets it, so 4.3.6.5 is not broken in the name of the seam.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
