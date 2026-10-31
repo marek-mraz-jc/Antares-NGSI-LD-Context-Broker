@@ -292,11 +292,13 @@ jobs:
             [ -n "${!v:-}" ] || { echo "::error::$v gates a test and is unset here"; rc=1; }
           done
           exit $rc
-      # count:N/4 deals each binary's tests round-robin over the four cells,
-      # so each gets a share of the slow pg binaries. Every cell builds the
-      # same test binaries and they share one rust-cache key.
+      # count:N/4 deals every other binary's tests round-robin over the four
+      # cells; each antares-sql pg binary runs whole in one cell
+      # (dev/test-cell.sh), because its plan and partition tests lean on what
+      # their siblings seed in the cell's database. Every cell builds the same
+      # test binaries and they share one rust-cache key.
       - name: The workspace suite, part ${{ matrix.part }} of 4
-        run: dev/unit-junit.sh default-${{ matrix.part }} --workspace --partition count:${{ matrix.part }}/4
+        run: dev/test-cell.sh default-${{ matrix.part }} ${{ matrix.part }} 4 --workspace
       # nextest cannot execute doctests. They stay gated here (a broken doc
       # example is still a red build) but contribute no JUnit, which the
       # /reports/unit/ footer says out loud rather than quietly overcounting.
@@ -631,7 +633,7 @@ jobs:
         run: dev/unit-junit.sh no-default-features --workspace --no-default-features
       - name: The workspace suite with every feature
         if: matrix.set == 'all-features'
-        run: dev/unit-junit.sh all-features-${{ matrix.part }} --workspace --all-features --partition count:${{ matrix.part }}/2
+        run: dev/test-cell.sh all-features-${{ matrix.part }} ${{ matrix.part }} 2 --workspace --all-features
       # AppState::new composes a fresh redb file store per state under this
       # harness variable, so every API test that passed on memory has to pass
       # on the durable backend too — no second copy of the tests.
