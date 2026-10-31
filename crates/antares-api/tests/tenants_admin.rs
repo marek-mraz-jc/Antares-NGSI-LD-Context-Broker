@@ -919,6 +919,30 @@ async fn a_history_out_of_time_is_estimated_and_says_so() {
     assert_eq!(guess["counts"]["entities"], 1, "{guess}");
 }
 
+/// T-6159: a tenant whose exact size scan fails (a big tenant past the
+/// scan's statement timeout) still answers its Entities' size, by type, from
+/// the store's statistics, and the answer says it is estimated.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_size_scan_that_fails_is_estimated_and_says_so() {
+    let mut st = state().await;
+    seed(&st, "estsize", "urn:ngsi-ld:Room:1").await;
+    let store = Arc::new(crate::common::Double::passthrough(st.store.clone()));
+    store.fail_size_scan();
+    st.store = store;
+    let (s, got) = send(&st, "GET", "/q/tenants/estsize", None, None).await;
+    assert_eq!(s, StatusCode::OK, "{got}");
+    assert_eq!(got["estimated"], true, "{got}");
+    assert!(got["bytes"]["entities"].as_u64() > Some(0), "{got}");
+    let by_type = got["bytes"]["byType"].as_object().expect("byType");
+    assert!(
+        by_type
+            .iter()
+            .any(|(k, v)| k.ends_with("Room") && v.as_u64() > Some(0)),
+        "{got}"
+    );
+    assert_eq!(got["counts"]["entities"], 1, "{got}");
+}
+
 /// T-6001: the Attribute names the Entities of one type hold, names only,
 /// compacted, the other type's names and every value left out.
 #[tokio::test(flavor = "multi_thread")]

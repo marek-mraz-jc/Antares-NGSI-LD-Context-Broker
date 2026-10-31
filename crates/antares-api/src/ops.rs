@@ -597,7 +597,8 @@ pub(super) fn bytes_cached_or_claim(
 /// `{entities, attrInstances, byType}`, `estimated` and `measuredAt`. The
 /// history is counted and sized in one pass under [`TENANT_COUNT_BOUND`];
 /// past it both numbers come from the store's statistics and `estimated` is
-/// true. `None` when nothing could be measured or another read is
+/// true, as it is when the Entities' exact size scan fails and their size
+/// is estimated too (T-6159). `None` when nothing could be measured or another read is
 /// measuring: the counts still answer, without these.
 pub(super) async fn tenant_usage(st: &AppState, tenant: &TenantId) -> Option<serde_json::Value> {
     let cache = || {
@@ -630,20 +631,28 @@ pub(super) async fn tenant_usage(st: &AppState, tenant: &TenantId) -> Option<ser
         }
     };
     let entities = match st.store.tenant_bytes(tenant).await {
-        Ok(b) => Some(b),
+        Ok(b) => Some((b, false)),
         Err(NgsiError::OperationNotSupported(_)) => None,
         Err(e) => {
-            tracing::warn!(tenant = t, error = %e, "tenant size not measured");
-            None
+            // a big tenant's exact scan passes its bound (T-6159)
+            tracing::warn!(tenant = t, error = %e, "tenant size not measured, estimating");
+            match st.store.tenant_bytes_estimate(tenant).await {
+                Ok(b) => Some((b, true)),
+                Err(e) => {
+                    tracing::warn!(tenant = t, error = %e, "tenant size not estimated");
+                    None
+                }
+            }
         }
     };
-    let v = history.map(|((count, history_bytes), estimated)| {
+    let v = history.map(|((count, history_bytes), history_estimated)| {
+        let estimated = history_estimated || entities.as_ref().is_some_and(|(_, e)| *e);
         let mut v = serde_json::json!({
             "attrInstances": count,
             "estimated": estimated,
             "measuredAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         });
-        if let (Some(e), Some(m)) = (entities, v.as_object_mut()) {
+        if let (Some((e, _)), Some(m)) = (entities, v.as_object_mut()) {
             m.insert(
                 "bytes".into(),
                 serde_json::json!({
