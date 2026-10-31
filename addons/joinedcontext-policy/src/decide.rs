@@ -135,7 +135,9 @@ pub fn decide(
     }
 }
 
-/// Whether `clause` only reads: what a read-only caller may ask.
+/// Whether `clause` only reads: what a read-only caller may ask. A query with an EntityMap
+/// (5.14.4, 5.14.5) is a read: the map it stores is that query's own expiring paging state,
+/// never context data (S-49 keeps a read-only caller off Entities, F-R2ANT1-017).
 fn reads(clause: &str) -> bool {
     FILTERABLE.contains(&clause)
         || NAME_READS.contains(&clause)

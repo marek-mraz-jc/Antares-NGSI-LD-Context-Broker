@@ -830,7 +830,7 @@ fn has_reg_context(reg: &FedReg) -> bool {
 /// return in registration order so warning and merge processing stay
 /// deterministic. Concurrency per request is bounded by
 /// bounds::MAX_FED_FANOUT.
-async fn fan_out<I, T, F, Fut>(items: Vec<I>, per_item: F) -> Vec<T>
+pub(crate) async fn fan_out<I, T, F, Fut>(items: Vec<I>, per_item: F) -> Vec<T>
 where
     F: FnMut(I) -> Fut,
     Fut: std::future::Future<Output = T>,

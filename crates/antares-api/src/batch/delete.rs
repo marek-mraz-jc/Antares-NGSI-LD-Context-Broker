@@ -282,8 +282,16 @@ async fn forward_deletes(
                 &mut remote.err,
             );
         } else if reg.supports("deleteEntity") {
-            for id in &sent_ids {
-                let status = forward_delete(st, tenant, headers, reg, &ctx_url, id).await;
+            // F-R2ANT1-014: one request per Entity, as many at once as a fan-out sends
+            let ctx_url = &ctx_url;
+            let answers = crate::federation::fan_out(sent_ids.iter().collect(), |id| async move {
+                (
+                    id,
+                    forward_delete(st, tenant, headers, reg, ctx_url, id).await,
+                )
+            })
+            .await;
+            for (id, status) in answers {
                 if (200..300).contains(&status) && status != 207 {
                     remote.ok.push((id.clone(), false));
                 } else {

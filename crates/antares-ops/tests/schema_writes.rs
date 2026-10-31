@@ -126,7 +126,8 @@ async fn an_update_upsert_creating_an_entity_is_held_to_the_whole_entity_rules()
     let schema = json!({"id": "https://e.org/", "name": "s"});
     let (s, body) = send(&app, "PUT", "/q/schemas/whole", "whole", &schema).await;
     assert!(s.is_success(), "{s} {body}");
-    let partial = json!([{"id": "urn:ngsi-ld:T:2", "type": "T", "m": {"type": "Property", "value": 1}}]);
+    let partial =
+        json!([{"id": "urn:ngsi-ld:T:2", "type": "T", "m": {"type": "Property", "value": 1}}]);
     let (s, body) = send(
         &app,
         "POST",

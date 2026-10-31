@@ -162,17 +162,21 @@ where
                 None
             }
         });
-        let missed = missed.into_inner();
+        let mut missed = missed.into_inner();
         if missed.is_empty() {
             return out;
         }
+        missed.sort();
+        missed.dedup();
+        // one read for every miss of the pass (F-R2ANT1-012); a failed read leaves them absent
+        let refs: Vec<&str> = missed.iter().map(String::as_str).collect();
+        let mut found = st
+            .store
+            .get_entities(tenant, &refs)
+            .await
+            .unwrap_or_default();
         for uri in missed {
-            let mut doc = st
-                .store
-                .get(tenant, Kind::Entity, &uri)
-                .await
-                .ok()
-                .flatten();
+            let mut doc = found.remove(&uri);
             if let (Some(d), Some((r, ctx))) = (&doc, narrow) {
                 // boxed: the admission check evaluates the policy's own q,
                 // which comes back here

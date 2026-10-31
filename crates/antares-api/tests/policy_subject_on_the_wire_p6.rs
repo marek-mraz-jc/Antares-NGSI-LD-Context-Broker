@@ -234,9 +234,15 @@ async fn a_registration_cannot_state_the_gateway_trust_headers() {
     for req in &asked {
         let lower = req.to_ascii_lowercase();
         for name in ["l5d-client-id", "jc-read-versions", "jc-provenance-actor"] {
-            assert!(!lower.contains(name), "{name} reached a Context Source: {req}");
+            assert!(
+                !lower.contains(name),
+                "{name} reached a Context Source: {req}"
+            );
         }
-        assert!(req.contains("registrant-own"), "the stated value is gone: {req}");
+        assert!(
+            req.contains("registrant-own"),
+            "the stated value is gone: {req}"
+        );
     }
 }
 

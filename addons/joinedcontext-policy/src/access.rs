@@ -8,7 +8,7 @@ use crate::decide::{held, refuses_types, withholds, POLICY_VOCABULARY};
 use crate::document::{context, Policy, Selector, Table};
 use crate::names::{self, OPERATIONS};
 use crate::subject::{Caller, Platform};
-use antares_api::policy::Rule;
+use antares_api::policy::{Rule, FILTERABLE};
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 
@@ -199,7 +199,8 @@ pub fn verdict<'t>(
     let write = clause.starts_with("5.6.");
     let lists = |p: &&&Policy| p.clauses.contains(clause);
     if let Some(p) = grants.prohibitions.iter().filter(lists).find(|p| {
-        refuses_types(p, &types, false)
+        // a read naming no type is narrowed, as decide reads it (F-R2ANT1-015)
+        refuses_types(p, &types, FILTERABLE.contains(&clause))
             || attribute
                 .as_deref()
                 .is_some_and(|a| withholds(p, &types, a))
@@ -780,6 +781,32 @@ mod tests {
         assert_eq!(
             f.omit_by_type.get(&ctx.expand_key("Car")),
             Some(&vec![ctx.expand_key("speed")])
+        );
+        Ok(())
+    }
+
+    /// F-R2ANT1-015: a read naming no type is narrowed by a prohibition naming Attributes, in
+    /// the check as in decide.
+    #[test]
+    fn an_untyped_read_check_agrees_with_decide() -> Result<(), String> {
+        let t = compiled(&json!([
+            {"id": "read-car", "assignee": {"kind": "role", "id": "public"},
+             "operations": ["5.7.1", "5.7.2"], "information": [{"entities": [{"type": "Car"}]}]},
+            {"id": "no-speed", "effect": "prohibit", "assignee": {"kind": "role", "id": "public"},
+             "operations": ["5.7.1", "5.7.2"],
+             "information": [{"entities": [{"type": "Car"}], "propertyNames": ["speed"]}]}
+        ]))?;
+        let public = caller(&[("x-jc-roles", "")]);
+        let grants = Grants::of(Some(&t), &public, Utc::now());
+        let decided =
+            crate::decide::decide(Some(&t), &public, &Operation::new("5.7.2"), Utc::now());
+        assert!(!matches!(decided, Decision::Deny(_)), "{decided:?}");
+        assert_eq!(
+            at(
+                &check(&grants, "queryEntity", None, None, &every),
+                "/decision"
+            ),
+            true
         );
         Ok(())
     }
