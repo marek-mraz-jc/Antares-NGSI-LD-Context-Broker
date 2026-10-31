@@ -1616,17 +1616,21 @@ fn serve(
             let mut app = app.clone();
             async move { tower::Service::call(&mut app, req.map(axum::body::Body::new)).await }
         });
-        let mut builder =
-            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+        // HTTP/1.1 only (hyper's http1 builder; the auto builder detects
+        // h2c even with http1_only once upgrades are on): the header read
+        // timeout and the one permit per connection are HTTP/1 bounds, and
+        // no client of the broker speaks h2c. An HTTP/2 connection would
+        // carry up to 200 streams under one permit with no header deadline.
+        let mut builder = hyper::server::conn::http1::Builder::new();
         builder
-            .http1()
             .timer(hyper_util::rt::TokioTimer::new())
             .header_read_timeout(header_read_timeout)
             .title_case_headers(true);
         // With upgrades: a WebSocket surface answers 101 and takes the
         // stream (ADR-0026); without an upgrading route nothing changes.
-        let conn =
-            builder.serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), svc);
+        let conn = builder
+            .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
+            .with_upgrades();
         let mut conn = std::pin::pin!(conn);
         // On drain, close an IDLE keep-alive connection immediately —
         // hyper finishes any active request first, then closes. Without this

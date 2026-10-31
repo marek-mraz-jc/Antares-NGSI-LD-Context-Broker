@@ -31,9 +31,6 @@ fn tenant_of(raw: &str) -> Result<TenantId, Box<Response>> {
             .into_response(),
         )
     };
-    if TenantId::is_reserved_str(raw) {
-        return Err(bad());
-    }
     TenantId::new(raw).map_err(|_| bad())
 }
 
@@ -147,6 +144,16 @@ pub async fn export(
         return ApiError::from(NgsiError::Conflict(format!(
             "the tenant holds {}, which an export does not carry (ADR-0030 rule 5)",
             held.join(", ")
+        )))
+        .into_response();
+    }
+    // The walk below pages history out of the current-state driver, which
+    // holds it only when one instance serves both seams; digest and import
+    // use `st.temporal`. A second backend would export no history at all.
+    if let Some(second) = st.temporal_name.as_deref().filter(|t| *t != st.store_name) {
+        return ApiError::from(NgsiError::Conflict(format!(
+            "the history lives in a second backend (ANTARES_TEMPORAL={second}), which an \
+             export does not carry; export from a broker whose store holds the history"
         )))
         .into_response();
     }
@@ -324,6 +331,7 @@ async fn take(
     let mut ended = false;
     let mut records = 0u64;
     let mut in_history = false;
+    let mut with_history = std::collections::HashSet::new();
     loop {
         let next = stream.next().await;
         let eof = next.is_none();
@@ -385,6 +393,7 @@ async fn take(
                 Some("temporal") => {
                     in_history = true;
                     st.temporal.upsert(tenant, &id, doc).await?;
+                    with_history.insert(id.clone());
                     written.push(id);
                 }
                 _ => return Err(bad(n, "a record of an unknown kind")),
@@ -406,6 +415,12 @@ async fn take(
         return Err(NgsiError::BadRequestData(
             "the export has no trailer: the stream was cut".into(),
         ));
+    }
+    // An Entity the export carried no history for had none at the source:
+    // drop what its create recorded through the change hook, or the target
+    // digests more attribute instances than the source.
+    for id in written.iter().filter(|id| !with_history.contains(*id)) {
+        st.temporal.delete(tenant, id).await?;
     }
     Ok(())
 }

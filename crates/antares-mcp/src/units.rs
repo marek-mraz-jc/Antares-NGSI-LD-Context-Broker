@@ -20,8 +20,13 @@ fn label(code: &str) -> Option<&'static str> {
         .map(|(_, label)| *label)
 }
 
+/// The members that hold a client's own data (4.5.2 `value`, 4.5.24 `json`,
+/// 4.5.21 `valueList`, the temporalValues pairs): an object in them is no
+/// attribute instance, and a `unitCode` in it is data the broker stored.
+const DATA_MEMBERS: [&str; 4] = ["value", "json", "valueList", "values"];
+
 /// Adds `unit` beside every known `unitCode` below `value` that has no
-/// `unit` of its own.
+/// `unit` of its own, outside the [`DATA_MEMBERS`].
 pub(crate) fn name(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -33,7 +38,9 @@ pub(crate) fn name(value: &mut Value) {
             if let Some(unit) = unit {
                 map.insert("unit".to_owned(), Value::String(unit.to_owned()));
             }
-            map.values_mut().for_each(name);
+            map.iter_mut()
+                .filter(|(k, _)| !DATA_MEMBERS.contains(&k.as_str()))
+                .for_each(|(_, v)| name(v));
         }
         Value::Array(items) => items.iter_mut().for_each(name),
         _ => {}
@@ -53,6 +60,20 @@ mod tests {
         // past the last code, and between two codes
         assert_eq!(label("ZZZ9"), None);
         assert_eq!(label("GQA"), None);
+    }
+
+    /// F-R2ANT2-018: a `unitCode` inside a client's own value is data,
+    /// left as stored.
+    #[test]
+    fn a_unit_code_inside_a_value_stays_data() {
+        let stored = json!({ "id": "urn:ngsi-ld:T:1",
+            "doc": { "type": "JsonProperty", "json": { "unitCode": "GQ" } },
+            "spec": { "type": "Property", "value": { "unitCode": "GQ" } },
+            "list": { "type": "ListProperty", "valueList": [{ "unitCode": "GQ" }] },
+            "pm10": { "type": "Property", "values": [[{ "unitCode": "GQ" }, "2026-01-01T00:00:00Z"]] } });
+        let mut got = stored.clone();
+        name(&mut got);
+        assert_eq!(got, stored);
     }
 
     #[test]

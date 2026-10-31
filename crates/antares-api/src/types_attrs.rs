@@ -944,9 +944,7 @@ pub(crate) async fn stored_attributes(
 ) -> Response {
     let go = async {
         let tenant = antares_model::TenantId::new(&raw)
-            .ok()
-            .filter(|_| !antares_model::TenantId::is_reserved_str(&raw))
-            .ok_or_else(|| NgsiError::BadRequestData(format!("invalid tenant: {raw:?}")))?;
+            .map_err(|_| NgsiError::BadRequestData(format!("invalid tenant: {raw:?}")))?;
         let ctx = crate::repr::policy_context();
         let iri = ctx.expand_key(&type_name);
         let max = *crate::bounds::MAX_FOLD_DOCS;
