@@ -934,7 +934,14 @@ mod tests {
                 memory.remember(sub, &thing.to_string(), members(MEMBERS));
             }
         }
-        let held: usize = memory.probes.values().map(Seen::weight).sum();
+        let held: usize = memory
+            .probes
+            .values()
+            .map(|s| match s {
+                Seen::One(_) => 1,
+                Seen::Members(m) => m.len(),
+            })
+            .sum();
         assert!(held <= MAX_SEEN, "{held} digests held");
         assert_eq!(held, memory.digests);
         memory.forget("b");
