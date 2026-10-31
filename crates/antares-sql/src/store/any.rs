@@ -2252,6 +2252,9 @@ impl antares_store::CurrentStateDriver for AnyStore {
         tenant: &TenantId,
         entities: u64,
     ) -> Result<antares_store::TenantBytes, NgsiError> {
+        // only the Postgres arm sizes from the count; the memory store is exact
+        #[cfg(not(feature = "postgres"))]
+        let _ = entities;
         match self {
             // exact, and as fast as a guess would be
             AnyStore::Mem(s) => Ok(s.tenant_bytes(tenant)),
