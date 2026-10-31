@@ -1173,6 +1173,20 @@ pub trait PolicyEngine: Send + Sync {
         notification: &mut Value,
     ) -> NotifyDecision;
 
+    /// [`pre_notify`](Self::pre_notify) with the `@context` the notification's data is
+    /// compacted with: the Subscription's own, so an engine expanding a type or Attribute
+    /// name reads the IRI the subscriber meant, not the core context's (F-R2ANT1-002). The
+    /// broker calls this one; an engine that reads no names keeps the default.
+    fn pre_notify_in(
+        &self,
+        subject: &Subject,
+        sub: &Value,
+        notification: &mut Value,
+        _ctx: &antares_jsonld::Context,
+    ) -> NotifyDecision {
+        self.pre_notify(subject, sub, notification)
+    }
+
     /// Whether the engine reads rule documents through
     /// [`load`](Self::load) (ADR-0020 amendment). No by default: `/q/policy`
     /// then answers 404, as it does for a broker without an engine.
@@ -1437,9 +1451,10 @@ pub fn pre_notify(
     subject: &Subject,
     sub: &Value,
     notification: &mut Value,
+    ctx: &antares_jsonld::Context,
 ) -> NotifyDecision {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        engine.pre_notify(subject, sub, notification)
+        engine.pre_notify_in(subject, sub, notification, ctx)
     })) {
         Ok(d) => d,
         Err(_) => {
@@ -1963,7 +1978,8 @@ pub async fn run_policy_contract(engine: &dyn PolicyEngine) {
     });
     let before = members(&notification);
     let entity_members = members(&doc);
-    if pre_notify(engine, &subject, &sub, &mut notification) != NotifyDecision::Drop {
+    if pre_notify(engine, &subject, &sub, &mut notification, &CORE_CONTEXT) != NotifyDecision::Drop
+    {
         for key in members(&notification) {
             assert!(
                 before.contains(&key),
@@ -2715,7 +2731,13 @@ mod tests {
         std::panic::set_hook(Box::new(|_| {}));
         let decided = decide(&Panicking, &subject(), &Operation::new("5.6.1")).await;
         let mut notification = json!({"type": "Notification"});
-        let notified = pre_notify(&Panicking, &subject(), &json!({}), &mut notification);
+        let notified = pre_notify(
+            &Panicking,
+            &subject(),
+            &json!({}),
+            &mut notification,
+            &CORE_CONTEXT,
+        );
         std::panic::set_hook(hook);
         assert_eq!(decided, Decision::Deny(ENGINE_FAILED.to_owned()));
         assert_eq!(notified, NotifyDecision::Drop);

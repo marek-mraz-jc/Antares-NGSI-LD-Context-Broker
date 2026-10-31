@@ -1564,3 +1564,96 @@ async fn a_read_only_caller_writes_nothing_whatever_it_is_granted() -> Res {
     assert_eq!(code, StatusCode::NO_CONTENT, "{body}");
     Ok(())
 }
+
+/// F-R2ANT1-001: a write by id is judged on every type the Entity has, so naming a granted
+/// type in the body opens no Entity of another type.
+#[tokio::test]
+async fn a_granted_type_in_the_body_opens_no_entity_of_another_type() -> Res {
+    let (st, _) = broker(doc(&[writer(json!([{"entities": [{"type": "Car"}]}]))])).await?;
+    fleet(&st).await?;
+    let at = "/ngsi-ld/v1/entities/urn:ngsi-ld:Secret:1/attrs";
+    let widened = json!({"type": "Car", "code": prop(json!("y"))});
+    for method in ["POST", "PATCH"] {
+        let (code, body) = send(&st, method, at, &ANA, Some(&widened)).await?;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{method}: {body}");
+    }
+    let (_, secret) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities/urn:ngsi-ld:Secret:1",
+        &ADMIN,
+        None,
+    )
+    .await?;
+    assert_eq!(secret.pointer("/code/value"), Some(&json!("x")), "{secret}");
+    // the grant still writes what it names
+    let (code, body) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/entities/urn:ngsi-ld:Car:1/attrs",
+        &ANA,
+        Some(&json!({"colour": prop(json!("blue"))})),
+    )
+    .await?;
+    assert_eq!(code, StatusCode::NO_CONTENT, "{body}");
+    Ok(())
+}
+
+/// F-R2ANT1-002: a notification's data is compacted with the subscriber's `@context`, which
+/// can alias a prohibited type with another short name; the engine expands with that context.
+#[tokio::test]
+async fn a_subscriber_alias_does_not_carry_a_prohibited_type_past_the_prohibition() -> Res {
+    use antares_api::policy::{NotifyDecision, PolicyEngine, Subject};
+    let prohibited = with(
+        grant(
+            "no-secret",
+            "group",
+            "city",
+            &["5.7.2"],
+            json!([{"entities": [{"type": "Secret"}]}]),
+        ),
+        "effect",
+        json!("prohibit"),
+    );
+    let (_, engine) = broker(doc(&[
+        grant("all", "group", "city", &["5.7.2"], json!([])),
+        prohibited,
+    ]))
+    .await?;
+    let subject = Subject {
+        tenant: antares_model::TenantId::default(),
+        headers: vec![
+            ("x-jc-subject".into(), "ana".into()),
+            ("x-jc-groups".into(), "city".into()),
+        ],
+    };
+    let mut ctx = antares_jsonld::core_context();
+    let alias = json!({"Hidden": "https://uri.etsi.org/ngsi-ld/default-context/Secret"});
+    ctx.merge_object(alias.as_object().ok_or("alias")?)
+        .map_err(|e| format!("{e:?}"))?;
+    let mut n = json!({"data": [{"id": "urn:ngsi-ld:Secret:1", "type": "Hidden"}]});
+    assert_eq!(
+        engine.pre_notify_in(&subject, &json!({}), &mut n, &ctx),
+        NotifyDecision::Drop
+    );
+    let mut n = json!({"data": [car(1, 10, "/a")]});
+    assert_eq!(
+        engine.pre_notify_in(&subject, &json!({}), &mut n, &ctx),
+        NotifyDecision::Deliver
+    );
+    Ok(())
+}
+
+/// F-R2ANT1-004: a caller the gate denies 5.6.19 gets the same 403 whether the Attribute
+/// exists or not, so a refused value tells it nothing of the stored one.
+#[tokio::test]
+async fn a_denied_set_attribute_value_answers_403_whatever_is_stored() -> Res {
+    let (st, _) = broker(doc(&[writer(json!([{"entities": [{"type": "Car"}]}]))])).await?;
+    fleet(&st).await?;
+    for attr in ["speed", "absent"] {
+        let uri = format!("/ngsi-ld/v1/entities/urn:ngsi-ld:Car:1/attrs/{attr}/value");
+        let (code, body) = send(&st, "PUT", &uri, &ANA, Some(&Value::Null)).await?;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{attr}: {body}");
+    }
+    Ok(())
+}
