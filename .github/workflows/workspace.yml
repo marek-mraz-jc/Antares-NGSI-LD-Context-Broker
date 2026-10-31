@@ -25,6 +25,27 @@ on:
         description: "base commit of the change under test (empty: run everything)"
         type: string
         default: ""
+      scope:
+        # T-6151 (owner 2026-10-30: push to dev under 5 minutes). `push` is
+        # the per-push gate: fmt, clippy --all-features, the workspace suite
+        # on the default features and on all features, the OData ABNF cases
+        # and the repository rules that need no build. `nightly` adds the
+        # fuzz smoke of every target. `sweep` runs every job of this file:
+        # each feature alone, the binary sizes, no-default-features and the
+        # file store, MSRV, the shared crates, package/semver, the OData
+        # CSDL schemas, the wasm32 and fuzz builds, the vanilla symbol gate,
+        # the new-surface smoke, the SBOM, cargo-audit and cargo-deny.
+        # sweep.yml runs it weekly when dev moved and on the commit a prod
+        # release pins; ci.yml and full.yml keep it.
+        description: "push | nightly | sweep (every job)"
+        type: string
+        default: sweep
+      ref:
+        # the commit to test; empty tests the triggering commit (sweep.yml
+        # passes the Antares commit a release pins)
+        description: "commit to check out (empty: the triggering commit)"
+        type: string
+        default: ""
 
 # Caches (T-6035): a run reads the caches of its own ref and of dev, the
 # default branch, and none of another branch's. Every train ran on a new
@@ -54,6 +75,7 @@ jobs:
     # antares-api test run 165 s x 7 features, one antares-broker run 69 s x
     # 4): a single job would pass 15 minutes on a runner, a split one stays
     # well under.
+    if: inputs.scope == 'sweep'
     name: Each feature alone (${{ matrix.package }}${{ matrix.partition && format(' {0}', matrix.partition) || '' }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -91,6 +113,8 @@ jobs:
           - { package: binary-size, partition: 6/6 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
       # T-6035: a shard whose package the change does not reach (no file in
       # it or in a crate below it, and none outside every crate) skips with
       # a notice; no base, or any doubt, runs it (dev/touched-packages.py)
@@ -139,12 +163,13 @@ jobs:
   workspace:
     # The workspace test suite on the default features, with live PostGIS /
     # TimescaleDB / mosquitto / NATS so no integration test skips vacuously.
-    # Two cells, each running half the tests (nextest --partition count:N/2):
-    # one cell took 32 min (run 40887864111: test build 6 min, 4106 tests
-    # 9.7 min, throughput-bound on the runner's 4 CPUs) and was the train's
-    # critical path (T-6072). fmt, clippy and the supply-chain and repo
-    # checks run in the lint job beside them.
-    name: Workspace tests (${{ matrix.part }}/2)
+    # Four cells, each running a quarter of the tests (nextest --partition
+    # count:N/4): one cell took 32 min (run 40887864111: test build 6 min,
+    # 4106 tests 9.7 min, throughput-bound on the runner's 4 CPUs) and was
+    # the train's critical path (T-6072); two cells still took ~12 min, the
+    # per-push gate's longest job (T-6151). fmt, clippy and the repo checks
+    # run in the lint job beside them.
+    name: Workspace tests (${{ matrix.part }}/4)
     # x86, not the arm runner: a COLD workspace build there dies with a bare
     # SIGTERM (exit 143) after 3-10 min — no rustc error, no cancel, and the
     # same cold job peaks at 1.2 GB locally. The msrv and shared-crate jobs
@@ -156,7 +181,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2]
+        # four cells since T-6151: the per-push gate waits on the slowest
+        part: [1, 2, 3, 4]
     env: &workspace-env
       # Live PostGIS for the antares-sql integration tests — without this
       # they skip vacuously and CI proves nothing about the Pg store.
@@ -197,6 +223,8 @@ jobs:
           --health-interval 5s --health-timeout 3s --health-retries 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
       # Five feature-set builds run below, and cargo keeps each one's
       # artifacts side by side in target/ — the last of them linked the
       # broker binary onto a full filesystem and the linker died with
@@ -264,11 +292,13 @@ jobs:
             [ -n "${!v:-}" ] || { echo "::error::$v gates a test and is unset here"; rc=1; }
           done
           exit $rc
-      # count:N/2 deals each binary's tests round-robin over the two cells,
-      # so both get a share of the slow pg binaries. Both cells build the
-      # same test binaries and share one rust-cache key.
-      - name: The workspace suite, half ${{ matrix.part }} of 2
-        run: dev/unit-junit.sh default-${{ matrix.part }} --workspace --partition count:${{ matrix.part }}/2
+      # count:N/4 deals every other binary's tests round-robin over the four
+      # cells; each antares-sql pg binary runs whole in one cell
+      # (dev/test-cell.sh), because its plan and partition tests lean on what
+      # their siblings seed in the cell's database. Every cell builds the same
+      # test binaries and they share one rust-cache key.
+      - name: The workspace suite, part ${{ matrix.part }} of 4
+        run: dev/test-cell.sh default-${{ matrix.part }} ${{ matrix.part }} 4 --workspace
       # nextest cannot execute doctests. They stay gated here (a broken doc
       # example is still a red build) but contribute no JUnit, which the
       # /reports/unit/ footer says out loud rather than quietly overcounting.
@@ -292,7 +322,7 @@ jobs:
       # Same store tests, timescale temporal mode (hypertable DDL branch,
       # compression-vs-RLS ordering, backend detection).
       - name: Store tests against the timescale temporal mode
-        if: matrix.part == 1
+        if: matrix.part == 3
         env:
           ANTARES_TEST_DATABASE_URL: postgresql://antares:antares@localhost:15433/antares
         run: |
@@ -312,7 +342,7 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           # fold-reports.sh takes `unit-junit` and every `unit-junit-*`
-          name: ${{ matrix.part == 1 && 'unit-junit' || 'unit-junit-default-2' }}
+          name: ${{ matrix.part == 1 && 'unit-junit' || format('unit-junit-default-{0}', matrix.part) }}
           path: unit-junit/
           if-no-files-found: warn
 
@@ -328,6 +358,8 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
       # clippy --all-features, the vanilla and plugin-example broker builds
       # and the template smoke all keep artifacts in target/.
       - name: Reclaim runner disk
@@ -351,10 +383,12 @@ jobs:
       # moves under everyone's feet takes the wasm32 arm down silently. A
       # check here costs one target and keeps the arm honest per commit.
       - run: cargo check --locked --target wasm32-unknown-unknown -p antares-wasm
+        if: inputs.scope == 'sweep'
       # T-3911: the JSON-LD algorithms without the `fetch` loader build for
       # the browser with no network stack at all, the shape another project
       # embeds (rule M3).
       - run: cargo check --locked --target wasm32-unknown-unknown -p ngsild-jsonld --no-default-features
+        if: inputs.scope == 'sweep'
       # --locked everywhere below: the image builds with it (Dockerfile), so
       # without it CI would gate on a dependency set the shipped binary never
       # used, and an out-of-date Cargo.lock would pass here and fail there.
@@ -380,6 +414,7 @@ jobs:
       # trips weeks later. Type-checking it here costs one pass over already
       # built dependencies and catches exactly that.
       - name: The fuzz targets still compile
+        if: inputs.scope == 'sweep'
         run: cargo check --locked --manifest-path fuzz/Cargo.toml --bins
       # Supply chain per run (surfaces-threat-model 11.1, T-3489), every
       # tool at an exact version. cargo-audit (run last, beside cargo-deny)
@@ -395,8 +430,10 @@ jobs:
       - name: cargo-machete
         run: cargo machete
       - name: SBOM (vanilla and full)
+        if: inputs.scope == 'sweep'
         run: dev/sbom.sh sbom
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: inputs.scope == 'sweep'
         with:
           name: sbom
           path: sbom/*.cdx.json
@@ -461,6 +498,7 @@ jobs:
       - name: Vanilla feature tree is committed
         run: dev/vanilla-tree.sh | diff -u ci/vanilla-tree.txt -
       - name: Vanilla binary links no surface
+        if: inputs.scope == 'sweep'
         run: ./dev/check-vanilla-symbols.sh
       # Module rules M1 and M2 (ADR-0027, surfaces-threat-model 9.3/9.4):
       # every package declares its role, a surface reaches the store only
@@ -481,6 +519,7 @@ jobs:
       # its own tests (the Policy deny test among them), lint clean and keep
       # rule M2, so the generator cannot rot while no new surface is made.
       - name: New-surface template smoke
+        if: inputs.scope == 'sweep'
         run: dev/new-surface.test.sh
       # Every STRIDE row of the surfaces threat model names a test, and the
       # test exists once the crate that owns it does (surfaces-test-plan.md
@@ -541,11 +580,12 @@ jobs:
       # for the same reason; deny runs even when audit is red, so one
       # advisory never hides the other tool's verdict.
       - name: cargo-audit
+        if: inputs.scope == 'sweep'
         run: |
           python3 dev/advisory-ignores.py --self-test
           cargo audit --deny warnings $(python3 dev/advisory-ignores.py)
       - name: cargo-deny (licenses, advisories, bans, sources)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && inputs.scope == 'sweep' }}
         run: |
           V=0.20.2
           curl -sSfL "https://github.com/EmbarkStudios/cargo-deny/releases/download/${V}/cargo-deny-${V}-$(uname -m)-unknown-linux-musl.tar.gz" \
@@ -560,7 +600,7 @@ jobs:
     # file-store 125 s) and the whole `fast` lane waited on them; a cell
     # each runs beside it, with the same databases, brokers and skip guard
     # (T-3710).
-    name: Workspace tests (${{ matrix.set }})
+    name: Workspace tests (${{ matrix.set }}${{ matrix.set == 'all-features' && format(' {0}/2', matrix.part) || '' }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env: *workspace-env
@@ -568,10 +608,15 @@ jobs:
     strategy:
       fail-fast: false
       max-parallel: ${{ inputs.max_parallel }}
+      # all-features in two cells (count:N/2), the per-push gate's other
+      # long job; no-default-features and the file store run in the sweep
+      # (T-6151: all-features catches what they caught)
       matrix:
-        set: [no-default-features, all-features, file-store]
+        include: ${{ fromJSON(inputs.scope == 'sweep' && '[{"set":"all-features","part":1},{"set":"all-features","part":2},{"set":"no-default-features","part":1},{"set":"file-store","part":1}]' || '[{"set":"all-features","part":1},{"set":"all-features","part":2}]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
@@ -588,7 +633,7 @@ jobs:
         run: dev/unit-junit.sh no-default-features --workspace --no-default-features
       - name: The workspace suite with every feature
         if: matrix.set == 'all-features'
-        run: dev/unit-junit.sh all-features --workspace --all-features
+        run: dev/test-cell.sh all-features-${{ matrix.part }} ${{ matrix.part }} 2 --workspace --all-features
       # AppState::new composes a fresh redb file store per state under this
       # harness variable, so every API test that passed on memory has to pass
       # on the durable backend too — no second copy of the tests.
@@ -600,7 +645,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: unit-junit-${{ matrix.set }}
+          name: unit-junit-${{ matrix.set }}-${{ matrix.part }}
           path: unit-junit/
           if-no-files-found: warn
 
@@ -612,11 +657,13 @@ jobs:
     # for 30 s with a 512 MB malloc cap. A dispatch run has no base and runs
     # every target. fuzz.yml keeps the long twice-weekly runs.
     name: Fuzz smoke (touched targets, 30 s each)
+    if: inputs.scope != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           fetch-depth: 0
       - name: Target selection self-test
         run: python3 dev/fuzz-smoke.py --self-test
@@ -656,10 +703,13 @@ jobs:
     # via xmllint, csdl.schema.json via ajv, the OASIS xml2json converter, and
     # every annotation term against the pinned vocabularies (T-3502).
     name: OData CSDL against the OASIS schemas
+    if: inputs.scope == 'sweep'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
@@ -682,6 +732,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
@@ -695,10 +747,13 @@ jobs:
   msrv:
     # The declared rust-version stays PROVEN as stable moves on.
     name: MSRV check (1.97)
+    if: inputs.scope == 'sweep'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.97"
@@ -717,6 +772,7 @@ jobs:
     # backend — a workspace build would unify features and hide exactly
     # that breakage.
     name: Shared crates standalone
+    if: inputs.scope == 'sweep'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     strategy:
@@ -726,6 +782,8 @@ jobs:
         crate: [ngsild-model, ngsild-ql, ngsild-jsonld, ngsild-matcher, ngsild-residual, antares-store]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
@@ -783,11 +841,13 @@ jobs:
     # the README packaged with its doctest), in dependency order, as a release would publish
     # them; and a breaking change to their public API is a visible line against the last v* tag.
     name: NGSI-LD crates (package, semver)
+    if: inputs.scope == 'sweep'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           # cargo-semver-checks builds the baseline from the last tag
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
