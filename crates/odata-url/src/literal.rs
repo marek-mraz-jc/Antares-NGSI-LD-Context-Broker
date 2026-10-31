@@ -170,8 +170,8 @@ pub(crate) fn is_duration(text: &str) -> bool {
     days_ok && time_ok && (!days.is_empty() || time.is_some())
 }
 
-/// Whether the JSON string `text` is a value of primitive type `name` in its
-/// ABNF form (OData JSON 7.1: Edm.Date, DateTimeOffset, TimeOfDay, Duration,
+/// ABNF form (`OData` JSON 7.1: `Edm.Date`, `DateTimeOffset`, `TimeOfDay`, `Duration`,
+/// `Guid` and `Binary` are strings, each in the lexical form its literal has);
 /// Guid and Binary are strings, each in the lexical form its literal has);
 /// `true` for every other type. A body holds JSON text, so the `%3A`/`%2B`
 /// spellings a URL literal may use are refused here.

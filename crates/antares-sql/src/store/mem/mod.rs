@@ -21,6 +21,10 @@ use self::redb::{
     T_META, T_TEMPORAL_ENTITIES,
 };
 use serde_json::Value;
+
+/// One key [`Store::persist_many`] writes: its table, its key, and the doc
+/// (`None` deletes the key).
+type Persisted<'a> = (Table, Vec<u8>, Option<&'a Value>);
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::RwLock;
@@ -352,11 +356,11 @@ impl Store {
     /// [`Self::persist`] of many keys in one commit (`file` mode): what a
     /// purge or a sweep deleted (`None`) or rewrote. A document that will not
     /// encode is skipped, as `persist` skips it.
-    fn persist_many(&self, writes: &[(Table, Vec<u8>, Option<&Value>)]) {
+    fn persist_many(&self, writes: &[Persisted<'_>]) {
         let Some(shadow) = &self.shadow else {
             return;
         };
-        let encoded: Vec<(Table, &[u8], Option<Vec<u8>>)> = writes
+        let encoded: Vec<_> = writes
             .iter()
             .filter_map(|(table, key, doc)| match doc {
                 Some(d) => serde_json::to_vec(d)
@@ -460,7 +464,7 @@ impl Store {
                 }
             }
         }
-        let mut gone: Vec<(Table, Vec<u8>, Option<&Value>)> = Vec::new();
+        let mut gone: Vec<Persisted<'_>> = Vec::new();
         for (tenant, id) in dead {
             if let Some(docs) = inner.entities.get_mut(&tenant) {
                 gone.push((T_ENTITIES, key_bytes(&tenant, &id), None));
@@ -805,7 +809,7 @@ impl Store {
         on_blocking(true, || {
             let mut inner = self.write_inner();
             let mut hit = false;
-            let mut gone: Vec<(Table, Vec<u8>, Option<&Value>)> = Vec::new();
+            let mut gone: Vec<Persisted<'_>> = Vec::new();
             for kind in kinds {
                 if let Some(docs) = Self::map_mut(&mut inner, *kind).remove(tenant.as_str()) {
                     hit = true;
@@ -835,7 +839,7 @@ impl Store {
                 .filter(|(_, row)| context_row_owner(row) == Some(tenant.as_str()))
                 .map(|(id, _)| id.clone())
                 .collect();
-            let gone: Vec<(Table, Vec<u8>, Option<&Value>)> = dead
+            let gone: Vec<Persisted<'_>> = dead
                 .iter()
                 .map(|id| (T_JSONLD_CONTEXTS, id.as_bytes().to_vec(), None))
                 .collect();

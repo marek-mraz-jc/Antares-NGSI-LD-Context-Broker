@@ -924,7 +924,7 @@ mod tests {
 
     /// F-R2ANT4-001: a collection weighs one digest per member, and every topic of the
     /// connection shares the bound, so 100 Things of 100 Datastreams on each of two topics hold
-    /// at most MAX_SEEN digests, not two times 100 paths of 100 members.
+    /// at most `MAX_SEEN` digests, not two times 100 paths of 100 members.
     #[test]
     fn the_memory_of_a_connection_counts_members_over_all_its_topics() {
         let members = |n: usize| Seen::Members((0..n).map(|i| (i.to_string(), 0)).collect());
