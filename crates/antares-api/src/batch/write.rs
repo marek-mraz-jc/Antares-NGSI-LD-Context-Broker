@@ -467,7 +467,18 @@ impl BatchRun<'_> {
                     .out
                     .errors
                     .push(err_entry(Some(id), &Conditions::not_found(id))),
-                None => replaces.push((id.clone(), expanded.clone())),
+                None => {
+                    // F-R2ANT1-009: the member was checked as a fragment; the Entity it now
+                    // creates is held to the whole-Entity rules
+                    #[cfg(feature = "views")]
+                    if let Err(e) =
+                        crate::schema_writes::admits_typed(self.st, &self.tenant, expanded, true)
+                    {
+                        self.out.errors.push(err_entry(Some(id), &e));
+                        continue;
+                    }
+                    replaces.push((id.clone(), expanded.clone()));
+                }
             }
         }
         Ok(replaces)
@@ -1033,11 +1044,10 @@ fn ngsi_of(e: ApiError) -> NgsiError {
         ApiError::Overloaded(_) => {
             NgsiError::InternalError(antares_model::error::DB_OVERLOADED.into())
         }
-        // The policy gate runs once per request, before the array is
-        // touched, so a refusal is the whole array's 403 and never one
-        // entry's — this arm is exhaustiveness, not a path. If a per-item
-        // gate is ever added, 422 is the nearest thing Table 6.3.2-1 has:
-        // the entry was refused, and the reason travels with it.
+        // The policy gate judges each member in `decide` (`gate_each`), which
+        // answers a refused member with its own entry (`denied_entry`); only a
+        // member's @context reaches here, and it is never refused by policy.
+        // 422 is the nearest thing Table 6.3.2-1 has should one ever arrive.
         ApiError::Denied(why) => NgsiError::OperationNotSupported(why),
     }
 }

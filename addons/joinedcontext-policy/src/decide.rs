@@ -135,7 +135,9 @@ pub fn decide(
     }
 }
 
-/// Whether `clause` only reads: what a read-only caller may ask.
+/// Whether `clause` only reads: what a read-only caller may ask. A query with an `EntityMap`
+/// (5.14.4, 5.14.5) is a read: the map it stores is that query's own expiring paging state,
+/// never context data (S-49 keeps a read-only caller off Entities, F-R2ANT1-017).
 fn reads(clause: &str) -> bool {
     FILTERABLE.contains(&clause)
         || NAME_READS.contains(&clause)
@@ -511,22 +513,42 @@ fn write(grants: &[&Policy], op: &Operation<'_>, types: &[String]) -> Decision {
             "{name:?} is access control and does not belong in an Entity"
         ));
     }
+    // Every type the Entity has or gets needs a grant of its own (F-R2ANT1-001): a grant of
+    // one type matching would let a body naming it open an Entity of any other type.
+    let each: Vec<&[String]> = if types.is_empty() {
+        vec![types]
+    } else {
+        types.iter().map(std::slice::from_ref).collect()
+    };
     let mut conditional = Vec::new();
-    for p in grants {
-        for admit in admits(p, op, types) {
+    let mut conditional_types = 0usize;
+    for one in each {
+        let mut rules = Vec::new();
+        let mut whole = false;
+        for admit in grants.iter().flat_map(|p| admits(p, op, one)) {
             match admit {
-                Admit::Whole => return Decision::Allow,
-                Admit::If(rule) => conditional.push(rule),
+                Admit::Whole => whole = true,
+                Admit::If(rule) => rules.push(rule),
             }
         }
+        if whole {
+            continue;
+        }
+        if rules.is_empty() {
+            return Decision::Deny(NOT_GRANTED.into());
+        }
+        conditional_types = conditional_types.saturating_add(1);
+        conditional.extend(rules);
     }
-    if conditional.is_empty() {
-        Decision::Deny(NOT_GRANTED.into())
-    } else {
-        Decision::AllowIf(Filter {
+    // Decided (worker-t6211, owner may override): a filter's rules are or-ed, so conditions
+    // of two types cannot both be required of one Entity; such a write is refused.
+    match conditional_types {
+        0 => Decision::Allow,
+        1 => Decision::AllowIf(Filter {
             rules: conditional,
             ..Filter::default()
-        })
+        }),
+        _ => Decision::Deny(NOT_GRANTED.into()),
     }
 }
 

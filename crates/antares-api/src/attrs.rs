@@ -1353,13 +1353,16 @@ async fn set_attr_value_inner(
         .and_then(|d| d.get(&attr_iri))
         .and_then(|a| instance_with_dataset(a, want_ds.as_deref()))
         .cloned();
-    refuse_null(stored_inst.as_ref(), &value)?;
-    // what the engine judges is the instance as it would be stored
-    let judged = stored_inst
-        .as_ref()
-        .map(|si| with_value(si, attr, &attr_iri, &value, &ctx, observed))
-        .transpose()?
-        .map(|i| serde_json::json!({ attr_iri.clone(): [i] }));
+    // what the engine judges is the instance as it would be stored; a refusal of the value
+    // waits for the gate, so a caller the gate denies learns nothing of the stored
+    // Attribute from a 400 (F-R2ANT1-004)
+    let judged = refuse_null(stored_inst.as_ref(), &value).and_then(|()| {
+        stored_inst
+            .as_ref()
+            .map(|si| with_value(si, attr, &attr_iri, &value, &ctx, observed))
+            .transpose()
+            .map(|i| i.map(|i| serde_json::json!({ attr_iri.clone(): [i] })))
+    });
     let pre = crate::policy::pre_image(st, &tenant, id, None).await?;
     let granted = gate!(
         st, &tenant, headers, "5.6.19",
@@ -1367,9 +1370,10 @@ async fn set_attr_value_inner(
         types: &pre.types,
         stored: pre.stored.as_ref(),
         attrs: std::slice::from_ref(&attr_iri),
-        body: judged.as_ref(),
+        body: judged.as_ref().ok().and_then(Option::as_ref),
     )
     .await?;
+    let judged = judged?;
     #[cfg(feature = "views")]
     if let Some(j) = &judged {
         crate::schema_writes::admits(st, &tenant, id, j, &pre.types).await?;

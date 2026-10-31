@@ -49,9 +49,12 @@ fn broker_base(configured: Option<&str>, headers: &HeaderMap) -> String {
     match configured.map(str::trim).filter(|u| !u.is_empty()) {
         Some(url) => url.trim_end_matches('/').to_owned(),
         None => {
+            // a Host that is no URI authority is client text, never written into a URL
+            // (F-R2ANT1-016: `a>b` closed the IRI of a Turtle document)
             let host = headers
                 .get(header::HOST)
                 .and_then(|h| h.to_str().ok())
+                .filter(|h| h.parse::<axum::http::uri::Authority>().is_ok())
                 .unwrap_or("localhost:9090");
             format!("http://{host}")
         }
@@ -736,6 +739,23 @@ pub async fn delete_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-R2ANT1-016: a Host header that is no URI authority never reaches a URL the broker
+    /// writes into a document.
+    #[test]
+    fn a_host_that_is_no_authority_falls_back() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            axum::http::HeaderValue::from_static("a> . <x"),
+        );
+        assert_eq!(broker_base(None, &headers), "http://localhost:9090");
+        headers.insert(
+            header::HOST,
+            axum::http::HeaderValue::from_static("broker:9090"),
+        );
+        assert_eq!(broker_base(None, &headers), "http://broker:9090");
+    }
 
     /// T-5895: a read with an inline @context stores one ImplicitlyCreated
     /// row per distinct @context, and the count cap alone let 1 000 of them

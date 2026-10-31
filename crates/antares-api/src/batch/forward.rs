@@ -291,17 +291,23 @@ impl Fwd<'_> {
         arr: Vec<Value>,
         remote: &mut Remote,
     ) -> bool {
+        // F-R2ANT1-014: one request per Entity, as many at once as a fan-out sends
         if opts.mode == BatchMode::Upsert && reg.supports("createEntity") {
-            for ent in arr {
-                self.upsert_one(reg, opts, ent, remote).await;
+            let answers =
+                crate::federation::fan_out(arr, |ent| self.upsert_one(reg, opts, ent)).await;
+            for answer in answers {
+                match answer {
+                    Ok((id, status, created)) => remote.one(&id, status, created),
+                    Err(entry) => remote.err.push(entry),
+                }
             }
             return true;
         }
         let Some(call) = BatchFwd::single(reg, opts) else {
             return false;
         };
-        for ent in arr {
-            let (id, status) = self.one(reg, ent, &call).await;
+        let call = &call;
+        for (id, status) in crate::federation::fan_out(arr, |ent| self.one(reg, ent, call)).await {
             remote.one(&id, status, call.created);
         }
         true
@@ -310,17 +316,16 @@ impl Fwd<'_> {
     /// 5.6.8.4: an upsert forwarded as Create Entity; an Entity the peer
     /// already holds is not a failed upsert — it falls through to the
     /// operation that updates the one that is there.
+    /// The id, status and whether it created, or the error entry when no path upserts it.
     async fn upsert_one(
         &self,
         reg: &crate::federation::FedReg,
         opts: WriteOpts,
         ent: Value,
-        remote: &mut Remote,
-    ) {
+    ) -> Result<(String, u16, bool), Value> {
         let (id, status) = self.one(reg, ent.clone(), &BatchFwd::create()).await;
         if status != 409 {
-            remote.one(&id, status, true);
-            return;
+            return Ok((id, status, true));
         }
         let call = if !opts.update && reg.supports("replaceEntity") {
             BatchFwd::replace()
@@ -328,15 +333,14 @@ impl Fwd<'_> {
             BatchFwd::update()
         } else {
             // 5.6.8.4: neither replace nor update available
-            remote.err.push(err_remote(
+            return Err(err_remote(
                 Some(&id),
                 422,
                 &format!("OperationNotSupported: no upsert path for {id}"),
             ));
-            return;
         };
         let (id, status) = self.one(reg, ent, &call).await;
-        remote.one(&id, status, call.created);
+        Ok((id, status, call.created))
     }
 
     async fn one(

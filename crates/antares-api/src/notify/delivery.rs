@@ -204,6 +204,7 @@ pub(super) async fn deliver_as(
             &crate::policy::stored_subject(tenant, sub),
             sub,
             &mut body,
+            ctx,
         ) {
             crate::policy::NotifyDecision::Deliver => {}
             crate::policy::NotifyDecision::Drop => {
