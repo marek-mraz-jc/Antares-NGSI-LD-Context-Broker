@@ -1238,6 +1238,61 @@ async fn tenant_bytes_are_the_tenants_own_rows_by_first_type() {
     }
 }
 
+/// T-6159: the size estimate of a tenant whose exact scan fails counts the
+/// tenant's own rows by first type and weighs each by the analyzed table's
+/// average row, so the types sum to the whole and another tenant's rows
+/// never count.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tenant_size_estimate_counts_its_own_rows_by_first_type() {
+    use antares_store::{CurrentStateDriver, Kind};
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect+migrate");
+    let store = antares_sql::store::any::AnyStore::Pg(antares_sql::store::any::PgBackend::new(
+        pool.clone(),
+    ));
+    let run = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let a = TenantId::new(&format!("pgest{run}")).expect("tenant");
+    let b = TenantId::new(&format!("pgest{run}x")).expect("tenant");
+    for t in [&a, &b] {
+        pg::ensure_tenant(&pool, t).await.expect("tenant row");
+    }
+    for (t, id, ty) in [
+        (&a, "urn:x:1", serde_json::json!("Room")),
+        (&a, "urn:x:2", serde_json::json!("Room")),
+        (&a, "urn:x:3", serde_json::json!(["Bridge", "Room"])),
+        (&b, "urn:x:4", serde_json::json!("Car")),
+    ] {
+        let doc = serde_json::json!({"id": id, "type": ty,
+            "createdAt": "2026-08-04T09:00:00Z", "modifiedAt": "2026-08-04T09:00:00Z"});
+        CurrentStateDriver::create(&store, t, Kind::Entity, id, doc)
+            .await
+            .expect("create");
+    }
+    sqlx::query("ANALYZE entities")
+        .execute(&pool)
+        .await
+        .expect("analyze");
+    let est = CurrentStateDriver::tenant_bytes_estimate(&store, &a)
+        .await
+        .expect("estimate");
+    assert_eq!(
+        est.by_type.keys().collect::<Vec<_>>(),
+        ["Bridge", "Room"],
+        "{est:?}"
+    );
+    assert!(est.by_type["Room"] > est.by_type["Bridge"], "{est:?}");
+    assert!(est.by_type["Bridge"] > 0, "{est:?}");
+    assert_eq!(est.entities, est.by_type.values().sum::<u64>(), "{est:?}");
+    for t in [&a, &b] {
+        CurrentStateDriver::purge_tenant(&store, t)
+            .await
+            .expect("purge");
+    }
+}
+
 /// T-2890: a size scan is bounded: held behind a lock (as behind a scan of a
 /// history table tens of GB long) it gives up within its statement timeout
 /// instead of holding the connection, and the caller answers without a size.

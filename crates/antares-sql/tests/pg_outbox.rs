@@ -223,8 +223,10 @@ async fn a_retained_row_leaves_the_page_and_stays_readable_until_it_is_reaped() 
 
     // Window 0 puts every stamped row past the horizon; a pending row carries
     // no stamp, and `NULL < now()` is never true, so the drain's queue is
-    // untouched by the reap.
-    assert!(outbox::reap_published(&pool, 0).await.expect("reap") >= 1);
+    // untouched by the reap. The count is not asserted: a broker test sharing
+    // this database reaps with window 0 too (wiring.rs), and may take the row
+    // first; the read below proves it is gone either way.
+    outbox::reap_published(&pool, 0).await.expect("reap");
     assert!(outbox::event(&pool, seq, &t)
         .await
         .expect("event")
