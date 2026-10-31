@@ -397,6 +397,32 @@ fn upsert_raced() -> NgsiError {
     )
 }
 
+/// An upsert's two steps, `first` then `second` (each an expression that
+/// awaits whether it took the row), until one of them took it: whether
+/// `first` did. A create that lost its race to a writer whose row a delete
+/// took again finds nothing to replace either, so the pair runs again, and
+/// after [`UPSERT_ROUNDS`] the upsert is refused: it never answers success
+/// for a write that stored nothing (F-R2ANT3-003). A macro, not an async
+/// fn over closures: the steps' futures stay concrete, so the caller's
+/// stays `Send`.
+#[cfg(feature = "postgres")]
+macro_rules! upsert_rounds {
+    ($first:expr, $second:expr) => {{
+        let mut took = Err(upsert_raced());
+        for _ in 0..UPSERT_ROUNDS {
+            if $first {
+                took = Ok(true);
+                break;
+            }
+            if $second {
+                took = Ok(false);
+                break;
+            }
+        }
+        took
+    }};
+}
+
 /// The longest the readiness ping waits for the database (see
 /// [`AnyStore::ping`]).
 #[cfg(feature = "postgres")]
@@ -705,16 +731,12 @@ impl AnyStore {
             #[cfg(feature = "postgres")]
             AnyStore::Pg(p) => match kind {
                 Kind::Entity => {
-                    // replace-or-create without a pre-read: try the replace
-                    // first (captures the true before-image under the row
-                    // lock), else the create; a create that lost its race to
-                    // a writer whose row a delete took again finds nothing to
-                    // replace either, so the pair runs again (F-R2ANT3-003)
+                    // replace-or-create without a pre-read: the replace first
+                    // (it captures the true before-image under the row lock),
+                    // else the create
                     let mut prev: Option<Value> = None;
-                    let mut existed = None;
-                    for _ in 0..UPSERT_ROUNDS {
-                        let replaced = p
-                            .entities
+                    let existed = upsert_rounds!(
+                        p.entities
                             .mutate(tenant, id, |d| {
                                 prev = Some(d.clone());
                                 *d = doc.clone();
@@ -722,40 +744,24 @@ impl AnyStore {
                             })
                             .await
                             .map_err(db)?
-                            .is_some();
-                        if replaced {
-                            existed = Some(true);
-                            break;
-                        }
-                        if p.entities.create(tenant, id, &doc).await.map_err(db)? {
-                            existed = Some(false);
-                            break;
-                        }
-                    }
-                    let existed = existed.ok_or_else(upsert_raced)?;
+                            .is_some(),
+                        p.entities.create(tenant, id, &doc).await.map_err(db)?
+                    )?;
                     p.emit(tenant, prev, Some(doc)).await;
                     Ok(existed)
                 }
-                Kind::Temporal => {
-                    for _ in 0..UPSERT_ROUNDS {
-                        if p.temporal.create(tenant, id, &doc).await.map_err(db)? {
-                            return Ok(false);
-                        }
-                        let replaced = p
-                            .temporal
-                            .mutate(tenant, id, |d| {
-                                *d = doc.clone();
-                                Ok::<(), std::convert::Infallible>(())
-                            })
-                            .await
-                            .map_err(db)?
-                            .is_some();
-                        if replaced {
-                            return Ok(true);
-                        }
-                    }
-                    Err(upsert_raced())
-                }
+                Kind::Temporal => upsert_rounds!(
+                    p.temporal.create(tenant, id, &doc).await.map_err(db)?,
+                    p.temporal
+                        .mutate(tenant, id, |d| {
+                            *d = doc.clone();
+                            Ok::<(), std::convert::Infallible>(())
+                        })
+                        .await
+                        .map_err(db)?
+                        .is_some()
+                )
+                .map(|created: bool| !created),
                 _ => {
                     let dk = doc_kind(kind)?;
                     p.docs.upsert(tenant, dk, id, &doc).await.map_err(db)
@@ -2789,6 +2795,29 @@ mod estimate_tests {
             Some(freqs.to_vec()),
             Some(distinct),
         )
+    }
+
+    /// F-R2ANT3-003: replace None, create false (lost the race), replace
+    /// None again (a delete took the row): the pair runs again, and a pair
+    /// that never takes the row is refused, never answered as stored.
+    #[test]
+    fn an_upsert_racing_create_and_delete_runs_again_and_never_fakes_a_write() {
+        use super::{upsert_raced, UPSERT_ROUNDS};
+        // each step answers its script in turn, then false
+        fn rounds(first: &[bool], second: &[bool]) -> Result<bool, antares_model::NgsiError> {
+            let (mut f, mut s) = (first.iter().copied(), second.iter().copied());
+            upsert_rounds!(f.next().unwrap_or(false), s.next().unwrap_or(false))
+        }
+        // replace, create, replace, create: the second create takes it
+        assert_eq!(rounds(&[false, false], &[false, true]).ok(), Some(false));
+        // the row came back between the steps: the second replace takes it
+        assert_eq!(rounds(&[false, true], &[false]).ok(), Some(true));
+        // never taken: refused, never answered as stored
+        let got = rounds(&[], &[]);
+        assert!(
+            matches!(got, Err(antares_model::NgsiError::InternalError(_))),
+            "{got:?}"
+        );
     }
 
     #[test]

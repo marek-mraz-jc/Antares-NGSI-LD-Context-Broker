@@ -319,13 +319,8 @@ async fn lift_orphans(
             .filter(|(rt, _)| *rt == t)
             .flat_map(|(_, list)| list.iter().map(|r| r.name.as_str()))
             .collect();
-        // A Tenant whose attribute catalogue never listed the mark holds
-        // none: no scan, which under forced RLS reads every Entity of the
-        // Tenant (F-R2ANT3-008). A backend without a catalogue scans.
-        if let Ok(Some(pairs)) = state.store.entity_attr_pairs(&t).await {
-            if !pairs.iter().any(|(_, a)| a == QUARANTINE_RULES) {
-                continue;
-            }
+        if !may_hold_marks(state, &t).await {
+            continue;
         }
         let lifted = match lift_in(state, &t, &current, &ts).await {
             Ok(lifted) => lifted,
@@ -383,6 +378,18 @@ fn strip_orphans(doc: &mut Value, current: &[&str], ts: &str) -> Vec<String> {
             gone
         }
         _ => Vec::new(),
+    }
+}
+
+/// Whether Tenant `t`'s Entities may hold a quarantine mark: false only
+/// when its attribute catalogue never listed one, so [`lift_in`] skips a
+/// scan that under forced RLS reads every Entity of the Tenant
+/// (F-R2ANT3-008). A backend without a catalogue, or one that failed to
+/// answer, scans.
+async fn may_hold_marks(state: &AppState, t: &TenantId) -> bool {
+    match state.store.entity_attr_pairs(t).await {
+        Ok(Some(pairs)) => pairs.iter().any(|(_, a)| a == QUARANTINE_RULES),
+        _ => true,
     }
 }
 
@@ -535,6 +542,41 @@ static DOC: super::TextDoc = super::TextDoc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-R2ANT3-008: a Tenant whose catalogue never listed the mark is not
+    /// scanned; one whose Entity carries it is.
+    #[tokio::test]
+    async fn only_a_tenant_whose_catalogue_lists_the_mark_is_scanned() {
+        let state = AppState::new("antares-test".into());
+        for (tenant, doc) in [
+            (
+                "plain",
+                json!({"id": "urn:v:1", "type": "V", "speed": {"type": "Property", "value": 1}}),
+            ),
+            (
+                "marked",
+                json!({"id": "urn:v:2", "type": "V",
+                "quarantineRules": {"type": "Property", "value": ["gone"]}}),
+            ),
+        ] {
+            let body = doc.to_string();
+            let req = axum::http::Request::post("/ngsi-ld/v1/entities")
+                .header("content-type", "application/json")
+                .header("content-length", body.len())
+                .header("ngsild-tenant", tenant)
+                .body(axum::body::Body::from(body))
+                .expect("request");
+            let answer = state.call(&axum::http::HeaderMap::new(), req).await;
+            assert_eq!(answer.status(), axum::http::StatusCode::CREATED, "{tenant}");
+        }
+        let plain = TenantId::new("plain").expect("tenant");
+        let marked = TenantId::new("marked").expect("tenant");
+        assert!(
+            !may_hold_marks(&state, &plain).await,
+            "nothing to lift there"
+        );
+        assert!(may_hold_marks(&state, &marked).await);
+    }
 
     const V: &str = "https://e.org/Vehicle";
     const LOCATION: &str = "https://e.org/location";
