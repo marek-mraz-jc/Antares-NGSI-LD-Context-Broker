@@ -538,5 +538,38 @@ async fn without_count_the_cursor_follows_the_rows_left() -> Result<(), String> 
     let s = a.structured();
     assert_eq!(s.get("total"), Some(&json!(BIG)), "{}", a.text);
     assert!(s.get("nextCursor").is_some(), "{}", a.text);
+    // T-6276: limit 0 with count is the total alone (TS 104 176 6.4.6), no cursor
+    let a = call(
+        &f.app,
+        "big",
+        "query_entities",
+        json!({"type": ["Car"], "q": "speed<100", "limit": 0, "count": true}),
+    )
+    .await;
+    let s = a.structured();
+    assert_eq!(s.get("total"), Some(&json!(BIG)), "{}", a.text);
+    assert_eq!(s.get("entities"), Some(&json!([])), "{}", a.text);
+    assert!(s.get("nextCursor").is_none(), "{}", a.text);
+    // and an id-only page (TS 104 175 7.3.2 pick=id)
+    let a = call(
+        &f.app,
+        "big",
+        "query_entities",
+        json!({"type": ["Car"], "q": "speed<100", "limit": 2, "pick": ["id"]}),
+    )
+    .await;
+    let rows = a
+        .structured()
+        .get("entities")
+        .and_then(Value::as_array)
+        .cloned();
+    let rows = rows.unwrap_or_default();
+    assert_eq!(rows.len(), 2, "{}", a.text);
+    assert!(
+        rows.iter()
+            .all(|r| r.as_object().is_some_and(|o| o.keys().eq(["id"]))),
+        "{}",
+        a.text
+    );
     Ok(())
 }
