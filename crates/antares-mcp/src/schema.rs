@@ -35,13 +35,17 @@ pub(crate) enum Kind {
     Attr,
     /// A list of Attributes the view shows.
     Attrs,
+    /// `pick` or `omit`: Attributes the view shows, or the Entity's own
+    /// `id` and `type` members (TS 104 175 7.3.2 `pick=id,temperature`).
+    Members,
     /// A free string of at most this many bytes (`q`, `idPattern`, ...).
     Text(usize),
     /// One of these words.
     Word(&'static [&'static str]),
     /// An integer in this closed range.
     Int(u64, u64),
-    /// A page `limit`: 1 to the broker's Entity page ceiling (`ANTARES_MAX_LIMIT`).
+    /// A page `limit`: 1 to the broker's Entity page ceiling (`ANTARES_MAX_LIMIT`),
+    /// or 0 beside `count` true for the total alone (TS 104 176 6.4.6).
     Limit,
     /// `lastN`: 1 to the broker's 6.3.10 instance ceiling
     /// (`ANTARES_TEMPORAL_INSTANCE_LIMIT`), so the schema says what one call serves.
@@ -194,11 +198,22 @@ fn schema_of(kind: Kind, names: &Names) -> Value {
         Kind::Attrs => {
             json!({"type": "array", "minItems": 1, "maxItems": MAX_ITEMS, "items": schema_of(Kind::Attr, names)})
         }
+        Kind::Members => {
+            let item = match schema_of(Kind::Attr, names) {
+                Value::Object(mut o) if o.contains_key("enum") => {
+                    let all = member_names(names, &["id", "type"]).get("enum").cloned();
+                    o.insert("enum".into(), all.unwrap_or_default());
+                    Value::Object(o)
+                }
+                other => other,
+            };
+            json!({"type": "array", "minItems": 1, "maxItems": MAX_ITEMS, "items": item})
+        }
         Kind::Text(max) => json!({"type": "string", "maxLength": max}),
         Kind::Word(words) => json!({"type": "string", "enum": words}),
         Kind::Int(min, max) => json!({"type": "integer", "minimum": min, "maximum": max}),
         Kind::Limit => json!({
-            "type": "integer", "minimum": 1, "maximum": limit_max(), "default": limit_default()
+            "type": "integer", "minimum": 0, "maximum": limit_max(), "default": limit_default()
         }),
         Kind::LastN => json!({
             "type": "integer", "minimum": 1, "maximum": last_n_max(), "default": last_n_default()
@@ -448,20 +463,8 @@ fn check(arg: &Arg, v: &Value, names: &Names) -> Result<Checked, Broken> {
             is_attr_name,
             "attributes",
         )?),
-        Kind::Attrs => Checked::Many(
-            list(name, v, 1, MAX_ITEMS)?
-                .iter()
-                .map(|a| {
-                    one_name(
-                        name,
-                        a,
-                        (&names.attributes, names.every),
-                        is_attr_name,
-                        "attributes",
-                    )
-                })
-                .collect::<Result<_, _>>()?,
-        ),
+        Kind::Attrs => attr_list(name, v, names, &[])?,
+        Kind::Members => attr_list(name, v, names, &["id", "type"])?,
         Kind::Text(max) => {
             let s = v.as_str().ok_or_else(|| broken(name, "must be a string"))?;
             if s.len() > max {
@@ -477,7 +480,7 @@ fn check(arg: &Arg, v: &Value, names: &Names) -> Result<Checked, Broken> {
             )
         }
         Kind::Int(min, max) => int(name, v, min, max)?,
-        Kind::Limit => int(name, v, 1, limit_max())?,
+        Kind::Limit => int(name, v, 0, limit_max())?,
         Kind::LastN => int(name, v, 1, last_n_max())?,
         Kind::Flag => Checked::Flag(
             v.as_bool()
@@ -495,6 +498,25 @@ fn check(arg: &Arg, v: &Value, names: &Names) -> Result<Checked, Broken> {
         | Kind::ListOf(..)
         | Kind::Endpoint => body(arg, v, names)?,
     })
+}
+
+/// A list of the Attributes `names` shows, or of the `core` members.
+fn attr_list(name: &str, v: &Value, names: &Names, core: &[&str]) -> Result<Checked, Broken> {
+    Ok(Checked::Many(
+        list(name, v, 1, MAX_ITEMS)?
+            .iter()
+            .map(|a| match a.as_str() {
+                Some(m) if core.contains(&m) => Ok(m.to_owned()),
+                _ => one_name(
+                    name,
+                    a,
+                    (&names.attributes, names.every),
+                    is_attr_name,
+                    "attributes",
+                ),
+            })
+            .collect::<Result<_, _>>()?,
+    ))
 }
 
 /// [`check`] of a body a write tool sends: kept as given once checked.
@@ -571,6 +593,17 @@ pub(crate) fn check_all(
             None => {}
         }
     }
+    // 6.4.6: limit 0 asks the count itself and no Entities
+    let counted = matches!(out.get("count"), Some(Checked::Flag(true)));
+    if matches!(out.get("limit"), Some(Checked::Int(0))) && !counted {
+        return Err(broken(
+            "limit",
+            &format!(
+                "must be an integer from 1 to {}, or 0 with count true for the total alone",
+                limit_max()
+            ),
+        ));
+    }
     Ok(out)
 }
 
@@ -624,6 +657,53 @@ mod tests {
         assert_eq!(
             one(Kind::Attrs, json!(["speed"])),
             Ok(Checked::Many(vec!["speed".into()]))
+        );
+    }
+
+    fn given(v: Value) -> Map<String, Value> {
+        match v {
+            Value::Object(m) => m,
+            _ => Map::new(),
+        }
+    }
+
+    #[test]
+    fn limit_zero_asks_the_count_alone_and_needs_count() {
+        // T-6276: TS 104 176 6.4.6 "limit may have the value 0" for the count itself
+        let n = names();
+        let args = [opt("count", Kind::Flag), opt("limit", Kind::Limit)];
+        let counted = check_all(&args, &given(json!({"count": true, "limit": 0})), &n);
+        assert_eq!(
+            counted.map(|a| a.get("limit").cloned()),
+            Ok(Some(Checked::Int(0)))
+        );
+        for alone in [json!({"limit": 0}), json!({"count": false, "limit": 0})] {
+            let refused = check_all(&args, &given(alone), &n);
+            assert!(refused
+                .is_err_and(|e| e.starts_with("argument limit:") && e.contains("count true")));
+        }
+        assert_eq!(schema_of(Kind::Limit, &n).get("minimum"), Some(&json!(0)));
+    }
+
+    #[test]
+    fn pick_and_omit_take_id_and_type_beside_the_attributes() {
+        // T-6276: TS 104 175 7.3.2 `pick=id,temperature,humidity`
+        let n = names();
+        let one = |v: Value| check(&req("pick", Kind::Members), &v, &n);
+        assert_eq!(
+            one(json!(["id", "type", "speed"])),
+            Ok(Checked::Many(vec![
+                "id".into(),
+                "type".into(),
+                "speed".into()
+            ]))
+        );
+        assert!(one(json!(["secret"])).is_err());
+        assert!(one(json!(["id", "secret"])).is_err());
+        assert!(one(json!([])).is_err());
+        assert_eq!(
+            schema_of(Kind::Members, &n).pointer("/items/enum"),
+            Some(&json!(["id", "type", "speed", "https://example.org/odd"]))
         );
     }
 

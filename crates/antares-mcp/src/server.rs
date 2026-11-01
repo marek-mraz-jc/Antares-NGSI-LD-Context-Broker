@@ -694,7 +694,8 @@ impl Server {
         if let (true, Some(total)) = (counted, answer.count) {
             out.insert("total".into(), json!(total));
         }
-        if fitted || past || answer.count.is_some_and(|c| c > next) {
+        // a count-only page (limit 0) has no next page: its cursor would repeat it
+        if fitted || past || (limit > 0 && answer.count.is_some_and(|c| c > next)) {
             out.insert(
                 "nextCursor".into(),
                 json!(cursor::encode(tool.name, digest, next)),

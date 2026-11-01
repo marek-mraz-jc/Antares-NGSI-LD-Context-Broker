@@ -258,6 +258,10 @@ One result's structured content is at most `ANTARES_MCP_MAX_RESULT_BYTES`
   and the arguments it was made for (MC20);
 - one item past the budget is a tool error naming `pick` or `attrs` (or
   `lastN` for history); nothing is ever cut (MC5).
+- `limit` 0 with `count` true answers `total` alone, no rows and no cursor
+  (TS 104 176 6.4.6); `limit` 0 without `count` is refused;
+- `pick` and `omit` take the Entity's `id` and `type` beside the
+  Attributes the view shows (TS 104 175 7.3.2 `pick=id,temperature`).
 
 Every `unitCode` of a tool result that is a UN/CEFACT Recommendation 20
 common code gains `unit`, the symbol a person reads (`GQ` → `µg/m³`), or
