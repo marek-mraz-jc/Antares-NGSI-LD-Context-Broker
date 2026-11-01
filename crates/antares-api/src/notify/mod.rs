@@ -455,6 +455,7 @@ pub async fn record_temporal_change(
                     crate::history::provenance(operation),
                 );
             }
+            crate::history::keep_replaced(st, tenant, &shell, &k, was, &inst).await;
             crate::history::push(st, event(op, &k, inst)).await;
         }
     }
