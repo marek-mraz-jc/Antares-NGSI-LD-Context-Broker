@@ -198,9 +198,13 @@ debug_lane() {
     step 02 clippy cargo clippy --locked "${pflags[@]}" --all-targets --all-features -- -D warnings
     # workspace.yml "dev/unit-junit.sh all-features"
     step 03 test cargo test --locked "${pflags[@]}" --all-features
+    # strict.yml "cargo doc --document-private-items" (daily, T-6327): a doc
+    # link from a pub item to a private or cfg(test) one fails only there
+    step 04 doc env RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --document-private-items "${pflags[@]}"
   else
     echo "PASS clippy 0s (no crate touched)" > "$work/res/02"
     echo "PASS test 0s (no crate touched)" > "$work/res/03"
+    echo "PASS doc 0s (no crate touched)" > "$work/res/04"
   fi
 }
 lane debug_lane
