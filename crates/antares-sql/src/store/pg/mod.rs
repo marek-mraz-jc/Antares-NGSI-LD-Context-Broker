@@ -171,7 +171,7 @@ pub const RELEASE_PING: std::time::Duration = std::time::Duration::from_secs(2);
 pub const IDLE_SESSION: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// The blocks a broker session's Bitmap Heap Scan reads ahead
-/// (`effective_io_concurrency`, T-6277); see [`options`].
+/// (`effective_io_concurrency`, T-6277); see `options`.
 pub const EFFECTIVE_IO_CONCURRENCY: u32 = 256;
 
 /// How long a connection may sit idle in the pool before the pool closes it.

@@ -198,7 +198,7 @@ fn normalize(uri: &str) -> Cow<'_, str> {
     normalized(uri).0
 }
 
-/// [`normalize`]d `uri` and the offsets in it where an escape was decoded, ascending.
+/// `uri` normalized (RFC 3986 6.2.2.2) and the offsets in it where an escape was decoded, ascending.
 fn normalized(uri: &str) -> (Cow<'_, str>, Vec<usize>) {
     let bytes = uri.as_bytes();
     let decoded = |i: usize| -> Option<u8> {

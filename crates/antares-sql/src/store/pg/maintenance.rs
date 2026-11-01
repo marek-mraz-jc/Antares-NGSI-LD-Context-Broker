@@ -440,7 +440,7 @@ const REAP_BATCH: i64 = 5000;
 /// Reap transactions one maintenance tick runs at most.
 const REAP_BATCHES: usize = 50;
 
-/// One batch of [`reap_expired_entities`]: at most `limit` Entities and their
+/// One batch of `reap_expired_entities`: at most `limit` Entities and their
 /// history. How many went.
 pub async fn reap_expired_entity_batch(pool: &PgPool, limit: i64) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
