@@ -76,22 +76,11 @@ pub(super) async fn process_queued(
     // (100 000 subscriptions), on the notification hot path.
     let mut index: std::collections::HashMap<(String, String), usize> =
         std::collections::HashMap::new();
-    let mut ctx_memo = CtxMemo::new();
     // estimated heap of the groups this drain holds (T-4562)
     #[cfg(not(target_arch = "wasm32"))]
     let mut held = 0usize;
-    for (queued, (tenant_str, before, after)) in changes {
-        let matched = matches_for(st, &tenant_str, before, after, queued, &mut ctx_memo);
-        #[cfg(not(target_arch = "wasm32"))]
-        let matched = match tokio::time::timeout(STEP_DEADLINE, matched).await {
-            Ok(m) => m,
-            Err(_) => {
-                note_stall("match", &tenant_str, "");
-                continue;
-            }
-        };
-        #[cfg(target_arch = "wasm32")]
-        let matched = matched.await;
+    let mut matched_in_order = matched_in_order(st, changes);
+    while let Some(matched) = futures_util::StreamExt::next(&mut matched_in_order).await {
         for m in matched {
             #[cfg(not(target_arch = "wasm32"))]
             {
@@ -173,6 +162,66 @@ pub(super) async fn process_queued(
             })
             .await;
     }
+}
+
+/// How many changes of one drain are matched at once (T-6371): the cores the
+/// process may use, at most 8. Matching one change against 1 000 candidate
+/// Subscriptions takes milliseconds, and one serial matcher capped the whole
+/// process's notification rate at one core while the delivery lanes waited.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) static MATCH_WIDTH: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| std::thread::available_parallelism().map_or(1, |n| n.get().min(8)));
+
+/// The matches of each change, in the order the changes came. Natively up to
+/// [`MATCH_WIDTH`] changes are matched at once, each on its own task and
+/// bounded by [`STEP_DEADLINE`]; their results still leave in change order,
+/// so a subscription's notifications keep the order of its changes. A match
+/// that panics or stalls is counted and its change matches nothing; the rest
+/// of the drain goes on.
+#[cfg(not(target_arch = "wasm32"))]
+fn matched_in_order(
+    st: &AppState,
+    changes: Vec<(u64, Change)>,
+) -> impl futures_util::Stream<Item = Vec<Matched>> + Unpin {
+    use futures_util::StreamExt as _;
+    let st = st.clone();
+    futures_util::stream::iter(changes)
+        .map(move |(queued, (tenant_str, before, after))| {
+            let st = st.clone();
+            tokio::spawn(async move {
+                let mut ctx_memo = CtxMemo::new();
+                let matched = matches_for(&st, &tenant_str, before, after, queued, &mut ctx_memo);
+                match tokio::time::timeout(STEP_DEADLINE, matched).await {
+                    Ok(m) => m,
+                    Err(_) => {
+                        note_stall("match", &tenant_str, "");
+                        Vec::new()
+                    }
+                }
+            })
+        })
+        .buffered(*MATCH_WIDTH)
+        .map(|joined| {
+            joined.unwrap_or_else(|_| {
+                note_panic();
+                Vec::new()
+            })
+        })
+}
+
+/// Wasm32 has one thread: the changes are matched one after the other.
+#[cfg(target_arch = "wasm32")]
+fn matched_in_order<'a>(
+    st: &'a AppState,
+    changes: Vec<(u64, Change)>,
+) -> impl futures_util::Stream<Item = Vec<Matched>> + Unpin + 'a {
+    use futures_util::StreamExt as _;
+    Box::pin(futures_util::stream::iter(changes).then(
+        move |(queued, (tenant_str, before, after))| async move {
+            let mut ctx_memo = CtxMemo::new();
+            matches_for(st, &tenant_str, before, after, queued, &mut ctx_memo).await
+        },
+    ))
 }
 
 /// One group out: the delivery permits, then the delivery, each bounded by

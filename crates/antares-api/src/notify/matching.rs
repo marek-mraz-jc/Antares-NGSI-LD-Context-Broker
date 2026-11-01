@@ -355,7 +355,7 @@ pub(super) type ViewSeen = (crate::policy::Shown<'static>, Value, crate::repr::R
 
 /// One change's [`ViewSeen`] per view, by the compiled view's address.
 #[cfg(feature = "views")]
-type SeenMemo = HashMap<usize, (Arc<crate::views::CompiledView>, Option<Arc<ViewSeen>>)>;
+type SeenMemo = HashMap<usize, Option<Arc<ViewSeen>>>;
 
 /// ADR-0023 rule 9: what a Subscription made through `view` sees of the
 /// changed Entity `doc` (internal form): the Attributes the view shows of it,
@@ -451,13 +451,14 @@ pub(crate) async fn sub_context(st: &AppState, tenant: &TenantId, sub: &Value) -
 /// another's identifier even where both name the same URL.
 pub(super) type CtxMemo = HashMap<String, HashMap<String, Arc<Context>>>;
 
-/// `sub_context` over one drain's memo. Resolving is a cache lookup per call,
-/// and this runs once per candidate subscription per change: a drain of
-/// `CHANGE_BATCH` changes resolves the same handful of `@context` URLs
-/// thousands of times over. The memo lives for the one drain that owns it, so
-/// an `@context` a request replaces or deletes meanwhile is picked up by the
-/// next drain. A Subscription naming an inline `@context` rather than a URL
-/// resolves as before — it has no cheap identity to key on.
+/// `sub_context` over one change's memo. Resolving is a cache lookup per
+/// call, and this runs once per candidate subscription per change: one change
+/// over 1 000 candidates resolves the same handful of `@context` URLs a
+/// thousand times. The memo lives for the one change that owns it (the
+/// changes of a drain are matched apart, T-6371), so an `@context` a request
+/// replaces or deletes meanwhile is picked up by the next change. A
+/// Subscription naming an inline `@context` rather than a URL resolves as
+/// before — it has no cheap identity to key on.
 pub(super) async fn sub_context_memo(
     st: &AppState,
     tenant: &TenantId,
@@ -545,8 +546,10 @@ pub(super) async fn matches_for(
     // through one view reads the same narrowing of the same document, and a
     // fan-out of 1 000 Subscriptions on one view judged and copied it 1 000
     // times per change on the serial matcher (T-6371). Keyed by the compiled
-    // view's address; the entry holds the view, so a view replaced during
-    // this call cannot free that address for another view to take.
+    // view's address in one snapshot of the table, held for this whole
+    // call, so no view can free its address for another to take.
+    #[cfg(feature = "views")]
+    let views = st.views.snapshot();
     #[cfg(feature = "views")]
     let mut seen_memo: SeenMemo = HashMap::new();
     for sub in subs {
@@ -558,16 +561,16 @@ pub(super) async fn matches_for(
         // shown Attributes (rule 2), and a change to hidden ones alone is no
         // change at all, so its timing does not leak.
         #[cfg(feature = "views")]
-        let seen = match crate::views::of_subscription(st, &tenant, &sub) {
+        let seen = match crate::views::of_subscription_in(&views, &tenant, &sub) {
             None => None,
             Some(None) => continue,
             Some(Some(view)) => {
-                let key = Arc::as_ptr(&view) as usize;
+                let key = Arc::as_ptr(view) as usize;
                 let seen = match seen_memo.get(&key) {
-                    Some((_, seen)) => seen.clone(),
+                    Some(seen) => seen.clone(),
                     None => {
-                        let seen = view_sees(st, &tenant, &view, eval_doc).await.map(Arc::new);
-                        seen_memo.insert(key, (view, seen.clone()));
+                        let seen = view_sees(st, &tenant, view, eval_doc).await.map(Arc::new);
+                        seen_memo.insert(key, seen.clone());
                         seen
                     }
                 };
