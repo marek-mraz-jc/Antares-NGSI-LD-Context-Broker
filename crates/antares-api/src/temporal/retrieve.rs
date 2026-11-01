@@ -173,7 +173,7 @@ pub(super) async fn retrieve_temporal_inner(
         Some(r) => rules_per_instance(&doc, r).ok_or_else(not_found)?,
         None => doc,
     };
-    let doc = crate::history::as_recorded(st, &tenant, &doc, versions).into_owned();
+    let doc = crate::history::as_recorded(st, &tenant, &doc, versions.is_some()).into_owned();
     let attrs_filter = selection(&trepr);
     check_selection(&doc, &trepr, attrs_filter.as_ref(), id)?;
     let versions = match &versions {
