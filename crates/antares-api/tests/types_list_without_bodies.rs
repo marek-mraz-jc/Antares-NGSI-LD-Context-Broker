@@ -48,7 +48,7 @@ impl PolicyEngine for Narrowing {
     }
 
     fn pre_notify(&self, _s: &Subject, _sub: &Value, _n: &mut Value) -> NotifyDecision {
-        NotifyDecision::Filter(self.0.clone())
+        NotifyDecision::Filter(Box::new(self.0.clone()))
     }
 }
 

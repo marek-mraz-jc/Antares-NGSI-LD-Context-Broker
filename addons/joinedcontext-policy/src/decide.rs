@@ -4,6 +4,7 @@
 
 use crate::document::{context, covers, scope_paths, Policy, Table};
 use crate::subject::{Caller, Platform};
+use antares_api::metadata::Metadata;
 use antares_api::policy::{
     Decision, Filter, Operation, Rule, Warning, FILTERABLE, NAME_READS, WHOLE_TENANT, WRITE_BY_ID,
 };
@@ -114,12 +115,20 @@ pub fn decide(
     if !read && touches(op, &withheld) {
         return Decision::Deny(PROHIBITED.into());
     }
+    let metadata = passed(&applying, op.clause);
     let grants: Vec<&Policy> = applying.into_iter().filter(|p| !p.prohibit).collect();
     if grants.is_empty() {
         return Decision::Deny(NOT_GRANTED.into());
     }
     if read {
-        read_filter(&grants, op, (&types, &refused), withheld, platform)
+        match read_filter(&grants, op, (&types, &refused), withheld, platform) {
+            Decision::Allow if metadata.is_some() => Decision::Filter(Filter {
+                metadata,
+                ..Filter::default()
+            }),
+            Decision::Filter(f) => Decision::Filter(Filter { metadata, ..f }),
+            other => other,
+        }
     } else if WHOLE_TENANT.contains(&op.clause) {
         if grants.iter().any(|p| unconditional_whole(p)) {
             Decision::Allow
@@ -133,6 +142,56 @@ pub fn decide(
     } else {
         Decision::Allow
     }
+}
+
+/// The reads of Entity data whose answers carry metadata members.
+const METADATA_READS: [&str; 6] = ["5.7.1", "5.7.2", "5.7.3", "5.7.4", "5.14.4", "5.14.5"];
+
+/// The members `applying` pass per Attribute on a read of `clause`
+/// (ADR-N-066 2.4): united across the permissions, less what a prohibition
+/// lists. `None` when every Attribute keeps `observedAt`, `unitCode`,
+/// `createdAt` and `modifiedAt`, the members a read carries without
+/// `versions=all`: today's answer, no block, and nothing to strip. A
+/// version answer reaches a caller only through the platform gateway's
+/// `JC-Read-Versions`, and the gateway strips its `modifiedBy` and
+/// `provenance` (DM-140, DM-151).
+fn passed(applying: &[&Policy], clause: &str) -> Option<Box<Metadata>> {
+    const PLAIN: [&str; 4] = ["observedAt", "unitCode", "createdAt", "modifiedAt"];
+    if !METADATA_READS.contains(&clause) {
+        return None;
+    }
+    let of = |m: &Metadata, name: Option<&str>| -> BTreeSet<String> {
+        name.and_then(|n| m.named.get(n)).unwrap_or(&m.rest).clone()
+    };
+    let at = |name: Option<&str>| -> BTreeSet<String> {
+        let mut out: BTreeSet<String> = applying
+            .iter()
+            .filter(|p| !p.prohibit)
+            .flat_map(|p| of(&p.metadata, name))
+            .collect();
+        for p in applying.iter().filter(|p| p.prohibit) {
+            let taken = of(&p.metadata, name);
+            out.retain(|m| !taken.contains(m));
+        }
+        out
+    };
+    let names: BTreeSet<&str> = applying
+        .iter()
+        .flat_map(|p| p.metadata.named.keys().map(String::as_str))
+        .collect();
+    let out = Metadata {
+        named: names
+            .into_iter()
+            .map(|n| (n.to_owned(), at(Some(n))))
+            .collect(),
+        rest: at(None),
+    };
+    let narrows = out
+        .named
+        .values()
+        .chain([&out.rest])
+        .any(|m| PLAIN.iter().any(|p| !m.contains(*p)));
+    narrows.then(|| Box::new(out))
 }
 
 /// Whether `clause` only reads: what a read-only caller may ask. A query with an `EntityMap`
@@ -1281,6 +1340,50 @@ mod tests {
         };
         assert_eq!(shown("5.7.2")?, [iri("speed"), iri("colour")]);
         assert_eq!(shown("5.7.3")?, [iri("speed")]);
+        Ok(())
+    }
+
+    /// ADR-N-066 2.4: a block passes per Attribute the members it lists, else `*`'s, else
+    /// the audience defaults; a prohibition takes back what it lists; no block narrows none.
+    #[test]
+    fn a_capability_block_passes_metadata_members_per_attribute() -> Result<(), String> {
+        let members = |d: Decision| match d {
+            Decision::Filter(f) => Ok(f.metadata),
+            other => Err(format!("{other:?}")),
+        };
+        let blockless = table(&json!({"operations": ["5.7.2"]}))?;
+        assert_eq!(members(on(&blockless, "5.7.2", None))?, None);
+        let t = table(&json!({"operations": ["5.7.2", "5.7.6"],
+            "information": [{"entities": [{"type": "Car"}],
+                             "propertyNames": ["speed", "colour"],
+                             "attributes": {"speed": {"metadata": ["observedAt"]}}}]}))?;
+        let got = members(on(&t, "5.7.2", None))?.ok_or("no members")?;
+        let set = |m: &[&str]| m.iter().map(|s| (*s).to_owned()).collect::<BTreeSet<_>>();
+        assert_eq!(got.named.get(&iri("speed")), Some(&set(&["observedAt"])));
+        assert_eq!(
+            got.rest,
+            set(&[
+                "observedAt",
+                "unitCode",
+                "modifiedAt",
+                "modifiedBy.organization",
+                "modifiedBy.actorKind"
+            ])
+        );
+        // a type list carries no data, so it strips nothing
+        assert!(matches!(
+            on(&t, "5.7.6", None),
+            Decision::Allow | Decision::Filter(Filter { metadata: None, .. })
+        ));
+        let with_prohibition = compile(&json!({"policies": [
+            {"id": "p", "assignee": {"kind": "role", "id": "r"}, "operations": ["5.7.2"],
+             "information": [{"entities": [{"type": "Car"}]}]},
+            {"id": "n", "effect": "prohibit", "assignee": {"kind": "role", "id": "r"},
+             "operations": ["5.7.2"],
+             "information": [{"entities": [{"type": "Car"}], "propertyNames": ["colour"],
+                              "attributes": {"*": {"metadata": ["unitCode"]}}}]}]}))?;
+        let got = members(on(&with_prohibition, "5.7.2", None))?.ok_or("no members")?;
+        assert!(!got.rest.contains("unitCode") && got.rest.contains("observedAt"));
         Ok(())
     }
 

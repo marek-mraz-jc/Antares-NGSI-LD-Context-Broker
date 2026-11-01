@@ -188,10 +188,10 @@ impl PolicyEngine for ExamplePolicy {
             // the tenant's `q` has no meaning here and is left off: it
             // selected which Entities the SUBSCRIPTION matches, which the
             // subscription's own conditions already did.
-            Some(rule) if !rule.omit.is_empty() => NotifyDecision::Filter(Filter {
+            Some(rule) if !rule.omit.is_empty() => NotifyDecision::Filter(Box::new(Filter {
                 omit: rule.omit.clone(),
                 ..Filter::default()
-            }),
+            })),
             _ => NotifyDecision::Deliver,
         }
     }

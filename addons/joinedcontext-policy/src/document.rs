@@ -3,6 +3,7 @@
 //! once at load: every name expanded, every query parsed, every pattern
 //! compiled, so a decision only compares.
 
+use antares_api::metadata::Metadata;
 use antares_api::policy::{Rule, TimeBound, Window};
 use antares_ql::geo::GeoQuery;
 use chrono::{DateTime, Duration, Utc};
@@ -319,6 +320,9 @@ pub struct Policy {
     pub conditions: Rule,
     /// The policy as written, for the access surface.
     pub source: Source,
+    /// The metadata members it passes (a permission) or takes back (a
+    /// prohibition) per Attribute (platform ADR-N-066 2.4).
+    pub metadata: Metadata,
 }
 
 /// A policy as its document wrote it (README section 4): names before
@@ -500,6 +504,7 @@ fn policy(p: PolicyDoc) -> Result<Vec<Policy>, String> {
     };
     let prohibit = p.effect == Effect::Prohibit;
     capabilities_checked(&p.information, &why)?;
+    let metadata = members(&p.information, &p.assignee, prohibit);
     if p.information.iter().all(|i| i.attributes.is_empty()) {
         let (selectors, written) = rules(p.information, &conditions, &why)?;
         source.selectors = written;
@@ -512,6 +517,7 @@ fn policy(p: PolicyDoc) -> Result<Vec<Policy>, String> {
             selectors,
             conditions,
             source,
+            metadata,
         }]);
     }
     let parts = Parts {
@@ -521,6 +527,7 @@ fn policy(p: PolicyDoc) -> Result<Vec<Policy>, String> {
         validity: (from, to),
         conditions,
         source,
+        metadata,
     };
     split(&parts, p.operations, &p.information, &why)
 }
@@ -533,6 +540,7 @@ struct Parts {
     validity: (Option<DateTime<Utc>>, Option<DateTime<Utc>>),
     conditions: Rule,
     source: Source,
+    metadata: Metadata,
 }
 
 /// ADR-N-066 2.1: one policy per need of its clauses, each with the
@@ -573,6 +581,7 @@ fn split(
                 selectors: written_selectors,
                 ..parts.source.clone()
             },
+            metadata: parts.metadata.clone(),
         });
     }
     Ok(out)
@@ -580,6 +589,67 @@ fn split(
 
 /// Each `attributes` key is `*` or an Attribute its entry lists (any name
 /// when it lists none), and each capability list is well formed.
+/// The members the audience gets for an Attribute its entry and `*` leave
+/// unset (ADR-N-066 2.4).
+fn defaults(public: bool) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = ["observedAt", "unitCode", "modifiedAt"]
+        .map(String::from)
+        .into();
+    if !public {
+        out.extend(["modifiedBy.organization", "modifiedBy.actorKind"].map(String::from));
+    }
+    out
+}
+
+/// One policy's metadata members (ADR-N-066 2.4), names expanded against
+/// [`context`]. A permission passes per Attribute what its entry lists,
+/// else the `*` entry's list, else the audience defaults; one without any
+/// `attributes` block passes every member, as before the block. A grant to
+/// `role: public` never passes `modifiedBy.actor` or `provenance` (DM-140).
+/// A prohibition takes back only what its entries list.
+fn members(information: &[Information], assignee: &Assignee, prohibit: bool) -> Metadata {
+    let mut named: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut star: Option<BTreeSet<String>> = None;
+    for (name, listed) in information
+        .iter()
+        .flat_map(|i| &i.attributes)
+        .filter_map(|(name, caps)| Some((name, caps.metadata.as_ref()?)))
+    {
+        let listed = listed.iter().cloned();
+        if name == "*" {
+            star.get_or_insert_with(BTreeSet::new).extend(listed);
+        } else {
+            named
+                .entry(context().expand_key(name))
+                .or_default()
+                .extend(listed);
+        }
+    }
+    if prohibit {
+        return Metadata {
+            named,
+            rest: star.unwrap_or_default(),
+        };
+    }
+    let public = assignee.kind == Kind::Role && assignee.id == "public";
+    let blocked = information.iter().any(|i| !i.attributes.is_empty());
+    let mut out = Metadata {
+        named,
+        rest: match (blocked, star) {
+            (_, Some(star)) => star,
+            (true, None) => defaults(public),
+            (false, None) => METADATA.map(String::from).into(),
+        },
+    };
+    if public {
+        for m in out.named.values_mut().chain([&mut out.rest]) {
+            m.remove("modifiedBy.actor");
+            m.remove("provenance");
+        }
+    }
+    out
+}
+
 fn capabilities_checked(
     information: &[Information],
     why: &dyn Fn(String) -> String,

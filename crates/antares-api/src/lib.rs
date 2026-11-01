@@ -90,6 +90,7 @@ pub mod erasure;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing;
 pub mod history;
+pub mod metadata;
 pub mod mirror;
 pub mod negotiate;
 pub mod notify;

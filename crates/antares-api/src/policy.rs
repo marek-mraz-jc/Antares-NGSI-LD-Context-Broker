@@ -17,6 +17,8 @@
 //! [`TIMEOUT`] denies. A deployment that wires in a broken engine loses
 //! service, never its access rules.
 
+/// What [`Filter::metadata`] holds, here beside it for an engine crate.
+pub use crate::metadata::Metadata;
 use antares_ql::geo::GeoQuery;
 use antares_ql::QNode;
 use axum::http::HeaderMap;
@@ -361,6 +363,12 @@ pub struct Filter {
     /// answers nothing, never a refusal that tells where the grant ends. A
     /// slice, not a `Vec`: every [`Decision`] carries a `Filter`'s size.
     pub temporal: Box<[Window]>,
+    /// The metadata members each Attribute shows (platform ADR-N-066 2.4,
+    /// DM-139): stripped from the answer after the handler, and a `q`,
+    /// `orderBy` or `timeproperty` naming a stripped one is refused 400
+    /// (`crate::metadata`). `None` passes every member. Boxed for the
+    /// size every [`Decision`] carries.
+    pub metadata: Option<Box<crate::metadata::Metadata>>,
 }
 
 /// A half-open interval `[from, to)` of `observedAt`; an open end is the
@@ -752,6 +760,7 @@ impl Filter {
             && self.pick.is_empty()
             && !self.has_rules()
             && self.temporal.is_empty()
+            && self.metadata.is_none()
     }
 
     /// Whether the filter removes anything from what it selects: a
@@ -1108,7 +1117,7 @@ pub enum NotifyDecision {
     /// before this point, there is nothing left to re-run the query against,
     /// and delivering the notification unfiltered would tell the engine a
     /// narrowing was applied that never was.
-    Filter(Filter),
+    Filter(Box<Filter>),
     /// Do not send. 5.8.6 counts this as no attempt at all — the
     /// notification was never sent, so it is neither a success nor a
     /// failure, and `timesSent` does not move.
@@ -1665,7 +1674,10 @@ pub async fn gate(
         // `resolve` lets an `AllowIf` through nowhere else, and turns a
         // `Filter` there into a deny, so a handler of such a clause reads
         // what it gets back as the condition and nothing else.
-        Decision::Filter(f) | Decision::AllowIf(f) => Ok(f),
+        Decision::Filter(f) | Decision::AllowIf(f) => {
+            crate::metadata::hold(f.metadata.as_deref())?;
+            Ok(f)
+        }
         Decision::Deny(why) => Err(Denied(why)),
     }
 }
@@ -2535,10 +2547,10 @@ mod tests {
                     }
                 }
             }
-            NotifyDecision::Filter(Filter {
+            NotifyDecision::Filter(Box::new(Filter {
                 omit: vec!["brand".into()],
                 ..Filter::default()
-            })
+            }))
         }
     }
 

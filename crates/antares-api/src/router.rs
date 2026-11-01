@@ -335,6 +335,12 @@ pub(super) fn routes(state: AppState) -> Router {
         .nest(
             API_ROOT,
             api.layer(axum::middleware::from_fn(conformance::prefer_version_layer))
+                // ADR-N-066 2.4: the metadata members a read's grants pass,
+                // stripped from the answer once, whichever surface asked.
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    metadata::layer,
+                ))
                 // The temporal seam's drain: every write's history events
                 // land in one driver call once the handler is done.
                 .layer(axum::middleware::from_fn_with_state(
