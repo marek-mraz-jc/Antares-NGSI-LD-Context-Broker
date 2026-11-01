@@ -170,6 +170,10 @@ pub const RELEASE_PING: std::time::Duration = std::time::Duration::from_secs(2);
 /// closes, and whatever waited on it (or the pool slot behind it) is freed.
 pub const IDLE_SESSION: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// The blocks a broker session's Bitmap Heap Scan reads ahead
+/// (`effective_io_concurrency`, T-6277); see [`options`].
+pub const EFFECTIVE_IO_CONCURRENCY: u32 = 256;
+
 /// How long a connection may sit idle in the pool before the pool closes it.
 pub const POOL_IDLE: std::time::Duration = std::time::Duration::from_secs(240);
 
@@ -243,9 +247,17 @@ fn options(
     // subplans, far past `jit_above_cost`, so PostgreSQL compiled ~900 LLVM
     // functions (4.4 s) for a page that runs in 1 ms, and a compile never
     // checks for interrupts, so `statement_timeout` could not end it (T-5904).
+    // Prefetch: a `q` or a count over a type reads its rows by a Bitmap Heap
+    // Scan, and the rows of one type lie scattered over the heap (no update
+    // is HOT: an index reads `entity`, and pipelines move `expires_at` daily).
+    // At PostgreSQL 16's default of 1 that scan waits on each block in turn:
+    // dev's 67 742 Helsinki Trees sat on 56 819 blocks, and a count with a
+    // `q` read them in 10.6-15.9 s, against 2.1 s at 64 and 1.6 s at 256
+    // (T-6277). Without parallel workers this is the read's only I/O depth.
     let session = format!(
         "SET statement_timeout = '{}ms'; SET lock_timeout = '5s'; \
          SET max_parallel_workers_per_gather = 0; SET jit = off; \
+         SET effective_io_concurrency = {EFFECTIVE_IO_CONCURRENCY}; \
          SET idle_session_timeout = '{}ms'",
         statement_timeout.as_millis(),
         IDLE_SESSION.as_millis()
