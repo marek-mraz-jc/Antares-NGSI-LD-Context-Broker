@@ -191,6 +191,74 @@ async fn a_correction_shows_its_chain_only_to_a_caller_granted_read_versions() {
     assert_eq!(last[0]["value"], 50.0);
 }
 
+/// ADR-N-066 2.3, DM-149: a grant listing `speed` reads the versions of
+/// `speed` alone; a read selecting `colour` is refused naming it, and a read
+/// selecting nothing gets `colour`'s history without its versions.
+#[tokio::test(flavor = "multi_thread")]
+async fn versions_are_answered_only_for_the_attributes_the_grant_lists() {
+    let Some((st, t)) = pg_state().await else {
+        return;
+    };
+    let id = "urn:ngsi-ld:Vehicle:ver-listed";
+    let at = "2026-10-18T07:00:00Z";
+    let both = |speed: f64, colour: &str| {
+        json!({"speed": {"type": "Property", "value": speed, "observedAt": at},
+               "colour": {"type": "Property", "value": colour, "observedAt": at}})
+    };
+    let mut doc = both(80.0, "red");
+    doc["id"] = json!(id);
+    doc["type"] = json!("Vehicle");
+    let (s, b) = send(&st, &t, "POST", "/ngsi-ld/v1/entities", &[], Some(doc)).await;
+    assert_eq!(s, 201, "{b}");
+    let attrs = format!("/ngsi-ld/v1/entities/{id}/attrs");
+    let (s, b) = send(&st, &t, "PATCH", &attrs, &[], Some(both(60.0, "blue"))).await;
+    assert_eq!(s, 204, "{b}");
+    let speed_only = [("l5d-client-id", GATEWAY), ("jc-read-versions", "speed")];
+    let temporal = |q: &str| format!("/ngsi-ld/v1/temporal/entities/{id}?versions=all{q}");
+
+    let (s, b) = send(
+        &st,
+        &t,
+        "GET",
+        &temporal("&attrs=colour"),
+        &speed_only,
+        None,
+    )
+    .await;
+    assert_eq!(s, 403, "{b}");
+    assert!(b.to_string().contains("colour"), "{b}");
+    let (s, b) = send(
+        &st,
+        &t,
+        "GET",
+        &temporal("&attrs=speed,colour"),
+        &speed_only,
+        None,
+    )
+    .await;
+    assert_eq!(s, 403, "{b}");
+
+    let (s, all) = send(&st, &t, "GET", &temporal(""), &speed_only, None).await;
+    assert_eq!(s, 200, "{all}");
+    let rows = |a: &str| match &all[a] {
+        Value::Array(rows) => rows.clone(),
+        v => vec![v.clone()],
+    };
+    assert_eq!(rows("speed").len(), 2, "{all}");
+    assert!(
+        rows("speed").iter().all(|r| r["version"].is_number()),
+        "{all}"
+    );
+    assert!(
+        rows("colour").iter().all(|r| r.get("version").is_none()),
+        "{all}"
+    );
+    assert!(
+        rows("colour").iter().all(|r| r.get("provenance").is_none()),
+        "{all}"
+    );
+}
+
 /// One write per channel (Done when of T-5361): what each row stores is
 /// what the gateway said when the gateway's mesh identity sent it, and
 /// `channel: api` with no actor for a write that reached the broker's port

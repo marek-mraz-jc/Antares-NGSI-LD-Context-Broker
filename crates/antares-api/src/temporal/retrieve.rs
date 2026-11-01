@@ -40,7 +40,7 @@ pub(super) fn versions_asked(
     st: &AppState,
     params: &HashMap<String, String>,
     headers: &HeaderMap,
-) -> ApiResult<bool> {
+) -> ApiResult<Option<Option<Vec<String>>>> {
     let versions = match params.get("versions").map(String::as_str) {
         None => false,
         Some("all") => true,
@@ -51,13 +51,57 @@ pub(super) fn versions_asked(
             .into())
         }
     };
-    if versions && !crate::provenance::may_read_versions(headers, st.provenance_from.as_deref()) {
-        return Err(ApiError::Denied(
+    if !versions {
+        return Ok(None);
+    }
+    match crate::provenance::versions_granted(headers, st.provenance_from.as_deref()) {
+        Some(granted) => Ok(Some(granted)),
+        None => Err(ApiError::Denied(
             "versions=all needs readVersions, which the space's Policy grants through the gateway"
                 .into(),
-        ));
+        )),
     }
-    Ok(versions)
+}
+
+/// The expanded Attributes whose versions a read gets (platform ADR-N-066
+/// 2.3, DM-149): every one the grant lists, `None` for every Attribute. A
+/// read selecting an Attribute the grant leaves out is refused naming it.
+#[cfg(feature = "jc")]
+fn versions_of(
+    granted: Option<&[String]>,
+    selected: Option<&Vec<String>>,
+    ctx: &antares_jsonld::Context,
+) -> ApiResult<Option<Vec<String>>> {
+    let Some(granted) = granted else {
+        return Ok(None);
+    };
+    let granted: Vec<String> = granted.iter().map(|n| ctx.expand_key(n)).collect();
+    if let Some(other) = selected
+        .into_iter()
+        .flatten()
+        .find(|a| !granted.contains(a))
+    {
+        return Err(ApiError::Denied(format!(
+            "versions=all of {:?} is not granted: the space's Policy lists the versions of {} only",
+            ctx.compact_iri(other),
+            granted
+                .iter()
+                .map(|g| ctx.compact_iri(g))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    Ok(Some(granted))
+}
+
+/// Vanilla: nothing asks for versions.
+#[cfg(not(feature = "jc"))]
+fn versions_of(
+    _granted: Option<&[String]>,
+    _selected: Option<&Vec<String>>,
+    _ctx: &antares_jsonld::Context,
+) -> ApiResult<Option<Vec<String>>> {
+    Ok(None)
 }
 
 /// Vanilla: `check_params` already refused `versions` as unknown.
@@ -66,8 +110,8 @@ pub(super) fn versions_asked(
     _st: &AppState,
     _params: &HashMap<String, String>,
     _headers: &HeaderMap,
-) -> ApiResult<bool> {
-    Ok(false)
+) -> ApiResult<Option<Option<Vec<String>>>> {
+    Ok(None)
 }
 
 pub(super) async fn retrieve_temporal_inner(
@@ -129,9 +173,17 @@ pub(super) async fn retrieve_temporal_inner(
         Some(r) => rules_per_instance(&doc, r).ok_or_else(not_found)?,
         None => doc,
     };
-    let doc = crate::history::as_recorded(st, &tenant, &doc, versions).into_owned();
+    let doc = crate::history::as_recorded(st, &tenant, &doc, versions.is_some()).into_owned();
     let attrs_filter = selection(&trepr);
     check_selection(&doc, &trepr, attrs_filter.as_ref(), id)?;
+    let versions = match &versions {
+        Some(granted) => Some(versions_of(
+            granted.as_deref(),
+            attrs_filter.as_ref(),
+            &ctx,
+        )?),
+        None => None,
+    };
     let mut w = window(
         &doc,
         tq.as_ref(),
@@ -151,8 +203,12 @@ pub(super) async fn retrieve_temporal_inner(
             page_n.size(st.temporal_default_instances, st.temporal_instance_limit),
         );
         // after the cut: lastN counts measurements, never versions (DM-119)
-        if versions {
-            with_versions(&mut w, &st.temporal.versions(&tenant, id).await?);
+        if let Some(only) = versions {
+            let mut chains = st.temporal.versions(&tenant, id).await?;
+            if let Some(only) = only {
+                chains.retain(|attr, _| only.contains(attr));
+            }
+            with_versions(&mut w, &chains);
         }
     }
     let payload = present_temporal(&doc, &w, &ctx, &trepr, tq.as_ref(), &timeprop)?;
