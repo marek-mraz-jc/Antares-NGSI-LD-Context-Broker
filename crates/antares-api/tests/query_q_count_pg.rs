@@ -205,6 +205,11 @@ async fn a_q_count_over_a_scattered_type_is_one_store_statement() {
         .with_policy(Arc::new(Narrowing(view)));
     antares_api::wire(&mut st).await;
 
+    // warm-up, untimed: the first read after the seed pays for its cold
+    // cache (5.9 s under preflight's parallel load, 1.1 s alone), which is
+    // the seed, not the count path; the type count is timed again below
+    let (code, total, _) = count(&st, &tenant, "type=Tree&count=true&limit=0").await;
+    assert_eq!((code, total), (StatusCode::OK, Some(TREES.to_string())));
     let mut sum = 0i64;
     for class in 0..7i64 {
         let query = format!("type=Tree&count=true&limit=0&q=trunkDiameterClass==%22cm{class}%22");
