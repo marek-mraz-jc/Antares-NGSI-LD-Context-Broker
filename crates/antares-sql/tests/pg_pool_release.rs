@@ -204,6 +204,27 @@ async fn the_server_ends_a_session_left_idle_past_the_pool() {
     );
 }
 
+/// T-6277: a count with a `q` over dev's 67 742 Helsinki Trees read 56 819
+/// scattered heap blocks one at a time (PostgreSQL 16 defaults
+/// `effective_io_concurrency` to 1) and passed the gateway's 10 s; read ahead,
+/// the same statement took 1.6 s. Every broker session reads ahead.
+#[tokio::test]
+async fn a_broker_session_reads_heap_blocks_ahead() {
+    let url = require_db!();
+    let pool = antares_sql::store::pg::connect_with(&url, 1, Duration::from_secs(30))
+        .await
+        .expect("pool");
+    let set: String = sqlx::query_scalar("SELECT current_setting('effective_io_concurrency')")
+        .fetch_one(&pool)
+        .await
+        .expect("setting");
+    assert_eq!(
+        set,
+        antares_sql::store::pg::EFFECTIVE_IO_CONCURRENCY.to_string(),
+        "a broker session prefetches its bitmap heap scans"
+    );
+}
+
 /// Requests dropped at every stage of a transaction (mid-stream, after a
 /// failed statement, mid-send of a large bind, inside a savepoint) leave
 /// every pool slot usable again.
