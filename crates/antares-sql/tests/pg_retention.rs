@@ -979,7 +979,7 @@ async fn a_week_holding_an_audit_row_is_not_dropped_until_the_audit_sweep_took_i
         eprintln!("SKIP: attr_instances is not natively partitioned here");
         return;
     }
-    const WEEK: &str = "attr_instances_2003w10";
+    const WEEK: &str = "attr_instances_2007w10";
     let seed_guard = hold_off_the_explain_seed(&pool).await;
     let mut claim = pool.begin().await.expect("claim");
     sqlx::query("SELECT name FROM maintenance_jobs WHERE name = 'temporal_partitions' FOR UPDATE")
@@ -987,7 +987,7 @@ async fn a_week_holding_an_audit_row_is_not_dropped_until_the_audit_sweep_took_i
         .await
         .expect("claim row");
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "CREATE TABLE IF NOT EXISTS {WEEK} PARTITION OF attr_instances FOR VALUES FROM ('2003-03-03') TO ('2003-03-10')"
+        "CREATE TABLE IF NOT EXISTS {WEEK} PARTITION OF attr_instances FOR VALUES FROM ('2007-03-05') TO ('2007-03-12')"
     )))
     .execute(&mut *claim)
     .await
@@ -1003,8 +1003,8 @@ async fn a_week_holding_an_audit_row_is_not_dropped_until_the_audit_sweep_took_i
         sqlx::query(
             "INSERT INTO attr_instances (tenant_id, entity_id, attr_id, instance_id, observed_at,
                                          created_at, modified_at, data, provenance)
-             VALUES ('part-audit', 'urn:v:a', 'https://example.org/name', $1, '2003-03-04',
-                     '2003-03-04', '2003-03-04', '{\"value\": 1}', $2)",
+             VALUES ('part-audit', 'urn:v:a', 'https://example.org/name', $1, '2007-03-06',
+                     '2007-03-06', '2007-03-06', '{\"value\": 1}', $2)",
         )
         .bind(id)
         .bind(provenance)
@@ -1026,7 +1026,7 @@ async fn a_week_holding_an_audit_row_is_not_dropped_until_the_audit_sweep_took_i
     let indexed = || async {
         sqlx::query_scalar::<_, bool>(
             "SELECT coalesce((SELECT indisvalid FROM pg_index
-                              WHERE indexrelid = to_regclass('public.attr_instances_2003w10_audit')), false)",
+                              WHERE indexrelid = to_regclass('public.attr_instances_2007w10_audit')), false)",
         )
         .fetch_one(&pool)
         .await
@@ -1034,7 +1034,7 @@ async fn a_week_holding_an_audit_row_is_not_dropped_until_the_audit_sweep_took_i
     };
     let floors = [(
         "part-audit".to_owned(),
-        "2003-04-01T00:00:00.000Z".to_owned(),
+        "2007-04-01T00:00:00.000Z".to_owned(),
     )];
     // Without its audit index a full week is kept: nothing reads it whole.
     let mut done = Vec::new();
@@ -1056,13 +1056,15 @@ async fn a_week_holding_an_audit_row_is_not_dropped_until_the_audit_sweep_took_i
     }
     assert!(exists().await, "the audit row keeps its week: {done:?}");
     assert_eq!(
-        retain_audit(&pool, "2003-03-05T00:00:00Z", 1000)
+        retain_audit(&pool, "2007-03-07T00:00:00Z", 1000)
             .await
             .expect("audit sweep"),
         1
     );
-    for _ in 0..50 {
+    // A parallel test's maintenance may hold the claim for a while: tick.
+    for _ in 0..100 {
         match pg::maintenance::drop_retained_partitions(&pool, &floors).await {
+            Ok(lines) if lines.is_empty() => done.push("nothing dropped".into()),
             Ok(lines) => done.extend(lines),
             Err(e) => done.push(format!("kept ({e})")),
         }

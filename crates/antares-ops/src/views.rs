@@ -794,7 +794,7 @@ fn audit_retention(raw: Option<String>) -> Result<std::time::Duration, String> {
         .strip_prefix('P')
         .and_then(|r| r.strip_suffix('Y'))
         .map(|n| match n.parse::<u64>() {
-            Ok(n @ 1..=10) => Ok(std::time::Duration::from_hours(n * 365 * 24)),
+            Ok(n @ 1..=10) => Ok(std::time::Duration::from_hours(n.saturating_mul(365 * 24))),
             _ => Err(format!("{raw:?} is not one to ten years")),
         });
     years

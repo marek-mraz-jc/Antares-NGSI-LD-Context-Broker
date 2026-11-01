@@ -407,7 +407,7 @@ async fn sweep_audit(r: &Reloader, now: chrono::DateTime<chrono::Utc>) {
             tracing::info!(count, "retention deleted audit rows");
         }
         Err(e) => {
-            tracing::warn!(error = %e, "retention: audit sweep failed; it runs again next sweep")
+            tracing::warn!(error = %e, "retention: audit sweep failed; it runs again next sweep");
         }
     }
 }
