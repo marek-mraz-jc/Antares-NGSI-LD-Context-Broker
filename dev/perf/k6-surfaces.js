@@ -70,6 +70,11 @@ export function entity(type, n) {
     },
   };
   if (type === "TrafficFlowObserved") e.lane = { type: "Property", value: n % LANES };
+  // SensorThings maps a Datastream from a current Attribute: a history entity holds its newest
+  // pm25 too, or sta-observations reads a Datastream that does not exist (404)
+  if (type === "AirQualityObserved" && n < HISTORY_ENTITIES) {
+    e.pm25 = { type: "Property", value: 5 + ((n * 7) % 60), observedAt: new Date(HISTORY_START + HISTORY_DAYS * 86400000).toISOString() };
+  }
   if (type === "Event") {
     const start = new Date(HISTORY_START + (n % 60) * 86400000 + (n % 24) * 3600000);
     e.startDate = { type: "Property", value: { "@type": "DateTime", "@value": start.toISOString() } };
@@ -116,6 +121,8 @@ function seed() {
     put("/q/views/load", {
       id: "load", tenant: "default", selector: TYPES,
       rules: [{ types: TYPES, attributes: ["name", "level", "category", "lane", "sentAt", "pm25", "startDate", "endDate", "location"] }],
+      // a view serves a calendar only for the outputs it names (T-5208): `events` of the sdm-event preset
+      representations: { ical: [{ name: "events", sources: [{}] }] },
       operations: ["query_entities", "retrieve_entity", "retrieve_entity_types", "retrieve_attributes", "temporal_query", "temporal_retrieve", "create_subscription", "delete_subscription"],
     });
   }
