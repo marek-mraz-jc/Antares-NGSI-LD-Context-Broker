@@ -1632,18 +1632,31 @@ async fn a_write_through_a_writer_view_notifies_a_public_view_socket() {
     .expect("subscribed");
     let writer = [("x-jc-client".to_owned(), SEEDER.to_owned())];
     let uri = "/x/views/pipes/ngsi-ld/v1/entityOperations/upsert";
+    // Each write's notification is read before the next write: a notification
+    // still queued on the socket takes the next one of the same Entity into it
+    // (coalescing, `x-coalesced`), so two writes in a row may arrive as one.
+    let mut socket = socket;
+    let mut messages = Vec::new();
     for speed in [10, 20] {
         let batch = json!([{"id": "urn:ngsi-ld:Vehicle:hel.fi:helsinki:1", "type": "Vehicle",
                             "speed": {"type": "Property", "value": speed}}]);
         let (status, _, body) = send(&app, "POST", uri, &writer, Some(&batch)).await;
         assert!(status.is_success(), "upsert {speed}: {status} {body}");
+        let (back, got) = tokio::task::spawn_blocking(move || {
+            let got = socket.next();
+            (socket, got)
+        })
+        .await
+        .expect("read");
+        socket = back;
+        messages.extend(got);
     }
-    let messages = tokio::task::spawn_blocking(move || {
-        let mut socket = socket;
+    let rest = tokio::task::spawn_blocking(move || {
         std::iter::from_fn(|| socket.next()).collect::<Vec<Value>>()
     })
     .await
     .expect("read");
+    messages.extend(rest);
     let speeds: Vec<&Value> = messages
         .iter()
         .filter(|m| m["metadata"]["x-op"] == "x-notification")
