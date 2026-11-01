@@ -260,10 +260,10 @@ async fn a_delivered_notification_still_counts() {
 /// asked for is still there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_filtered_notification_loses_only_what_the_engine_named() {
-    let (st, _) = state(NotifyDecision::Filter(Filter {
+    let (st, _) = state(NotifyDecision::Filter(Box::new(Filter {
         omit: vec!["colour".into()],
         ..Filter::default()
-    }))
+    })))
     .await;
     let (uri, mut rx) = capture().await;
     subscribe(&st, &uri, Some("alice")).await;
@@ -285,10 +285,10 @@ async fn a_filtered_notification_loses_only_what_the_engine_named() {
 /// silently match nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_projection_named_as_an_iri_removes_the_member_it_names() {
-    let (st, _) = state(NotifyDecision::Filter(Filter {
+    let (st, _) = state(NotifyDecision::Filter(Box::new(Filter {
         omit: vec!["https://uri.etsi.org/ngsi-ld/default-context/colour".into()],
         ..Filter::default()
-    }))
+    })))
     .await;
     let (uri, mut rx) = capture().await;
     subscribe(&st, &uri, Some("alice")).await;
@@ -310,10 +310,10 @@ async fn a_projection_named_as_an_iri_removes_the_member_it_names() {
 /// `type` because a document without them is not an Entity.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pick_leaves_the_entity_frame_and_nothing_it_did_not_name() {
-    let (st, _) = state(NotifyDecision::Filter(Filter {
+    let (st, _) = state(NotifyDecision::Filter(Box::new(Filter {
         pick: vec!["speed".into()],
         ..Filter::default()
-    }))
+    })))
     .await;
     let (uri, mut rx) = capture().await;
     subscribe(&st, &uri, Some("alice")).await;
@@ -335,10 +335,10 @@ async fn a_pick_leaves_the_entity_frame_and_nothing_it_did_not_name() {
 /// refused the way a panicking engine is — the notification is not sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_notification_filter_that_carries_a_query_is_dropped() {
-    let (st, _) = state(NotifyDecision::Filter(Filter {
+    let (st, _) = state(NotifyDecision::Filter(Box::new(Filter {
         q: Some(Box::new(antares_ql::parse_q("speed<50").expect("q"))),
         ..Filter::default()
-    }))
+    })))
     .await;
     let (uri, mut rx) = capture().await;
     subscribe(&st, &uri, Some("alice")).await;
@@ -461,10 +461,10 @@ async fn a_joined_notification_does_not_carry_a_target_the_narrowing_hides() {
     for (answer, delivered) in [
         (NotifyDecision::Deliver, true),
         (
-            NotifyDecision::Filter(Filter {
+            NotifyDecision::Filter(Box::new(Filter {
                 q: Some(Box::new(antares_ql::parse_q("public==true").expect("q"))),
                 ..Filter::default()
-            }),
+            })),
             false,
         ),
     ] {
@@ -529,10 +529,10 @@ async fn a_linked_condition_under_a_projecting_narrowing_is_not_an_oracle() {
     for (answer, delivered) in [
         (NotifyDecision::Deliver, true),
         (
-            NotifyDecision::Filter(Filter {
+            NotifyDecision::Filter(Box::new(Filter {
                 omit: vec!["https://uri.etsi.org/ngsi-ld/default-context/salary".into()],
                 ..Filter::default()
-            }),
+            })),
             false,
         ),
     ] {
@@ -585,10 +585,10 @@ async fn a_linked_condition_under_a_projecting_narrowing_is_not_an_oracle() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_notification_projection_reaches_the_inline_joined_entity() {
     for format in ["normalized", "keyValues"] {
-        let (st, _) = state(NotifyDecision::Filter(Filter {
+        let (st, _) = state(NotifyDecision::Filter(Box::new(Filter {
             omit: vec!["https://uri.etsi.org/ngsi-ld/default-context/salary".into()],
             ..Filter::default()
-        }))
+        })))
         .await;
         let (uri, mut rx) = capture().await;
         let (code, body) = call(

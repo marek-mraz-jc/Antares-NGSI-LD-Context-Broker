@@ -321,7 +321,7 @@ pub struct Policy {
     /// The policy as written, for the access surface.
     pub source: Source,
     /// The metadata members it passes (a permission) or takes back (a
-    /// prohibition) per Attribute (platform ADR-N-066 2.4), see [`members`].
+    /// prohibition) per Attribute (platform ADR-N-066 2.4).
     pub metadata: Metadata,
 }
 

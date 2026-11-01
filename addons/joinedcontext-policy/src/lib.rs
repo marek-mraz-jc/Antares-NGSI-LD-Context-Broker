@@ -163,7 +163,7 @@ impl PolicyEngine for JoinedcontextPolicy {
         };
         match self.decide_now(subject, &op) {
             Decision::Allow => NotifyDecision::Deliver,
-            Decision::Filter(f) => NotifyDecision::Filter(f),
+            Decision::Filter(f) => NotifyDecision::Filter(Box::new(f)),
             Decision::Deny(_) | Decision::AllowIf(_) => NotifyDecision::Drop,
         }
     }

@@ -1117,7 +1117,7 @@ pub enum NotifyDecision {
     /// before this point, there is nothing left to re-run the query against,
     /// and delivering the notification unfiltered would tell the engine a
     /// narrowing was applied that never was.
-    Filter(Filter),
+    Filter(Box<Filter>),
     /// Do not send. 5.8.6 counts this as no attempt at all — the
     /// notification was never sent, so it is neither a success nor a
     /// failure, and `timesSent` does not move.
@@ -2547,10 +2547,10 @@ mod tests {
                     }
                 }
             }
-            NotifyDecision::Filter(Filter {
+            NotifyDecision::Filter(Box::new(Filter {
                 omit: vec!["brand".into()],
                 ..Filter::default()
-            })
+            }))
         }
     }
 

@@ -1658,6 +1658,11 @@ async fn a_denied_set_attribute_value_answers_403_whatever_is_stored() -> Res {
     Ok(())
 }
 
+/// The member at JSON pointer `path`, `null` when absent.
+fn at<'v>(v: &'v Value, path: &str) -> &'v Value {
+    v.pointer(path).unwrap_or(&Value::Null)
+}
+
 /// ADR-N-066 2.4: the public grant passes `pm10`'s `observedAt` only and every other
 /// Attribute the public defaults; the anonymous caller creates its own subscriptions.
 async fn air() -> Result<AppState, String> {
@@ -1688,9 +1693,9 @@ const AIR: &str = "/ngsi-ld/v1/entities/urn:ngsi-ld:Air:1";
 
 /// One stripped (`pm10.unitCode`) and one passed (`pm10.observedAt`, `name.unitCode`) member.
 fn stripped_as_granted(entity: &Value) -> Res {
-    let ok = entity["pm10"].get("unitCode").is_none()
-        && entity["pm10"]["observedAt"] == "2026-11-01T10:00:00Z"
-        && entity["name"]["unitCode"] == "C62";
+    let ok = at(entity, "/pm10").get("unitCode").is_none()
+        && at(entity, "/pm10/observedAt") == "2026-11-01T10:00:00Z"
+        && at(entity, "/name/unitCode") == "C62";
     if ok {
         Ok(())
     } else {
@@ -1713,10 +1718,10 @@ async fn a_read_keeps_only_the_metadata_members_the_grant_passes() -> Res {
     )
     .await?;
     assert_eq!(code, StatusCode::OK, "{list}");
-    stripped_as_granted(&list[0])?;
+    stripped_as_granted(at(&list, "/0"))?;
     // the seed's caller holds a grant without a block: every member, as before
     let (_, whole) = send(&st, "GET", AIR, &ADMIN, None).await?;
-    assert_eq!(whole["pm10"]["unitCode"], "GQ", "{whole}");
+    assert_eq!(at(&whole, "/pm10/unitCode"), "GQ", "{whole}");
     Ok(())
 }
 
@@ -1740,10 +1745,10 @@ async fn a_geojson_answer_is_stripped_too() -> Res {
         .map_err(|e| e.to_string())?
         .to_bytes();
     let feature: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    stripped_as_granted(&feature["properties"])
+    stripped_as_granted(at(&feature, "/properties"))
 }
 
-/// MCP, OData, OGC Features and SensorThings read through `AppState::call`: the same
+/// MCP, `OData`, OGC Features and `SensorThings` read through `AppState::call`: the same
 /// router, so the same strip.
 #[tokio::test]
 async fn a_surface_reading_in_process_gets_the_stripped_answer() -> Res {
@@ -1843,11 +1848,15 @@ async fn a_notification_carries_only_the_members_the_subscriber_may_read() -> Re
     while let Ok(Some(n)) =
         tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await
     {
-        let entity = &n["data"][0];
-        if entity["pm10"]["value"] == 50 {
-            assert!(entity["pm10"].get("unitCode").is_none(), "{n}");
-            assert_eq!(entity["pm10"]["observedAt"], "2026-11-01T11:00:00Z", "{n}");
-            assert_eq!(entity["name"]["unitCode"], "C62", "{n}");
+        let entity = &at(&n, "/data/0");
+        if at(entity, "/pm10/value") == 50 {
+            assert!(at(entity, "/pm10").get("unitCode").is_none(), "{n}");
+            assert_eq!(
+                at(entity, "/pm10/observedAt"),
+                "2026-11-01T11:00:00Z",
+                "{n}"
+            );
+            assert_eq!(at(entity, "/name/unitCode"), "C62", "{n}");
             return Ok(());
         }
     }
@@ -1872,5 +1881,7 @@ async fn a_history_read_is_stripped_per_instance() -> Res {
             .cloned()
             .unwrap_or_default()
     };
-    stripped_as_granted(&json!({"pm10": one(&evolution["pm10"]), "name": one(&evolution["name"])}))
+    stripped_as_granted(
+        &json!({"pm10": one(at(&evolution, "/pm10")), "name": one(at(&evolution, "/name"))}),
+    )
 }
