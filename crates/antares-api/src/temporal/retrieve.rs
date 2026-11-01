@@ -158,6 +158,10 @@ pub(super) async fn retrieve_temporal_inner(
         default_page(st, &tenant, &trepr),
         types_rule.as_deref(),
         &timeprop,
+        trepr
+            .attrs
+            .as_deref()
+            .filter(|_| !super::query::reach_reads_state(&filter)),
     );
     let mut warnings: Vec<String> = Vec::new();
     let doc = load_evolution(&req, &tf, &timeprop, &mut warnings).await?;
@@ -268,16 +272,20 @@ struct RetrieveReq<'a> {
 /// is always safe here); window() stays the arbiter. ADR-0023 rule 11: a
 /// condition rebuilds each instance's state from the whole history, so
 /// the store prunes no instance under one; rules without one read only
-/// the window (T-4246).
+/// the window (T-4246). `attrs` (expanded) keeps the read to those
+/// Attributes' rows, under the same rule: a condition may read any other
+/// (T-6346).
 fn retrieve_filter<'a>(
     tq: Option<&'a TemporalQ>,
     page_n: InstancePage,
     default: Option<usize>,
     types_rule: Option<&crate::policy::Filter>,
     timeprop: &'a str,
+    attrs: Option<&'a [String]>,
 ) -> antares_store::filter::TemporalFilter<'a> {
     let replays = replays_state(types_rule);
     antares_store::filter::TemporalFilter {
+        attrs: attrs.filter(|_| !replays),
         range: tq
             .filter(|_| !replays)
             .map(|t| antares_store::filter::InstanceRange {
@@ -563,4 +571,40 @@ pub(super) async fn kept_no_history(
         }
     }
     Ok(Some(Value::Object(shell)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T-6346: `attrs` reaches the store, which then reads only those
+    /// Attributes' rows; a conditional rule rebuilds state from any other
+    /// Attribute, so under one the store reads them all.
+    #[test]
+    fn the_store_reads_only_the_asked_attributes_unless_a_rule_reads_state() {
+        let asked = ["https://uri.etsi.org/ngsi-ld/default-context/speed".to_owned()];
+        let page = InstancePage::default();
+        let f = retrieve_filter(None, page, None, None, "observedAt", Some(&asked));
+        assert_eq!(f.attrs, Some(&asked[..]));
+        let conditional = crate::policy::Filter {
+            rules: vec![crate::policy::Rule {
+                types: vec!["https://uri.etsi.org/ngsi-ld/default-context/Car".to_owned()],
+                q: Some(Box::new(antares_ql::parse_q("status==\"ok\"").expect("q"))),
+                ..crate::policy::Rule::default()
+            }],
+            ..crate::policy::Filter::default()
+        };
+        let f = retrieve_filter(
+            None,
+            page,
+            None,
+            Some(&conditional),
+            "observedAt",
+            Some(&asked),
+        );
+        assert_eq!(f.attrs, None);
+        assert!(!super::super::query::reach_reads_state(
+            &crate::policy::Filter::default()
+        ));
+    }
 }

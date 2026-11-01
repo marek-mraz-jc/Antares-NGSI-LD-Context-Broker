@@ -943,8 +943,18 @@ pub use crate::store::filter::{TemporalFilter, TemporalOutcome};
 /// Returns the SQL fragment + its text binds, numbered from `first_bind`;
 /// `None` when a range is present but outside the compiler's exact subset —
 /// the caller then reconstructs unpruned and the window stays the arbiter.
-fn attr_object_expr(f: &TemporalFilter<'_>, first_bind: usize) -> Option<(String, Vec<String>)> {
-    let (range_and, mut binds) = window_sql(f, first_bind)?;
+/// `only`, the bind of a `text[]` of Attribute IRIs, keeps the read to their
+/// rows (T-6346: a one-Attribute week of one station read every Attribute's
+/// rows, ~1 heap page each, 3.4 s on dev).
+fn attr_object_expr(
+    f: &TemporalFilter<'_>,
+    first_bind: usize,
+    only: Option<usize>,
+) -> Option<(String, Vec<String>)> {
+    let (mut range_and, mut binds) = window_sql(f, first_bind)?;
+    if let Some(k) = only {
+        range_and.push_str(&format!(" AND ai.attr_id = ANY(${k}::text[])"));
+    }
     let tp = first_bind;
     let expr = match f.last_n {
         Some(n) => {
@@ -962,7 +972,7 @@ fn attr_object_expr(f: &TemporalFilter<'_>, first_bind: usize) -> Option<(String
             } else {
                 "DESC NULLS LAST"
             };
-            let rows = newest_rows(f, first_bind, n_bind)
+            let rows = newest_rows(f, first_bind, n_bind, only)
                 .unwrap_or_else(|| format!("{} ai WHERE true", history("m.tenant_id", "m.id")));
             format!(
                 "COALESCE((SELECT jsonb_object_agg(g.attr_id, g.insts) FROM (\
@@ -1023,10 +1033,7 @@ const NEWEST_ROWS: &str = "(WITH RECURSIVE a(attr) AS (\
                     WHERE r.tenant_id = m.tenant_id AND r.entity_no = iri_no(m.tenant_id, m.id) \
                       AND r.attr_no > b.no{rwindow}) \
             FROM b WHERE b.no IS NOT NULL), \
-          n(attr) AS (\
-            SELECT a.attr FROM a WHERE a.attr IS NOT NULL \
-          UNION \
-            SELECT i.iri FROM b JOIN iri_ids i ON i.tenant_id = m.tenant_id AND i.id = b.no) \
+          n(attr) AS ({names}) \
           SELECT ai.* FROM n a \
           CROSS JOIN LATERAL (SELECT CASE WHEN a.attr = ANY(m.dataset_attrs) THEN '-infinity'::timestamptz \
               ELSE (SELECT CASE WHEN k.nth - interval '28 hours' > m.offset_until THEN k.nth \
@@ -1042,9 +1049,14 @@ const NEWEST_ROWS: &str = "(WITH RECURSIVE a(attr) AS (\
                 '-infinity'::timestamptz) AS nth) k) END AS th) c \
           CROSS JOIN LATERAL (SELECT * FROM attr_instances ai \
             WHERE ai.tenant_id = m.tenant_id AND ai.entity_id = m.id AND ai.attr_id = a.attr \
-            AND ai.observed_at >= c.th \
+            AND ai.observed_at >= c.th{awindow} \
             UNION ALL SELECT * FROM attr_rows_at(m.tenant_id, m.id, a.attr) ai \
-            WHERE ai.observed_at >= c.th OFFSET 0) ai) ai WHERE true";
+            WHERE ai.observed_at >= c.th{awindow} OFFSET 0) ai) ai WHERE true";
+
+/// [`NEWEST_ROWS`]' Attributes when no `only` names them: the skip scans'.
+const SKIPPED_ATTRS: &str = "SELECT a.attr FROM a WHERE a.attr IS NOT NULL \
+          UNION \
+            SELECT i.iri FROM b JOIN iri_ids i ON i.tenant_id = m.tenant_id AND i.id = b.no";
 
 /// lastN's candidate rows, read through the (tenant, entity, attr,
 /// observed_at DESC) btree instead of ranking every instance of the window:
@@ -1055,6 +1067,11 @@ const NEWEST_ROWS: &str = "(WITH RECURSIVE a(attr) AS (\
 /// has N rows strictly above it under either order. KPI histories of 22k
 /// instances per Entity passed the gateway's 30 s ranking all of them
 /// (T-4246); this reads about N plus 28 hours of rows per Attribute.
+/// The rows themselves keep to the window's column bound as well: a window
+/// holding fewer than N rows has no N-th newest (`-infinity`), and without
+/// the bound that read every week of the Attribute's retention (T-6346:
+/// 20 546 rows from disk to keep 288, past the 30 s statement timeout).
+/// `only` (see [`attr_object_expr`]) replaces the skip scans by its list.
 /// Where the Entity's `offset_until` (migration 0028) lies more than 28 h
 /// before the N-th newest, every row within those 28 h is a UTC stamp,
 /// whose text key orders like `observed_at`: the N newest and their ties are
@@ -1070,7 +1087,12 @@ const NEWEST_ROWS: &str = "(WITH RECURSIVE a(attr) AS (\
 ///   datasetId, and a sparse dataset's newest may sit below the Attribute's
 ///   N-th; such an Attribute keeps every row (`-infinity`), found through the
 ///   Entity's `dataset_attrs` (migration 0009), which the write path keeps.
-fn newest_rows(f: &TemporalFilter<'_>, first_bind: usize, n_bind: usize) -> Option<String> {
+fn newest_rows(
+    f: &TemporalFilter<'_>,
+    first_bind: usize,
+    n_bind: usize,
+    only: Option<usize>,
+) -> Option<String> {
     if f.oldest_first || f.timeproperty != "observedAt" {
         return None;
     }
@@ -1083,8 +1105,14 @@ fn newest_rows(f: &TemporalFilter<'_>, first_bind: usize, n_bind: usize) -> Opti
         }
         Some(_) => None,
     };
+    let names = match only {
+        Some(k) => format!("SELECT DISTINCT unnest(${k}::text[])"),
+        None => SKIPPED_ATTRS.to_owned(),
+    };
     Some(
         NEWEST_ROWS
+            .replace("{names}", &names)
+            .replace("{awindow}", &bound("ai")?)
             .replace("{window}", &bound("t")?)
             .replace("{xwindow}", &bound("x")?)
             .replace("{rwindow}", &bound("r")?)
@@ -1114,6 +1142,42 @@ fn window_sql(f: &TemporalFilter<'_>, first_bind: usize) -> Option<(String, Vec<
         }
     }
     Some((range_and, binds))
+}
+
+/// One Entity's Retrieve Temporal Evolution statement
+/// ([`PgTemporalStore::get_range`]): `$1` the Tenant, `$2` the Entity id,
+/// `$3` the `only` Attribute IRIs when there are any, then `binds` as text.
+/// Public so a test can EXPLAIN exactly what the read runs (T-6346).
+pub struct RangeStatement {
+    pub sql: String,
+    pub only: Option<Vec<String>>,
+    pub binds: Vec<String>,
+}
+
+/// Builds [`RangeStatement`] for `f`. Same unpruned fallback as
+/// `query_inner`, and compiling for the same reason: no range and no lastN
+/// is the shape that never refuses. A request reaches this: a refusal is an
+/// error, never a panic (T-3915). `attrs` keeps the read to their rows.
+pub fn range_statement(f: &TemporalFilter<'_>) -> Result<RangeStatement, sqlx::Error> {
+    let only = f.attrs.map(super::storable).filter(|a| !a.is_empty());
+    let (first, only_bind) = match only {
+        Some(_) => (4, Some(3)),
+        None => (3, None),
+    };
+    let (attr_expr, binds) = match attr_object_expr(f, first, only_bind) {
+        Some(v) => v,
+        None => {
+            attr_object_expr(&TemporalFilter::default(), first, only_bind).ok_or_else(|| {
+                sqlx::Error::Protocol("the unpruned temporal shape did not compile".into())
+            })?
+        }
+    };
+    // 4.22: an expired entity is invalid → None (404), same as get().
+    let sql = format!(
+        "SELECT m.meta || {attr_expr} FROM temporal_entities m \
+         WHERE m.tenant_id = $1 AND m.id = $2 AND {NOT_EXPIRED}"
+    );
+    Ok(RangeStatement { sql, only, binds })
 }
 
 /// Timestamp text in the shape the API's aggregated rows carry.
@@ -1844,17 +1908,21 @@ impl PgTemporalStore {
         let aggregated = agg.is_some();
         let (attr_expr, extra) = match agg {
             Some((e, b)) => (format!("jsonb_build_object('$agg', {e})"), b),
-            None => match attr_object_expr(f, n_where.saturating_add(1)) {
+            None => match attr_object_expr(f, n_where.saturating_add(1), None) {
                 Some(v) => v,
                 // refused range shape: reconstruct unpruned, window arbitrates.
                 // The default filter has neither range nor lastN, the two
                 // shapes the compiler can refuse: pinned by
                 // `the_unpruned_fallback_always_compiles`. A request reaches
                 // this line: a refusal is an error, never a panic (T-3915).
-                None => attr_object_expr(&TemporalFilter::default(), n_where.saturating_add(1))
-                    .ok_or_else(|| {
-                        sqlx::Error::Protocol("the unpruned temporal shape did not compile".into())
-                    })?,
+                None => {
+                    attr_object_expr(&TemporalFilter::default(), n_where.saturating_add(1), None)
+                        .ok_or_else(|| {
+                            sqlx::Error::Protocol(
+                                "the unpruned temporal shape did not compile".into(),
+                            )
+                        })?
+                }
             },
         };
         binds.extend(extra.into_iter().map(B::Text));
@@ -1969,27 +2037,16 @@ impl PgTemporalStore {
         id: &str,
         f: &TemporalFilter<'_>,
     ) -> Result<Option<Value>, sqlx::Error> {
-        // Same unpruned fallback as `query_inner`, and compiling for the
-        // same reason: no range and no lastN is the shape that never refuses.
-        // A request reaches this line: a refusal here is an error, never a
-        // panic (T-3915).
-        let (attr_expr, binds) = match attr_object_expr(f, 3) {
-            Some(v) => v,
-            None => attr_object_expr(&TemporalFilter::default(), 3).ok_or_else(|| {
-                sqlx::Error::Protocol("the unpruned temporal shape did not compile".into())
-            })?,
-        };
-        // 4.22: an expired entity is invalid → None (404), same as get().
-        let sql = format!(
-            "SELECT m.meta || {attr_expr} FROM temporal_entities m \
-             WHERE m.tenant_id = $1 AND m.id = $2 AND {NOT_EXPIRED}"
-        );
+        let st = range_statement(f)?;
         let mut tx = super::begin(&self.pool).await?;
         crate::store::pg::set_tenant(&mut tx, tenant).await?;
-        let mut qy = sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+        let mut qy = sqlx::query(sqlx::AssertSqlSafe(st.sql))
             .bind(tenant.as_str())
             .bind(id);
-        for b in &binds {
+        if let Some(a) = st.only {
+            qy = qy.bind(a);
+        }
+        for b in st.binds {
             qy = qy.bind(b);
         }
         let row = qy.fetch_optional(&mut *tx).await?;
@@ -2315,7 +2372,7 @@ mod tests {
         assert!(f.range.is_none(), "the default filter carries no range");
         assert!(f.last_n.is_none(), "the default filter carries no lastN");
         for first_bind in [1, 3, 4, 17] {
-            let built = attr_object_expr(&f, first_bind);
+            let built = attr_object_expr(&f, first_bind, None);
             let (sql, binds) = built.unwrap_or_else(|| {
                 panic!("the unpruned fallback failed to compile at bind {first_bind}")
             });
@@ -2386,7 +2443,7 @@ mod tests {
 
     #[test]
     fn range_binds_are_numbered_from_first_bind() {
-        let (expr, binds) = attr_object_expr(&between(), 2).expect("compiles");
+        let (expr, binds) = attr_object_expr(&between(), 2, None).expect("compiles");
         assert_eq!(
             binds,
             vec!["observedAt", "2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z"]
@@ -2405,7 +2462,7 @@ mod tests {
             last_n: Some(5),
             ..Default::default()
         };
-        let (expr, binds) = attr_object_expr(&f, 1).expect("compiles");
+        let (expr, binds) = attr_object_expr(&f, 1, None).expect("compiles");
         // RANK keeps timestamp ties; ROW_NUMBER would cut an instance the
         // API-side per-attr lastN still wants (the tie-break divergence bug)
         assert!(expr.contains("rank() OVER"), "{expr}");
@@ -2433,7 +2490,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let sql = newest_rows(&after, 3, 7).expect("after reads the newest rows");
+        let sql = newest_rows(&after, 3, 7, None).expect("after reads the newest rows");
         assert!(!sql.contains("window}"), "{sql}");
         for alias in ["x", "r", "t"] {
             let bound = format!("{alias}.observed_at >= $4::timestamptz - interval '48 hours'");
@@ -2445,7 +2502,7 @@ mod tests {
             last_n: Some(10),
             ..Default::default()
         };
-        let sql = newest_rows(&unbounded, 3, 4).expect("no range reads the newest rows");
+        let sql = newest_rows(&unbounded, 3, 4, None).expect("no range reads the newest rows");
         assert!(!sql.contains("window}"), "{sql}");
         assert!(!sql.contains("observed_at >= $"), "{sql}");
     }
@@ -2500,7 +2557,7 @@ mod tests {
             last_n: Some(10),
             ..Default::default()
         };
-        let sql = newest_rows(&f, 3, 4).expect("reads the newest rows");
+        let sql = newest_rows(&f, 3, 4, None).expect("reads the newest rows");
         assert!(
             sql.contains(
                 "CASE WHEN k.nth - interval '28 hours' > m.offset_until THEN k.nth \
@@ -2555,7 +2612,7 @@ mod tests {
             oldest_first: true,
             ..Default::default()
         };
-        let (expr, binds) = attr_object_expr(&f, 1).expect("compiles");
+        let (expr, binds) = attr_object_expr(&f, 1, None).expect("compiles");
         assert!(expr.contains("COLLATE \"C\" ASC NULLS FIRST"), "{expr}");
         assert!(!expr.contains("DESC"), "{expr}");
         assert_eq!(binds, vec!["observedAt", "5"]);
@@ -2574,7 +2631,7 @@ mod tests {
             ..Default::default()
         };
         // half-pruning would silently skip the range: refuse instead
-        assert!(attr_object_expr(&f, 1).is_none());
+        assert!(attr_object_expr(&f, 1, None).is_none());
     }
 
     #[test]
