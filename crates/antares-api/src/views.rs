@@ -781,11 +781,21 @@ pub(crate) fn of_subscription(
     tenant: &antares_model::TenantId,
     sub: &serde_json::Value,
 ) -> Option<Option<Arc<CompiledView>>> {
+    of_subscription_in(&st.views.snapshot(), tenant, sub).map(|v| v.cloned())
+}
+
+/// [`of_subscription`] in a table the caller already holds: the matcher
+/// takes one snapshot per change instead of one per candidate (T-6371).
+pub(crate) fn of_subscription_in<'a>(
+    table: &'a BTreeMap<String, ViewEntry>,
+    tenant: &antares_model::TenantId,
+    sub: &serde_json::Value,
+) -> Option<Option<&'a Arc<CompiledView>>> {
     let id = sub.get(VIEW_MEMBER)?.as_str().unwrap_or_default();
-    Some(match st.views.snapshot().get(id) {
+    Some(match table.get(id) {
         Some(ViewEntry::Loaded {
             view, tenant: t, ..
-        }) if t == tenant.as_str() => Some(view.clone()),
+        }) if t == tenant.as_str() => Some(view),
         _ => None,
     })
 }
