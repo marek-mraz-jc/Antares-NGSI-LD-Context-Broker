@@ -34,7 +34,10 @@ fn iri(term: &str) -> String {
     format!("{DEFAULT}{term}")
 }
 
-/// The Entity rows the store's reads returned to the broker since `take`.
+/// The most Entity rows one store read returned to the broker since `take`.
+/// The largest statement, not the sum: sqlx logs a statement when its
+/// logger drops, which can come after the answer, so the previous count's
+/// own row may land in the next count's window (sweep 41279198278).
 #[derive(Clone, Default)]
 struct EntityRows(Arc<Mutex<u64>>);
 
@@ -73,7 +76,7 @@ impl<S: tracing::Subscriber> Layer<S> for EntityRows {
             e.record(&mut q);
             if q.sql.contains("SELECT entity AS entity FROM") {
                 let mut n = self.0.lock().unwrap_or_else(|e| e.into_inner());
-                *n = n.saturating_add(q.rows);
+                *n = (*n).max(q.rows);
             }
         }
     }
@@ -202,20 +205,25 @@ async fn a_q_count_over_a_scattered_type_is_one_store_statement() {
         .with_policy(Arc::new(Narrowing(view)));
     antares_api::wire(&mut st).await;
 
+    // warm-up, untimed: the first read after the seed pays for its cold
+    // cache (5.9 s under preflight's parallel load, 1.1 s alone), which is
+    // the seed, not the count path; the type count is timed again below
+    let (code, total, _) = count(&st, &tenant, "type=Tree&count=true&limit=0").await;
+    assert_eq!((code, total), (StatusCode::OK, Some(TREES.to_string())));
     let mut sum = 0i64;
     for class in 0..7i64 {
         let query = format!("type=Tree&count=true&limit=0&q=trunkDiameterClass==%22cm{class}%22");
         rows.take();
         let (code, total, took) = count(&st, &tenant, &query).await;
         let read = rows.take();
-        eprintln!("{query}: {code} {total:?} in {took:?}, {read} Entity rows read");
+        eprintln!("{query}: {code} {total:?} in {took:?}, at most {read} Entity rows in one read");
         assert_eq!(code, StatusCode::OK, "{query}");
         let want = (1..=TREES).filter(|n| n % 7 == class).count().to_string();
         assert_eq!(total.as_deref(), Some(want.as_str()), "{query}");
         // the count statement's own row; a walk returns the class (~9 700)
         assert!(
             read <= 1,
-            "{query}: the count walked {read} Entities in the broker"
+            "{query}: a store read returned {read} Entities to the broker"
         );
         assert!(took < BUDGET, "{query} took {took:?}");
         sum = sum.saturating_add(want.parse::<i64>().unwrap_or_default());
