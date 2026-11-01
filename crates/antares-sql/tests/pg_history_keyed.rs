@@ -717,3 +717,35 @@ async fn a_cut_over_set_after_the_first_write_routes_the_next_one() {
         "the observation after the cut-over is keyed, the first one is not"
     );
 }
+
+/// Two versions kept at one instant (platform ADR-N-054 2.9: two edits in the
+/// same millisecond) read in one order, by instance id, whichever was written
+/// first.
+#[tokio::test]
+async fn versions_of_one_instant_read_in_instance_id_order() {
+    let Ok(url) = std::env::var("ANTARES_TEST_DATABASE_URL") else {
+        eprintln!("SKIP: ANTARES_TEST_DATABASE_URL not set");
+        return;
+    };
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let s = PgTemporalStore::new(pool.clone());
+    let t = TenantId::new("pgsameinstant").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let id = "urn:ngsi-ld:Station:same-instant";
+    let _ = s.delete(&t, id).await;
+    let name = "https://uri.etsi.org/ngsi-ld/default-context/name";
+    let version = |value: &str, n: u8| {
+        json!({"type": "Property", "value": value, "observedAt": "2026-01-02T06:00:00.123Z",
+               "instanceId": format!("urn:ngsi-ld:Instance:00000000-0000-4000-8000-00000000004{n}")})
+    };
+    let doc =
+        json!({"id": id, "type": "Station", name: [version("second", 2), version("first", 1)]});
+    assert!(s.create(&t, id, &doc).await.expect("create"));
+    let all = s.versions(&t, id).await.expect("versions");
+    let values: Vec<Value> = all
+        .get(name)
+        .and_then(Value::as_array)
+        .map(|rows| rows.iter().map(|r| r["value"].clone()).collect())
+        .unwrap_or_default();
+    assert_eq!(values, [json!("first"), json!("second")], "{all:?}");
+}

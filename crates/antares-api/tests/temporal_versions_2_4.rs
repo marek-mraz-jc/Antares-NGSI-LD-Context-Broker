@@ -376,3 +376,94 @@ async fn an_audited_endpoint_keeps_every_change_where_history_is_off() {
         [vec![json!(1.0), json!(2.0), json!(3.0)], vec![], vec![]]
     );
 }
+
+/// Versions on request (platform ADR-N-054 2.9, DM-145, DM-146): where the
+/// type keeps no history, a rename sent with the gateway's audit mark (the
+/// gateway's translation of `JC-Record: version`) keeps the replaced name
+/// first, attributed to whoever the current state says wrote it, then each
+/// new name with its own writer and reason; an exact repeat keeps nothing,
+/// the same renames without the mark keep nothing, and a temporal read
+/// without `versions=all` shows none of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rename_asked_as_a_version_keeps_the_old_name_and_the_new_where_history_is_off() {
+    let Some((st, t)) = pg_state_as(Some(antares_api::TemporalRecord::Ruled)).await else {
+        return;
+    };
+    let creator = [
+        ("l5d-client-id", GATEWAY),
+        ("jc-provenance-channel", "pipeline"),
+        ("jc-provenance-actor", "serviceAccount%3Apl-stations"),
+        ("jc-provenance-organization", "hel"),
+        ("jc-provenance-actor-kind", "pipeline"),
+    ];
+    let versioned = [
+        ("l5d-client-id", GATEWAY),
+        ("jc-provenance-channel", "ui"),
+        ("jc-provenance-actor", "user%3Ajana"),
+        ("jc-provenance-organization", "bb"),
+        ("jc-provenance-actor-kind", "person"),
+        ("jc-provenance-audit", "changes"),
+        ("jc-reason", "Renamed%20by%20the%20council"),
+    ];
+    let plain = &versioned[..5];
+    let granted = [("l5d-client-id", GATEWAY), ("jc-read-versions", "true")];
+    let name = |v: &str| json!({"name": {"type": "Property", "value": v}});
+    let mut chains = Vec::new();
+    for (id, renamer) in [
+        ("urn:ngsi-ld:Station:renamed", &versioned[..]),
+        ("urn:ngsi-ld:Station:plain", plain),
+    ] {
+        let mut doc = name("Hlavná stanica");
+        doc["id"] = json!(id);
+        doc["type"] = json!("Station");
+        let (s, b) = send(&st, &t, "POST", "/ngsi-ld/v1/entities", &creator, Some(doc)).await;
+        assert_eq!(s, 201, "{b}");
+        let attrs = format!("/ngsi-ld/v1/entities/{id}/attrs");
+        for value in ["Stanica Centrum", "Stanica Centrum", "Stanica Námestie"] {
+            let (s, b) = send(&st, &t, "PATCH", &attrs, renamer, Some(name(value))).await;
+            assert_eq!(s, 204, "{b}");
+        }
+        let uri = format!("/ngsi-ld/v1/temporal/entities/{id}?attrs=name&versions=all");
+        let (s, all) = send(&st, &t, "GET", &uri, &granted, None).await;
+        // nothing kept of `name` is the 404 of an Attribute the Entity never had
+        let expected = if id.ends_with("renamed") { 200 } else { 404 };
+        assert_eq!(s, expected, "{all}");
+        let rows = all["name"].as_array().cloned().unwrap_or_default();
+        if id.ends_with("renamed") {
+            let p = |i: usize| rows.get(i).map(|r| r["provenance"].clone());
+            let p0 = p(0).unwrap_or_default();
+            assert_eq!(p0["operation"], json!("create"), "{all}");
+            assert_eq!(p0["organization"], json!("hel"), "{all}");
+            assert_eq!(p0["audit"], json!(true), "{all}");
+            for i in [1, 2] {
+                let pi = p(i).unwrap_or_default();
+                assert_eq!(pi["organization"], json!("bb"), "{all}");
+                assert_eq!(pi["actorKind"], json!("person"), "{all}");
+                assert_eq!(pi["reason"], json!("Renamed by the council"), "{all}");
+                assert!(pi["writtenAt"].is_string(), "{all}");
+            }
+            let (_, flat) = send(
+                &st,
+                &t,
+                "GET",
+                &format!("/ngsi-ld/v1/temporal/entities/{id}?attrs=name"),
+                &granted,
+                None,
+            )
+            .await;
+            assert!(flat.get("name").is_none(), "{flat}");
+        }
+        chains.push(rows.iter().map(|r| r["value"].clone()).collect::<Vec<_>>());
+    }
+    assert_eq!(
+        chains,
+        [
+            vec![
+                json!("Hlavná stanica"),
+                json!("Stanica Centrum"),
+                json!("Stanica Námestie")
+            ],
+            vec![]
+        ]
+    );
+}

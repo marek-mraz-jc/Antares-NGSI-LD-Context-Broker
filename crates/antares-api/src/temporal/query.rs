@@ -1056,6 +1056,7 @@ fn assemble_page(
     let mut payload: Vec<Value> = Vec::new();
     let mut g = PageCut::default();
     for d in page {
+        let d = &*crate::history::as_recorded(st, req.tenant, d, false);
         let mut w = window(
             d,
             qry.tq.as_ref(),

@@ -194,6 +194,107 @@ fn audited() -> bool {
     false
 }
 
+/// The temporal `doc` as a read without `versions=all` sees it (platform
+/// ADR-N-054 2.9, DM-146): an Entity whose type keeps no history answers no
+/// Attribute, though the version rows an audited write kept are there, so a
+/// chart and a public Endpoint see nothing a version request added.
+pub(crate) fn as_recorded<'a>(
+    st: &AppState,
+    tenant: &TenantId,
+    doc: &'a Value,
+    versions: bool,
+) -> std::borrow::Cow<'a, Value> {
+    if versions || records_history(st, tenant, doc) {
+        return std::borrow::Cow::Borrowed(doc);
+    }
+    let shell: Map<String, Value> = ["id", "type", "scope"]
+        .into_iter()
+        .filter_map(|k| Some((k.to_owned(), doc.get(k)?.clone())))
+        .collect();
+    std::borrow::Cow::Owned(Value::Object(shell))
+}
+
+/// Versions on request (platform ADR-N-054 2.9, DM-145): on an audited change
+/// of `attr` whose history holds no row of the changed instance's datasetId
+/// yet, the value it replaces (in `before`) goes to history first, so the
+/// first change already reads as the old value and the new. Its provenance is
+/// what the current state knew of its writer (`modifiedBy`, DM-138), with
+/// `operation: create`, never the request's: the broker names no writer of
+/// the old value it did not record. A store that cannot answer whether a row
+/// exists keeps nothing extra, and the write stands.
+pub(crate) async fn keep_replaced(
+    st: &AppState,
+    tenant: &TenantId,
+    shell: &Value,
+    attr: &str,
+    before: Option<&Value>,
+    instance: &Value,
+) {
+    if !audited() {
+        return;
+    }
+    let ds = |i: &Value| i.get("datasetId").cloned();
+    let same = |i: &&Value| ds(i) == ds(instance);
+    let was = match before {
+        Some(Value::Array(all)) => all.iter().find(same),
+        Some(one) => Some(one).filter(same),
+        None => None,
+    };
+    let (Some(was), Some(entity)) = (was, shell.get("id").and_then(Value::as_str)) else {
+        return;
+    };
+    let attrs = [attr.to_owned()];
+    let held = antares_store::filter::TemporalFilter {
+        attrs: Some(&attrs),
+        last_n: Some(1),
+        ..Default::default()
+    };
+    let kept = match st.temporal.get_temporal(tenant, entity, &held).await {
+        Ok(doc) => doc
+            .as_ref()
+            .and_then(|d| d.get(attr))
+            .is_some_and(|a| match a {
+                Value::Array(all) => all.iter().any(|i| same(&i)),
+                one => same(&one),
+            }),
+        Err(e) => {
+            tracing::warn!("versions on request: the replaced value is not kept: {e}");
+            true
+        }
+    };
+    if kept {
+        return;
+    }
+    let mut old = was.clone();
+    let Some(o) = old.as_object_mut() else {
+        return;
+    };
+    let mut p = o
+        .remove(antares_jsonld::compact::MODIFIED_BY_KEY)
+        .filter(Value::is_object)
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    if let Some(po) = p.as_object_mut() {
+        po.insert("operation".into(), Value::String("create".into()));
+        po.insert(crate::provenance::AUDIT.into(), Value::Bool(true));
+        if let Some(at) = o.get("modifiedAt").or_else(|| o.get("createdAt")) {
+            po.insert("writtenAt".into(), at.clone());
+        }
+    }
+    let iid = crate::notify::instance_id(entity, attr, o);
+    o.entry("instanceId".to_owned())
+        .or_insert(Value::String(iid));
+    o.insert(antares_store::PROVENANCE_KEY.to_owned(), p);
+    let event = TemporalEvent {
+        op: antares_store::TemporalOp::AttrModified,
+        tenant: tenant.clone(),
+        entity_id: entity.to_owned(),
+        shell: shell.clone(),
+        attr: attr.to_owned(),
+        instance: old,
+    };
+    push(st, event).await;
+}
+
 /// Buffer one entity change for the request in flight so the matcher
 /// receives the whole request at once. Handed back when no request is in
 /// flight — the caller then gives it to the matcher on the spot.
