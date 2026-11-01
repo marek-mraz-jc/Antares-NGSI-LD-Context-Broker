@@ -127,10 +127,15 @@ jobs:
           mkdir -p bin
           git fetch --depth 1 origin "$BASE_REF"
           git worktree add ../base FETCH_HEAD
-          (cd ../base && cargo build --locked --release -p antares-broker --features "$FEATURES" --target-dir "$GITHUB_WORKSPACE/target")
-          cp target/release/antares bin/antares-base
+          # The base builds into a target dir of its own: cargo names a path crate's artifacts by
+          # its path relative to the workspace, so in a shared dir the head's older checkout
+          # mtimes make the base's rlibs look fresh and the head links or compiles against them
+          # (run 41321243156: E0599 Lit::Duration, T-6356).
+          (cd ../base && cargo build --locked --release -p antares-broker --features "$FEATURES" --target-dir "$RUNNER_TEMP/target-base")
+          cp "$RUNNER_TEMP/target-base/release/antares" bin/antares-base
           cargo build --locked --release -p antares-broker --features "$FEATURES"
           cp target/release/antares bin/antares-head
+          if cmp -s bin/antares-base bin/antares-head; then echo "::error::the head binary equals the baseline"; exit 1; fi
       - name: Heavy workload, baseline then this commit
         env:
           DATABASE_URL: postgresql://antares:antares@localhost:15432/antares
