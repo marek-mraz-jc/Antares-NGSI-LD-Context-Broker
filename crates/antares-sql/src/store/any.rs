@@ -1175,6 +1175,21 @@ impl AnyStore {
         }
     }
 
+    /// [`antares_store::TypeSummary`] of the live Entities of `ty` (T-6294):
+    /// one aggregate over the first-type index on Postgres, one pass in
+    /// memory; `None` when one of them carries a second type.
+    pub async fn entity_type_summary(
+        &self,
+        tenant: &TenantId,
+        ty: &str,
+    ) -> Result<Option<antares_store::TypeSummary>, NgsiError> {
+        match self {
+            AnyStore::Mem(s) => Ok(s.entity_type_summary(tenant, ty, &now_utc())),
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => p.entities.type_summary(tenant, ty).await.map_err(db),
+        }
+    }
+
     /// The types of the Tenant's live Entities that carry one of `any_of`,
     /// sorted (T-4683): the types index on Postgres, one pass in memory.
     pub async fn entity_types_beside(
@@ -2056,6 +2071,13 @@ impl antares_store::CurrentStateDriver for AnyStore {
         tenant: &TenantId,
     ) -> Result<Option<Vec<(String, String)>>, NgsiError> {
         AnyStore::entity_attr_pairs(self, tenant).await.map(Some)
+    }
+    async fn entity_type_summary(
+        &self,
+        tenant: &TenantId,
+        ty: &str,
+    ) -> Result<Option<antares_store::TypeSummary>, NgsiError> {
+        AnyStore::entity_type_summary(self, tenant, ty).await
     }
     async fn entity_types_beside(
         &self,

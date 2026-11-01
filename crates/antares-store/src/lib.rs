@@ -193,6 +193,18 @@ pub struct TenantBytes {
     pub by_type: std::collections::BTreeMap<String, u64>,
 }
 
+/// One Entity type's live Entities as one aggregate (5.7.7, T-6294): how
+/// many there are and, per member name their documents carry (Entity frame
+/// members included), the `type` of every live instance under it, as the
+/// 5.7.7 fold reads them after 4.22 stripped expired instances.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TypeSummary {
+    /// The live Entities of the type.
+    pub count: u64,
+    /// Member name -> the instance types seen under it.
+    pub members: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
 /// The read-modify-write closure as the object-safe seam carries it. The
 /// typed `Result<T, E>` travels through [`CurrentStateDriverExt::mutate`]'s
 /// side slot; the boxed closure only signals commit (`Ok`) vs reject
@@ -624,6 +636,19 @@ pub trait CurrentStateDriver: Send + Sync {
         tenant: &TenantId,
     ) -> Result<Option<Vec<(String, String)>>, NgsiError> {
         let _ = tenant;
+        Ok(None)
+    }
+    /// [`TypeSummary`] of the live Entities of type `ty`, read without
+    /// handing a document over (T-6294): `/types/{type}` folded every one in
+    /// id order. `None` when the backend has no such read or a live Entity
+    /// of `ty` carries a second type, whose other type a view can judge it
+    /// by; the caller folds then.
+    async fn entity_type_summary(
+        &self,
+        tenant: &TenantId,
+        ty: &str,
+    ) -> Result<Option<TypeSummary>, NgsiError> {
+        let _ = (tenant, ty);
         Ok(None)
     }
     /// Read-modify-write under the row lock; `None` = absent (never an

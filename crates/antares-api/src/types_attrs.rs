@@ -886,14 +886,20 @@ pub async fn entity_type_info(
         // attributeDetails (5.2.26), so the fold asks the datastore for those
         // and the ceiling applies to them — a tenant of 100M entities with 50
         // Buildings answers exactly, instead of from the tenant's first page.
-        let (stats, partial) = type_stats(
-            &st,
-            &tenant,
-            *crate::bounds::MAX_FOLD_DOCS,
-            Narrow::Type(&iri),
-            view.as_ref().map(|r| (r, &*ctx)),
-        )
-        .await?;
+        let narrowed = view.as_ref().map(|r| (r, &*ctx));
+        let (stats, partial) = match summarized(&st, &tenant, &iri, narrowed).await? {
+            Some(stats) => (stats, false),
+            None => {
+                type_stats(
+                    &st,
+                    &tenant,
+                    *crate::bounds::MAX_FOLD_DOCS,
+                    Narrow::Type(&iri),
+                    narrowed,
+                )
+                .await?
+            }
+        };
         let Some((count, attrs)) = stats.get(&iri) else {
             let mut resp = ApiError::from(NgsiError::ResourceNotFound(format!(
                 "no entities of type {type_name}"
@@ -926,6 +932,79 @@ pub async fn entity_type_info(
         Ok::<_, ApiError>(resp)
     };
     go.await.unwrap_or_else(|e| e.into_response())
+}
+
+/// The 5.7.7 answer for `iri` from the store's aggregate (T-6294), as the
+/// fold over the same Entities gives it, or `None` and the caller folds.
+/// Only a view that decides every Entity of `iri` by its type alone sees
+/// each the same way: then one stand-in Entity holding every member name the
+/// aggregate found goes through [`visible`] for all of them, and the names
+/// it keeps are the ones shown. A row condition (`q`, `scopeQ`, an area, an
+/// id) on the narrowing or on a rule naming `iri` decides per Entity, and an
+/// Entity of a second type can be judged by that one, which the store
+/// reports as `None`.
+async fn summarized(
+    st: &AppState,
+    tenant: &antares_model::TenantId,
+    iri: &str,
+    view: View<'_>,
+) -> Result<Option<TypeStats>, NgsiError> {
+    if !view.is_none_or(|(r, _)| by_type_alone(r, iri)) {
+        return Ok(None);
+    }
+    let Some(sum) = st.store.entity_type_summary(tenant, iri).await? else {
+        return Ok(None);
+    };
+    let mut stats = TypeStats::new();
+    if sum.count == 0 {
+        return Ok(Some(stats));
+    }
+    let mut stand_in = serde_json::Map::new();
+    stand_in.insert("id".into(), json!(format!("{iri}:summary")));
+    stand_in.insert("type".into(), json!([iri]));
+    for k in sum.members.keys().filter(|k| !is_meta(k)) {
+        stand_in.insert(k.clone(), json!([]));
+    }
+    let mut shown = None;
+    visible(st, tenant, view, vec![Value::Object(stand_in)], &mut |d| {
+        shown = Some(d);
+    })
+    .await;
+    let Some(shown) = shown else {
+        return Ok(Some(stats));
+    };
+    let attrs = sum
+        .members
+        .into_iter()
+        .filter(|(k, _)| !is_meta(k) && shown.get(k).is_some())
+        .collect();
+    stats.insert(
+        iri.to_owned(),
+        (usize::try_from(sum.count).unwrap_or(usize::MAX), attrs),
+    );
+    Ok(Some(stats))
+}
+
+/// Whether the narrowing admits and shows every Entity of type `iri` (and
+/// of no second type) alike: no row condition on it nor on a rule naming
+/// `iri`. A rule naming other types never holds for such an Entity.
+fn by_type_alone(r: &crate::repr::Repr, iri: &str) -> bool {
+    let rows = r
+        .policy_reach
+        .as_deref()
+        .is_none_or(|reach| reach.q.is_none() && reach.scope_q.is_none() && reach.areas.is_empty());
+    rows && r.policy_types.as_deref().is_none_or(|f| {
+        f.rules
+            .iter()
+            .filter(|rule| rule.types.iter().any(|t| t == iri))
+            .all(|rule| {
+                rule.q.is_none()
+                    && rule.scope_q.is_none()
+                    && rule.areas().next().is_none()
+                    && rule.ids.is_empty()
+                    && rule.id_patterns.is_empty()
+            })
+    })
 }
 
 // ---------- GET /q/tenants/{tenant}/types/{type}/attributes (T-6001) ----------
@@ -1160,6 +1239,141 @@ mod discovery_folds {
         }
         // 5.2.28 attributeTypes: every attribute type an instance carried
         assert!(attrs[V].contains("Property") && attrs[V].contains("GeoProperty"));
+    }
+
+    /// T-6294: the store's aggregate answers 5.7.7 as the fold does, for the
+    /// whole view and for views that hide by type alone; an Attribute whose
+    /// instances all expired (4.22) and an expired instance's type are in
+    /// neither. A row condition or an Entity of a second type folds.
+    #[tokio::test]
+    async fn the_type_summary_answers_what_the_fold_answers() {
+        use crate::policy::{Filter, Rule};
+        let st = AppState::new("test".into());
+        let gone = "https://uri.etsi.org/ngsi-ld/default-context/gone";
+        let half = "https://uri.etsi.org/ngsi-ld/default-context/half";
+        let past = "2000-01-01T00:00:00Z";
+        for n in 0..6u32 {
+            let id = format!("urn:ngsi-ld:B:{n}");
+            let mut doc = json!({"id": id, "type": [BUILDING],
+                V: [{"type": "Property", "value": n}],
+                half: [{"type": "Property", "value": 1},
+                       {"type": "Relationship", "object": "urn:ngsi-ld:B:0",
+                        "datasetId": "urn:ngsi-ld:d:1", "expiresAt": past}]});
+            if n % 2 == 0 {
+                doc[R] = json!([{"type": "Relationship", "object": "urn:ngsi-ld:B:0"}]);
+            }
+            if n == 3 {
+                doc[gone] = json!([{"type": "GeoProperty", "expiresAt": past,
+                    "value": {"type": "Point", "coordinates": [0, 0]}}]);
+            }
+            seed(&st, "tsum", &id, doc).await;
+        }
+        seed(
+            &st,
+            "tsum",
+            "urn:ngsi-ld:B:expired",
+            json!({"id": "urn:ngsi-ld:B:expired", "type": [BUILDING], "expiresAt": past,
+                   "https://uri.etsi.org/ngsi-ld/default-context/old": [{"type": "Property", "value": 0}]}),
+        )
+        .await;
+        let only = |types: &[&str], q: Option<&str>, attrs: &[&str]| Rule {
+            types: types.iter().map(|t| (*t).to_owned()).collect(),
+            q: q.map(|q| Box::new(antares_ql::parse_q(q).expect("q"))),
+            attributes: attrs.iter().map(|a| (*a).to_owned()).collect(),
+            ..Rule::default()
+        };
+        let shapes = [
+            ("the whole view", None),
+            (
+                "a rule hiding r",
+                Some(Filter {
+                    rules: vec![only(&[BUILDING], None, &[V, half, gone])],
+                    ..Filter::default()
+                }),
+            ),
+            (
+                "a policy omit",
+                Some(Filter {
+                    omit: vec![V.to_owned()],
+                    ..Filter::default()
+                }),
+            ),
+            (
+                "an omit by type",
+                Some(Filter {
+                    omit_by_type: [(BUILDING.to_owned(), vec![R.to_owned()])].into(),
+                    ..Filter::default()
+                }),
+            ),
+            (
+                "a rule on another type",
+                Some(Filter {
+                    rules: vec![only(&[SENSOR], None, &[V])],
+                    ..Filter::default()
+                }),
+            ),
+            (
+                "an omitted type",
+                Some(Filter {
+                    omit: vec![BUILDING.to_owned()],
+                    ..Filter::default()
+                }),
+            ),
+        ];
+        let ctx = antares_jsonld::pinned::core_context();
+        let t = tid("tsum");
+        for (shape, filter) in shapes {
+            let repr = filter.as_ref().map(crate::repr::narrowing);
+            let view = repr.as_ref().map(|r| (r, &ctx));
+            let (fold, cut) = type_stats(&st, &t, ALL, Narrow::Type(BUILDING), view)
+                .await
+                .expect("fold");
+            let got = summarized(&st, &t, BUILDING, view)
+                .await
+                .expect("summary")
+                .unwrap_or_else(|| panic!("{shape}: the memory store summarizes"));
+            assert!(!cut, "{shape}");
+            assert_eq!(got, fold, "{shape}");
+            if let Some((count, attrs)) = got.get(BUILDING) {
+                assert_eq!(*count, 6, "{shape}: the expired Entity is not counted");
+                assert!(!attrs.contains_key(gone), "{shape}: {attrs:?}");
+                assert!(
+                    attrs
+                        .get(half)
+                        .is_none_or(|t| t.len() == 1 && t.contains("Property")),
+                    "{shape}: the expired instance's type: {attrs:?}"
+                );
+            }
+            match shape {
+                "the whole view" => assert_eq!(got[BUILDING].1.len(), 3, "{got:?}"),
+                "a rule hiding r" | "an omit by type" => {
+                    assert!(!got[BUILDING].1.contains_key(R), "{shape}: {got:?}")
+                }
+                "a policy omit" => assert!(!got[BUILDING].1.contains_key(V), "{got:?}"),
+                _ => assert!(got.is_empty(), "{shape}: {got:?}"),
+            }
+        }
+        // a row condition decides per Entity, and so does a second type
+        let cond = crate::repr::narrowing(&Filter {
+            rules: vec![only(&[BUILDING], Some("v>2"), &[V])],
+            ..Filter::default()
+        });
+        assert!(summarized(&st, &t, BUILDING, Some((&cond, &ctx)))
+            .await
+            .expect("summary")
+            .is_none());
+        seed(
+            &st,
+            "tsum",
+            "urn:ngsi-ld:BS:1",
+            json!({"id": "urn:ngsi-ld:BS:1", "type": [SENSOR, BUILDING],
+                   V: [{"type": "Property", "value": 9}]}),
+        )
+        .await;
+        assert!(summarized(&st, &t, BUILDING, None)
+            .await
+            .expect("summary")
+            .is_none());
     }
 
     /// T-4934: the catalogue answer equals the fold for three grant shapes,

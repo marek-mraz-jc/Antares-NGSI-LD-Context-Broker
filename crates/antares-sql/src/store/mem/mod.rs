@@ -584,6 +584,53 @@ impl Store {
             .collect()
     }
 
+    /// [`antares_store::TypeSummary`] of the live Entities of `ty` (T-6294):
+    /// one pass, each document read as 4.22 lets a read see it. `None` when
+    /// one of them carries a second type.
+    pub fn entity_type_summary(
+        &self,
+        tenant: &TenantId,
+        ty: &str,
+        now: &str,
+    ) -> Option<antares_store::TypeSummary> {
+        let inner = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut sum = antares_store::TypeSummary::default();
+        let Some(m) = Self::map(&inner, Kind::Entity).get(tenant.as_str()) else {
+            return Some(sum);
+        };
+        for doc in m.values() {
+            let types: Vec<&str> = match &doc["type"] {
+                Value::String(t) => vec![t.as_str()],
+                Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+                _ => Vec::new(),
+            };
+            if !types.contains(&ty) {
+                continue;
+            }
+            let mut live = doc.clone();
+            if filter::strip_expired(&mut live, now) {
+                continue;
+            }
+            if types.len() > 1 {
+                return None;
+            }
+            sum.count = sum.count.saturating_add(1);
+            for (k, v) in live.as_object().into_iter().flatten() {
+                sum.members.entry(k.clone()).or_default().extend(
+                    v.as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|i| i.get("type").and_then(Value::as_str))
+                        .map(str::to_owned),
+                );
+            }
+        }
+        Some(sum)
+    }
+
     fn entity_types_where(
         &self,
         tenant: &TenantId,

@@ -124,6 +124,11 @@ name = "read_statement_budget"
 path = "tests/read_statement_budget.rs"
 
 [[test]]
+# own process: sets the global tracing subscriber that counts statements
+name = "type_info_summary_pg"
+path = "tests/type_info_summary_pg.rs"
+
+[[test]]
 # own process: sets the global tracing subscriber that counts Entity rows read
 name = "types_id_pattern_probe_pg"
 path = "tests/types_id_pattern_probe_pg.rs"

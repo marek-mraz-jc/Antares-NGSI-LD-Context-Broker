@@ -978,6 +978,91 @@ impl PgEntityStore {
         Ok(pairs)
     }
 
+    /// [`antares_store::TypeSummary`] of the live Entities of `ty` (T-6294).
+    /// The 5.7.7 fold paged them in id order, an ordered index scan that
+    /// waits on one random heap read per Entity (no prefetch in PostgreSQL
+    /// 16): 67 742 Trees on 56 819 blocks took dev's gateway past its 10 s
+    /// cut. One aggregate over `types[1] = $2` reads them by bitmap, in
+    /// block order: 1.3 s for 67 742 Trees of 406 452 Entities locally, where
+    /// the bare scan takes 0.7 s. The instances it keeps are the ones
+    /// `filter::strip_expired` keeps (4.22), an Attribute left with none
+    /// dropped; `id`, a member of every Entity, carries the count. `None`
+    /// when a live Entity of `ty` has a second type: first or not (the
+    /// multi-type index), the caller folds then.
+    pub async fn type_summary(
+        &self,
+        tenant: &TenantId,
+        ty: &str,
+    ) -> Result<Option<antares_store::TypeSummary>, sqlx::Error> {
+        let mut tx = super::begin(&self.pool).await?;
+        crate::store::pg::set_tenant(&mut tx, tenant).await?;
+        let beside: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM entities e WHERE e.tenant_id = $1
+               AND cardinality(e.types) > 1 AND e.types[1] <> $2
+               AND e.types @> ARRAY[$2::text]
+               AND (e.expires_at IS NULL OR e.expires_at > now()))",
+        )
+        .bind(tenant.as_str())
+        .bind(ty)
+        .fetch_one(&mut *tx)
+        .await?;
+        if beside {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        // A generic plan guesses few rows per type and takes the ordered
+        // index scan again (no prefetch); off, Postgres reads the bitmap.
+        sqlx::query("SET LOCAL enable_indexscan = off")
+            .execute(&mut *tx)
+            .await?;
+        // Grouped twice so the inner hash aggregate holds one row per
+        // (member, instance type): one DISTINCT over every instance sorted
+        // 745 162 rows to disk for the dev-sized Tree type.
+        let rows: Vec<(String, i64, Option<bool>, Option<Vec<String>>)> = sqlx::query_as(
+            "SELECT g.k, sum(g.n)::int8, bool_or(g.multi), array_remove(array_agg(g.ty), NULL)
+               FROM (SELECT x.k,
+                            CASE WHEN jsonb_typeof(i.v -> 'type') = 'string'
+                              THEN i.v ->> 'type' END AS ty,
+                            count(*) AS n, bool_or(cardinality(e.types) > 1) AS multi
+                       FROM entities e
+                      CROSS JOIN LATERAL jsonb_each(e.entity) AS x(k, v)
+                      CROSS JOIN LATERAL (SELECT CASE
+                          WHEN e.attrs_expire_at IS NULL OR e.attrs_expire_at >= now()
+                            OR strpos(x.k, ':') = 0 OR jsonb_typeof(x.v) <> 'array'
+                            OR jsonb_array_length(x.v) = 0 THEN x.v
+                          ELSE (SELECT jsonb_agg(i.v) FROM jsonb_array_elements(x.v) AS i(v)
+                                 WHERE jsonb_typeof(i.v -> 'expiresAt') IS DISTINCT FROM 'string'
+                                    OR try_timestamptz(i.v ->> 'expiresAt') IS NULL
+                                    OR try_timestamptz(i.v ->> 'expiresAt') >= now())
+                          END AS v) AS l
+                       LEFT JOIN LATERAL jsonb_array_elements(CASE
+                          WHEN jsonb_typeof(l.v) = 'array' THEN l.v ELSE '[]'::jsonb END) AS i(v)
+                         ON true
+                      WHERE e.tenant_id = $1 AND e.types[1] = $2
+                        AND (e.expires_at IS NULL OR e.expires_at > now())
+                        AND l.v IS NOT NULL
+                      GROUP BY 1, 2) AS g
+              GROUP BY g.k",
+        )
+        .bind(tenant.as_str())
+        .bind(ty)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        if rows.iter().any(|r| r.2 == Some(true)) {
+            return Ok(None);
+        }
+        let mut sum = antares_store::TypeSummary::default();
+        for (k, n, _, tys) in rows {
+            if k == "id" {
+                sum.count = u64::try_from(n).unwrap_or_default();
+            }
+            sum.members
+                .insert(k, tys.unwrap_or_default().into_iter().collect());
+        }
+        Ok(Some(sum))
+    }
+
     /// The types of the Tenant's live Entities of two or more types that carry
     /// one of `any_of`, sorted (T-4683): one probe of the multi-type index per
     /// catalogued type.
