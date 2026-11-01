@@ -2202,8 +2202,9 @@ fn max_page(headers: &HeaderMap, max_len: usize) -> u64 {
 
 pub(crate) use antares_ops::percent::encode;
 
-/// A 400 of the operation: the data model's refusal (T-5912) passed on as
-/// it is, since it names the attribute and the rule and never the value or
+/// A 400 of the operation: the data model's refusal (T-5912) and a query on
+/// a stripped metadata member (ADR-N-066 2.4) passed on as they are, since
+/// they name the attribute and the rule or member and never the value or
 /// anything the view hides; any other 400 as [`refused`].
 async fn model_refusal(
     reads: &Reads,
@@ -2216,7 +2217,9 @@ async fn model_refusal(
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
         .and_then(|p| {
             let d = p.get("detail")?.as_str()?;
-            d.contains(linkml_model::check::MARK).then(|| d.to_owned())
+            (d.contains(linkml_model::check::MARK)
+                || d.contains(antares_ops::policy::METADATA_STRIPPED))
+            .then(|| d.to_owned())
         });
     match detail {
         Some(d) => {

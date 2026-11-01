@@ -311,6 +311,7 @@ pub fn compose(a: &Filter, b: Filter) -> Result<Filter, Denied> {
         restricted: a.restricted || b.restricted,
         warning: Warning::join(a.warning.as_ref(), b.warning),
         temporal: [&a.temporal[..], &b.temporal[..]].concat().into(),
+        metadata: crate::metadata::Metadata::both(a.metadata.as_deref(), b.metadata),
     })
 }
 

@@ -73,8 +73,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// The policy seam's public types (ADR-0020), so a surface names no
 /// `antares-api` item.
 pub mod policy {
+    /// The words a refusal of a query on a stripped metadata member carries.
+    pub use antares_api::metadata::STRIPPED as METADATA_STRIPPED;
     pub use antares_api::policy::{
-        Decision, DecisionFuture, Filter, NotifyDecision, Operation, PolicyEngine, Rule, Subject,
+        Decision, DecisionFuture, Filter, Metadata, NotifyDecision, Operation, PolicyEngine, Rule,
+        Subject,
     };
 }
 

@@ -231,6 +231,16 @@ pub(super) async fn deliver_as(
                     );
                     return;
                 }
+                // ADR-N-066 2.4: each notified Attribute keeps the members
+                // the subscriber's grants pass
+                if let (Some(m), Some(arr)) = (
+                    &f.metadata,
+                    body.get_mut("data").and_then(Value::as_array_mut),
+                ) {
+                    for e in arr.iter_mut().filter_map(Value::as_object_mut) {
+                        m.strip_entity(e, ctx);
+                    }
+                }
                 let rules = crate::repr::type_rules(&f).filter(|r| !r.rules.is_empty());
                 let f = crate::repr::compacted_filter(&f, ctx);
                 let n = sub.get("notification");

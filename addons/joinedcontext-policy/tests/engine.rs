@@ -1657,3 +1657,220 @@ async fn a_denied_set_attribute_value_answers_403_whatever_is_stored() -> Res {
     }
     Ok(())
 }
+
+/// ADR-N-066 2.4: the public grant passes `pm10`'s `observedAt` only and every other
+/// Attribute the public defaults; the anonymous caller creates its own subscriptions.
+async fn air() -> Result<AppState, String> {
+    let public = grant(
+        "pub",
+        "role",
+        "public",
+        &["5.7.1", "5.7.2", "5.7.3", "5.8.1"],
+        json!([{"entities": [{"type": "Air"}], "propertyNames": ["pm10", "name"],
+                "attributes": {"pm10": {"metadata": ["observedAt"]}}}]),
+    );
+    let (st, _) = broker(doc(&[public])).await?;
+    seed(
+        &st,
+        &[json!({"id": "urn:ngsi-ld:Air:1", "type": "Air",
+                 "location": {"type": "GeoProperty",
+                              "value": {"type": "Point", "coordinates": [0.5, 0.5]}},
+                 "pm10": {"type": "Property", "value": 41, "unitCode": "GQ",
+                          "observedAt": "2026-11-01T10:00:00Z"},
+                 "name": {"type": "Property", "value": "Námestie", "unitCode": "C62",
+                          "observedAt": "2026-11-01T10:00:00Z"}})],
+    )
+    .await?;
+    Ok(st)
+}
+
+const AIR: &str = "/ngsi-ld/v1/entities/urn:ngsi-ld:Air:1";
+
+/// One stripped (`pm10.unitCode`) and one passed (`pm10.observedAt`, `name.unitCode`) member.
+fn stripped_as_granted(entity: &Value) -> Res {
+    let ok = entity["pm10"].get("unitCode").is_none()
+        && entity["pm10"]["observedAt"] == "2026-11-01T10:00:00Z"
+        && entity["name"]["unitCode"] == "C62";
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("not stripped as granted: {entity}"))
+    }
+}
+
+#[tokio::test]
+async fn a_read_keeps_only_the_metadata_members_the_grant_passes() -> Res {
+    let st = air().await?;
+    let (code, entity) = send(&st, "GET", AIR, &ANONYMOUS, None).await?;
+    assert_eq!(code, StatusCode::OK, "{entity}");
+    stripped_as_granted(&entity)?;
+    let (code, list) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities?type=Air",
+        &ANONYMOUS,
+        None,
+    )
+    .await?;
+    assert_eq!(code, StatusCode::OK, "{list}");
+    stripped_as_granted(&list[0])?;
+    // the seed's caller holds a grant without a block: every member, as before
+    let (_, whole) = send(&st, "GET", AIR, &ADMIN, None).await?;
+    assert_eq!(whole["pm10"]["unitCode"], "GQ", "{whole}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_geojson_answer_is_stripped_too() -> Res {
+    let st = air().await?;
+    let req = Request::get(AIR)
+        .header("Accept", "application/geo+json")
+        .header("x-jc-roles", "")
+        .body(Body::empty())
+        .map_err(|e| e.to_string())?;
+    let resp = antares_api::router(st.clone())
+        .oneshot(req)
+        .await
+        .map_err(|e| e.to_string())?;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| e.to_string())?
+        .to_bytes();
+    let feature: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    stripped_as_granted(&feature["properties"])
+}
+
+/// MCP, OData, OGC Features and SensorThings read through `AppState::call`: the same
+/// router, so the same strip.
+#[tokio::test]
+async fn a_surface_reading_in_process_gets_the_stripped_answer() -> Res {
+    let st = air().await?;
+    let mut caller = axum::http::HeaderMap::new();
+    caller.insert("x-jc-roles", axum::http::HeaderValue::from_static(""));
+    let req = Request::get(AIR)
+        .body(Body::empty())
+        .map_err(|e| e.to_string())?;
+    let resp = st.call(&caller, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| e.to_string())?
+        .to_bytes();
+    stripped_as_granted(&serde_json::from_slice(&bytes).map_err(|e| e.to_string())?)
+}
+
+/// DM-139: filtering or ordering by a stripped member would tell its value.
+#[tokio::test]
+async fn a_query_on_a_stripped_member_answers_400_naming_it() -> Res {
+    let st = air().await?;
+    let (code, problem) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities?type=Air&q=pm10.unitCode==%22GQ%22",
+        &ANONYMOUS,
+        None,
+    )
+    .await?;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "{problem}");
+    assert!(problem.to_string().contains("pm10.unitCode"), "{problem}");
+    let (code, list) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/entities?type=Air&q=pm10.observedAt%3E2026-01-01T00:00:00Z",
+        &ANONYMOUS,
+        None,
+    )
+    .await?;
+    assert_eq!(code, StatusCode::OK, "{list}");
+    assert_eq!(ids(&list), ["urn:ngsi-ld:Air:1"]);
+    Ok(())
+}
+
+/// A notification goes from the broker straight to the subscriber: stripped under the
+/// subscriber's grant, `pm10` without `unitCode`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_notification_carries_only_the_members_the_subscriber_may_read() -> Res {
+    antares_jsonld::allow_private_egress(true);
+    let st = air().await?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(8);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| e.to_string())?;
+    let addr = listener.local_addr().map_err(|e| e.to_string())?;
+    let app = axum::Router::new().route(
+        "/notify",
+        axum::routing::post(move |body: axum::body::Bytes| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx
+                    .send(serde_json::from_slice(&body).unwrap_or(Value::Null))
+                    .await;
+                StatusCode::OK
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let sub = json!({"type": "Subscription", "entities": [{"type": "Air"}],
+                     "notification": {"endpoint": {"uri": format!("http://{addr}/notify")}}});
+    let (code, body) = send(
+        &st,
+        "POST",
+        "/ngsi-ld/v1/subscriptions",
+        &ANONYMOUS,
+        Some(&sub),
+    )
+    .await?;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+    let (code, body) = send(
+        &st,
+        "PATCH",
+        &format!("{AIR}/attrs"),
+        &ADMIN,
+        Some(
+            &json!({"pm10": {"type": "Property", "value": 50, "unitCode": "GQ",
+                              "observedAt": "2026-11-01T11:00:00Z"}}),
+        ),
+    )
+    .await?;
+    assert_eq!(code, StatusCode::NO_CONTENT, "{body}");
+    while let Ok(Some(n)) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await
+    {
+        let entity = &n["data"][0];
+        if entity["pm10"]["value"] == 50 {
+            assert!(entity["pm10"].get("unitCode").is_none(), "{n}");
+            assert_eq!(entity["pm10"]["observedAt"], "2026-11-01T11:00:00Z", "{n}");
+            assert_eq!(entity["name"]["unitCode"], "C62", "{n}");
+            return Ok(());
+        }
+    }
+    Err("no notification of the change".into())
+}
+
+#[tokio::test]
+async fn a_history_read_is_stripped_per_instance() -> Res {
+    let st = air().await?;
+    let (code, evolution) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/temporal/entities/urn:ngsi-ld:Air:1",
+        &ANONYMOUS,
+        None,
+    )
+    .await?;
+    assert_eq!(code, StatusCode::OK, "{evolution}");
+    let one = |v: &Value| {
+        v.as_array()
+            .and_then(|a| a.first())
+            .cloned()
+            .unwrap_or_default()
+    };
+    stripped_as_granted(&json!({"pm10": one(&evolution["pm10"]), "name": one(&evolution["name"])}))
+}
