@@ -572,3 +572,39 @@ pub(super) async fn kept_no_history(
     }
     Ok(Some(Value::Object(shell)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T-6346: `attrs` reaches the store, which then reads only those
+    /// Attributes' rows; a conditional rule rebuilds state from any other
+    /// Attribute, so under one the store reads them all.
+    #[test]
+    fn the_store_reads_only_the_asked_attributes_unless_a_rule_reads_state() {
+        let asked = ["https://uri.etsi.org/ngsi-ld/default-context/speed".to_owned()];
+        let page = InstancePage::default();
+        let f = retrieve_filter(None, page, None, None, "observedAt", Some(&asked));
+        assert_eq!(f.attrs, Some(&asked[..]));
+        let conditional = crate::policy::Filter {
+            rules: vec![crate::policy::Rule {
+                types: vec!["https://uri.etsi.org/ngsi-ld/default-context/Car".to_owned()],
+                q: Some(Box::new(antares_ql::parse_q("status==\"ok\"").expect("q"))),
+                ..crate::policy::Rule::default()
+            }],
+            ..crate::policy::Filter::default()
+        };
+        let f = retrieve_filter(
+            None,
+            page,
+            None,
+            Some(&conditional),
+            "observedAt",
+            Some(&asked),
+        );
+        assert_eq!(f.attrs, None);
+        assert!(!super::super::query::reach_reads_state(
+            &crate::policy::Filter::default()
+        ));
+    }
+}
