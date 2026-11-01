@@ -285,6 +285,14 @@ pub(super) fn type_and_attrs_match(
     true
 }
 
+/// Whether [`member_now`] may judge the Entity on its held history: a policy
+/// narrowing by `q`, `scopeQ` or an area reads Attributes the request may not
+/// name, so a read for it keeps every Attribute (T-6346).
+pub(super) fn reach_reads_state(filter: &crate::policy::Filter) -> bool {
+    crate::repr::narrowing(filter)
+        .policy_reach
+        .is_some_and(|r| r.q.is_some() || r.scope_q.is_some() || !r.areas.is_empty())
+}
 /// ADR-0023 rule 8, for every narrowing: a history is served while the
 /// narrowing's own predicates (its `q`, `scopeQ` and areas) hold for the
 /// Entity as it is now, so an Entity that left the narrowing takes its
@@ -301,12 +309,12 @@ pub(super) async fn member_now(
     id: &str,
     held: Option<&Value>,
 ) -> ApiResult<bool> {
+    if !reach_reads_state(filter) {
+        return Ok(true);
+    }
     let Some(reach) = crate::repr::narrowing(filter).policy_reach else {
         return Ok(true);
     };
-    if reach.q.is_none() && reach.scope_q.is_none() && reach.areas.is_empty() {
-        return Ok(true);
-    }
     let reach = crate::repr::PolicyReach {
         rules: None,
         ..(*reach).clone()

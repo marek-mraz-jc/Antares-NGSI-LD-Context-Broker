@@ -158,6 +158,10 @@ pub(super) async fn retrieve_temporal_inner(
         default_page(st, &tenant, &trepr),
         types_rule.as_deref(),
         &timeprop,
+        trepr
+            .attrs
+            .as_deref()
+            .filter(|_| !super::query::reach_reads_state(&filter)),
     );
     let mut warnings: Vec<String> = Vec::new();
     let doc = load_evolution(&req, &tf, &timeprop, &mut warnings).await?;
@@ -268,16 +272,20 @@ struct RetrieveReq<'a> {
 /// is always safe here); window() stays the arbiter. ADR-0023 rule 11: a
 /// condition rebuilds each instance's state from the whole history, so
 /// the store prunes no instance under one; rules without one read only
-/// the window (T-4246).
+/// the window (T-4246). `attrs` (expanded) keeps the read to those
+/// Attributes' rows, under the same rule: a condition may read any other
+/// (T-6346).
 fn retrieve_filter<'a>(
     tq: Option<&'a TemporalQ>,
     page_n: InstancePage,
     default: Option<usize>,
     types_rule: Option<&crate::policy::Filter>,
     timeprop: &'a str,
+    attrs: Option<&'a [String]>,
 ) -> antares_store::filter::TemporalFilter<'a> {
     let replays = replays_state(types_rule);
     antares_store::filter::TemporalFilter {
+        attrs: attrs.filter(|_| !replays),
         range: tq
             .filter(|_| !replays)
             .map(|t| antares_store::filter::InstanceRange {

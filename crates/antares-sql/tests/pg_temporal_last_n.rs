@@ -501,3 +501,150 @@ async fn a_bare_entity_is_skipped_by_the_page_until_it_gains_history() {
         assert!(s.delete(&t, id).await.expect("delete"));
     }
 }
+
+/// `2026-01-01T00:00:00Z` plus `i` half hours, without a date library.
+fn half_hour(i: usize) -> String {
+    let (h, m) = (i / 2, (i % 2) * 30);
+    let day = h / 24;
+    let (month, d) = if day < 31 {
+        (1, day + 1)
+    } else {
+        (2, day - 30)
+    };
+    format!("2026-{month:02}-{d:02}T{:02}:{m:02}:00Z", h % 24)
+}
+
+/// Heap rows the plan read from `attr_instances` (every scan node on a
+/// partition of it that visits the heap, actual rows times loops): on dev
+/// each costs about a page read, while the N-th newest probes are index only.
+fn history_rows_read(plan: &str) -> usize {
+    plan.lines()
+        .filter(|l| l.contains("Scan") && l.contains(" on attr_instances"))
+        .filter(|l| !l.contains("Index Only Scan"))
+        .filter_map(|l| {
+            let n = |key: &str| -> Option<usize> {
+                let rest = &l[l.find(key)? + key.len()..];
+                rest.split(|c: char| !c.is_ascii_digit())
+                    .next()?
+                    .parse()
+                    .ok()
+            };
+            Some(n("actual rows=")?.saturating_mul(n("loops=")?))
+        })
+        .sum()
+}
+
+/// T-6346: one Entity's one-Attribute week read with lastN reads only that
+/// Attribute's rows inside the window's column bound. Before, `between` read
+/// every Attribute's rows of the window (dev: 3.4 s, a heap page a row), and
+/// `after` with fewer than N rows in the window read the Attribute's whole
+/// history, every weekly partition (dev: 20 546 rows from disk, past the
+/// 30 s statement timeout). Four Attributes of 2 500 instances each, half
+/// hourly over eight weeks; the window is the last week.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_attribute_week_reads_only_its_rows_in_the_window() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let s = PgTemporalStore::new(pool.clone());
+    let t = TenantId::new("pgweek").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let id = "urn:ngsi-ld:BikeHireDockingStation:week";
+    let _ = s.delete(&t, id).await;
+    const D: &str = "https://uri.etsi.org/ngsi-ld/default-context/";
+    let names: Vec<String> = ["availableBikeNumber", "freeSlotNumber", "status", "total"]
+        .iter()
+        .map(|n| format!("{D}{n}"))
+        .collect();
+    let mut doc = json!({
+        "id": id, "type": "BikeHireDockingStation",
+        "createdAt": "2026-01-01T00:00:00Z", "modifiedAt": "2026-01-01T00:00:00Z",
+    });
+    for (a, name) in names.iter().enumerate() {
+        let insts: Vec<Value> = (0..2500)
+            .map(|i| inst(a * 10_000 + i, &half_hour(i), None))
+            .collect();
+        doc[name] = Value::Array(insts);
+    }
+    assert!(s.create(&t, id, &doc).await.expect("create"));
+
+    let asked = [names[0].clone()];
+    let (from, to) = ("2026-02-15T00:00:00Z", "2026-02-22T00:00:00Z");
+    let all = doc[&names[0]].as_array().expect("instances").clone();
+    let in_window = |end: Option<&str>| -> BTreeSet<String> {
+        all.iter()
+            .filter(|i| {
+                let at = i["observedAt"].as_str().unwrap_or("");
+                at >= from && end.is_none_or(|e| at < e)
+            })
+            .map(|i| i["instanceId"].as_str().unwrap_or("").to_owned())
+            .collect()
+    };
+    // the rows inside the widened (48 h) column bound of the asked Attribute
+    let widened = all
+        .iter()
+        .filter(|i| i["observedAt"].as_str().unwrap_or("") >= "2026-02-13T00:00:00Z")
+        .count();
+    for (timerel, end) in [("between", Some(to)), ("after", None)] {
+        let filter = |attrs| TemporalFilter {
+            attrs,
+            range: Some(InstanceRange {
+                timerel,
+                time_at: from,
+                end_time_at: end,
+                timeproperty: "observedAt",
+            }),
+            last_n: Some(1000),
+            timeproperty: "observedAt",
+            ..TemporalFilter::default()
+        };
+        let f = filter(Some(&asked[..]));
+        let got = s.get_range(&t, id, &f).await.expect("read").expect("held");
+        assert_eq!(ids(&got[&names[0]]), in_window(end), "{timerel}");
+        for other in &names[1..] {
+            assert!(got.get(other).is_none(), "{timerel}: {other} was read");
+        }
+        // without `attrs` the same instances of the asked Attribute come back
+        let every = filter(None);
+        let whole = s
+            .get_range(&t, id, &every)
+            .await
+            .expect("read")
+            .expect("held");
+        assert_eq!(
+            ids(&whole[&names[0]]),
+            in_window(end),
+            "{timerel} unfiltered"
+        );
+        assert!(whole.get(&names[3]).is_some(), "{timerel} unfiltered");
+
+        let st = pg::temporal::range_statement(&f).expect("statement");
+        let mut tx = pool.begin().await.expect("tx");
+        sqlx::query(antares_sql::SET_TENANT_SQL)
+            .bind(t.as_str())
+            .execute(&mut *tx)
+            .await
+            .expect("tenant");
+        let mut q = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, FORMAT TEXT) {}",
+            st.sql
+        )))
+        .bind(t.as_str())
+        .bind(id)
+        .bind(st.only.expect("attrs bound"));
+        for b in st.binds {
+            q = q.bind(b);
+        }
+        let plan = q.fetch_all(&mut *tx).await.expect("explain").join("\n");
+        tx.rollback().await.expect("rollback");
+        let read = history_rows_read(&plan);
+        assert!(
+            read > 0,
+            "{timerel}: no history scan found in the plan:\n{plan}"
+        );
+        assert!(
+            read <= 3 * widened,
+            "{timerel} read {read} history rows for {widened} in the window's bound:\n{plan}"
+        );
+    }
+    assert!(s.delete(&t, id).await.expect("delete"));
+}
