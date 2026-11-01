@@ -296,15 +296,22 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Pinned to the last nightly with a green run (rustc 12433c307
+      # 2026-10-24, run 40160884839): nightly 2026-10-31 refuses the
+      # Box-recursive ngsild_residual::Shape/Node with E0391 "cycle detected
+      # when computing when ... needs async drop" (run 41316472538,
+      # rust-lang/rust#165263, a regression of #164987, closed 2026-11-01).
+      # Move the date forward once a nightly holding that fix builds (T-6355).
       - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
         with:
+          toolchain: nightly-2026-10-25
           components: rust-src
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # The runner's kernel randomizes mmap with more bits than TSan's fixed
       # shadow layout allows (google/sanitizers#1716, run 38850474298, T-4250).
       - run: sudo sysctl -w vm.mmap_rnd_bits=28
       - run: >
-          cargo +nightly test -Zbuild-std
+          cargo +nightly-2026-10-25 test -Zbuild-std
           --target x86_64-unknown-linux-gnu
           --workspace --exclude antares-broker --tests
 
