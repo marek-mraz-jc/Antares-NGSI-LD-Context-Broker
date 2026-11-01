@@ -201,10 +201,8 @@ fn schema_of(kind: Kind, names: &Names) -> Value {
         Kind::Members => {
             let item = match schema_of(Kind::Attr, names) {
                 Value::Object(mut o) if o.contains_key("enum") => {
-                    o.insert(
-                        "enum".into(),
-                        member_names(names, &["id", "type"])["enum"].take(),
-                    );
+                    let all = member_names(names, &["id", "type"]).get("enum").cloned();
+                    o.insert("enum".into(), all.unwrap_or_default());
                     Value::Object(o)
                 }
                 other => other,
@@ -465,35 +463,8 @@ fn check(arg: &Arg, v: &Value, names: &Names) -> Result<Checked, Broken> {
             is_attr_name,
             "attributes",
         )?),
-        Kind::Attrs => Checked::Many(
-            list(name, v, 1, MAX_ITEMS)?
-                .iter()
-                .map(|a| {
-                    one_name(
-                        name,
-                        a,
-                        (&names.attributes, names.every),
-                        is_attr_name,
-                        "attributes",
-                    )
-                })
-                .collect::<Result<_, _>>()?,
-        ),
-        Kind::Members => Checked::Many(
-            list(name, v, 1, MAX_ITEMS)?
-                .iter()
-                .map(|a| match a.as_str() {
-                    Some(core @ ("id" | "type")) => Ok(core.to_owned()),
-                    _ => one_name(
-                        name,
-                        a,
-                        (&names.attributes, names.every),
-                        is_attr_name,
-                        "attributes",
-                    ),
-                })
-                .collect::<Result<_, _>>()?,
-        ),
+        Kind::Attrs => attr_list(name, v, names, &[])?,
+        Kind::Members => attr_list(name, v, names, &["id", "type"])?,
         Kind::Text(max) => {
             let s = v.as_str().ok_or_else(|| broken(name, "must be a string"))?;
             if s.len() > max {
@@ -527,6 +498,25 @@ fn check(arg: &Arg, v: &Value, names: &Names) -> Result<Checked, Broken> {
         | Kind::ListOf(..)
         | Kind::Endpoint => body(arg, v, names)?,
     })
+}
+
+/// A list of the Attributes `names` shows, or of the `core` members.
+fn attr_list(name: &str, v: &Value, names: &Names, core: &[&str]) -> Result<Checked, Broken> {
+    Ok(Checked::Many(
+        list(name, v, 1, MAX_ITEMS)?
+            .iter()
+            .map(|a| match a.as_str() {
+                Some(m) if core.contains(&m) => Ok(m.to_owned()),
+                _ => one_name(
+                    name,
+                    a,
+                    (&names.attributes, names.every),
+                    is_attr_name,
+                    "attributes",
+                ),
+            })
+            .collect::<Result<_, _>>()?,
+    ))
 }
 
 /// [`check`] of a body a write tool sends: kept as given once checked.
@@ -671,7 +661,10 @@ mod tests {
     }
 
     fn given(v: Value) -> Map<String, Value> {
-        v.as_object().cloned().unwrap_or_default()
+        match v {
+            Value::Object(m) => m,
+            _ => Map::new(),
+        }
     }
 
     #[test]
