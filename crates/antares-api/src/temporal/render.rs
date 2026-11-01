@@ -91,9 +91,14 @@ pub(super) fn with_versions(w: &mut Windowed, chains: &Map<String, Value>) {
         *instances = instances
             .iter()
             .flat_map(|inst| {
+                // a value written without observedAt (ADR-N-054 2.9) is
+                // its own row: the window stamps it, its chain row is not
                 let own: Vec<Value> = chain
                     .iter()
-                    .filter(|v| key(v) == key(inst))
+                    .filter(|v| match v.get("observedAt") {
+                        Some(_) => key(v) == key(inst),
+                        None => v.get("instanceId") == inst.get("instanceId"),
+                    })
                     .cloned()
                     .collect();
                 if own.is_empty() {

@@ -194,6 +194,26 @@ fn audited() -> bool {
     false
 }
 
+/// The temporal `doc` as a read without `versions=all` sees it (platform
+/// ADR-N-054 2.9, DM-146): an Entity whose type keeps no history answers no
+/// Attribute, though the version rows an audited write kept are there, so a
+/// chart and a public Endpoint see nothing a version request added.
+pub(crate) fn as_recorded<'a>(
+    st: &AppState,
+    tenant: &TenantId,
+    doc: &'a Value,
+    versions: bool,
+) -> std::borrow::Cow<'a, Value> {
+    if versions || records_history(st, tenant, doc) {
+        return std::borrow::Cow::Borrowed(doc);
+    }
+    let shell: Map<String, Value> = ["id", "type", "scope"]
+        .into_iter()
+        .filter_map(|k| Some((k.to_owned(), doc.get(k)?.clone())))
+        .collect();
+    std::borrow::Cow::Owned(Value::Object(shell))
+}
+
 /// Versions on request (platform ADR-N-054 2.9, DM-145): on an audited change
 /// of `attr` whose history holds no row of the changed instance's datasetId
 /// yet, the value it replaces (in `before`) goes to history first, so the
@@ -230,10 +250,13 @@ pub(crate) async fn keep_replaced(
         ..Default::default()
     };
     let kept = match st.temporal.get_temporal(tenant, entity, &held).await {
-        Ok(doc) => doc.as_ref().and_then(|d| d.get(attr)).is_some_and(|a| match a {
-            Value::Array(all) => all.iter().any(|i| same(&i)),
-            one => same(&one),
-        }),
+        Ok(doc) => doc
+            .as_ref()
+            .and_then(|d| d.get(attr))
+            .is_some_and(|a| match a {
+                Value::Array(all) => all.iter().any(|i| same(&i)),
+                one => same(&one),
+            }),
         Err(e) => {
             tracing::warn!("versions on request: the replaced value is not kept: {e}");
             true

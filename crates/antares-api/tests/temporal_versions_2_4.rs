@@ -425,7 +425,9 @@ async fn a_rename_asked_as_a_version_keeps_the_old_name_and_the_new_where_histor
         }
         let uri = format!("/ngsi-ld/v1/temporal/entities/{id}?attrs=name&versions=all");
         let (s, all) = send(&st, &t, "GET", &uri, &granted, None).await;
-        assert_eq!(s, 200, "{all}");
+        // nothing kept of `name` is the 404 of an Attribute the Entity never had
+        let expected = if id.ends_with("renamed") { 200 } else { 404 };
+        assert_eq!(s, expected, "{all}");
         let rows = all["name"].as_array().cloned().unwrap_or_default();
         if id.ends_with("renamed") {
             let p = |i: usize| rows.get(i).map(|r| r["provenance"].clone());
