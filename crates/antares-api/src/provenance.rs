@@ -97,15 +97,33 @@ pub fn of_request(_headers: &HeaderMap, _gateway: Option<&str>) -> Value {
     json!({"channel": "api"})
 }
 
-/// Whether the request may read `versions=all` (ADR-N-054 2.4): the
-/// gateway grants it with `JC-Read-Versions: true` once the space's Policy
-/// granted the caller `readVersions`; nobody else can.
+/// Whether the request may read `versions=all` (ADR-N-054 2.4) of any
+/// Attribute: see [`versions_granted`].
 #[cfg(feature = "jc")]
 pub fn may_read_versions(headers: &HeaderMap, gateway: Option<&str>) -> bool {
-    from_gateway(headers, gateway)
-        && headers
-            .get("jc-read-versions")
-            .is_some_and(|v| v.as_bytes() == b"true")
+    versions_granted(headers, gateway).is_some()
+}
+
+/// The Attributes whose versions the request may read (platform ADR-N-066
+/// 2.3, DM-149): the gateway sends `JC-Read-Versions` once the space's
+/// Policy granted the caller `readVersions`, as `*` (or `true`, the form
+/// before ADR-N-066) for every Attribute or as a comma list of
+/// percent-encoded short names; nobody else can. `Some(None)` is every
+/// Attribute; a value out of shape grants nothing.
+#[cfg(feature = "jc")]
+pub fn versions_granted(headers: &HeaderMap, gateway: Option<&str>) -> Option<Option<Vec<String>>> {
+    if !from_gateway(headers, gateway) {
+        return None;
+    }
+    let raw = headers.get("jc-read-versions")?.to_str().ok()?;
+    if raw == "true" || raw == "*" {
+        return Some(None);
+    }
+    let names: Option<Vec<String>> = raw
+        .split(',')
+        .map(|n| percent_decoded(n.trim()).filter(|n| !n.is_empty() && n != "*"))
+        .collect();
+    names.map(Some)
 }
 
 /// Does the request carry the gateway's mesh identity `gateway`?
@@ -308,6 +326,27 @@ mod tests {
             &headers(&[("l5d-client-id", GATEWAY), ("jc-read-versions", "yes")]),
             Some(GATEWAY)
         ));
+    }
+
+    #[cfg(feature = "jc")]
+    #[test]
+    fn versions_are_granted_per_attribute_as_the_gateway_lists_them() {
+        let of = |v: &str| {
+            versions_granted(
+                &headers(&[("l5d-client-id", GATEWAY), ("jc-read-versions", v)]),
+                Some(GATEWAY),
+            )
+        };
+        assert_eq!(of("*"), Some(None));
+        assert_eq!(of("true"), Some(None));
+        assert_eq!(of("name"), Some(Some(vec!["name".into()])));
+        assert_eq!(
+            of("name, air%3Apm10"),
+            Some(Some(vec!["name".into(), "air:pm10".into()]))
+        );
+        for odd in ["", "name,,pm10", "name,*", "%zz", "yes,"] {
+            assert_eq!(of(odd), None, "{odd:?}");
+        }
     }
 
     #[cfg(feature = "jc")]

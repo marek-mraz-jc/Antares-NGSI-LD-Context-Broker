@@ -7,7 +7,7 @@ use antares_api::policy::{Rule, TimeBound, Window};
 use antares_ql::geo::GeoQuery;
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 #[derive(Deserialize)]
@@ -86,7 +86,7 @@ struct Validity {
     to: Option<DateTime<Utc>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct Information {
     #[serde(default)]
@@ -95,9 +95,198 @@ struct Information {
     property_names: Vec<String>,
     #[serde(default)]
     relationship_names: Vec<String>,
+    /// Per Attribute or `*`, what the grant lets a caller do with it
+    /// (platform ADR-N-066, DM-147): it only narrows the operations.
+    #[serde(default)]
+    attributes: BTreeMap<String, Capabilities>,
 }
 
-#[derive(Deserialize)]
+/// One Attribute's capabilities (platform `AttributeCapabilities`); a field
+/// left unset takes the `*` entry's, then the grant's own behaviour.
+#[derive(Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct Capabilities {
+    #[serde(default)]
+    read: Option<bool>,
+    #[serde(default)]
+    history: Option<bool>,
+    /// `read`, `keep`: the gateway decides both (DM-149, DM-150).
+    #[serde(default)]
+    versions: Option<Vec<Versions>>,
+    /// The members the gateway passes (DM-139): checked here, enforced there.
+    #[serde(default)]
+    metadata: Option<Vec<String>>,
+    #[serde(default)]
+    write: Option<Vec<Write>>,
+}
+
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+enum Versions {
+    Read,
+    Keep,
+}
+
+/// A write kind of ADR-N-066 2.1.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+enum Write {
+    Update,
+    Append,
+    Delete,
+}
+
+/// The metadata members a grant may pass (platform `MetadataMember`).
+const METADATA: [&str; 9] = [
+    "observedAt",
+    "unitCode",
+    "createdAt",
+    "modifiedAt",
+    "modifiedBy.organization",
+    "modifiedBy.actorKind",
+    "modifiedBy.actor",
+    "provenance",
+    "reason",
+];
+
+impl Capabilities {
+    /// Why these capabilities are refused: a list naming a value twice, or
+    /// a metadata member the platform does not know.
+    fn refusal(&self) -> Option<String> {
+        fn repeats<T: Ord>(list: Option<&Vec<T>>) -> bool {
+            list.is_some_and(|l| l.iter().collect::<BTreeSet<_>>().len() != l.len())
+        }
+        if repeats(self.versions.as_ref())
+            || repeats(self.write.as_ref())
+            || repeats(self.metadata.as_ref())
+        {
+            return Some("a capability list names each value once".into());
+        }
+        self.metadata
+            .iter()
+            .flatten()
+            .find(|m| !METADATA.contains(&m.as_str()))
+            .map(|m| format!("metadata {m:?} is none of {}", METADATA.join(", ")))
+    }
+}
+
+/// What a clause needs of an Attribute's capabilities (ADR-N-066 2.1).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Need {
+    /// A type or Attribute list (5.7.5 to 5.7.10): the shape, never data,
+    /// narrowed by the entry's lists alone.
+    Schema,
+    /// The current value: retrievals, queries, subscriptions.
+    Read,
+    /// The history: 5.7.3, 5.7.4 and an Entity Map over it.
+    History,
+    /// A write needing every kind it names.
+    Write(bool, bool, bool),
+}
+
+impl Need {
+    fn of(clause: &str) -> Self {
+        const U: Need = Need::Write(true, false, false);
+        const A: Need = Need::Write(false, true, false);
+        const D: Need = Need::Write(false, false, true);
+        match clause {
+            "5.7.5" | "5.7.6" | "5.7.7" | "5.7.8" | "5.7.9" | "5.7.10" => Self::Schema,
+            "5.7.3" | "5.7.4" | "5.14.5" => Self::History,
+            "5.6.2" | "5.6.4" | "5.6.9" | "5.6.14" | "5.6.17" | "5.6.19" | "5.6.20" => U,
+            "5.6.1" | "5.6.3" | "5.6.7" | "5.6.12" => A,
+            "5.6.5" | "5.6.6" | "5.6.10" | "5.6.13" | "5.6.15" | "5.6.16" | "5.6.21" => D,
+            // an upsert may add or change; any other write, a replace among them, may do all
+            "5.6.8" | "5.6.11" => Self::Write(true, true, false),
+            c if c.starts_with("5.6.") => Self::Write(true, true, true),
+            _ => Self::Read,
+        }
+    }
+
+    /// Whether `caps` (the Attribute's own, then `*`'s) give this need.
+    fn given(self, own: Option<&Capabilities>, every: Option<&Capabilities>) -> bool {
+        let pick = |f: fn(&Capabilities) -> Option<bool>| {
+            own.and_then(f)
+                .or_else(|| every.and_then(f))
+                .unwrap_or(true)
+        };
+        match self {
+            Self::Schema => true,
+            Self::Read => pick(|c| c.read),
+            Self::History => pick(|c| c.history),
+            Self::Write(u, a, d) => {
+                let kinds = own
+                    .and_then(|c| c.write.as_ref())
+                    .or_else(|| every.and_then(|c| c.write.as_ref()));
+                kinds.is_none_or(|k| {
+                    (!u || k.contains(&Write::Update))
+                        && (!a || k.contains(&Write::Append))
+                        && (!d || k.contains(&Write::Delete))
+                })
+            }
+        }
+    }
+}
+
+impl Information {
+    /// This entry as `need` sees it: its Attribute lists narrowed to the
+    /// Attributes whose capabilities give it; `None` when none is left, so
+    /// the entry grants nothing for `need` (deny by default). An entry
+    /// without `attributes` is today's, whole.
+    fn narrowed(&self, need: Need) -> Result<Option<Self>, String> {
+        if self.attributes.is_empty() || need == Need::Schema {
+            return Ok(Some(Self {
+                attributes: BTreeMap::new(),
+                ..self.clone()
+            }));
+        }
+        let every = self.attributes.get("*");
+        let keep = |names: &[String]| -> Vec<String> {
+            names
+                .iter()
+                .filter(|n| need.given(self.attributes.get(n.as_str()), every))
+                .cloned()
+                .collect()
+        };
+        let (property_names, relationship_names) =
+            if self.property_names.is_empty() && self.relationship_names.is_empty() {
+                // every Attribute: `*` decides, a named key adds or takes away
+                let named = self.attributes.keys().filter(|k| *k != "*");
+                if need.given(None, every) {
+                    if let Some(k) = named
+                        .clone()
+                        .find(|k| !need.given(self.attributes.get(k.as_str()), every))
+                    {
+                        return Err(format!(
+                            "attribute {k:?} is narrowed under an entry that lists no Attribute: \
+                         list propertyNames or relationshipNames"
+                        ));
+                    }
+                    (Vec::new(), Vec::new())
+                } else {
+                    let names: Vec<String> = named.cloned().collect();
+                    let names = keep(&names);
+                    if names.is_empty() {
+                        return Ok(None);
+                    }
+                    (names, Vec::new())
+                }
+            } else {
+                let (p, r) = (keep(&self.property_names), keep(&self.relationship_names));
+                if p.is_empty() && r.is_empty() {
+                    return Ok(None);
+                }
+                (p, r)
+            };
+        Ok(Some(Self {
+            entities: self.entities.clone(),
+            property_names,
+            relationship_names,
+            attributes: BTreeMap::new(),
+        }))
+    }
+}
+
+#[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct SelectorDoc {
     #[serde(rename = "type")]
@@ -218,7 +407,7 @@ pub fn compile(doc: &serde_json::Value) -> Result<Table, String> {
         if !seen.insert(p.id.clone()) {
             return Err(format!("policy {:?} is named twice", p.id));
         }
-        policies.push(policy(p)?);
+        policies.extend(policy(p)?);
     }
     let mut views = HashMap::with_capacity(doc.views.len());
     for (view, ids) in doc.views {
@@ -249,7 +438,7 @@ pub fn compile(doc: &serde_json::Value) -> Result<Table, String> {
     Ok(Table { policies, views })
 }
 
-fn policy(p: PolicyDoc) -> Result<Policy, String> {
+fn policy(p: PolicyDoc) -> Result<Vec<Policy>, String> {
     let id = p.id;
     let why = |what: String| format!("policy {id:?}: {what}");
     if id.is_empty() {
@@ -309,18 +498,84 @@ fn policy(p: PolicyDoc) -> Result<Policy, String> {
         temporal: temporal.into_iter().collect(),
         ..Rule::default()
     };
-    let (selectors, written) = rules(p.information, &conditions, &why)?;
-    source.selectors = written;
-    Ok(Policy {
-        id,
-        prohibit: p.effect == Effect::Prohibit,
-        assignee: p.assignee,
-        clauses: p.operations.into_iter().collect(),
-        validity: (from, to),
-        selectors,
-        conditions,
-        source,
-    })
+    let prohibit = p.effect == Effect::Prohibit;
+    capabilities_checked(&p.information, &why)?;
+    if p.information.iter().all(|i| i.attributes.is_empty()) {
+        let (selectors, written) = rules(p.information, &conditions, &why)?;
+        source.selectors = written;
+        return Ok(vec![Policy {
+            id,
+            prohibit,
+            assignee: p.assignee,
+            clauses: p.operations.into_iter().collect(),
+            validity: (from, to),
+            selectors,
+            conditions,
+            source,
+        }]);
+    }
+    // ADR-N-066 2.1: one policy per need of its clauses, each with the
+    // Attributes whose capabilities give that need; a need no Attribute
+    // is given grants (or prohibits) nothing. All keep the policy's id, so
+    // a view listing it lists them all.
+    let mut by_need: BTreeMap<Need, BTreeSet<String>> = BTreeMap::new();
+    for clause in p.operations {
+        by_need.entry(Need::of(&clause)).or_default().insert(clause);
+    }
+    let mut out = Vec::with_capacity(by_need.len());
+    for (need, clauses) in by_need {
+        let mut information = Vec::with_capacity(p.information.len());
+        for info in &p.information {
+            if let Some(narrowed) = info.narrowed(need).map_err(&why)? {
+                information.push(narrowed);
+            }
+        }
+        if information.is_empty() {
+            continue;
+        }
+        let (selectors, written) = rules(information, &conditions, &why)?;
+        out.push(Policy {
+            id: id.clone(),
+            prohibit,
+            assignee: p.assignee.clone(),
+            clauses,
+            validity: (from, to),
+            selectors,
+            conditions: conditions.clone(),
+            source: Source {
+                selectors: written,
+                ..source.clone()
+            },
+        });
+    }
+    Ok(out)
+}
+
+/// Each `attributes` key is `*` or an Attribute its entry lists (any name
+/// when it lists none), and each capability list is well formed.
+fn capabilities_checked(
+    information: &[Information],
+    why: &dyn Fn(String) -> String,
+) -> Result<(), String> {
+    for info in information {
+        let any = info.property_names.is_empty() && info.relationship_names.is_empty();
+        for (name, caps) in &info.attributes {
+            if name != "*"
+                && (name.trim().is_empty()
+                    || !(any
+                        || info.property_names.contains(name)
+                        || info.relationship_names.contains(name)))
+            {
+                return Err(why(format!(
+                    "attribute {name:?} is `*` or one propertyNames or relationshipNames lists"
+                )));
+            }
+            if let Some(reason) = caps.refusal() {
+                return Err(why(format!("attribute {name:?}: {reason}")));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One rule per Entity selector of `information`, with its information's
@@ -540,6 +795,149 @@ mod tests {
         );
         assert!(!p.prohibit && !p.is_conditional());
         Ok(())
+    }
+
+    /// The compiled policies of one written policy, keyed by their clauses.
+    fn split(p: &serde_json::Value) -> Result<Vec<(Vec<String>, Vec<Rule>)>, String> {
+        Ok(compile(&json!({ "policies": [p] }))?
+            .policies
+            .into_iter()
+            .map(|p| (p.clauses.into_iter().collect(), p.selectors))
+            .collect())
+    }
+
+    fn air(attributes: serde_json::Value, operations: serde_json::Value) -> serde_json::Value {
+        json!({"id": "p", "assignee": {"kind": "role", "id": "public"},
+               "operations": operations,
+               "information": [{"entities": [{"type": "Air"}],
+                                "propertyNames": ["name", "pm10"],
+                                "attributes": attributes}]})
+    }
+
+    fn names(rules: &[Rule]) -> Vec<String> {
+        let ctx = context();
+        let (name, pm10) = (ctx.expand_key("name"), ctx.expand_key("pm10"));
+        rules
+            .iter()
+            .flat_map(|r| &r.attributes)
+            .map(|a| {
+                if *a == name {
+                    "name".to_owned()
+                } else if *a == pm10 {
+                    "pm10".to_owned()
+                } else {
+                    a.clone()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn history_of_one_attribute_leaves_current_reads_whole() -> Result<(), String> {
+        let got = split(&air(
+            json!({"*": {"history": false}, "name": {"history": true}}),
+            json!(["5.7.1", "5.7.2", "5.7.3", "5.7.4"]),
+        ))?;
+        let [(reads, read_rules), (history, history_rules)] = got.as_slice() else {
+            return Err(format!("{} policies, not 2", got.len()));
+        };
+        assert_eq!(reads, &["5.7.1", "5.7.2"]);
+        assert_eq!(names(read_rules), ["name", "pm10"]);
+        assert_eq!(history, &["5.7.3", "5.7.4"]);
+        assert_eq!(names(history_rules), ["name"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_need_no_attribute_is_given_grants_nothing() -> Result<(), String> {
+        // never the whole Entity: an empty list would read as every Attribute
+        let got = split(&air(
+            json!({"*": {"history": false}}),
+            json!(["5.7.2", "5.7.3"]),
+        ))?;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got.first().map(|g| g.0.clone()), Some(vec!["5.7.2".into()]));
+        Ok(())
+    }
+
+    #[test]
+    fn write_kinds_narrow_each_write_clause() -> Result<(), String> {
+        let got = split(&air(
+            json!({"*": {"write": []}, "name": {"write": ["update"]}}),
+            json!(["5.6.2", "5.6.3", "5.6.5", "5.6.8"]),
+        ))?;
+        // 5.6.2 (update) keeps name; append, delete and the upsert keep none
+        let [(clauses, rules)] = got.as_slice() else {
+            return Err(format!("{} policies, not 1", got.len()));
+        };
+        assert_eq!(clauses, &["5.6.2"]);
+        assert_eq!(names(rules), ["name"]);
+        Ok(())
+    }
+
+    #[test]
+    fn read_false_keeps_the_type_lists_and_the_history() -> Result<(), String> {
+        let got = split(&air(
+            json!({"pm10": {"read": false}}),
+            json!(["5.7.2", "5.7.3", "5.7.8"]),
+        ))?;
+        let by = |c: &str| {
+            got.iter()
+                .find(|(cl, _)| cl.iter().any(|x| x == c))
+                .map(|(_, r)| names(r))
+        };
+        assert_eq!(by("5.7.2"), Some(vec!["name".into()]));
+        assert_eq!(by("5.7.3"), Some(vec!["name".into(), "pm10".into()]));
+        assert_eq!(by("5.7.8"), Some(vec!["name".into(), "pm10".into()]));
+        Ok(())
+    }
+
+    #[test]
+    fn an_entry_listing_no_attribute_is_narrowed_only_by_naming() -> Result<(), String> {
+        let every = json!({"id": "p", "assignee": {"kind": "role", "id": "public"},
+            "operations": ["5.7.2", "5.7.3"],
+            "information": [{"entities": [{"type": "Air"}],
+                             "attributes": {"*": {"history": false}, "name": {"history": true}}}]});
+        let got = split(&every)?;
+        let history = got
+            .iter()
+            .find(|(c, _)| c.iter().any(|x| x == "5.7.3"))
+            .ok_or("no history policy")?;
+        assert_eq!(names(&history.1), ["name"]);
+        let current = got
+            .iter()
+            .find(|(c, _)| c.iter().any(|x| x == "5.7.2"))
+            .ok_or("no read policy")?;
+        assert!(current.1.iter().all(|r| r.every_attribute));
+        let except = json!({"id": "p", "assignee": {"kind": "role", "id": "public"},
+            "operations": ["5.7.3"],
+            "information": [{"entities": [{"type": "Air"}],
+                             "attributes": {"pm10": {"history": false}}}]});
+        assert!(split(&except).is_err_and(|e| e.contains("list propertyNames")));
+        Ok(())
+    }
+
+    #[test]
+    fn a_malformed_capability_is_refused_by_name() {
+        for (attributes, said) in [
+            (json!({"speed": {"read": true}}), "\"speed\" is `*` or one"),
+            (
+                json!({"name": {"write": ["update", "update"]}}),
+                "each value once",
+            ),
+            (
+                json!({"name": {"metadata": ["colour"]}}),
+                "metadata \"colour\"",
+            ),
+            (json!({"name": {"edit": true}}), "unknown field"),
+        ] {
+            let got = split(&air(attributes, json!(["5.7.2"])));
+            assert!(
+                got.as_ref().is_err_and(|e| e.contains(said)),
+                "{said}: {:?}",
+                got.err()
+            );
+        }
     }
 
     #[test]

@@ -1250,6 +1250,40 @@ mod tests {
         Ok(())
     }
 
+    /// ADR-N-066 2.1: a grant editing `speed` but not `colour` allows a write of the first
+    /// and refuses one of the second, and a history read of `colour` it never gives.
+    #[test]
+    fn a_capability_block_decides_each_attribute_per_operation() -> Result<(), String> {
+        let t = table(&json!({"operations": ["5.6.2", "5.7.2", "5.7.3"],
+            "information": [{"entities": [{"type": "Car"}],
+                             "propertyNames": ["speed", "colour"],
+                             "attributes": {"*": {"write": [], "history": false},
+                                            "speed": {"write": ["update"], "history": true}}}]}))?;
+        let types = car();
+        let (speed, colour) = (vec![iri("speed")], vec![iri("colour")]);
+        let write =
+            |attrs: &[String], body: &Value| with(&t, "5.6.2", &types, attrs, Some(body), false);
+        assert_eq!(
+            write(&speed, &json!({ (iri("speed")): [] })),
+            Decision::Allow
+        );
+        assert!(matches!(
+            write(&colour, &json!({ (iri("colour")): [] })),
+            Decision::Deny(_)
+        ));
+        let shown = |clause: &'static str| match on(&t, clause, None) {
+            Decision::Filter(f) => Ok(f
+                .rules
+                .iter()
+                .flat_map(|r| r.attributes.clone())
+                .collect::<Vec<_>>()),
+            other => Err(format!("{clause}: {other:?}")),
+        };
+        assert_eq!(shown("5.7.2")?, [iri("speed"), iri("colour")]);
+        assert_eq!(shown("5.7.3")?, [iri("speed")]);
+        Ok(())
+    }
+
     /// T-3796: the names one header line cannot hold are counted, not cut.
     #[test]
     fn the_warning_fits_one_header_line() -> Result<(), String> {
