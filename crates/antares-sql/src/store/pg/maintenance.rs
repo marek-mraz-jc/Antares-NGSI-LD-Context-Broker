@@ -360,7 +360,7 @@ async fn plain_retention(pool: &PgPool, days: i64) -> Result<Vec<String>, sqlx::
                 .bind(days)
                 .fetch_one(&mut *tx)
                 .await?;
-        if expired && !audit_free(&mut *tx, &name).await? {
+        if expired && !audit_free(&mut tx, &name).await? {
             done.push(format!(
                 "expired partition {name} kept: it holds audit rows"
             ));
@@ -1478,7 +1478,12 @@ fn audit_index_names(part: &str) -> (String, String, String) {
 /// The leaf partitions of both history parents without a valid
 /// `{partition}_audit` index, with whether an invalid one (a build that
 /// failed) is in the way, smallest first by `relpages` (a catalog read that
-/// takes no lock).
+/// takes no lock). Not the DEFAULT partitions: no drop takes them, and a
+/// build there would hold up each new week's `CREATE TABLE`, which locks
+/// the parent against every write while it checks DEFAULT.
+///
+/// ponytail: the audit sweep reads a DEFAULT partition whole each minute;
+/// it holds only backfill (`default_partition_load` warns past 100 000 rows).
 const LEAVES_WITHOUT_AUDIT_INDEX: &str = "SELECT c.relname, x.indexrelid IS NOT NULL AS stale
      FROM (SELECT relid FROM pg_partition_tree('public.attr_instances') WHERE isleaf
            UNION ALL
@@ -1488,11 +1493,13 @@ const LEAVES_WITHOUT_AUDIT_INDEX: &str = "SELECT c.relname, x.indexrelid IS NOT 
                           AND ic.relnamespace = 'public'::regnamespace
      LEFT JOIN pg_index x ON x.indexrelid = ic.oid
      WHERE c.relkind = 'r' AND x.indisvalid IS NOT TRUE
+       AND pg_get_expr(c.relpartbound, c.oid) <> 'DEFAULT'
      ORDER BY c.relpages";
 
 /// Whether partition `name` holds no audit row, read through its
-/// `{name}_audit` index; a partition without a valid one counts as holding
-/// some, as reading it whole could take minutes under the drop's lock.
+/// `{name}_audit` index. Without a valid one only an empty partition counts
+/// as free: reading a full one whole could take minutes under the drop's
+/// lock.
 async fn audit_free(conn: &mut sqlx::PgConnection, name: &str) -> Result<bool, sqlx::Error> {
     let (_, index, table) = audit_index_names(name);
     let indexed: bool = sqlx::query_scalar(
@@ -1502,24 +1509,31 @@ async fn audit_free(conn: &mut sqlx::PgConnection, name: &str) -> Result<bool, s
     .bind(&index)
     .fetch_one(&mut *conn)
     .await?;
-    if !indexed {
-        return Ok(false);
-    }
-    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-        "SELECT NOT EXISTS (SELECT 1 FROM {table} WHERE provenance @> '{{\"audit\": true}}')"
-    )))
-    .fetch_one(conn)
-    .await
+    let probe = if indexed {
+        format!(
+            "SELECT NOT EXISTS (SELECT 1 FROM {table} WHERE provenance @> '{{\"audit\": true}}')"
+        )
+    } else {
+        format!("SELECT NOT EXISTS (SELECT 1 FROM {table})")
+    };
+    sqlx::query_scalar(sqlx::AssertSqlSafe(probe))
+        .fetch_one(conn)
+        .await
 }
 
 /// How long one maintenance pass builds audit indexes for.
 const AUDIT_INDEX_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long one audit index build waits for a lock or an older snapshot.
+const AUDIT_INDEX_WAIT: &str = "10s";
 
 /// Give every history partition its `{partition}_audit` index (T-6337) with
 /// `CREATE INDEX CONCURRENTLY`, so writes go on, smallest first, for up to
-/// [`AUDIT_INDEX_BUDGET`]; a week created since gets its own on the next
-/// pass. Until a partition has one, no partition drop takes it. `None` when
-/// nothing was missing or another pod holds the step.
+/// `AUDIT_INDEX_BUDGET`; a week created since gets its own on the next
+/// pass. Until a partition has one, no partition drop takes it unless it is
+/// empty. A concurrent build waits for every transaction with an older
+/// snapshot, so one that waits `AUDIT_INDEX_WAIT` gives up, leaving an
+/// invalid index the next pass drops and builds again. `None` when nothing
+/// was missing or another pod holds the step.
 pub async fn history_audit_index(pool: &PgPool) -> Result<Option<String>, sqlx::Error> {
     use sqlx::Executor;
     let missing: Vec<(String, bool)> = sqlx::query_as(LEAVES_WITHOUT_AUDIT_INDEX)
@@ -1541,7 +1555,9 @@ pub async fn history_audit_index(pool: &PgPool) -> Result<Option<String>, sqlx::
     let started = std::time::Instant::now();
     let mut built = 0usize;
     let mut result = conn
-        .execute("SET statement_timeout = 0; SET lock_timeout = '60s'")
+        .execute(sqlx::AssertSqlSafe(format!(
+            "SET statement_timeout = 0; SET lock_timeout = '{AUDIT_INDEX_WAIT}'"
+        )))
         .await
         .map(|_| ());
     for (part, stale) in &missing {

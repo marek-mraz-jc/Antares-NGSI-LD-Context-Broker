@@ -95,6 +95,34 @@ async fn count(pool: &sqlx::PgPool, sql: &'static str, tenant: &str) -> i64 {
         .expect("count")
 }
 
+/// Build the audit index of each partition `names` (T-6337), ticking as
+/// the broker's maintenance does while another pod or test holds the step.
+async fn audit_indexed(pool: &sqlx::PgPool, names: &[&str]) {
+    let mut done = Vec::new();
+    for _ in 0..100 {
+        let mut all = true;
+        for name in names {
+            all &= sqlx::query_scalar::<_, bool>(
+                "SELECT coalesce((SELECT indisvalid FROM pg_index
+                                  WHERE indexrelid = to_regclass('public.' || $1 || '_audit')), false)",
+            )
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .expect("catalog");
+        }
+        if all {
+            return;
+        }
+        match history_audit_index(pool).await {
+            Ok(line) => done.push(format!("{line:?}")),
+            Err(e) => done.push(format!("no audit index yet ({e})")),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("no audit index on {names:?}: {done:?}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn current_state_of_one_type_in_one_tenant_goes_and_a_writers_expiry_wins() {
     let url = require_db!();
@@ -700,6 +728,12 @@ async fn a_week_every_tenant_in_it_outlived_is_dropped_and_a_longer_rule_keeps_i
         .expect("row");
     }
     claim.commit().await.expect("release");
+    // No full week goes before its audit index says it holds no audit row.
+    // A concurrent build waits for every older snapshot, a test waiting on
+    // the guard included: build it with the guard released.
+    seed_guard.commit().await.expect("seed guard");
+    audit_indexed(&pool, &[weeks[0].0, weeks[1].0]).await;
+    let seed_guard = hold_off_the_explain_seed(&pool).await;
     let exists = |name: &'static str| {
         let pool = pool.clone();
         async move {
@@ -729,10 +763,6 @@ async fn a_week_every_tenant_in_it_outlived_is_dropped_and_a_longer_rule_keeps_i
         // A drop that loses its lock, or meets a parallel test's GRANT on
         // every table ("tuple concurrently updated", XX000), waits for the
         // next tick in the broker: tick again.
-        // No week goes before its audit index says it holds no audit row.
-        if let Err(e) = pg::maintenance::history_audit_index(&pool).await {
-            done.push(format!("no audit index yet ({e})"));
-        }
         match pg::maintenance::drop_retained_partitions(&pool, &floors).await {
             Ok(lines) => done.extend(lines),
             Err(e) => done.push(format!("kept ({e})")),
@@ -936,14 +966,15 @@ async fn audited_rows_outlive_the_history_rules_and_go_with_the_audit_retention(
     for id in ["urn:v:audit", "urn:w:audit"] {
         let _ = store.delete(&tenant, id).await;
     }
+    a_week_holding_an_audit_row_is_not_dropped_until_the_audit_sweep_took_it(pool).await;
 }
 
 /// T-6337: a past week holding an audit row stays whatever the floors say,
-/// and goes once the audit sweep took the row.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_week_holding_an_audit_row_is_not_dropped_until_the_audit_sweep_took_it() {
-    let url = require_db!();
-    let pool = pg::connect(&url, 5).await.expect("connect");
+/// and goes once the audit sweep took the row. Run by the test above, as
+/// the audit sweep deletes across Tenants.
+async fn a_week_holding_an_audit_row_is_not_dropped_until_the_audit_sweep_took_it(
+    pool: sqlx::PgPool,
+) {
     if pg::maintenance::detect_temporal_backend(&pool).await != Ok(TemporalBackend::Partitioned) {
         eprintln!("SKIP: attr_instances is not natively partitioned here");
         return;
@@ -982,6 +1013,7 @@ async fn a_week_holding_an_audit_row_is_not_dropped_until_the_audit_sweep_took_i
         .expect("row");
     }
     claim.commit().await.expect("release");
+    seed_guard.commit().await.expect("seed guard");
     let exists = || async {
         sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = $1 AND relnamespace = 'public'::regnamespace)",
@@ -1004,7 +1036,7 @@ async fn a_week_holding_an_audit_row_is_not_dropped_until_the_audit_sweep_took_i
         "part-audit".to_owned(),
         "2003-04-01T00:00:00.000Z".to_owned(),
     )];
-    // Without its audit index the week is kept: nothing reads it whole.
+    // Without its audit index a full week is kept: nothing reads it whole.
     let mut done = Vec::new();
     if !indexed().await {
         done.extend(
@@ -1014,16 +1046,9 @@ async fn a_week_holding_an_audit_row_is_not_dropped_until_the_audit_sweep_took_i
         );
         assert!(exists().await, "no audit index, no drop: {done:?}");
     }
-    for _ in 0..50 {
-        if let Err(e) = history_audit_index(&pool).await {
-            done.push(format!("no audit index yet ({e})"));
-        }
-        if indexed().await {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    assert!(indexed().await, "the week gets its audit index: {done:?}");
+    // Built with the guard released (see the test above).
+    audit_indexed(&pool, &[WEEK]).await;
+    let seed_guard = hold_off_the_explain_seed(&pool).await;
     for _ in 0..5 {
         if let Ok(lines) = pg::maintenance::drop_retained_partitions(&pool, &floors).await {
             done.extend(lines);
