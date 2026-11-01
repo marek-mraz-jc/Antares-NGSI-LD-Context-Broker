@@ -250,6 +250,10 @@ const LIVE_ENTITY: &str = "(CASE WHEN attrs_expire_at IS NULL OR attrs_expire_at
         ELSE x.v END AS v FROM jsonb_each(entity) AS x(k, v)) AS l \
       WHERE l.v IS NOT NULL) END)";
 
+/// A member name, its carriers, whether one has a second type, and the
+/// types of its live instances ([`PgEntityStore::type_summary`]).
+type SummaryRow = (String, i64, Option<bool>, Option<Vec<String>>);
+
 /// Distinct types a type selection may split into arms; a longer list keeps
 /// the plain containment, which reads the Tenant.
 const MAX_TYPE_ARMS: usize = 16;
@@ -1018,7 +1022,7 @@ impl PgEntityStore {
         // Grouped twice so the inner hash aggregate holds one row per
         // (member, instance type): one DISTINCT over every instance sorted
         // 745 162 rows to disk for the dev-sized Tree type.
-        let rows: Vec<(String, i64, Option<bool>, Option<Vec<String>>)> = sqlx::query_as(
+        let rows: Vec<SummaryRow> = sqlx::query_as(
             "SELECT g.k, sum(g.n)::int8, bool_or(g.multi), array_remove(array_agg(g.ty), NULL)
                FROM (SELECT x.k,
                             CASE WHEN jsonb_typeof(i.v -> 'type') = 'string'
