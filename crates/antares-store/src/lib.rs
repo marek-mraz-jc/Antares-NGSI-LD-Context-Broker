@@ -1267,6 +1267,15 @@ pub trait TemporalDriver: Send + Sync {
         let _ = floors;
         Ok(Vec::new())
     }
+    /// The audit sweep (T-6337, ADR-N-054 2.7): delete at most `batch` audit
+    /// rows (provenance `audit: true`, which every other retention keeps)
+    /// of each history table whose instant is before `before`, a UTC
+    /// DateTime, in every Tenant. Returns how many went; a driver that keeps
+    /// no provenance holds no audit rows.
+    async fn retain_audit(&self, before: &str, batch: usize) -> Result<u64, NgsiError> {
+        let _ = (before, batch);
+        Ok(0)
+    }
     /// The retention rules' [`ShortHistory`], replaced whole on each reload
     /// of the rules; a driver without unlogged storage ignores it.
     fn set_short_history(&self, short: ShortHistory) {

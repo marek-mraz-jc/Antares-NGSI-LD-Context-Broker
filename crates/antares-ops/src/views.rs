@@ -60,12 +60,21 @@ pub use antares_api::schema_writes::{Mode as SchemaWrites, SCHEMA_WRITES_ENV};
 /// them.
 pub const HISTORY_DEFAULT_ENV: &str = "ANTARES_RETENTION_HISTORY_DEFAULT";
 
+/// How long audit rows (provenance `audit: true`, ADR-N-054 2.7-2.9) are
+/// kept, whatever the history rules say (T-6337): `P2Y` unset. A duration
+/// as the retention rules read it, or whole years (`P3Y`, 365 days each).
+pub const AUDIT_RETENTION_ENV: &str = "ANTARES_RETENTION_AUDIT";
+
+/// [`AUDIT_RETENTION_ENV`] unset: two years.
+const AUDIT_RETENTION_DEFAULT: std::time::Duration = std::time::Duration::from_hours(2 * 365 * 24);
+
 /// Every variable the view table reads. The broker accepts these as config
 /// keys from here, so a new one is added in this crate alone (T-3766).
 pub const ENV_KEYS: &[&str] = &[
     RELOAD_ENV,
     SCHEMA_MAX_ENV,
     HISTORY_DEFAULT_ENV,
+    AUDIT_RETENTION_ENV,
     antares_api::schema_writes::SCHEMA_WRITES_ENV,
     crate::view_cache::VIEW_IDLE_ENV,
 ];
@@ -571,6 +580,8 @@ struct Reloader {
     /// The platform's history retention for what no Entity, type or Tenant
     /// rules ([`HISTORY_DEFAULT_ENV`], DM-97); `None` keeps it.
     platform_history: Option<std::time::Duration>,
+    /// How long audit rows are kept ([`AUDIT_RETENTION_ENV`]).
+    audit_retention: std::time::Duration,
 }
 
 /// One stored document of the view tenant and what the reloader made of it.
@@ -772,6 +783,25 @@ fn platform_history(raw: Option<String>) -> Result<Option<std::time::Duration>, 
     .transpose()
 }
 
+/// [`AUDIT_RETENTION_ENV`]: two years unset; a value that is no duration
+/// is an error, so a typo never deletes audit rows early.
+fn audit_retention(raw: Option<String>) -> Result<std::time::Duration, String> {
+    let Some(raw) = raw else {
+        return Ok(AUDIT_RETENTION_DEFAULT);
+    };
+    let raw = raw.trim();
+    let years = raw
+        .strip_prefix('P')
+        .and_then(|r| r.strip_suffix('Y'))
+        .map(|n| match n.parse::<u64>() {
+            Ok(n @ 1..=10) => Ok(std::time::Duration::from_hours(n.saturating_mul(365 * 24))),
+            _ => Err(format!("{raw:?} is not one to ten years")),
+        });
+    years
+        .unwrap_or_else(|| retention::parse_duration(raw))
+        .map_err(|e| format!("{AUDIT_RETENTION_ENV}: {e}"))
+}
+
 /// Load the stored views into `state`'s table, serve `/q/views`,
 /// `/q/schemas` and `/q/policy` on its admin surface, and reload the table
 /// every [`RELOAD_ENV`] milliseconds. Call it once, after the policy engine
@@ -820,6 +850,7 @@ pub(crate) async fn install_with(
         turns: std::sync::Mutex::default(),
         quality: std::sync::RwLock::default(),
         platform_history,
+        audit_retention: audit_retention(std::env::var(AUDIT_RETENTION_ENV).ok())?,
     });
     reloader.reload().await?;
     // DM-127: what was erased before a restore is gone before this pod serves
@@ -1607,6 +1638,20 @@ mod tests {
         }
     }
 
+    /// T-6337: audit rows keep two years unset, a duration or whole years
+    /// when set, and anything else stops the start.
+    #[test]
+    fn the_audit_retention_is_two_years_unless_set() {
+        let day = std::time::Duration::from_hours(24);
+        assert_eq!(audit_retention(None), Ok(day * 730));
+        assert_eq!(audit_retention(Some(" P3Y ".into())), Ok(day * 1095));
+        assert_eq!(audit_retention(Some("P400D".into())), Ok(day * 400));
+        for bad in ["2y", "P0Y", "P11Y", "PY", "forever", "PT30S"] {
+            let err = audit_retention(Some(bad.into())).expect_err(bad);
+            assert!(err.starts_with(AUDIT_RETENTION_ENV), "{err}");
+        }
+    }
+
     #[tokio::test]
     async fn without_a_bound_no_schema_is_taken_or_stored() {
         let r = Arc::new(Reloader {
@@ -1620,6 +1665,7 @@ mod tests {
             turns: std::sync::Mutex::default(),
             quality: std::sync::RwLock::default(),
             platform_history: None,
+            audit_retention: AUDIT_RETENTION_DEFAULT,
         });
         let put = put_schema(r.clone(), "city".into(), Bytes::from_static(b"{}")).await;
         assert_eq!(put.map(|p| p.status()), Ok(StatusCode::SERVICE_UNAVAILABLE));
@@ -1641,6 +1687,7 @@ mod tests {
             turns: std::sync::Mutex::default(),
             quality: std::sync::RwLock::default(),
             platform_history: None,
+            audit_retention: AUDIT_RETENTION_DEFAULT,
         };
         let fetched = || r.fetched.load(std::sync::atomic::Ordering::Relaxed);
         r.state.put_view_doc("v", base()).await.expect("view");

@@ -2449,6 +2449,21 @@ impl antares_store::TemporalDriver for AnyStore {
             .map_err(db),
         }
     }
+    async fn retain_audit(&self, before: &str, batch: usize) -> Result<u64, NgsiError> {
+        match self {
+            // memory keeps no provenance, so it holds no audit rows
+            AnyStore::Mem(_) => {
+                let _ = (before, batch);
+                Ok(0)
+            }
+            #[cfg(feature = "postgres")]
+            AnyStore::Pg(p) => {
+                crate::store::pg::maintenance::retain_audit(p.docs.pool(), before, batch)
+                    .await
+                    .map_err(db)
+            }
+        }
+    }
     async fn drop_retained_history(
         &self,
         floors: &[(String, String)],

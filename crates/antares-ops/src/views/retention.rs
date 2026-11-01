@@ -57,6 +57,9 @@ pub const ANY_TYPE: &str = "*";
 pub const ENTITY_LABEL: &str = "@entity";
 /// See [`ENTITY_LABEL`].
 pub const PLATFORM_LABEL: &str = "@platform";
+/// The `type` label of what the audit sweep deleted, under Tenant `*`: it
+/// runs across Tenants (T-6337).
+pub const AUDIT_LABEL: &str = "@audit";
 /// The most Entities with their own `historyRetention` one sweep reads.
 // ponytail: one bounded read per sweep; page it once a deployment holds more.
 const MAX_OVERRIDES: usize = 10_000;
@@ -367,6 +370,7 @@ pub(super) async fn sweep_within(
         entities: true,
     };
     let out = retain(&r.state, &plan, budget, Some(&r.turns)).await;
+    sweep_audit(r, now).await;
     let mut totals = r
         .deleted
         .lock()
@@ -383,6 +387,29 @@ pub(super) async fn sweep_within(
         *total = total.saturating_add(count);
     }
     out
+}
+
+/// The audit sweep (T-6337, ADR-N-054 2.7): audit rows older than the
+/// audit retention, at most [`BATCH`] per history table each sweep; the
+/// history rules never delete them. Logs and counts how many, never which.
+async fn sweep_audit(r: &Reloader, now: chrono::DateTime<chrono::Utc>) {
+    match r
+        .state
+        .temporal
+        .retain_audit(&cut(now, r.audit_retention), BATCH)
+        .await
+    {
+        Ok(0) => {}
+        Ok(count) => {
+            metrics::counter!("antares_retention_deleted_total",
+                "tenant" => ANY_TYPE, "type" => AUDIT_LABEL, "kind" => "audit")
+            .increment(count);
+            tracing::info!(count, "retention deleted audit rows");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "retention: audit sweep failed; it runs again next sweep");
+        }
+    }
 }
 
 /// What one run of [`retain`] covers.

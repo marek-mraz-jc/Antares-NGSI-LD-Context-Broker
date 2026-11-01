@@ -135,6 +135,10 @@ pub async fn temporal_maintenance(
     // statement_timeout, and a reap that times out must not abort the partition
     // pre-creation that keeps ingest writable.
     if backend == TemporalBackend::Hypertable {
+        // ponytail: drop_chunks takes a chunk's audit rows along with it
+        // (T-6337); a timescale deployment that audits leaves
+        // ANTARES_TEMPORAL_RETENTION_DAYS unset and lets the rule sweeps,
+        // which keep them, do the work.
         if let Some(days) = retention_days {
             for sql in [
                 "SELECT public.drop_chunks('attr_instances', older_than => make_interval(days => $1::int))",
@@ -233,6 +237,12 @@ pub async fn temporal_maintenance(
         }
     }
     if backend == TemporalBackend::Partitioned {
+        // Before any drop: a partition without its audit index is kept.
+        match history_audit_index(pool).await {
+            Ok(Some(line)) => done.push(line),
+            Ok(None) => {}
+            Err(e) => done.push(format!("audit index build deferred ({e})")),
+        }
         if let Some(days) = retention_days {
             match plain_retention(pool, days).await {
                 Ok(lines) => done.extend(lines),
@@ -297,7 +307,8 @@ async fn versions_retention(pool: &PgPool, days: i64) -> Result<u64, sqlx::Error
     let mut tx = pool.begin().await?;
     crate::store::pg::set_service(&mut tx).await?;
     let n = sqlx::query(
-        "DELETE FROM attr_versions WHERE observed_at < now() - make_interval(days => $1::int)",
+        "DELETE FROM attr_versions WHERE observed_at < now() - make_interval(days => $1::int)
+           AND NOT coalesce(provenance @> '{\"audit\": true}', false)",
     )
     .bind(days)
     .execute(&mut *tx)
@@ -349,7 +360,11 @@ async fn plain_retention(pool: &PgPool, days: i64) -> Result<Vec<String>, sqlx::
                 .bind(days)
                 .fetch_one(&mut *tx)
                 .await?;
-        if expired {
+        if expired && !audit_free(&mut tx, &name).await? {
+            done.push(format!(
+                "expired partition {name} kept: it holds audit rows"
+            ));
+        } else if expired {
             sqlx::query(sqlx::AssertSqlSafe(drop_partition_sql(&name)))
                 .execute(&mut *tx)
                 .await?;
@@ -359,9 +374,11 @@ async fn plain_retention(pool: &PgPool, days: i64) -> Result<Vec<String>, sqlx::
     let mut purged = 0u64;
     for sql in [
         "DELETE FROM attr_instances_default
-         WHERE observed_at < now() - make_interval(days => $1::int)",
+         WHERE observed_at < now() - make_interval(days => $1::int)
+           AND NOT coalesce(provenance @> '{\"audit\": true}', false)",
         "DELETE FROM attr_rows_default
-         WHERE observed_at < now() - make_interval(days => $1::int)",
+         WHERE observed_at < now() - make_interval(days => $1::int)
+           AND NOT coalesce(provenance @> '{\"audit\": true}', false)",
     ] {
         let n = sqlx::query(sql)
             .bind(days)
@@ -463,10 +480,13 @@ pub async fn reap_expired_entity_batch(pool: &PgPool, limit: i64) -> Result<u64,
     }
     for (tenant, ids) in by_tenant {
         for sql in [
-            "DELETE FROM attr_instances WHERE tenant_id = $1 AND entity_id = ANY($2::text[])",
+            "DELETE FROM attr_instances WHERE tenant_id = $1 AND entity_id = ANY($2::text[]) \
+             AND NOT coalesce(provenance @> '{\"audit\": true}', false)",
             "DELETE FROM attr_rows WHERE tenant_id = $1 AND entity_no IN \
-             (SELECT i.id FROM iri_ids i WHERE i.tenant_id = $1 AND i.iri = ANY($2::text[]))",
-            "DELETE FROM attr_versions WHERE tenant_id = $1 AND entity_id = ANY($2::text[])",
+             (SELECT i.id FROM iri_ids i WHERE i.tenant_id = $1 AND i.iri = ANY($2::text[])) \
+             AND NOT coalesce(provenance @> '{\"audit\": true}', false)",
+            "DELETE FROM attr_versions WHERE tenant_id = $1 AND entity_id = ANY($2::text[]) \
+             AND NOT coalesce(provenance @> '{\"audit\": true}', false)",
         ] {
             sqlx::query(sql)
                 .bind(tenant)
@@ -576,6 +596,7 @@ const ENTITY_ROWS: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instanc
            FROM attr_instances a
            WHERE a.tenant_id = $1 AND a.entity_id = ANY($2::text[])
              AND a.observed_at < $3::timestamptz
+             AND NOT coalesce(a.provenance @> '{\"audit\": true}', false)
            LIMIT $4";
 /// The same over `attr_rows` (T-5200), its keys mapped through the Tenant's
 /// `iri_ids`; both of its children, the short one included (T-5249).
@@ -584,6 +605,7 @@ const KEYED_ROWS: &str = "SELECT a.tenant_id, a.entity_no, a.attr_no, a.instance
            WHERE a.tenant_id = $1
              AND a.entity_no IN (SELECT i.id FROM iri_ids i WHERE i.tenant_id = $1 AND i.iri = ANY($2::text[]))
              AND a.observed_at < $3::timestamptz
+             AND NOT coalesce(a.provenance @> '{\"audit\": true}', false)
            LIMIT $4";
 /// The same over the superseded versions (T-4665).
 const VERSION_ROWS: &str =
@@ -591,6 +613,7 @@ const VERSION_ROWS: &str =
            FROM attr_versions a
            WHERE a.tenant_id = $1 AND a.entity_id = ANY($2::text[])
              AND a.observed_at < $3::timestamptz
+             AND NOT coalesce(a.provenance @> '{\"audit\": true}', false)
            LIMIT $4";
 
 /// Retention of history (`/q/retention`, T-3900, DM-97): at most `batch`
@@ -614,6 +637,7 @@ pub async fn retain_history(
            WHERE a.tenant_id = $1 AND t.types @> $2::text[]
              AND a.entity_id <> ALL($5::text[])
              AND a.observed_at < $3::timestamptz
+             AND NOT coalesce(a.provenance @> '{\"audit\": true}', false)
            LIMIT $4";
     const REST: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
            FROM attr_instances a
@@ -621,6 +645,7 @@ pub async fn retain_history(
            WHERE a.tenant_id = $1 AND NOT (t.types && $2::text[])
              AND a.entity_id <> ALL($5::text[])
              AND a.observed_at < $3::timestamptz
+             AND NOT coalesce(a.provenance @> '{\"audit\": true}', false)
            LIMIT $4";
     // The type and rest selections over `attr_rows` (T-5200), its keys mapped
     // through the Tenant's `iri_ids`; KEYED_ROWS is the Entity one.
@@ -631,6 +656,7 @@ pub async fn retain_history(
            WHERE a.tenant_id = $1 AND t.types @> $2::text[]
              AND i.iri <> ALL($5::text[])
              AND a.observed_at < $3::timestamptz
+             AND NOT coalesce(a.provenance @> '{\"audit\": true}', false)
            LIMIT $4";
     const R_REST: &str = "SELECT a.tenant_id, a.entity_no, a.attr_no, a.instance_no, a.observed_at
            FROM attr_rows a
@@ -639,6 +665,7 @@ pub async fn retain_history(
            WHERE a.tenant_id = $1 AND NOT (t.types && $2::text[])
              AND i.iri <> ALL($5::text[])
              AND a.observed_at < $3::timestamptz
+             AND NOT coalesce(a.provenance @> '{\"audit\": true}', false)
            LIMIT $4";
     // A measurement past retention takes its superseded versions along
     // (T-4665): the same three selections over `attr_versions`, written out so
@@ -651,6 +678,7 @@ pub async fn retain_history(
            WHERE a.tenant_id = $1 AND t.types @> $2::text[]
              AND a.entity_id <> ALL($5::text[])
              AND a.observed_at < $3::timestamptz
+             AND NOT coalesce(a.provenance @> '{\"audit\": true}', false)
            LIMIT $4";
     const V_REST: &str = "SELECT a.tenant_id, a.entity_id, a.attr_id, a.instance_id, a.observed_at
            FROM attr_versions a
@@ -658,6 +686,7 @@ pub async fn retain_history(
            WHERE a.tenant_id = $1 AND NOT (t.types && $2::text[])
              AND a.entity_id <> ALL($5::text[])
              AND a.observed_at < $3::timestamptz
+             AND NOT coalesce(a.provenance @> '{\"audit\": true}', false)
            LIMIT $4";
     // A sweep's delete of a type walks its Entities (T-5157): see
     // [`walk_history`]. A dry run counts the whole scope in one statement.
@@ -1169,9 +1198,10 @@ async fn drop_partitions(
     Ok(done)
 }
 
-/// Whether [`DROPPABLE`] admits the partition `name` with upper bound `hi`.
-/// The partition is read directly: it carries no policy of its own, so the
-/// read sees every Tenant's rows whatever the role.
+/// Whether [`DROPPABLE`] admits the partition `name` with upper bound `hi`
+/// and it holds no audit row ([`audit_free`]). The partition is read
+/// directly: it carries no policy of its own, so the read sees every
+/// Tenant's rows whatever the role.
 async fn droppable(
     tx: &mut sqlx::PgConnection,
     name: &str,
@@ -1179,6 +1209,9 @@ async fn droppable(
     tenants: &[String],
     cuts: &[String],
 ) -> Result<bool, sqlx::Error> {
+    if !audit_free(&mut *tx, name).await? {
+        return Ok(false);
+    }
     let quoted = format!("public.\"{}\"", name.replace('"', "\"\""));
     sqlx::query_scalar(sqlx::AssertSqlSafe(DROPPABLE.replace("{p}", &quoted)))
         .bind(tenants)
@@ -1277,9 +1310,12 @@ async fn reap_expired_instances(pool: &PgPool) -> Result<u64, sqlx::Error> {
     // jsonb TEXT and a stamp PostgreSQL cannot parse would abort this
     // DELETE for the whole deployment, every tick, forever.
     for sql in [
-        "DELETE FROM attr_instances WHERE try_timestamptz(data->>'expiresAt') < now()",
-        "DELETE FROM attr_rows WHERE try_timestamptz(data->>'expiresAt') < now()",
-        "DELETE FROM attr_versions WHERE try_timestamptz(data->>'expiresAt') < now()",
+        "DELETE FROM attr_instances WHERE try_timestamptz(data->>'expiresAt') < now()
+           AND NOT coalesce(provenance @> '{\"audit\": true}', false)",
+        "DELETE FROM attr_rows WHERE try_timestamptz(data->>'expiresAt') < now()
+           AND NOT coalesce(provenance @> '{\"audit\": true}', false)",
+        "DELETE FROM attr_versions WHERE try_timestamptz(data->>'expiresAt') < now()
+           AND NOT coalesce(provenance @> '{\"audit\": true}', false)",
     ] {
         n = n.saturating_add(sqlx::query(sql).execute(&mut *tx).await?.rows_affected());
     }
@@ -1423,6 +1459,181 @@ async fn one_index_step(conn: &mut sqlx::PgConnection) -> Result<String, sqlx::E
         "history on one index: {} partitions swapped",
         parts.len()
     ))
+}
+
+/// The partial index on each history partition that finds its audit rows
+/// (provenance `audit: true`, ADR-N-054 2.8, DM-146), quoted bare and
+/// qualified, and the partition qualified. A weekly suffix keeps the name
+/// under the 63-byte identifier limit.
+fn audit_index_names(part: &str) -> (String, String, String) {
+    let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let index = q(&format!("{part}_audit"));
+    (
+        index.clone(),
+        format!("public.{index}"),
+        format!("public.{}", q(part)),
+    )
+}
+
+/// The leaf partitions of both history parents without a valid
+/// `{partition}_audit` index, with whether an invalid one (a build that
+/// failed) is in the way, smallest first by `relpages` (a catalog read that
+/// takes no lock). Not the DEFAULT partitions: no drop takes them, and a
+/// build there would hold up each new week's `CREATE TABLE`, which locks
+/// the parent against every write while it checks DEFAULT.
+///
+/// ponytail: the audit sweep reads a DEFAULT partition whole each minute;
+/// it holds only backfill (`default_partition_load` warns past 100 000 rows).
+const LEAVES_WITHOUT_AUDIT_INDEX: &str = "SELECT c.relname, x.indexrelid IS NOT NULL AS stale
+     FROM (SELECT relid FROM pg_partition_tree('public.attr_instances') WHERE isleaf
+           UNION ALL
+           SELECT relid FROM pg_partition_tree('public.attr_rows') WHERE isleaf) t
+     JOIN pg_class c ON c.oid = t.relid
+     LEFT JOIN pg_class ic ON ic.relname = c.relname || '_audit'
+                          AND ic.relnamespace = 'public'::regnamespace
+     LEFT JOIN pg_index x ON x.indexrelid = ic.oid
+     WHERE c.relkind = 'r' AND x.indisvalid IS NOT TRUE
+       AND pg_get_expr(c.relpartbound, c.oid) <> 'DEFAULT'
+     ORDER BY c.relpages";
+
+/// Whether partition `name` holds no audit row, read through its
+/// `{name}_audit` index. Without a valid one only an empty partition counts
+/// as free: reading a full one whole could take minutes under the drop's
+/// lock.
+async fn audit_free(conn: &mut sqlx::PgConnection, name: &str) -> Result<bool, sqlx::Error> {
+    let (_, index, table) = audit_index_names(name);
+    let indexed: bool = sqlx::query_scalar(
+        "SELECT coalesce((SELECT x.indisvalid FROM pg_index x
+                          WHERE x.indexrelid = to_regclass($1)), false)",
+    )
+    .bind(&index)
+    .fetch_one(&mut *conn)
+    .await?;
+    let probe = if indexed {
+        format!(
+            "SELECT NOT EXISTS (SELECT 1 FROM {table} WHERE provenance @> '{{\"audit\": true}}')"
+        )
+    } else {
+        format!("SELECT NOT EXISTS (SELECT 1 FROM {table})")
+    };
+    sqlx::query_scalar(sqlx::AssertSqlSafe(probe))
+        .fetch_one(conn)
+        .await
+}
+
+/// How long one maintenance pass builds audit indexes for.
+const AUDIT_INDEX_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long one audit index build waits for a lock or an older snapshot.
+const AUDIT_INDEX_WAIT: &str = "10s";
+
+/// Give every history partition its `{partition}_audit` index (T-6337) with
+/// `CREATE INDEX CONCURRENTLY`, so writes go on, smallest first, for up to
+/// `AUDIT_INDEX_BUDGET`; a week created since gets its own on the next
+/// pass. Until a partition has one, no partition drop takes it unless it is
+/// empty. A concurrent build waits for every transaction with an older
+/// snapshot, so one that waits `AUDIT_INDEX_WAIT` gives up, leaving an
+/// invalid index the next pass drops and builds again. `None` when nothing
+/// was missing or another pod holds the step.
+pub async fn history_audit_index(pool: &PgPool) -> Result<Option<String>, sqlx::Error> {
+    use sqlx::Executor;
+    let missing: Vec<(String, bool)> = sqlx::query_as(LEAVES_WITHOUT_AUDIT_INDEX)
+        .fetch_all(pool)
+        .await?;
+    if missing.is_empty() {
+        return Ok(None);
+    }
+    // As in history_one_index: a concurrent build runs outside a transaction
+    // on a connection of its own, and closing it releases the advisory lock.
+    let mut conn = pool.acquire().await?.detach();
+    let held: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext('antares.history_audit_index'))")
+            .fetch_one(&mut conn)
+            .await?;
+    if !held {
+        return Ok(None);
+    }
+    let started = std::time::Instant::now();
+    let mut built = 0usize;
+    let mut result = conn
+        .execute(sqlx::AssertSqlSafe(format!(
+            "SET statement_timeout = 0; SET lock_timeout = '{AUDIT_INDEX_WAIT}'"
+        )))
+        .await
+        .map(|_| ());
+    for (part, stale) in &missing {
+        if result.is_err() || started.elapsed() >= AUDIT_INDEX_BUDGET {
+            break;
+        }
+        let (bare, index, table) = audit_index_names(part);
+        if *stale {
+            result = conn
+                .execute(sqlx::AssertSqlSafe(format!(
+                    "DROP INDEX CONCURRENTLY IF EXISTS {index}"
+                )))
+                .await
+                .map(|_| ());
+        }
+        if result.is_ok() {
+            result = conn
+                .execute(sqlx::AssertSqlSafe(format!(
+                    "CREATE INDEX CONCURRENTLY {bare} ON {table} (observed_at)
+                     WHERE provenance @> '{{\"audit\": true}}'"
+                )))
+                .await
+                .map(|_| ());
+        }
+        if result.is_ok() {
+            built = built.saturating_add(1);
+        }
+    }
+    use sqlx::Connection;
+    conn.close().await?;
+    result?;
+    Ok(Some(format!(
+        "audit index built on {built} of {} partitions",
+        missing.len()
+    )))
+}
+
+/// The audit sweep (T-6337, ADR-N-054 2.7): delete at most `batch` audit
+/// rows (provenance `audit: true`) of each history table observed before
+/// `before`, a UTC DateTime, across Tenants. Erasure (ADR-N-054 2.6) still
+/// deletes them earlier; every other retention keeps them. Returns how many
+/// went.
+pub async fn retain_audit(pool: &PgPool, before: &str, batch: usize) -> Result<u64, sqlx::Error> {
+    const AUDIT_SWEEP: [&str; 3] = [
+        "DELETE FROM attr_instances
+         WHERE provenance @> '{\"audit\": true}' AND observed_at < $1::timestamptz
+           AND (tenant_id, entity_id, attr_id, instance_id, observed_at) IN (
+             SELECT tenant_id, entity_id, attr_id, instance_id, observed_at FROM attr_instances
+             WHERE provenance @> '{\"audit\": true}' AND observed_at < $1::timestamptz LIMIT $2)",
+        "DELETE FROM attr_rows
+         WHERE provenance @> '{\"audit\": true}' AND observed_at < $1::timestamptz
+           AND (tenant_id, entity_no, attr_no, instance_no, observed_at) IN (
+             SELECT tenant_id, entity_no, attr_no, instance_no, observed_at FROM attr_rows
+             WHERE provenance @> '{\"audit\": true}' AND observed_at < $1::timestamptz LIMIT $2)",
+        "DELETE FROM attr_versions WHERE ctid IN (
+             SELECT ctid FROM attr_versions
+             WHERE provenance @> '{\"audit\": true}' AND observed_at < $1::timestamptz LIMIT $2)",
+    ];
+    let before = antares_store::filter::canonical_datetime(before).into_owned();
+    let mut total = 0u64;
+    for sql in AUDIT_SWEEP {
+        let mut tx = pool.begin().await?;
+        crate::store::pg::set_service(&mut tx).await?;
+        sqlx::query("SET LOCAL statement_timeout = '5s'")
+            .execute(&mut *tx)
+            .await?;
+        let n = sqlx::query(sql)
+            .bind(&before)
+            .bind(i64::try_from(batch).unwrap_or(i64::MAX))
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        total = total.saturating_add(n);
+    }
+    Ok(total)
 }
 
 #[cfg(test)]

@@ -11,7 +11,8 @@
 use antares_model::TenantId;
 use antares_sql::store::pg;
 use antares_sql::store::pg::maintenance::{
-    history_overrides, retain_current, retain_history, temporal_maintenance, TemporalBackend,
+    history_audit_index, history_overrides, retain_audit, retain_current, retain_history,
+    temporal_maintenance, TemporalBackend,
 };
 use antares_sql::store::pg::temporal::PgTemporalStore;
 use antares_store::{HistoryScope, HISTORY_RETENTION};
@@ -92,6 +93,34 @@ async fn count(pool: &sqlx::PgPool, sql: &'static str, tenant: &str) -> i64 {
         .fetch_one(pool)
         .await
         .expect("count")
+}
+
+/// Build the audit index of each partition `names` (T-6337), ticking as
+/// the broker's maintenance does while another pod or test holds the step.
+async fn audit_indexed(pool: &sqlx::PgPool, names: &[&str]) {
+    let mut done = Vec::new();
+    for _ in 0..100 {
+        let mut all = true;
+        for name in names {
+            all &= sqlx::query_scalar::<_, bool>(
+                "SELECT coalesce((SELECT indisvalid FROM pg_index
+                                  WHERE indexrelid = to_regclass('public.' || $1 || '_audit')), false)",
+            )
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .expect("catalog");
+        }
+        if all {
+            return;
+        }
+        match history_audit_index(pool).await {
+            Ok(line) => done.push(format!("{line:?}")),
+            Err(e) => done.push(format!("no audit index yet ({e})")),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("no audit index on {names:?}: {done:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -699,6 +728,12 @@ async fn a_week_every_tenant_in_it_outlived_is_dropped_and_a_longer_rule_keeps_i
         .expect("row");
     }
     claim.commit().await.expect("release");
+    // No full week goes before its audit index says it holds no audit row.
+    // A concurrent build waits for every older snapshot, a test waiting on
+    // the guard included: build it with the guard released.
+    seed_guard.commit().await.expect("seed guard");
+    audit_indexed(&pool, &[weeks[0].0, weeks[1].0]).await;
+    let seed_guard = hold_off_the_explain_seed(&pool).await;
     let exists = |name: &'static str| {
         let pool = pool.clone();
         async move {
@@ -860,4 +895,187 @@ async fn an_expired_entity_goes_with_its_history() {
     );
     let shells = store.get(&tenant, "urn:v:exp").await.expect("read");
     assert!(shells.is_none(), "the temporal Entity is gone too");
+}
+
+/// T-6337 (ADR-N-054 2.7-2.9): an audited write's rows (provenance `audit:
+/// true`) outlive the type's history rule, `off` or `P1D`, swept as at
+/// now + 30 days, and keep their week from the partition drop; the audit
+/// sweep takes them once past the audit retention, and the week goes after.
+#[tokio::test(flavor = "multi_thread")]
+async fn audited_rows_outlive_the_history_rules_and_go_with_the_audit_retention() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let store = PgTemporalStore::new(pool.clone());
+    let tenant = TenantId::new("retain-audit").expect("tenant");
+    pg::ensure_tenant(&pool, &tenant).await.expect("tenant row");
+    let day = 24 * 60;
+    let at = ago(40 * day);
+    for (id, ty) in [("urn:v:audit", V), ("urn:w:audit", W)] {
+        let _ = store.delete(&tenant, id).await;
+        let doc = json!({
+            "id": id, "type": [ty], "createdAt": at, "modifiedAt": at,
+            "https://example.org/name": [
+                {"type": "Property", "value": "old", "observedAt": at, "instanceId": format!("urn:i:{id}:plain")},
+                {"type": "Property", "value": "new", "observedAt": at, "instanceId": format!("urn:i:{id}:audit"),
+                 "@provenance": {"channel": "api", "audit": true}}]
+        });
+        assert!(store.create(&tenant, id, &doc).await.expect("create"));
+    }
+    let rows = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT (SELECT count(*) FROM attr_instances WHERE tenant_id = $1)
+                  + (SELECT count(*) FROM attr_rows WHERE tenant_id = $1)",
+        )
+        .bind("retain-audit")
+        .fetch_one(&pool)
+        .await
+        .expect("count")
+    };
+    assert_eq!(rows().await, 4);
+    // V's history is off (every instant is before the cut), W keeps P1D;
+    // both sweep as at now + 30 days, so W's cut is 31 days back.
+    for (scope, before) in [
+        (ty(V), "9999-12-31T23:59:59.999Z".to_owned()),
+        (ty(W), ago(31 * day)),
+    ] {
+        assert_eq!(
+            retain_history(&pool, "retain-audit", scope, &before, 1000, true)
+                .await
+                .expect("dry run"),
+            1,
+            "only the plain row is the rule's"
+        );
+        retain_history(&pool, "retain-audit", scope, &before, 1000, false)
+            .await
+            .expect("retain");
+    }
+    assert_eq!(rows().await, 2, "both audited rows stay");
+    // The audit retention not yet passed (cut before the rows): nothing goes.
+    retain_audit(&pool, &ago(41 * day), 1000)
+        .await
+        .expect("audit sweep");
+    assert_eq!(rows().await, 2);
+    // Past it (as at now + 2 years + 1 day): they go.
+    assert_eq!(
+        retain_audit(&pool, &ago(39 * day), 1000)
+            .await
+            .expect("audit sweep"),
+        2
+    );
+    assert_eq!(rows().await, 0);
+    for id in ["urn:v:audit", "urn:w:audit"] {
+        let _ = store.delete(&tenant, id).await;
+    }
+    a_week_holding_an_audit_row_is_not_dropped_until_the_audit_sweep_took_it(pool).await;
+}
+
+/// T-6337: a past week holding an audit row stays whatever the floors say,
+/// and goes once the audit sweep took the row. Run by the test above, as
+/// the audit sweep deletes across Tenants.
+async fn a_week_holding_an_audit_row_is_not_dropped_until_the_audit_sweep_took_it(
+    pool: sqlx::PgPool,
+) {
+    if pg::maintenance::detect_temporal_backend(&pool).await != Ok(TemporalBackend::Partitioned) {
+        eprintln!("SKIP: attr_instances is not natively partitioned here");
+        return;
+    }
+    const WEEK: &str = "attr_instances_2007w10";
+    let seed_guard = hold_off_the_explain_seed(&pool).await;
+    let mut claim = pool.begin().await.expect("claim");
+    sqlx::query("SELECT name FROM maintenance_jobs WHERE name = 'temporal_partitions' FOR UPDATE")
+        .fetch_optional(&mut *claim)
+        .await
+        .expect("claim row");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE IF NOT EXISTS {WEEK} PARTITION OF attr_instances FOR VALUES FROM ('2007-03-05') TO ('2007-03-12')"
+    )))
+    .execute(&mut *claim)
+    .await
+    .expect("partition");
+    sqlx::query("DELETE FROM attr_instances WHERE tenant_id = 'part-audit'")
+        .execute(&mut *claim)
+        .await
+        .expect("clean");
+    for (id, provenance) in [
+        ("urn:i:plain", None),
+        ("urn:i:audit", Some(json!({"audit": true}))),
+    ] {
+        sqlx::query(
+            "INSERT INTO attr_instances (tenant_id, entity_id, attr_id, instance_id, observed_at,
+                                         created_at, modified_at, data, provenance)
+             VALUES ('part-audit', 'urn:v:a', 'https://example.org/name', $1, '2007-03-06',
+                     '2007-03-06', '2007-03-06', '{\"value\": 1}', $2)",
+        )
+        .bind(id)
+        .bind(provenance)
+        .execute(&mut *claim)
+        .await
+        .expect("row");
+    }
+    claim.commit().await.expect("release");
+    seed_guard.commit().await.expect("seed guard");
+    let exists = || async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = $1 AND relnamespace = 'public'::regnamespace)",
+        )
+        .bind(WEEK)
+        .fetch_one(&pool)
+        .await
+        .expect("catalog")
+    };
+    let indexed = || async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT coalesce((SELECT indisvalid FROM pg_index
+                              WHERE indexrelid = to_regclass('public.attr_instances_2007w10_audit')), false)",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("catalog")
+    };
+    let floors = [(
+        "part-audit".to_owned(),
+        "2007-04-01T00:00:00.000Z".to_owned(),
+    )];
+    // Without its audit index a full week is kept: nothing reads it whole.
+    let mut done = Vec::new();
+    if !indexed().await {
+        done.extend(
+            pg::maintenance::drop_retained_partitions(&pool, &floors)
+                .await
+                .unwrap_or_default(),
+        );
+        assert!(exists().await, "no audit index, no drop: {done:?}");
+    }
+    // Built with the guard released (see the test above).
+    audit_indexed(&pool, &[WEEK]).await;
+    let seed_guard = hold_off_the_explain_seed(&pool).await;
+    for _ in 0..5 {
+        if let Ok(lines) = pg::maintenance::drop_retained_partitions(&pool, &floors).await {
+            done.extend(lines);
+        }
+    }
+    assert!(exists().await, "the audit row keeps its week: {done:?}");
+    assert_eq!(
+        retain_audit(&pool, "2007-03-07T00:00:00Z", 1000)
+            .await
+            .expect("audit sweep"),
+        1
+    );
+    // A parallel test's maintenance may hold the claim for a while: tick.
+    for _ in 0..100 {
+        match pg::maintenance::drop_retained_partitions(&pool, &floors).await {
+            Ok(lines) if lines.is_empty() => done.push("nothing dropped".into()),
+            Ok(lines) => done.extend(lines),
+            Err(e) => done.push(format!("kept ({e})")),
+        }
+        if !exists().await {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        !exists().await,
+        "the week goes once its audit row went: {done:?}"
+    );
+    seed_guard.commit().await.expect("seed guard");
 }
