@@ -75,8 +75,9 @@ pub(super) fn truncate(w: &mut Windowed, timeprop: &str, descending: bool, limit
 
 /// Each instance of `w` replaced by its chain of versions in `chains` (the
 /// store's `versions`), the same measurement being the same Attribute,
-/// `observedAt` and `datasetId` (ADR-N-054 2.4). An instance the store keeps
-/// no version of stays as it is.
+/// `observedAt` and `datasetId` (ADR-N-054 2.4); a value written without
+/// `observedAt` is its own row, by `instanceId` (2.9). An instance the store
+/// keeps no version of stays as it is.
 pub(super) fn with_versions(w: &mut Windowed, chains: &Map<String, Value>) {
     let key = |i: &Value| {
         (
