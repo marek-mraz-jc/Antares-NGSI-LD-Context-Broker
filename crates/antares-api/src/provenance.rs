@@ -323,7 +323,7 @@ mod tests {
             Some(GATEWAY)
         ));
         assert!(!may_read_versions(
-            &headers(&[("l5d-client-id", GATEWAY), ("jc-read-versions", "yes")]),
+            &headers(&[("l5d-client-id", GATEWAY), ("jc-read-versions", "")]),
             Some(GATEWAY)
         ));
     }

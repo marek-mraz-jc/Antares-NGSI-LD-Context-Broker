@@ -263,12 +263,12 @@ impl Information {
                     }
                     (Vec::new(), Vec::new())
                 } else {
-                    let names: Vec<String> = named.cloned().collect();
-                    let names = keep(&names);
-                    if names.is_empty() {
+                    let keys: Vec<String> = named.cloned().collect();
+                    let given = keep(&keys);
+                    if given.is_empty() {
                         return Ok(None);
                     }
-                    (names, Vec::new())
+                    (given, Vec::new())
                 }
             } else {
                 let (p, r) = (keep(&self.property_names), keep(&self.relationship_names));
@@ -514,37 +514,64 @@ fn policy(p: PolicyDoc) -> Result<Vec<Policy>, String> {
             source,
         }]);
     }
-    // ADR-N-066 2.1: one policy per need of its clauses, each with the
-    // Attributes whose capabilities give that need; a need no Attribute
-    // is given grants (or prohibits) nothing. All keep the policy's id, so
-    // a view listing it lists them all.
+    let parts = Parts {
+        id: id.clone(),
+        prohibit,
+        assignee: p.assignee,
+        validity: (from, to),
+        conditions,
+        source,
+    };
+    split(&parts, p.operations, &p.information, &why)
+}
+
+/// What every policy split from one written policy shares.
+struct Parts {
+    id: String,
+    prohibit: bool,
+    assignee: Assignee,
+    validity: (Option<DateTime<Utc>>, Option<DateTime<Utc>>),
+    conditions: Rule,
+    source: Source,
+}
+
+/// ADR-N-066 2.1: one policy per need of its clauses, each with the
+/// Attributes whose capabilities give that need; a need no Attribute is
+/// given grants (or prohibits) nothing. All keep the policy's id, so a view
+/// listing it lists them all.
+fn split(
+    parts: &Parts,
+    operations: Vec<String>,
+    written: &[Information],
+    why: &dyn Fn(String) -> String,
+) -> Result<Vec<Policy>, String> {
     let mut by_need: BTreeMap<Need, BTreeSet<String>> = BTreeMap::new();
-    for clause in p.operations {
+    for clause in operations {
         by_need.entry(Need::of(&clause)).or_default().insert(clause);
     }
     let mut out = Vec::with_capacity(by_need.len());
     for (need, clauses) in by_need {
-        let mut information = Vec::with_capacity(p.information.len());
-        for info in &p.information {
-            if let Some(narrowed) = info.narrowed(need).map_err(&why)? {
+        let mut information = Vec::with_capacity(written.len());
+        for info in written {
+            if let Some(narrowed) = info.narrowed(need).map_err(why)? {
                 information.push(narrowed);
             }
         }
         if information.is_empty() {
             continue;
         }
-        let (selectors, written) = rules(information, &conditions, &why)?;
+        let (selectors, written_selectors) = rules(information, &parts.conditions, why)?;
         out.push(Policy {
-            id: id.clone(),
-            prohibit,
-            assignee: p.assignee.clone(),
+            id: parts.id.clone(),
+            prohibit: parts.prohibit,
+            assignee: parts.assignee.clone(),
             clauses,
-            validity: (from, to),
+            validity: parts.validity,
             selectors,
-            conditions: conditions.clone(),
+            conditions: parts.conditions.clone(),
             source: Source {
-                selectors: written,
-                ..source.clone()
+                selectors: written_selectors,
+                ..parts.source.clone()
             },
         });
     }
@@ -798,7 +825,9 @@ mod tests {
     }
 
     /// The compiled policies of one written policy, keyed by their clauses.
-    fn split(p: &serde_json::Value) -> Result<Vec<(Vec<String>, Vec<Rule>)>, String> {
+    type Compiled = Vec<(Vec<String>, Vec<Rule>)>;
+
+    fn split(p: &serde_json::Value) -> Result<Compiled, String> {
         Ok(compile(&json!({ "policies": [p] }))?
             .policies
             .into_iter()
@@ -806,7 +835,7 @@ mod tests {
             .collect())
     }
 
-    fn air(attributes: serde_json::Value, operations: serde_json::Value) -> serde_json::Value {
+    fn air(attributes: &serde_json::Value, operations: &serde_json::Value) -> serde_json::Value {
         json!({"id": "p", "assignee": {"kind": "role", "id": "public"},
                "operations": operations,
                "information": [{"entities": [{"type": "Air"}],
@@ -835,8 +864,8 @@ mod tests {
     #[test]
     fn history_of_one_attribute_leaves_current_reads_whole() -> Result<(), String> {
         let got = split(&air(
-            json!({"*": {"history": false}, "name": {"history": true}}),
-            json!(["5.7.1", "5.7.2", "5.7.3", "5.7.4"]),
+            &json!({"*": {"history": false}, "name": {"history": true}}),
+            &json!(["5.7.1", "5.7.2", "5.7.3", "5.7.4"]),
         ))?;
         let [(reads, read_rules), (history, history_rules)] = got.as_slice() else {
             return Err(format!("{} policies, not 2", got.len()));
@@ -852,8 +881,8 @@ mod tests {
     fn a_need_no_attribute_is_given_grants_nothing() -> Result<(), String> {
         // never the whole Entity: an empty list would read as every Attribute
         let got = split(&air(
-            json!({"*": {"history": false}}),
-            json!(["5.7.2", "5.7.3"]),
+            &json!({"*": {"history": false}}),
+            &json!(["5.7.2", "5.7.3"]),
         ))?;
         assert_eq!(got.len(), 1);
         assert_eq!(got.first().map(|g| g.0.clone()), Some(vec!["5.7.2".into()]));
@@ -863,8 +892,8 @@ mod tests {
     #[test]
     fn write_kinds_narrow_each_write_clause() -> Result<(), String> {
         let got = split(&air(
-            json!({"*": {"write": []}, "name": {"write": ["update"]}}),
-            json!(["5.6.2", "5.6.3", "5.6.5", "5.6.8"]),
+            &json!({"*": {"write": []}, "name": {"write": ["update"]}}),
+            &json!(["5.6.2", "5.6.3", "5.6.5", "5.6.8"]),
         ))?;
         // 5.6.2 (update) keeps name; append, delete and the upsert keep none
         let [(clauses, rules)] = got.as_slice() else {
@@ -878,8 +907,8 @@ mod tests {
     #[test]
     fn read_false_keeps_the_type_lists_and_the_history() -> Result<(), String> {
         let got = split(&air(
-            json!({"pm10": {"read": false}}),
-            json!(["5.7.2", "5.7.3", "5.7.8"]),
+            &json!({"pm10": {"read": false}}),
+            &json!(["5.7.2", "5.7.3", "5.7.8"]),
         ))?;
         let by = |c: &str| {
             got.iter()
@@ -931,7 +960,7 @@ mod tests {
             ),
             (json!({"name": {"edit": true}}), "unknown field"),
         ] {
-            let got = split(&air(attributes, json!(["5.7.2"])));
+            let got = split(&air(&attributes, &json!(["5.7.2"])));
             assert!(
                 got.as_ref().is_err_and(|e| e.contains(said)),
                 "{said}: {:?}",
