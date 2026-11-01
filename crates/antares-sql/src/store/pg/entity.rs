@@ -230,12 +230,12 @@ async fn enqueue_change(
 /// that carries no page (idPattern, federation, orderBy) has at all.
 pub const MAX_UNDECIDED_ROWS: i64 = 10_000;
 
-/// The column `q=` is compiled over: the stored document, or, for a row
+/// The document `q=` is judged against: the stored document, or, for a row
 /// holding an instance past its `expiresAt` (`attrs_expire_at` past, rare
 /// until the sweep rewrites it), the document 4.22 lets a read see: expired
 /// top-level instances dropped, an Attribute left with none removed, as
 /// `filter::strip_expired` does in memory (F-ANT1-007). A live row pays
-/// only the CASE test.
+/// only the CASE test. [`live_q`] evaluates it once per row as [`LIVE_DOC`].
 // ponytail: only top-level instances are stripped here; a sub-Attribute past
 // its expiresAt still matches a `q` until the sweep, which reaches the row
 // through `attrs_expire_at`, rewrites it (one maintenance tick). Recurse here
@@ -249,6 +249,23 @@ const LIVE_ENTITY: &str = "(CASE WHEN attrs_expire_at IS NULL OR attrs_expire_at
           OR try_timestamptz(i.v ->> 'expiresAt') >= now()) \
         ELSE x.v END AS v FROM jsonb_each(entity) AS x(k, v)) AS l \
       WHERE l.v IS NOT NULL) END)";
+
+/// The column a compiled `q=` reads inside [`live_q`].
+const LIVE_DOC: &str = "live.doc";
+
+/// A `q=` compiled over [`LIVE_DOC`] as a WHERE clause of `entities`. A `q`
+/// leaf compiles to one jsonpath test per value member (nine), so a `q` of
+/// three leaves named the column 27 times: inlined, [`LIVE_ENTITY`] put 54
+/// expiry subplans into the statement, and planning and starting them cost
+/// a page ~7 ms of PostgreSQL CPU against ~1 ms over the bare column, which
+/// held the OData load shape at p95 1.3 s on four cores (T-6351). The
+/// `OFFSET 0` keeps PostgreSQL from pulling the subquery up and copying the
+/// expression into every reference again.
+fn live_q(compiled: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM (SELECT {LIVE_ENTITY} AS doc OFFSET 0) AS live WHERE {compiled})"
+    )
+}
 
 /// Distinct types a type selection may split into arms; a longer list keeps
 /// the plain containment, which reads the Tenant.
@@ -1354,12 +1371,12 @@ impl PgEntityStore {
         if let Some(node) = f.q {
             match crate::compile::q::compile_q(
                 node,
-                LIVE_ENTITY,
+                LIVE_DOC,
                 binds.len().saturating_add(1),
                 f.expand,
             ) {
                 Some(c) => {
-                    wheres.push(c.sql);
+                    wheres.push(live_q(&c.sql));
                     binds.extend(c.binds.into_iter().map(Bind::Path));
                     if let Some((iri, key)) = valued(node, f.expand) {
                         probes.push(value_probe(tenant, iri, key));
@@ -2296,6 +2313,20 @@ mod tests {
 
     fn wheres() -> Vec<String> {
         vec!["tenant_id = $1".to_owned()]
+    }
+
+    /// T-6351: a `q` of three leaves names the expiry-stripped document 27
+    /// times, and the statement still holds its rebuild once.
+    #[test]
+    fn a_q_holds_the_expiry_rebuild_once() {
+        let expand = |t: &str| format!("https://x/{t}");
+        let node = antares_ql::parse_q(r#"level>=10;level<20;category=="c3""#).expect("q parses");
+        let c = crate::compile::q::compile_q(&node, LIVE_DOC, 2, &expand).expect("compiles");
+        assert!(c.sql.matches(LIVE_DOC).count() >= 27, "{}", c.sql);
+        let sql = live_q(&c.sql);
+        assert_eq!(sql.matches("jsonb_each(entity)").count(), 1, "{sql}");
+        assert_eq!(sql.matches(LIVE_ENTITY).count(), 1, "{sql}");
+        assert!(sql.contains("OFFSET 0) AS live WHERE"), "{sql}");
     }
 
     /// T-5136: only a `!location` every match must satisfy narrows to
