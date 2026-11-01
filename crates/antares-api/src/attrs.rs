@@ -1373,7 +1373,10 @@ async fn set_attr_value_inner(
         body: judged.as_ref().ok().and_then(Option::as_ref),
     )
     .await?;
+    #[cfg(feature = "views")]
     let judged = judged?;
+    #[cfg(not(feature = "views"))]
+    judged?;
     #[cfg(feature = "views")]
     if let Some(j) = &judged {
         crate::schema_writes::admits(st, &tenant, id, j, &pre.types).await?;
