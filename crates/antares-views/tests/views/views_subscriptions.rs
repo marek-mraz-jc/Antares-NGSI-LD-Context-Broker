@@ -370,3 +370,79 @@ async fn a_subscription_is_reachable_only_through_its_view() -> Result<(), Strin
     assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.text);
     Ok(())
 }
+
+/// T-6371: one change is judged once per view, not once per Subscription.
+/// Two Subscriptions through `fleet` and one through `narrow` (speed only)
+/// match the same change: each `fleet` one gets the shown colour, the
+/// `narrow` one never sees it, and a colour-only change reaches `fleet`
+/// alone. A view's judgement never stands in for another view's.
+#[tokio::test(flavor = "multi_thread")]
+async fn subscriptions_of_two_views_each_see_their_own_view_of_one_change() -> Result<(), String> {
+    let f = fixture().await?;
+    let mut narrow = crate::common::fleet_view();
+    if let Some(o) = narrow.as_object_mut() {
+        o.insert("id".into(), json!("narrow"));
+        o.insert(
+            "rules".into(),
+            json!([{"types": ["Car"], "attributes": ["speed"]}]),
+        );
+    }
+    put_view(&f.app, &narrow).await?;
+    let (wide_uri, mut wide) = sink().await?;
+    let (narrow_uri, mut narrowed) = sink().await?;
+    for id in ["a", "b"] {
+        subscribe(
+            &f,
+            FLEET,
+            &to_cars(&format!("urn:ngsi-ld:Subscription:wide-{id}"), &wide_uri),
+        )
+        .await?;
+    }
+    subscribe(
+        &f,
+        "/x/views/narrow/ngsi-ld/v1",
+        &to_cars("urn:ngsi-ld:Subscription:narrow", &narrow_uri),
+    )
+    .await?;
+    // one change at a time, so no lane folds the two into one notification
+    let mut sent = Vec::new();
+    for change in [
+        json!({"colour": prop(&json!("grey"))}),
+        json!({"speed": prop(&json!(20)), "colour": prop(&json!("green"))}),
+    ] {
+        patch(&f, "1", &change).await?;
+        for _ in 0..2 {
+            let n = next(&mut wide).await?;
+            assert!(only(&n)?.get("colour").is_some(), "fleet shows colour: {n}");
+            sent.push(
+                n.get("subscriptionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
+        }
+    }
+    sent.sort();
+    assert_eq!(
+        sent,
+        [
+            "urn:ngsi-ld:Subscription:wide-a",
+            "urn:ngsi-ld:Subscription:wide-a",
+            "urn:ngsi-ld:Subscription:wide-b",
+            "urn:ngsi-ld:Subscription:wide-b"
+        ]
+    );
+    let n = next(&mut narrowed).await?;
+    let car = only(&n)?;
+    assert_eq!(car.pointer("/speed/value"), Some(&json!(20)), "{n}");
+    for hidden in ["colour", "grey", "green", "secret"] {
+        assert!(!leaks(&n, hidden), "{hidden} leaked to narrow: {n}");
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), narrowed.recv())
+            .await
+            .is_err(),
+        "the colour-only change reached the narrow view"
+    );
+    Ok(())
+}

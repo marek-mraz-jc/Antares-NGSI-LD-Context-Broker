@@ -348,6 +348,15 @@ pub(super) fn project_joined(f: &crate::policy::Filter, e: &mut Value, key_value
     }
 }
 
+/// What [`view_sees`] answers: the shown set, the narrowed document, the
+/// view's representation.
+#[cfg(feature = "views")]
+pub(super) type ViewSeen = (crate::policy::Shown<'static>, Value, crate::repr::Repr);
+
+/// One change's [`ViewSeen`] per view, by the compiled view's address.
+#[cfg(feature = "views")]
+type SeenMemo = HashMap<usize, (Arc<crate::views::CompiledView>, Option<Arc<ViewSeen>>)>;
+
 /// ADR-0023 rule 9: what a Subscription made through `view` sees of the
 /// changed Entity `doc` (internal form): the Attributes the view shows of it,
 /// the document with only those, and the view's narrowing for a linked
@@ -359,7 +368,7 @@ pub(super) async fn view_sees(
     tenant: &TenantId,
     view: &crate::views::CompiledView,
     doc: &Value,
-) -> Option<(crate::policy::Shown<'static>, Value, crate::repr::Repr)> {
+) -> Option<ViewSeen> {
     let repr = crate::repr::narrowing(view.narrowing());
     let ctx = crate::repr::policy_context();
     if !crate::repr::policy_admits(st, tenant, ctx, repr.policy_reach.as_deref(), doc).await {
@@ -532,6 +541,14 @@ pub(super) async fn matches_for(
     // one instant for the change, so equal shapes render one payload
     let now = now_iso();
     let mut built: HashMap<String, Vec<Value>> = HashMap::new();
+    // What a view sees of this change, once per view: every Subscription made
+    // through one view reads the same narrowing of the same document, and a
+    // fan-out of 1 000 Subscriptions on one view judged and copied it 1 000
+    // times per change on the serial matcher (T-6371). Keyed by the compiled
+    // view's address; the entry holds the view, so a view replaced during
+    // this call cannot free that address for another view to take.
+    #[cfg(feature = "views")]
+    let mut seen_memo: SeenMemo = HashMap::new();
     for sub in subs {
         if !is_active(&sub) || sub.get("timeInterval").is_some() {
             continue;
@@ -544,13 +561,24 @@ pub(super) async fn matches_for(
         let seen = match crate::views::of_subscription(st, &tenant, &sub) {
             None => None,
             Some(None) => continue,
-            Some(Some(view)) => match view_sees(st, &tenant, &view, eval_doc).await {
-                Some(seen) => Some(seen),
-                None => continue,
-            },
+            Some(Some(view)) => {
+                let key = Arc::as_ptr(&view) as usize;
+                let seen = match seen_memo.get(&key) {
+                    Some((_, seen)) => seen.clone(),
+                    None => {
+                        let seen = view_sees(st, &tenant, &view, eval_doc).await.map(Arc::new);
+                        seen_memo.insert(key, (view, seen.clone()));
+                        seen
+                    }
+                };
+                match seen {
+                    Some(seen) => Some(seen),
+                    None => continue,
+                }
+            }
         };
         #[cfg(feature = "views")]
-        let (eval_doc, narrow) = match &seen {
+        let (eval_doc, narrow) = match seen.as_deref() {
             Some((_, doc, repr)) => (doc, Some((repr, crate::repr::policy_context()))),
             None => (eval_doc, None),
         };
@@ -568,7 +596,7 @@ pub(super) async fn matches_for(
             .filter(|(k, _)| watched.as_ref().is_none_or(|w| w.contains(&k.as_str())))
             .collect();
         #[cfg(feature = "views")]
-        if let Some((shown, _, _)) = &seen {
+        if let Some((shown, _, _)) = seen.as_deref() {
             relevant.retain(|(k, _)| shown.allows(k));
             if relevant.is_empty() {
                 continue;
