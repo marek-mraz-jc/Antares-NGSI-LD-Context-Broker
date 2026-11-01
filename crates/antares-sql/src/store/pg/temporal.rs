@@ -1614,12 +1614,12 @@ impl PgTemporalStore {
             "SELECT attr_id, data || jsonb_build_object('version', version) || jsonb_strip_nulls( \
                  jsonb_build_object('provenance', provenance, 'supersededAt', \
                    to_char(superseded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'))) \
-             FROM (SELECT attr_id, observed_at, dataset_id, version, data, provenance, superseded_at \
+             FROM (SELECT attr_id, observed_at, dataset_id, version, instance_id, data, provenance, superseded_at \
                      FROM attr_versions WHERE tenant_id = $1 AND entity_id = $2 \
                    UNION ALL \
-                   SELECT ai.attr_id, ai.observed_at, ai.dataset_id, ai.version, {}, ai.provenance, NULL \
+                   SELECT ai.attr_id, ai.observed_at, ai.dataset_id, ai.version, ai.instance_id, {}, ai.provenance, NULL \
                      FROM {} ai) v \
-             ORDER BY attr_id, observed_at, dataset_id NULLS FIRST, version",
+             ORDER BY attr_id, observed_at, dataset_id NULLS FIRST, version, instance_id",
             restamp("ai"),
             history("$1", "$2")
         )))
