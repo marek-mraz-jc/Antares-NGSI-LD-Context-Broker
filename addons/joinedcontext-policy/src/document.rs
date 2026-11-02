@@ -78,7 +78,7 @@ pub enum Kind {
     ServiceAccount,
     /// No header carries one yet: matches nobody.
     Did,
-    /// `x-jc-organization`: a member of the Organization of the Endpoint's project, as the
+    /// `x-jc-member: true`: a member of the Organization of the Endpoint's project, as the
     /// gateway verified it from the token's `jc_org` (ADR-N-067 2.3). Carries no id.
     Organization,
 }

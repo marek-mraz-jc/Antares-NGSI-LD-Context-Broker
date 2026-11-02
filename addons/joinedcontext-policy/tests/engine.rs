@@ -243,7 +243,7 @@ async fn a_participant_reads_what_its_agreement_grants_and_nothing_public() -> R
 }
 
 /// ADR-N-067 2.3: an `organization` assignee carries no id and grants every caller the gateway
-/// sent `x-jc-organization` for, which it does only when the token's verified `jc_org` names the
+/// sent `x-jc-member: true` for, which it does only when the token's verified `jc_org` names the
 /// Organization of the Endpoint's project.
 fn members(ops: &[&str]) -> Value {
     let p = json!({"id": "members", "assignee": {"kind": "organization"}, "operations": ops});
@@ -254,10 +254,7 @@ fn members(ops: &[&str]) -> Value {
 async fn a_member_of_the_endpoints_organization_reads_the_granted_type() -> Res {
     let (st, _) = broker(doc(&[members(&["5.7.2"])])).await?;
     fleet(&st).await?;
-    let member = [
-        ("x-jc-subject", "ana@example.org"),
-        ("x-jc-organization", "hel"),
-    ];
+    let member = [("x-jc-subject", "ana@example.org"), ("x-jc-member", "true")];
     let (code, list) = send(&st, "GET", QUERY, &member, None).await?;
     assert_eq!(code, StatusCode::OK, "{list}");
     assert_eq!(ids(&list), car_ids(&[1, 2, 3]));
@@ -266,8 +263,8 @@ async fn a_member_of_the_endpoints_organization_reads_the_granted_type() -> Res 
     Ok(())
 }
 
-/// A member of another Organization reaches the broker with no `x-jc-organization` (the gateway
-/// sends it only for the Endpoint's own), whatever groups and roles they carry.
+/// A member of another Organization reaches the broker with no `x-jc-member` (the gateway sends
+/// it only for the Endpoint's own Organization), whatever groups and roles they carry.
 #[tokio::test]
 async fn a_member_of_another_organization_reads_nothing() -> Res {
     let (st, _) = broker(doc(&[members(&["5.7.2"])])).await?;
@@ -277,7 +274,7 @@ async fn a_member_of_another_organization_reads_nothing() -> Res {
         ("x-jc-groups", "members,hel"),
         ("x-jc-roles", "member"),
     ];
-    for who in [&outsider[..], &ANA[..], &[("x-jc-organization", "")][..]] {
+    for who in [&outsider[..], &ANA[..], &[("x-jc-member", "yes")][..]] {
         assert_eq!(
             send(&st, "GET", QUERY, who, None).await?.0,
             StatusCode::FORBIDDEN,
@@ -288,17 +285,21 @@ async fn a_member_of_another_organization_reads_nothing() -> Res {
 }
 
 /// An anonymous caller and a data-space participant hold no Organization, even with an
-/// `x-jc-organization` beside their headers.
+/// `x-jc-member: true` beside their headers.
 #[tokio::test]
 async fn an_organization_header_beside_an_anonymous_caller_or_a_participant_is_ignored() -> Res {
     let (st, _) = broker(doc(&[members(&["5.7.2"])])).await?;
     fleet(&st).await?;
-    let anonymous = [("x-jc-roles", "public"), ("x-jc-organization", "hel")];
+    let anonymous = [("x-jc-roles", "public"), ("x-jc-member", "true")];
     let participant = [
         ("x-jc-did", "did:web:consumer.example"),
-        ("x-jc-organization", "hel"),
+        ("x-jc-member", "true"),
     ];
-    for who in [&anonymous[..], &participant[..], &[("x-jc-organization", "hel")][..]] {
+    for who in [
+        &anonymous[..],
+        &participant[..],
+        &[("x-jc-member", "true")][..],
+    ] {
         assert_eq!(
             send(&st, "GET", QUERY, who, None).await?.0,
             StatusCode::FORBIDDEN,
@@ -314,7 +315,10 @@ async fn an_organization_header_beside_an_anonymous_caller_or_a_participant_is_i
 async fn an_organization_assignee_naming_an_id_is_refused() -> Res {
     let (_, engine) = broker(doc(&[members(&["5.7.2"])])).await?;
     let named = grant("org", "organization", "hel", &["5.7.2"], cars(&[]));
-    let why = engine.load("default", &doc(&[named])).err().unwrap_or_default();
+    let why = engine
+        .load("default", &doc(&[named]))
+        .err()
+        .unwrap_or_default();
     assert!(why.contains("names no id"), "{why:?}");
     Ok(())
 }
