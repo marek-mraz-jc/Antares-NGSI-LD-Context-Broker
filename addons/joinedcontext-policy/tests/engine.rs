@@ -274,7 +274,9 @@ async fn a_member_of_another_organization_reads_nothing() -> Res {
         ("x-jc-groups", "members,hel"),
         ("x-jc-roles", "member"),
     ];
-    for who in [&outsider[..], &ANA[..], &[("x-jc-member", "yes")][..]] {
+    // only `true` is a member (deny by default)
+    let malformed = [("x-jc-subject", "ana@example.org"), ("x-jc-member", "yes")];
+    for who in [&outsider[..], &ANA[..], &malformed[..]] {
         assert_eq!(
             send(&st, "GET", QUERY, who, None).await?.0,
             StatusCode::FORBIDDEN,
