@@ -43,9 +43,10 @@ drivers keep the current version only.
 
 Each row carries its provenance: `channel` (`api`, `pipeline`, `ui`,
 `import`, `backfill`, `mqtt`), `actor`, `operation` (`create`, `update`,
-`correct`, `backfill`, `delete`), `reason` and `requestId`. The broker
-believes the `JC-Provenance-Channel`, `JC-Provenance-Actor`, `JC-Reason`
-(percent-encoded) and `X-Request-Id` headers only from the mesh identity
+`correct`, `backfill`, `delete`), `client` (the application the write came
+through), `reason` and `requestId`. The broker believes the
+`JC-Provenance-Channel`, `JC-Provenance-Actor`, `JC-Provenance-Client`,
+`JC-Reason` (percent-encoded) and `X-Request-Id` headers only from the mesh identity
 `ANTARES_PROVENANCE_FROM` names in `l5d-client-id`; from anyone else a
 write is `channel: api` with no actor. A read never returns provenance as
 data, except through `versions=all` (below).
