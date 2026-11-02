@@ -12,7 +12,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 /// The largest grant document `/q/grants` accepts, in bytes.
 pub const MAX_GRANT_BYTES: usize = 4096;
