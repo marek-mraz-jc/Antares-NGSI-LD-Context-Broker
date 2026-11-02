@@ -556,7 +556,9 @@ impl PgDocStore {
         id: &str,
         now: &str,
     ) -> Result<Option<(Value, Option<Value>)>, sqlx::Error> {
-        let mut found = self.record_deliveries(tenant, kind, &[(id, now)]).await?;
+        let mut found = self
+            .record_deliveries(tenant, kind, &[(id, now, 1)])
+            .await?;
         Ok(found.remove(id))
     }
 
@@ -564,37 +566,43 @@ impl PgDocStore {
     /// (T-5159): the rows are locked in id order, so two batches over
     /// overlapping subscriptions queue behind each other instead of
     /// deadlocking, and each pre-image is still the value its own row lock
-    /// re-read. A subscription that is gone has no entry in the answer.
+    /// re-read. An attempt is (id, instant, times): `timesSent` moves by
+    /// `times`, a window's merged notifications (T-6371). A subscription
+    /// that is gone has no entry in the answer.
     pub async fn record_deliveries(
         &self,
         tenant: &TenantId,
         kind: DocKind,
-        attempts: &[(&str, &str)],
+        attempts: &[(&str, &str, i64)],
     ) -> Result<std::collections::HashMap<String, (Value, Option<Value>)>, sqlx::Error> {
         if attempts.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
         let table = kind.table();
         let col = kind.doc_column();
-        let (ids, stamps): (Vec<&str>, Vec<&str>) = attempts.iter().copied().unzip();
+        let ids: Vec<&str> = attempts.iter().map(|a| a.0).collect();
+        let stamps: Vec<&str> = attempts.iter().map(|a| a.1).collect();
+        let times: Vec<i64> = attempts.iter().map(|a| a.2).collect();
         // literals from DocKind; every value is bound
         let sql = format!(
             "UPDATE {table} AS d SET
                {col} = jsonb_set(jsonb_set(jsonb_set(jsonb_set(
                    d.{col} - 'status',
                    '{{notification,timesSent}}',
-                   to_jsonb(COALESCE((d.{col} #>> '{{notification,timesSent}}')::bigint, 0) + 1)),
+                   to_jsonb(COALESCE((d.{col} #>> '{{notification,timesSent}}')::bigint, 0) + prev.times)),
                    '{{notification,lastNotification}}', to_jsonb(prev.stamp)),
                    '{{notification,lastSuccess}}', to_jsonb(prev.stamp)),
                    '{{notification,status}}', '\"ok\"'::jsonb),
-               times_sent = COALESCE(d.times_sent, 0) + 1,
+               times_sent = COALESCE(d.times_sent, 0) + prev.times,
                last_notification = prev.stamp::timestamptz,
                last_success = prev.stamp::timestamptz
              FROM (SELECT s.id AS locked_id,
                           s.{col} #> '{{notification,lastSuccess}}' AS ls,
-                          a.stamp
+                          a.stamp,
+                          a.times
                      FROM {table} AS s
-                     JOIN unnest($2::text[], $3::text[]) AS a(id, stamp) ON s.id = a.id
+                     JOIN unnest($2::text[], $3::text[], $4::bigint[]) AS a(id, stamp, times)
+                       ON s.id = a.id
                     WHERE s.tenant_id = $1
                     ORDER BY s.id
                       FOR UPDATE OF s) AS prev
@@ -607,6 +615,7 @@ impl PgDocStore {
             .bind(tenant.as_str())
             .bind(&ids)
             .bind(&stamps)
+            .bind(&times)
             .fetch_all(&mut *tx)
             .await?;
         tx.commit().await?;

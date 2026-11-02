@@ -664,20 +664,26 @@ pub trait CurrentStateDriver: Send + Sync {
         record_delivery_via_mutate(self, tenant, kind, id, now).await
     }
     /// [`Self::record_delivery`] for several attempts at once, one answer per
-    /// attempt in input order. The ids are distinct: an attempt books exactly
-    /// one notification and its pre-image is the value it overwrote. The
-    /// default books them one by one; a backend that can should write them
-    /// as one statement, which is what keeps a fan-out of thousands of
-    /// in-process deliveries at one round trip per batch (T-5159).
+    /// attempt in input order. An attempt is (id, instant, times): the ids
+    /// are distinct, `times` notifications are booked at the instant (the
+    /// last of a merged window, T-6371) and the pre-image is the value it
+    /// overwrote. The default books them one by one; a backend that can
+    /// should write them as one statement, which is what keeps a fan-out of
+    /// thousands of in-process deliveries at one round trip per batch
+    /// (T-5159).
     async fn record_deliveries(
         &self,
         tenant: &TenantId,
         kind: Kind,
-        attempts: &[(&str, &str)],
+        attempts: &[(&str, &str, i64)],
     ) -> Result<Vec<Option<Delivery>>, NgsiError> {
         let mut out = Vec::with_capacity(attempts.len());
-        for (id, now) in attempts {
-            out.push(self.record_delivery(tenant, kind, id, now).await?);
+        for (id, now, times) in attempts {
+            let mut booked = None;
+            for _ in 0..*times {
+                booked = self.record_delivery(tenant, kind, id, now).await?;
+            }
+            out.push(booked);
         }
         Ok(out)
     }

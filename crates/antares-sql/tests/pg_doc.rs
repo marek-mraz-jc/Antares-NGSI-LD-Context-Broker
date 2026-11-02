@@ -1045,14 +1045,22 @@ async fn record_deliveries_books_each_subscription_once() {
         .record_deliveries(
             &t,
             DocKind::Subscription,
-            &[(b, tb), ("urn:ngsi-ld:Subscription:gone", ta), (a, ta)],
+            &[
+                (b, tb, 1),
+                ("urn:ngsi-ld:Subscription:gone", ta, 1),
+                (a, ta, 3),
+            ],
         )
         .await
         .expect("book");
     assert_eq!(found.len(), 2, "the gone subscription books nothing");
     let (doc_a, prev_a) = found.get(a).expect("a booked");
     assert_eq!(prev_a, &Some(json!(t0)));
-    assert_eq!(doc_a["notification"]["timesSent"], json!(5));
+    assert_eq!(
+        doc_a["notification"]["timesSent"],
+        json!(7),
+        "a merged window"
+    );
     assert_eq!(doc_a["notification"]["lastNotification"], json!(ta));
     let (doc_b, prev_b) = found.get(b).expect("b booked");
     assert_eq!(prev_b, &None);

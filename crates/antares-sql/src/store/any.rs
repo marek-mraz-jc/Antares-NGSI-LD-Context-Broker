@@ -2126,7 +2126,7 @@ impl antares_store::CurrentStateDriver for AnyStore {
         &self,
         tenant: &TenantId,
         kind: Kind,
-        attempts: &[(&str, &str)],
+        attempts: &[(&str, &str, i64)],
     ) -> Result<Vec<Option<antares_store::Delivery>>, NgsiError> {
         #[cfg(feature = "postgres")]
         {
@@ -2138,7 +2138,7 @@ impl antares_store::CurrentStateDriver for AnyStore {
                     .map_err(db)?;
                 return Ok(attempts
                     .iter()
-                    .map(|(id, _)| {
+                    .map(|(id, _, _)| {
                         found
                             .remove(*id)
                             .map(|(doc, prev_success)| antares_store::Delivery {
@@ -2150,8 +2150,13 @@ impl antares_store::CurrentStateDriver for AnyStore {
             }
         }
         let mut out = Vec::with_capacity(attempts.len());
-        for (id, now) in attempts {
-            out.push(antares_store::record_delivery_via_mutate(self, tenant, kind, id, now).await?);
+        for (id, now, times) in attempts {
+            let mut booked = None;
+            for _ in 0..*times {
+                booked =
+                    antares_store::record_delivery_via_mutate(self, tenant, kind, id, now).await?;
+            }
+            out.push(booked);
         }
         Ok(out)
     }

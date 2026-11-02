@@ -17,6 +17,7 @@
 mod coalesce;
 mod csource;
 mod delivery;
+pub(crate) use coalesce::settle_bookings;
 pub(crate) use delivery::kv_pairs;
 mod interval;
 mod matching;

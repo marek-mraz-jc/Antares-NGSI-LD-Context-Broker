@@ -437,6 +437,15 @@ impl SubMirror {
             .collect()
     }
 
+    /// Whether the subscription `id` of `tenant` is in the mirror now.
+    pub(crate) fn holds(&self, tenant: &str, id: &str) -> bool {
+        self.map
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(tenant)
+            .is_some_and(|t| t.docs.contains_key(id))
+    }
+
     #[cfg(any(test, feature = "test-kit"))]
     pub fn docs(&self, tenant: &str) -> Vec<std::sync::Arc<Value>> {
         self.map

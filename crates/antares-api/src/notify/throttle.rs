@@ -141,6 +141,8 @@ pub(super) async fn process_queued(
     // every group's round-trips on a single task's poll budget.
     #[cfg(not(target_arch = "wasm32"))]
     {
+        let tenants: std::collections::HashSet<TenantId> =
+            groups.iter().map(|g| g.tenant.clone()).collect();
         let mut set = tokio::task::JoinSet::new();
         for g in groups {
             let st = st.clone();
@@ -150,6 +152,9 @@ pub(super) async fn process_queued(
             if joined.is_err() {
                 note_panic();
             }
+        }
+        for tenant in &tenants {
+            super::coalesce::settle_bookings(st, tenant).await;
         }
     }
     #[cfg(target_arch = "wasm32")]
