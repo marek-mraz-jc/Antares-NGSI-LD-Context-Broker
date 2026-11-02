@@ -22,6 +22,7 @@ token and strips them from every client request.
 | `x-jc-restricted` | `true` when the caller opted into the restricted signal (O-3 (b)) |
 | `x-jc-did` | the data-space participant a transfer token names (platform DS-02, map K38) |
 | `x-jc-read-only` | `true` when the caller's token is a read-only connector's (platform S-49): every operation but a read is refused, whatever the policies grant; any value counts |
+| `x-jc-organization` | the Organization of the Endpoint's project, sent only when the token's verified `jc_org` names it (platform ADR-N-067 2.3): an `organization` assignee, which carries no `id`, grants every caller holding it; ignored beside an anonymous caller or `x-jc-did` |
 
 Each value, and each member of a list, is percent-encoded UTF-8 (RFC 3986:
 the unreserved characters `A-Z a-z 0-9 - . _ ~` stay as they are, every
