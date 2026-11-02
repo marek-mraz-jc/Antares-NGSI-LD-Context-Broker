@@ -105,9 +105,9 @@ A view without a schema, or with one the build cannot read, has no
 endpoint (`404`). A collection's `extent` is the bounding box (CRS84) of
 the Features the caller reads through the view, read as the caller, so the
 view's rules, its `q` and the Policy narrow it as they narrow `items`. One
-read takes at most 1 000 Features and is kept for 60 s per view, collection
-and caller; a larger collection, a `{type}-history` collection and one
-without a geometry state no `extent`. A `FeatureCollection` carries
+read takes at most 1 000 Features, asks for no count (T-6508) and is kept for
+60 s per view, collection and caller; a collection filling that read, a
+`{type}-history` collection and one without a geometry state no `extent`. A `FeatureCollection` carries
 `timeStamp`, the time the answer was made (T-5909).
 
 A view's `representations.ogc` list ([Views](views.md)) adds a collection per

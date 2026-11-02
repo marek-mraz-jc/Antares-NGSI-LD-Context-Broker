@@ -42,6 +42,9 @@ pub(crate) struct Params {
     pub filter: Option<ogc_cql2::Expr>,
     /// The NGSI-LD `lang` a `LanguageProperty` is read in: the caller's `Accept-Language`.
     pub lang: Option<String>,
+    /// Read the page without the store's whole count (T-6508), which walks every matching
+    /// row: the [`Page`] states neither `matched` nor a `next` from it.
+    pub uncounted: bool,
 }
 
 /// The `ngsild.` options a collection's `items` declares (ADR-0028 rule 6): each narrows.
@@ -664,6 +667,8 @@ pub(crate) struct Cursor {
     start: (usize, usize),
     limit: usize,
     digest: u64,
+    /// [`Params::uncounted`].
+    uncounted: bool,
     /// The part being read and where its read stands, `None` before its first read.
     part: usize,
     reading: Option<Reading>,
@@ -717,6 +722,7 @@ impl Cursor {
             start,
             limit: usize::try_from(p.limit).unwrap_or(usize::MAX),
             digest,
+            uncounted: p.uncounted,
             part: 0,
             reading: None,
             served: 0,
@@ -752,11 +758,7 @@ impl Cursor {
             self.limit.saturating_sub(self.served)
         };
         let size = room.min(view.page_size());
-        let page = antares_ops::Page {
-            start: r.pos,
-            size,
-            whole: r.residual.is_none() && r.first,
-        };
+        let page = self.store_page(&r, size);
         let (docs, next, count) = match &r.residual {
             None => scanned(view.scan(caller, &r.pushdown, None, page).await)?,
             Some(program) => scanned(
@@ -788,6 +790,7 @@ impl Cursor {
             return Ok(Some(features));
         }
         let count = match &r.residual {
+            _ if self.uncounted => None,
             None => r.count,
             // ponytail: the count reads the residual's answer again, within the budget; a
             // count kept beside the cursor when one request reads both.
@@ -820,6 +823,15 @@ impl Cursor {
         // anything, starts the next page at its offset 0.
         self.next = next.map(|next| token(i, next, self.digest));
         Ok(Some(features))
+    }
+
+    /// The next store read: a part's first read also counts it, unless the page is uncounted.
+    fn store_page(&self, r: &Reading, size: usize) -> antares_ops::Page {
+        antares_ops::Page {
+            start: r.pos,
+            size,
+            whole: !self.uncounted && r.residual.is_none() && r.first,
+        }
     }
 
     /// The first read of `part`: its residual compiled and its pushdown.
@@ -1126,6 +1138,25 @@ pub(crate) async fn one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T-6508: an uncounted page asks the store for no whole count; `items` still does.
+    #[test]
+    fn an_uncounted_page_asks_the_store_for_no_count() -> Result<(), String> {
+        let c = car();
+        let whole = |p: Params| -> Result<bool, String> {
+            let cursor = Cursor::new(&c, &p, 0).map_err(|e| e.1.to_owned())?;
+            let part = cursor.parts.first().ok_or("one part")?;
+            let reading = cursor.enter(part).map_err(|e| e.1.to_owned())?;
+            Ok(cursor.store_page(&reading, 10).whole)
+        };
+        assert!(whole(params(&c, &[]).map_err(|e| e.1.to_owned())?)?);
+        let uncounted = Params {
+            uncounted: true,
+            ..params(&c, &[]).map_err(|e| e.1.to_owned())?
+        };
+        assert!(!whole(uncounted)?);
+        Ok(())
+    }
 
     fn prop(name: &str, sortable: bool) -> crate::model::Prop {
         crate::model::Prop {

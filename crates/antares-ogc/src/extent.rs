@@ -2,8 +2,10 @@
 //! C6 and M8: a collection's spatial `extent` (T-5909), the bounding box of the Features the
 //! caller reads through the view. It is read as the caller through [`items::page`], so the
 //! view's rules, its `q` and the Policy narrow it exactly as they narrow `items`: a hidden
-//! Entity's location never widens it. One read takes at most [`EXTENT_SCAN`] Features; a
-//! collection holding more, a history collection and one without a geometry state none.
+//! Entity's location never widens it. One read takes at most [`EXTENT_SCAN`] Features, with no
+//! whole count (T-6508: on dev that count alone outran the read cut of a type of 67 000 rows,
+//! a page of it took 1 s); a collection filling that page, a history collection and one
+//! without a geometry state none.
 //! An answer is kept for [`FRESH_MICROS`] per view compilation, collection and caller, so a
 //! `/collections` read costs one read per collection per minute and `/collections` and
 //! `/collections/{c}` state the same extent (ETS `FeatureCollection` compares them).
@@ -82,12 +84,13 @@ pub(crate) async fn of(
     bbox.map(|b| json!({"spatial": {"bbox": [b], "crs": crate::crs::CRS84}}))
 }
 
-/// The bounding box of the collection's Features as the caller reads them; `None` past
+/// The bounding box of the collection's Features as the caller reads them; `None` at
 /// [`EXTENT_SCAN`] Features, on a refused read, or when no Feature has a position.
 async fn read(view: &ViewOps, caller: &Caller, c: &Collection) -> Option<[f64; 4]> {
     let p = Params {
         limit: EXTENT_SCAN,
         properties: Some(Vec::new()),
+        uncounted: true,
         ..items::params(c, &[]).ok()?
     };
     let refs = Refs {
@@ -96,7 +99,7 @@ async fn read(view: &ViewOps, caller: &Caller, c: &Collection) -> Option<[f64; 4
         alternate: false,
     };
     let page = items::page(view, caller, c, &p, 0, refs).await.ok()?;
-    if page.next.is_some() {
+    if page.features.len() >= EXTENT_SCAN as usize || page.next.is_some() {
         return None;
     }
     page.features
