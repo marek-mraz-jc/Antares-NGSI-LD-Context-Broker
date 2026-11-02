@@ -45,7 +45,6 @@ fn a_subject_from_an_unlisted_identity_counts_as_no_subject() {
     let _broker = Broker(
         Command::new(env!("CARGO_BIN_EXE_antares"))
             .env("ANTARES_HTTP_PORT", port.to_string())
-            .env("ANTARES_POLICY", "joinedcontext")
             .env("ANTARES_POLICY_SUBJECT_HEADERS", "x-jc-subject")
             .env("ANTARES_POLICY_SUBJECT_FROM", GATEWAY)
             .spawn()
