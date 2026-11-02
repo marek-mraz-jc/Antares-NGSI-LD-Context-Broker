@@ -22,6 +22,7 @@ token and strips them from every client request.
 | `x-jc-restricted` | `true` when the caller opted into the restricted signal (O-3 (b)) |
 | `x-jc-did` | the data-space participant a transfer token names (platform DS-02, map K38) |
 | `x-jc-read-only` | `true` when the caller's token is a read-only connector's (platform S-49): every operation but a read is refused, whatever the policies grant; any value counts |
+| `x-jc-member` | `true` when the token's verified `jc_org` names the Organization of the Endpoint's project (platform ADR-N-067 2.3): an `organization` assignee, which carries no `id`, grants every caller holding it; any other value, and the header beside an anonymous caller or `x-jc-did`, counts as no member |
 
 Each value, and each member of a list, is percent-encoded UTF-8 (RFC 3986:
 the unreserved characters `A-Z a-z 0-9 - . _ ~` stay as they are, every
@@ -94,7 +95,7 @@ refused:
 | `id` | required, unique in the document; named by the access surface and in a load error, never in a refusal |
 | `effect` | `permit` (default) or `prohibit` |
 | `assigner` | optional: the party that granted it (a DID or URL), shown by the access surface (section 4); decides nothing |
-| `assignee.kind` | `user` (`x-jc-subject`), `group`, `role`, `serviceAccount` (`x-jc-client`); `did` (`x-jc-did`) |
+| `assignee.kind` | `user` (`x-jc-subject`), `group`, `role`, `serviceAccount` (`x-jc-client`); `did` (`x-jc-did`); `organization` (`x-jc-member`, no `id`) |
 | `operations` | CIM 009 clauses (`5.6.1`, `5.7.2`, ...); the compiler expands the platform's operation names and groups |
 | `validity` | optional half-open `[from, to)`, RFC 3339 |
 | `information` | the grant's selectors; each `entities` member has a `type` (an IRI or a core term), at most one of `id` and `idPattern`; `propertyNames` and `relationshipNames` are the Attributes it shows, none = the whole Entity |
