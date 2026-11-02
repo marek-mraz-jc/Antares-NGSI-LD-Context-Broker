@@ -16,7 +16,6 @@
 
 use std::sync::{Arc, OnceLock};
 
-use antares_model::{NgsiError, TenantId};
 use serde_json::Value;
 
 /// The environment key of [`Mode`]: `enforce`, `report` (default) or `off`.
@@ -76,81 +75,6 @@ impl Hook {
     pub fn mode(&self) -> Mode {
         self.mode.get().copied().unwrap_or(Mode::Report)
     }
-}
-
-/// [`admits`] for a document whose `type` names the Entity's types (a
-/// create, a replace, a batch member): no store read.
-pub(crate) fn admits_typed(
-    st: &crate::state::AppState,
-    tenant: &TenantId,
-    doc: &Value,
-    whole: bool,
-) -> Result<(), NgsiError> {
-    let hook = &st.views.schema_writes;
-    let Some(check) = hook.check.get() else {
-        return Ok(());
-    };
-    let mode = hook.mode();
-    if mode == Mode::Off {
-        return Ok(());
-    }
-    let Some(schema) = st.views.schema(tenant.as_str()) else {
-        return Ok(());
-    };
-    match check(schema.revision, &schema.bytes, doc, whole) {
-        Ok(()) => Ok(()),
-        Err(why) if mode == Mode::Enforce => Err(NgsiError::BadRequestData(why)),
-        Err(why) => {
-            tracing::warn!(tenant = %tenant, refusal = %why, "a write breaks the Tenant's schema (reported, not refused)");
-            Ok(())
-        }
-    }
-}
-
-/// Rule T-5912 for a write to the Entity `id`: `doc` (expanded) keeps to
-/// the Tenant's schema. A fragment that names no `type` is judged by
-/// `types` (the stored types the policy gate read) or, when the gate read
-/// none, by the stored Entity's, read only when a check and a schema are
-/// there to use them.
-pub(crate) async fn admits(
-    st: &crate::state::AppState,
-    tenant: &TenantId,
-    id: &str,
-    doc: &Value,
-    types: &[String],
-) -> Result<(), NgsiError> {
-    if doc.get("type").is_some() {
-        return admits_typed(st, tenant, doc, false);
-    }
-    let hook = &st.views.schema_writes;
-    if hook.check.get().is_none()
-        || hook.mode() == Mode::Off
-        || st.views.schema(tenant.as_str()).is_none()
-    {
-        return Ok(());
-    }
-    let types: Vec<Value> = if types.is_empty() {
-        let stored = st
-            .store
-            .get(tenant, antares_store::Kind::Entity, id)
-            .await?;
-        stored
-            .as_ref()
-            .and_then(|d| d.get("type"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-    } else {
-        types.iter().cloned().map(Value::String).collect()
-    };
-    if types.is_empty() {
-        return Ok(());
-    }
-    let mut typed = doc.clone();
-    if let Some(o) = typed.as_object_mut() {
-        o.insert("type".to_owned(), Value::Array(types));
-    }
-    admits_typed(st, tenant, &typed, false)
 }
 
 #[cfg(test)]

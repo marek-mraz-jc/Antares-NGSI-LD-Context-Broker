@@ -11,6 +11,8 @@
 //! drain is logged and counted (`/q/health` temporalDrainErrors) — it never
 //! changes the response of a write that already committed.
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::provenance::PROVENANCE;
 use crate::state::{AppState, RecordMode};
 use antares_model::TenantId;
 use antares_store::{TemporalDriverExt as _, TemporalEvent};
@@ -34,7 +36,6 @@ tokio::task_local! {
     static BUFFER: std::cell::RefCell<Vec<TemporalEvent>>;
     static STAGED: std::cell::RefCell<Vec<TemporalEvent>>;
     static CHANGES: std::cell::RefCell<Vec<crate::mirror::Change>>;
-    static PROVENANCE: Value;
     static TENANT: Option<TenantId>;
 }
 
@@ -168,18 +169,6 @@ pub(crate) fn provenance(operation: &str) -> Value {
         o.insert("writtenAt".into(), Value::String(now));
     }
     out
-}
-
-/// The `modifiedBy` of the request in flight (DM-138); `None` outside a
-/// request and for a write the gateway did not send.
-pub(crate) fn modified_by() -> Option<Value> {
-    #[cfg(not(target_arch = "wasm32"))]
-    return PROVENANCE
-        .try_with(crate::provenance::modified_by)
-        .ok()
-        .flatten();
-    #[cfg(target_arch = "wasm32")]
-    None
 }
 
 /// Whether the request in flight came through an Endpoint that audits its

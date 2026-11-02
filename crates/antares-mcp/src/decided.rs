@@ -7,6 +7,7 @@
 //! nothing: an AI client cannot approve its own write.
 
 use crate::confirm::TTL;
+use antares_ops::ngsi_problem;
 use axum::extract::Path;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -265,7 +266,7 @@ fn read(questions: &Questions, id: &str, now: Instant) -> Response {
     let map = locked(questions);
     match map.get(id).filter(|q| q.until > now) {
         Some(q) => axum::Json(shown(id, q, now)).into_response(),
-        None => problem(StatusCode::NOT_FOUND, "no such open question"),
+        None => ngsi_problem(StatusCode::NOT_FOUND, "no such open question"),
     }
 }
 
@@ -276,14 +277,14 @@ fn read(questions: &Questions, id: &str, now: Instant) -> Response {
 fn decide(questions: &Questions, id: &str, body: &[u8], now: Instant) -> Response {
     let (decision, by) = match parse(body) {
         Ok(parsed) => parsed,
-        Err(why) => return problem(StatusCode::BAD_REQUEST, why),
+        Err(why) => return ngsi_problem(StatusCode::BAD_REQUEST, why),
     };
     let mut map = locked(questions);
     let Some(q) = map
         .get_mut(id)
         .filter(|q| q.until > now && by.iter().all(|pair| q.subject.contains(pair)))
     else {
-        return problem(StatusCode::NOT_FOUND, "no such open question");
+        return ngsi_problem(StatusCode::NOT_FOUND, "no such open question");
     };
     q.decision = Some(decision);
     tracing::info!(view = %q.view, tool = %q.tool, decision = decision.as_str(), "mcp write decided");
@@ -317,26 +318,6 @@ fn parse(body: &[u8]) -> Result<(Decision, Subject), &'static str> {
         return Err("subject: name the person who decided");
     }
     Ok((decision, by))
-}
-
-fn problem(status: StatusCode, detail: &str) -> Response {
-    let kind = if status == StatusCode::NOT_FOUND {
-        "ResourceNotFound"
-    } else {
-        "BadRequestData"
-    };
-    (
-        status,
-        [(axum::http::header::CONTENT_TYPE, "application/problem+json")],
-        json!({
-            "type": format!("https://uri.etsi.org/ngsi-ld/errors/{kind}"),
-            "title": kind,
-            "status": status.as_u16(),
-            "detail": detail,
-        })
-        .to_string(),
-    )
-        .into_response()
 }
 
 #[cfg(test)]

@@ -18,10 +18,12 @@
 //! service, never its access rules.
 
 /// What [`Filter::metadata`] holds, here beside it for an engine crate.
-pub use crate::metadata::Metadata;
+pub mod metadata;
+
 use antares_ql::geo::GeoQuery;
 use antares_ql::QNode;
 use axum::http::HeaderMap;
+pub use metadata::Metadata;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -366,9 +368,9 @@ pub struct Filter {
     /// The metadata members each Attribute shows (platform ADR-N-066 2.4,
     /// DM-139): stripped from the answer after the handler, and a `q`,
     /// `orderBy` or `timeproperty` naming a stripped one is refused 400
-    /// (`crate::metadata`). `None` passes every member. Boxed for the
+    /// ([`metadata`]). `None` passes every member. Boxed for the
     /// size every [`Decision`] carries.
-    pub metadata: Option<Box<crate::metadata::Metadata>>,
+    pub metadata: Option<Box<metadata::Metadata>>,
 }
 
 /// A half-open interval `[from, to)` of `observedAt`; an open end is the
@@ -1698,7 +1700,7 @@ pub async fn gate(
         // `Filter` there into a deny, so a handler of such a clause reads
         // what it gets back as the condition and nothing else.
         Decision::Filter(f) | Decision::AllowIf(f) => {
-            crate::metadata::hold(f.metadata.as_deref())?;
+            metadata::hold(f.metadata.as_deref())?;
             Ok(f)
         }
         Decision::Deny(why) => Err(Denied(why)),

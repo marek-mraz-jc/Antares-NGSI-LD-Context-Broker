@@ -93,16 +93,6 @@ pub(crate) struct Topic {
     pub select: Option<String>,
 }
 
-/// Whether `id` is an absolute URI (RFC 3986 3.1), as every NGSI-LD Entity id is.
-fn is_uri(id: &str) -> bool {
-    id.split_once(':').is_some_and(|(scheme, _)| {
-        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-            && scheme
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-    })
-}
-
 /// An id as the STA surface writes it into a path: an `OData` key literal, percent-encoded but for
 /// `:` and the quote (`antares_sta::mapping::self_link`).
 fn key(id: &str) -> String {
@@ -142,7 +132,7 @@ fn entity_of(set: &str, id: &str) -> Result<String, &'static str> {
         "ObservedProperties" => return Err("an ObservedProperty has no topic: name a Datastream"),
         _ => id.split('/').next().and_then(percent::decoded),
     };
-    urn.filter(|u| is_uri(u))
+    urn.filter(|u| antares_ops::outputs::is_uri(u))
         .ok_or("the id names no Entity of the view")
 }
 

@@ -62,6 +62,29 @@ pub enum Refusal {
     },
 }
 
+/// An NGSI-LD problem document (`application/problem+json`) for a route a surface adds beside
+/// the API: 400 `BadRequestData`, 404 `ResourceNotFound`, anything else `InternalError`.
+#[must_use]
+pub fn ngsi_problem(status: StatusCode, detail: &str) -> Response {
+    let kind = match status {
+        StatusCode::BAD_REQUEST => "BadRequestData",
+        StatusCode::NOT_FOUND => "ResourceNotFound",
+        _ => "InternalError",
+    };
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/problem+json")],
+        serde_json::json!({
+            "type": format!("https://uri.etsi.org/ngsi-ld/errors/{kind}"),
+            "title": kind,
+            "status": status.as_u16(),
+            "detail": detail,
+        })
+        .to_string(),
+    )
+        .into_response()
+}
+
 /// The fixed detail of [`Refusal::ContextNotAvailable`].
 pub const CONTEXT_DETAIL: &str = "a JSON-LD @context the request names could not be retrieved";
 
@@ -224,6 +247,32 @@ impl Problem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_ngsi_problem_names_its_kind_by_status() {
+        for (status, kind) in [
+            (StatusCode::BAD_REQUEST, "BadRequestData"),
+            (StatusCode::NOT_FOUND, "ResourceNotFound"),
+            (StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
+        ] {
+            let answer = ngsi_problem(status, "why");
+            assert_eq!(answer.status(), status);
+            assert_eq!(
+                answer.headers().get(header::CONTENT_TYPE),
+                Some(&HeaderValue::from_static("application/problem+json"))
+            );
+            let body = axum::body::to_bytes(answer.into_body(), 1024)
+                .await
+                .expect("body");
+            let doc: serde_json::Value = serde_json::from_slice(&body).expect("json");
+            assert_eq!(doc["title"], kind);
+            assert_eq!(doc["detail"], "why");
+            assert_eq!(
+                doc["type"],
+                format!("https://uri.etsi.org/ngsi-ld/errors/{kind}")
+            );
+        }
+    }
 
     #[test]
     fn a_problem_answers_as_its_kind() {

@@ -376,6 +376,18 @@ fn is_path(path: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "_-.:".contains(c))
 }
 
+/// Whether an id is an absolute URI (RFC 3986 section 3.1: a scheme, then `:`), as every
+/// NGSI-LD Entity id is.
+#[must_use]
+pub fn is_uri(id: &str) -> bool {
+    id.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    })
+}
+
 /// An NGSI-LD name: a letter or `_`, then letters, digits and `_`, at most 128.
 #[must_use]
 pub fn is_name(name: &str) -> bool {

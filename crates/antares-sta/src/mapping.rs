@@ -9,6 +9,7 @@
 //! an Attribute name `A` as the view answers it and a `datasetId` `D` enter an id through [`part`],
 //! an instant `T` through [`instant`], so every id splits back into the parts it was made of.
 
+use antares_ops::outputs::is_uri;
 use serde_json::{json, Map, Value};
 
 /// The UN/CEFACT unit code list a `unitCode` is read from.
@@ -260,18 +261,6 @@ pub fn urn_of(id: &str) -> Option<String> {
 pub fn stream_of(observation: &str) -> Option<&str> {
     let (stream, time) = observation.rsplit_once('/')?;
     (!time.is_empty() && split_stream(stream).is_some()).then_some(stream)
-}
-
-/// Whether an id is an absolute URI (RFC 3986 section 3.1: a scheme, then `:`), as every
-/// NGSI-LD Entity id is.
-#[must_use]
-pub fn is_uri(id: &str) -> bool {
-    id.split_once(':').is_some_and(|(scheme, _)| {
-        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-            && scheme
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-    })
 }
 
 /// A Datastream id as its Entity id, its Attribute's name and its `datasetId`.
