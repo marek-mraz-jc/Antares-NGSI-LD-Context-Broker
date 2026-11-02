@@ -897,7 +897,7 @@ pub async fn run_current_state_contract(
         .record_deliveries(
             a,
             Kind::Subscription,
-            &[(gone.as_str(), t3), (sub.as_str(), t3)],
+            &[(gone.as_str(), t3, 1), (sub.as_str(), t3, 1)],
         )
         .await
         .expect("record_deliveries");
@@ -917,8 +917,21 @@ pub async fn run_current_state_contract(
         Some(t2),
         "each attempt of a batch gets back the lastSuccess it overwrote"
     );
+    // T-6371: a merged window books its notifications at once, at its last
+    // instant.
+    let t4 = "2020-01-04T00:00:00.000Z";
+    let merged = d
+        .record_deliveries(a, Kind::Subscription, &[(sub.as_str(), t4, 3)])
+        .await
+        .expect("record_deliveries");
+    let merged = merged
+        .first()
+        .and_then(Option::as_ref)
+        .expect("the subscription is booked");
+    assert_eq!(merged.doc["notification"]["timesSent"], 6);
+    assert_eq!(merged.doc["notification"]["lastNotification"], t4);
     let elsewhere = d
-        .record_deliveries(b, Kind::Subscription, &[(sub.as_str(), t3)])
+        .record_deliveries(b, Kind::Subscription, &[(sub.as_str(), t3, 1)])
         .await
         .expect("record_deliveries");
     assert!(

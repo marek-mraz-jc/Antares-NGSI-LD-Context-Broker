@@ -177,6 +177,123 @@ impl<Q, A> Drop for Retire<'_, Q, A> {
     }
 }
 
+/// How long the stamps of in-process deliveries gather before one statement
+/// books them (T-6371). A fan-out of 10 000 notifications a second over 1 000
+/// sockets wrote 10 000 rows a second, and every socket waited for its row:
+/// one statement busy all the time, the largest single share of write-to-socket
+/// time. Over a second the same fan-out writes each Subscription once.
+#[cfg(not(target_arch = "wasm32"))]
+const BOOK_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The notifications of one window per Subscription: how many left, and the
+/// instant of the last. At most one entry per Subscription in the mirror.
+#[cfg(not(target_arch = "wasm32"))]
+type Window = HashMap<String, (i64, String)>;
+
+#[cfg(not(target_arch = "wasm32"))]
+static WINDOWS: std::sync::LazyLock<std::sync::Mutex<HashMap<Key, Window>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Taken around a window's statement, so a reader waits for the stamps that
+/// already left the window as well as for those still in it. ponytail: one
+/// turn for the process; a turn per tenant when one tenant's window is seen
+/// holding up another's reads.
+#[cfg(not(target_arch = "wasm32"))]
+static SETTLING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Whether this delivery may leave before its stamp is written. The mirror
+/// answers "does the Subscription still exist" (5.8.6: a deleted one is not
+/// notified) without a statement. A Subscription that reads its own stamp
+/// to decide stays booked first: `throttling` and `timeInterval` read
+/// `lastNotification`.
+pub(super) fn may_defer(st: &AppState, tenant: &TenantId, sub: &Value, id: &str) -> bool {
+    cfg!(not(target_arch = "wasm32"))
+        && sub.get("throttling").is_none()
+        && sub.get("timeInterval").is_none()
+        && st
+            .sub_mirror
+            .as_ref()
+            .is_some_and(|m| m.holds(tenant.as_str(), id))
+}
+
+/// Book one sent notification with its window. The window's task counts as a
+/// pending change, so a shutdown drain writes it before the pool closes; a
+/// crash loses at most one window of `timesSent`, never a notification.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn defer_booking(st: &AppState, tenant: &TenantId, sub_id: &str, now: &str) {
+    let key = key(st, tenant);
+    let mut windows = WINDOWS.lock().unwrap_or_else(|p| p.into_inner());
+    let opens = !windows.contains_key(&key);
+    let (times, last) = windows
+        .entry(key)
+        .or_default()
+        .entry(sub_id.to_owned())
+        .or_default();
+    *times = times.saturating_add(1);
+    now.clone_into(last);
+    drop(windows);
+    if opens {
+        st.pending_changes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let done = BatchDone {
+            pending: st.pending_changes.clone(),
+            taken: 1,
+        };
+        let (st, tenant) = (st.clone(), tenant.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(BOOK_WINDOW).await;
+            settle_bookings(&st, &tenant).await;
+            drop(done);
+        });
+    }
+}
+
+/// Wasm32 books every delivery before it leaves ([`may_defer`]).
+#[cfg(target_arch = "wasm32")]
+pub(super) fn defer_booking(_: &AppState, _: &TenantId, _: &str, _: &str) {}
+
+/// Write what `tenant`'s window holds now and wait for it. A reader of
+/// 5.2.14.2 members comes here first, so nobody who holds a notification
+/// reads a `timesSent` that does not count it.
+pub(crate) async fn settle_bookings(st: &AppState, tenant: &TenantId) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let key = key(st, tenant);
+        let _turn = SETTLING.lock().await;
+        let window = WINDOWS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key);
+        let attempts: Vec<(String, String, i64)> = window
+            .into_iter()
+            .flatten()
+            .map(|(id, (times, last))| (id, last, times))
+            .collect();
+        for ((id, _, _), booked) in attempts.iter().zip(book(st, tenant, &attempts).await) {
+            let doc = booked.map(|b| b.doc);
+            super::delivery::mirror_bookkeeping(st, tenant, Kind::Subscription, id, doc);
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = (st, tenant);
+}
+
+/// Book a deferred delivery that failed: after its window, so the failure
+/// lands on top of every success before it and rolls `lastSuccess` back to
+/// the last of them. What the failure write-back needs: the `lastSuccess`
+/// this attempt overwrote.
+pub(super) async fn book_failed_attempt(
+    st: &AppState,
+    tenant: &TenantId,
+    sub_id: &str,
+    now: &str,
+) -> Option<Value> {
+    settle_bookings(st, tenant).await;
+    let booked = book_in_process(st, tenant, sub_id, now).await?;
+    super::delivery::mirror_bookkeeping(st, tenant, Kind::Subscription, sub_id, Some(booked.doc));
+    booked.prev_success
+}
+
 /// The 5.2.14.2 stamp of one in-process delivery, written with every other
 /// in-process delivery of its tenant waiting for the same statement. `None`:
 /// the subscription is gone or the write failed, and nothing may be sent.
@@ -188,13 +305,13 @@ pub(super) async fn book_in_process(
 ) -> Option<Delivery> {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        static BOOKINGS: std::sync::LazyLock<Coalescer<(String, String), Option<Delivery>>> =
+        static BOOKINGS: std::sync::LazyLock<Coalescer<(String, String, i64), Option<Delivery>>> =
             std::sync::LazyLock::new(Coalescer::new);
         BOOKINGS
             .call(
                 st,
                 tenant,
-                (sub_id.to_owned(), now.to_owned()),
+                (sub_id.to_owned(), now.to_owned(), 1),
                 |st, tenant, attempts| async move { book(&st, &tenant, &attempts).await },
             )
             .await
@@ -202,7 +319,7 @@ pub(super) async fn book_in_process(
     }
     #[cfg(target_arch = "wasm32")]
     {
-        book(st, tenant, &[(sub_id.to_owned(), now.to_owned())])
+        book(st, tenant, &[(sub_id.to_owned(), now.to_owned(), 1)])
             .await
             .pop()
             .flatten()
@@ -216,7 +333,7 @@ pub(super) async fn book_in_process(
 pub(super) async fn book(
     st: &AppState,
     tenant: &TenantId,
-    attempts: &[(String, String)],
+    attempts: &[(String, String, i64)],
 ) -> Vec<Option<Delivery>> {
     let mut out: Vec<Option<Delivery>> = vec![None; attempts.len()];
     let mut left: Vec<usize> = (0..attempts.len()).collect();
@@ -225,12 +342,12 @@ pub(super) async fn book(
         let (round, later): (Vec<usize>, Vec<usize>) = left.into_iter().partition(|i| {
             attempts
                 .get(*i)
-                .is_some_and(|(id, _)| seen.insert(id.as_str()))
+                .is_some_and(|(id, _, _)| seen.insert(id.as_str()))
         });
-        let stamps: Vec<(&str, &str)> = round
+        let stamps: Vec<(&str, &str, i64)> = round
             .iter()
             .filter_map(|i| attempts.get(*i))
-            .map(|(id, now)| (id.as_str(), now.as_str()))
+            .map(|(id, now, times)| (id.as_str(), now.as_str(), *times))
             .collect();
         match st
             .store

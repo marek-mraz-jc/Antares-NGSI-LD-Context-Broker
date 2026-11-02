@@ -384,27 +384,34 @@ pub(super) async fn deliver_as(
     // it as a single statement instead of locking the row across a round
     // trip. At fan-out that lock is what serializes delivery.
     // An in-process delivery (a WebSocket, the forward transport) books with
-    // every other one of its tenant in one statement (T-5159); a network one
-    // keeps its own stamp right before its own send (046_12_01).
-    let booked = if !policed && kind == Kind::Subscription {
-        super::coalesce::book_in_process(st, tenant, &sub_id, &now).await
-    } else {
-        st.store
-            .record_delivery(tenant, kind, &sub_id, &now)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!("bookkeeping writeback failed: {e}");
-                None
-            })
-    };
-    // 5.8.6: notifications are sent for the subscriptions the broker holds.
-    // No row to book against means the subscription was deleted (or the
-    // store failed) between matching and delivery — nothing may be sent.
-    let Some(booked) = booked else {
-        return;
-    };
-    let mut prev_success = booked.prev_success;
-    mirror_bookkeeping(st, tenant, kind, &sub_id, Some(booked.doc));
+    // every other one of its tenant in one statement (T-5159), after its
+    // send where nothing depends on the stamp (T-6371); a network one keeps
+    // its own stamp right before its own send (046_12_01).
+    let in_process_booking = !policed && kind == Kind::Subscription;
+    let deferred = in_process_booking && super::coalesce::may_defer(st, tenant, sub, &sub_id);
+    let mut prev_success = None;
+    if !deferred {
+        let booked = if in_process_booking {
+            super::coalesce::book_in_process(st, tenant, &sub_id, &now).await
+        } else {
+            st.store
+                .record_delivery(tenant, kind, &sub_id, &now)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("bookkeeping writeback failed: {e}");
+                    None
+                })
+        };
+        // 5.8.6: notifications are sent for the subscriptions the broker
+        // holds. No row to book against means the subscription was deleted
+        // (or the store failed) between matching and delivery — nothing may
+        // be sent.
+        let Some(booked) = booked else {
+            return;
+        };
+        prev_success = booked.prev_success;
+        mirror_bookkeeping(st, tenant, kind, &sub_id, Some(booked.doc));
+    }
     // The notification endpoint is an egress destination like any other
     // — policy check once, breaker consulted before the attempt.
     // A refusal is a delivery failure for bookkeeping (status "failed",
@@ -460,7 +467,13 @@ pub(super) async fn deliver_as(
     } else {
         metrics::counter!("antares_notifications_failed_total", "scheme" => scheme).increment(1);
     }
+    if ok && deferred {
+        super::coalesce::defer_booking(st, tenant, &sub_id, &now);
+    }
     if !ok {
+        if deferred {
+            prev_success = super::coalesce::book_failed_attempt(st, tenant, &sub_id, &now).await;
+        }
         // 5.8.6 / 5.11.7: subscription status → "failed" on delivery failure;
         // roll back the optimistic lastSuccess stamp.
         let ts = now_iso();

@@ -1238,6 +1238,7 @@ pub async fn retrieve(
     let ctx = request_context(&st.loader, headers).await?;
     let clause = clause_on(st, &tenant, kind, id, "5.8.3", "5.11.4").await?;
     gate!(st, &tenant, headers, clause, ids: &[id]).await?;
+    crate::notify::settle_bookings(st, &tenant).await;
     let doc = st
         .store
         .get(&tenant, kind, id)
@@ -1265,6 +1266,7 @@ pub async fn list(
     let accept = parse_accept(headers)?;
     let ctx = request_context(&st.loader, headers).await?;
     let narrowing = gate!(st, &tenant, headers, clause_of(kind, "5.8.4", "5.11.5")).await?;
+    crate::notify::settle_bookings(st, &tenant).await;
     let cond = crate::policy::Condition::of(&narrowing);
     // 5.5.9.1: "only up to a maximum of L NGSI-LD Elements are RETRIEVED
     // and returned". 5.8.4 takes no filter parameters — `check_params`
