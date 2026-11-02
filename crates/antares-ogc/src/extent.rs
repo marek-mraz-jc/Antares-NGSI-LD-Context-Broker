@@ -99,7 +99,7 @@ async fn read(view: &ViewOps, caller: &Caller, c: &Collection) -> Option<[f64; 4
         alternate: false,
     };
     let page = items::page(view, caller, c, &p, 0, refs).await.ok()?;
-    if page.features.len() >= EXTENT_SCAN as usize || page.next.is_some() {
+    if page.features.len() as u64 >= EXTENT_SCAN || page.next.is_some() {
         return None;
     }
     page.features
