@@ -192,32 +192,6 @@ impl Mirror for DocMirror {
     }
 }
 
-/// What decides whether a change fires a Subscription, as text: its whole
-/// document without the members that belong to this one Subscription and no
-/// condition reads. Two Subscriptions of one shape give one verdict on one
-/// change, so a matcher judges the shape once (T-6371); a member added
-/// later keeps two Subscriptions apart until it is listed here, which costs
-/// time and never a wrong verdict.
-pub(crate) fn conditions_shape(doc: &Value) -> std::sync::Arc<str> {
-    const OWN: [&str; 6] = [
-        "id",
-        "notification",
-        "createdAt",
-        "modifiedAt",
-        "expiresAt",
-        "status",
-    ];
-    let conditions: std::collections::BTreeMap<&String, &Value> = doc
-        .as_object()
-        .into_iter()
-        .flatten()
-        .filter(|(k, _)| !OWN.contains(&k.as_str()))
-        .collect();
-    serde_json::to_string(&conditions)
-        .unwrap_or_default()
-        .into()
-}
-
 /// The subscription mirror — docs plus the inverted candidate index.
 ///
 /// Bucketing per subscription (conservative, union-of-buckets = candidates):
@@ -277,8 +251,6 @@ struct TenantIndex {
     // is a refcount bump, and the registration mirror above already holds
     // its documents this way.
     docs: std::collections::HashMap<String, std::sync::Arc<Value>>,
-    /// [`conditions_shape`] of each document.
-    shapes: std::collections::HashMap<String, std::sync::Arc<str>>,
     by_type: std::collections::HashMap<String, std::collections::HashSet<String>>,
     by_attr: std::collections::HashMap<String, std::collections::HashSet<String>>,
     broad: std::collections::HashSet<String>,
@@ -346,17 +318,12 @@ impl SubMirror {
     /// Apply one KV delta: `None` doc = deleted. Rekeys the index from the
     /// old doc before inserting the new one.
     pub fn apply(&self, tenant: &str, id: &str, doc: Option<Value>) {
-        let shape = doc.as_ref().map(conditions_shape);
         let mut map = self
             .map
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let t = map.entry(tenant.to_owned()).or_default();
         let born = t.born.remove(id);
-        t.shapes.remove(id);
-        if let Some(shape) = shape {
-            t.shapes.insert(id.to_owned(), shape);
-        }
         if let Some(old) = t.docs.remove(id) {
             match index_keys(&old) {
                 Keys::Types(ts) => {
@@ -435,22 +402,17 @@ impl SubMirror {
         changed_attrs: &[&str],
     ) -> Vec<std::sync::Arc<Value>> {
         self.candidates_before(tenant, types, changed_attrs, u64::MAX)
-            .into_iter()
-            .map(|(doc, _)| doc)
-            .collect()
     }
 
     /// [`SubMirror::candidates`] of a change queued at `queued` (a `tick`):
-    /// only the subscriptions that were in the mirror before it, each with
-    /// its conditions shape (the text two Subscriptions with one verdict on
-    /// a change share).
+    /// only the subscriptions that were in the mirror before it.
     pub fn candidates_before(
         &self,
         tenant: &str,
         types: &[&str],
         changed_attrs: &[&str],
         queued: u64,
-    ) -> Vec<(std::sync::Arc<Value>, std::sync::Arc<str>)> {
+    ) -> Vec<std::sync::Arc<Value>> {
         let map = self
             .map
             .read()
@@ -471,7 +433,7 @@ impl SubMirror {
         }
         ids.iter()
             .filter(|id| t.born.get(**id).is_some_and(|b| *b < queued))
-            .filter_map(|id| Some((t.docs.get(*id)?.clone(), t.shapes.get(*id)?.clone())))
+            .filter_map(|id| t.docs.get(*id).cloned())
             .collect()
     }
 
@@ -635,7 +597,7 @@ mod born {
         let mut out: Vec<String> = m
             .candidates_before("t", &["Car"], &[], queued)
             .iter()
-            .filter_map(|(d, _)| d["id"].as_str().map(str::to_owned))
+            .filter_map(|d| d["id"].as_str().map(str::to_owned))
             .collect();
         out.sort();
         out
