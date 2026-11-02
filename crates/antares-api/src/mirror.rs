@@ -442,7 +442,8 @@ impl SubMirror {
 
     /// [`SubMirror::candidates`] of a change queued at `queued` (a `tick`):
     /// only the subscriptions that were in the mirror before it, each with
-    /// its [`conditions_shape`].
+    /// its conditions shape (the text two Subscriptions with one verdict on
+    /// a change share).
     pub fn candidates_before(
         &self,
         tenant: &str,
