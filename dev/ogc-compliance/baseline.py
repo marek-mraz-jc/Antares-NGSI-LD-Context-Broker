@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The regression gate over a TEAM Engine run of the OGC API - Features ETS (T-3747), and of the
-SensorThings ETS ets-sta10 against ci/sta-compliance-baseline.json (T-4878).
+SensorThings ETS ets-sta10 against ci/sta-compliance-baseline.json (T-4878), and of the OGC API -
+Tiles ETS ets-ogcapi-tiles10 against ci/ogc-tiles-compliance-baseline.json (T-5195).
 
     dev/ogc-compliance/baseline.py write RESULTS.xml BASELINE.json   record a run as the baseline
     dev/ogc-compliance/baseline.py check RESULTS.xml BASELINE.json   red when a baseline pass is lost

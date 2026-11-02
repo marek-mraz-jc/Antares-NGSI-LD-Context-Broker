@@ -79,6 +79,10 @@ const KNOWN_KEYS: &[&str] = &[
     // provenance headers. Unset, every write is `channel: api`. Read by the
     // `jc` build only (T-4854); vanilla ignores it.
     "ANTARES_PROVENANCE_FROM",
+    // T-4875: the mesh identities (l5d-client-id) whose policy subject
+    // headers are believed; from anyone else they are dropped. Unset,
+    // every caller's are, as before.
+    "ANTARES_POLICY_SUBJECT_FROM",
     // 4.22 GC interval (memory/file arm); default 900 s, the ETSI stack runs
     // at 2 s so the transient TPs (422_01) exercise the sweep itself.
     "ANTARES_SWEEP_SECS",
@@ -1422,6 +1426,25 @@ async fn run(
         antares_api::ops_router(state)
     }
     .layer(antares_api::compression());
+    let routed = match subject_from()? {
+        Some(from) => {
+            tracing::info!(
+                ?from,
+                "policy subject headers believed from these mesh identities alone"
+            );
+            routed.layer(tower::util::MapRequestLayer::new(
+                move |mut req: axum::extract::Request| {
+                    antares_api::policy::drop_subject_unless_from(
+                        req.headers_mut(),
+                        &antares_api::policy::SUBJECT_HEADERS,
+                        &from,
+                    );
+                    req
+                },
+            ))
+        }
+        None => routed,
+    };
     let app: App = tower::util::MapRequest::new(routed, antares_api::trim_trailing_slash);
 
     // A connection that never finishes its request headers must not hold a
@@ -1585,6 +1608,31 @@ fn accept_backoff(e: &std::io::Error) -> bool {
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::Interrupted
     )
+}
+
+/// `ANTARES_POLICY_SUBJECT_FROM`, comma-separated mesh identities; `None`
+/// when unset, which believes every caller's subject headers. Set but naming
+/// nobody is fatal: an operator who set it asked for deny by default, and a
+/// blank value must not fall back to believing everyone.
+fn subject_from() -> Result<Option<Vec<String>>, String> {
+    let Ok(raw) = std::env::var("ANTARES_POLICY_SUBJECT_FROM") else {
+        return Ok(None);
+    };
+    parse_subject_from(&raw).map(Some)
+}
+
+/// The identities of a set `ANTARES_POLICY_SUBJECT_FROM`.
+fn parse_subject_from(raw: &str) -> Result<Vec<String>, String> {
+    let from: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if from.is_empty() {
+        return Err("ANTARES_POLICY_SUBJECT_FROM is set but names no mesh identity".to_owned());
+    }
+    Ok(from)
 }
 
 /// The served app: the router under trailing-slash normalization, which
@@ -1900,6 +1948,24 @@ mod switch_tests {
             "1", "true", "TRUE", "True", "on", "On", "yes", "YES", " 1 ", "enabled",
         ] {
             assert!(!is_off(on), "{on:?} must NOT read as off");
+        }
+    }
+}
+
+#[cfg(test)]
+mod subject_from_tests {
+    use super::parse_subject_from;
+
+    /// A set key always names someone: blank refuses to start instead of
+    /// believing every caller (T-6432).
+    #[test]
+    fn a_set_key_names_at_least_one_identity() {
+        assert_eq!(
+            parse_subject_from(" a.b , c.d,").expect("two identities"),
+            vec!["a.b".to_owned(), "c.d".to_owned()]
+        );
+        for blank in ["", " ", " , "] {
+            assert!(parse_subject_from(blank).is_err(), "{blank:?}");
         }
     }
 }
