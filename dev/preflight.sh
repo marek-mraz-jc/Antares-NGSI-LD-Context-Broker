@@ -225,6 +225,8 @@ bg step 14 route-docs dev/check-route-docs.sh
 bg step 15 env-docs dev/check-env-docs.sh
 # workspace.yml "Migration rollback manifest"
 bg step 16 migrations bash -c 'python3 dev/check-migrations.py --self-test && python3 dev/check-migrations.py'
+# workspace.yml "Coverage passes run to the end"
+bg step 17 etsi-coverage dev/etsi-coverage.test.sh
 # Our own pids only: a bare `wait` also waits for the `tee` behind --log
 # (bash 5.1+), which never exits while this shell holds its stdout.
 wait "${lanes[@]}"

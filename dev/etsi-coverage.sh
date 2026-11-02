@@ -38,6 +38,13 @@ STORE="${STORE:-memory}"
 RESULTS_DIR="${RESULTS_DIR:-results/coverage-$STORE}"
 PORT="${ANTARES_HTTP_PORT:-9090}"   # 050_04/051_03 hardcode 9090 — keep it
 
+# The workflow's matrix hands the memory and file cells these as ''. A test
+# reads a set variable as a database to connect to and panics, so empty means
+# unset: the pg tests skip (T-6499).
+for v in ANTARES_DATABASE_URL ANTARES_TEST_DATABASE_URL; do
+  [ -n "${!v:-}" ] || unset "$v"
+done
+
 command -v cargo-llvm-cov >/dev/null || {
   echo "cargo-llvm-cov missing — cargo install cargo-llvm-cov --locked"; exit 1; }
 
@@ -88,8 +95,10 @@ if [ "${UNIT_TESTS:-0}" = 1 ]; then
   # while the total rises.
   echo "=== unit tests: lib + bins (instrumented) ==="
   # Failures don't abort: coverage measures what ran, the per-push gate for
-  # test green is ci.yml. -j 2: default parallelism OOM-kills the linker here.
-  cargo test --workspace --lib --bins -j 2 || true
+  # test green is ci.yml. --no-fail-fast because cargo otherwise skips every
+  # binary after the first red one, and with it their coverage (T-6499).
+  # -j 2: default parallelism OOM-kills the linker here.
+  cargo test --workspace --lib --bins -j 2 --no-fail-fast || true
   stash_profraw unit
   echo "=== api tests: the integration binaries (instrumented) ==="
   # Every package with a tests/*.rs rather than --workspace: a package with
@@ -109,7 +118,7 @@ if [ "${UNIT_TESTS:-0}" = 1 ]; then
   # Built first and without `|| true`: an unknown package or a test that no
   # longer compiles must fail the run, never measure an empty api pass.
   cargo test "${API_PKGS[@]}" --test '*' -j 2 --no-run
-  cargo test "${API_PKGS[@]}" --test '*' -j 2 || true
+  cargo test "${API_PKGS[@]}" --test '*' -j 2 --no-fail-fast || true
   stash_profraw api
 fi
 
