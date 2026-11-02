@@ -1953,6 +1953,24 @@ mod switch_tests {
 }
 
 #[cfg(test)]
+mod subject_from_tests {
+    use super::parse_subject_from;
+
+    /// A set key always names someone: blank refuses to start instead of
+    /// believing every caller (T-6432).
+    #[test]
+    fn a_set_key_names_at_least_one_identity() {
+        assert_eq!(
+            parse_subject_from(" a.b , c.d,").unwrap(),
+            vec!["a.b".to_owned(), "c.d".to_owned()]
+        );
+        for blank in ["", " ", " , "] {
+            assert!(parse_subject_from(blank).is_err(), "{blank:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod sweep_secs_tests {
     use super::parse_sweep_secs;
 
