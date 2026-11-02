@@ -216,6 +216,7 @@ bg step 05 machete bash -c 'need() { "$@" >/dev/null 2>&1 || { echo "missing too
 bg step 07 spec bash -c 'python3 dev/spec.py check && python3 dev/spec_test.py'
 # workspace.yml "Module rules"
 bg step 08 module-rules python3 dev/check-module-rules.py
+bg step 08b module-graph python3 dev/module-graph.py
 # workspace.yml "Vanilla feature tree is committed"
 bg step 09 vanilla-tree bash -c 'set -o pipefail; dev/vanilla-tree.sh | diff -u ci/vanilla-tree.txt -'
 # workspace.yml "Licence headers"

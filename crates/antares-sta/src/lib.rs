@@ -933,7 +933,7 @@ impl Cx<'_> {
     /// One Entity the view shows, by URN. A key that is no URI names no Entity (NGSI-LD 4.5.1):
     /// it is the 404 of an unknown one, not the view's 400.
     async fn entity(&self, urn: Option<&str>) -> Result<Option<Value>, Problem> {
-        let Some(urn) = urn.filter(|u| mapping::is_uri(u)) else {
+        let Some(urn) = urn.filter(|u| antares_ops::outputs::is_uri(u)) else {
             return Ok(None);
         };
         Ok(self.by_ids(&[urn]).await?.into_iter().next())

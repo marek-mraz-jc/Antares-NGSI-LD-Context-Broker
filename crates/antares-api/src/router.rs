@@ -339,7 +339,7 @@ pub(super) fn routes(state: AppState) -> Router {
                 // stripped from the answer once, whichever surface asked.
                 .layer(axum::middleware::from_fn_with_state(
                     state.clone(),
-                    metadata::layer,
+                    policy::metadata::layer,
                 ))
                 // The temporal seam's drain: every write's history events
                 // land in one driver call once the handler is done.

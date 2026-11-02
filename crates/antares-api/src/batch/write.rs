@@ -333,7 +333,7 @@ impl BatchRun<'_> {
                     BatchMode::Upsert => !self.opts.update,
                     BatchMode::Update | BatchMode::Merge => false,
                 };
-                crate::schema_writes::admits_typed(self.st, &self.tenant, &doc, whole)?;
+                crate::views::schema_admits_typed(self.st, &self.tenant, &doc, whole)?;
                 Ok((id, doc))
             });
             match prep {
@@ -472,7 +472,7 @@ impl BatchRun<'_> {
                     // creates is held to the whole-Entity rules
                     #[cfg(feature = "views")]
                     if let Err(e) =
-                        crate::schema_writes::admits_typed(self.st, &self.tenant, expanded, true)
+                        crate::views::schema_admits_typed(self.st, &self.tenant, expanded, true)
                     {
                         self.out.errors.push(err_entry(Some(id), &e));
                         continue;

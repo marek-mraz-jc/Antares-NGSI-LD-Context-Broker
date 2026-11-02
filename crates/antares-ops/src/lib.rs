@@ -55,7 +55,7 @@ pub use antares_ql::PRIMER;
 /// The residual of a standard query (ADR-0028 rule 2), re-exported so a surface compiles into
 /// it through `antares-ops` alone (rule M2).
 pub use antares_residual as residual;
-pub use error::{Problem, Refusal, CONTEXT_DETAIL, INNER_DETAIL, TIMEOUT_DETAIL};
+pub use error::{ngsi_problem, Problem, Refusal, CONTEXT_DETAIL, INNER_DETAIL, TIMEOUT_DETAIL};
 pub use operation::OperationId;
 pub use scan::{pickable, Page, Pushdown, Scanned, RESIDUAL_SCAN, TOO_COMPLEX};
 
@@ -74,7 +74,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// `antares-api` item.
 pub mod policy {
     /// The words a refusal of a query on a stripped metadata member carries.
-    pub use antares_api::metadata::STRIPPED as METADATA_STRIPPED;
+    pub use antares_api::policy::metadata::STRIPPED as METADATA_STRIPPED;
     pub use antares_api::policy::{
         Decision, DecisionFuture, Filter, Metadata, NotifyDecision, Operation, PolicyEngine, Rule,
         Subject,

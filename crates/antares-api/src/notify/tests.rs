@@ -3653,21 +3653,18 @@ mod booking_window {
         let tenant = tenant();
         let sub = subscribed(&st, &tenant, json!({})).await;
         send(&st, &tenant, &sub).await;
-        let answer = crate::subscriptions::retrieve(
-            &st,
-            Kind::Subscription,
-            ID,
-            &HashMap::new(),
-            &axum::http::HeaderMap::new(),
-        )
-        .await
-        .expect("retrieve");
-        let body = axum::body::to_bytes(
-            axum::response::IntoResponse::into_response(answer).into_body(),
-            usize::MAX,
-        )
-        .await
-        .expect("body");
+        let answer = st
+            .call(
+                &axum::http::HeaderMap::new(),
+                axum::http::Request::builder()
+                    .uri(format!("/ngsi-ld/v1/subscriptions/{ID}"))
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await;
+        let body = axum::body::to_bytes(answer.into_body(), usize::MAX)
+            .await
+            .expect("body");
         let doc: Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(doc["notification"]["timesSent"], json!(1), "{doc}");
     }

@@ -4,7 +4,7 @@
 //! `/q/grants` and read again on every forward, so a removal stops data
 //! at once.
 
-use antares_ops::Ops;
+use antares_ops::{ngsi_problem, Ops};
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path};
 use axum::http::StatusCode;
@@ -12,7 +12,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 /// The largest grant document `/q/grants` accepts, in bytes.
 pub const MAX_GRANT_BYTES: usize = 4096;
@@ -163,12 +162,12 @@ async fn put_one(ops: &Ops, target: &str, source: &str, body: &[u8]) -> Result<R
     let grant = match ExportGrant::parse(body) {
         Ok(g) if g.target == target && g.source == source => g,
         Ok(_) => {
-            return Ok(problem(
+            return Ok(ngsi_problem(
                 StatusCode::BAD_REQUEST,
                 "the document names another target or source than the path",
             ))
         }
-        Err(why) => return Ok(problem(StatusCode::BAD_REQUEST, &why)),
+        Err(why) => return Ok(ngsi_problem(StatusCode::BAD_REQUEST, &why)),
     };
     let doc = serde_json::to_value(&grant).map_err(|e| e.to_string())?;
     let replaced = ops.put_grant_doc(&key(target, source), doc).await?;
@@ -206,32 +205,12 @@ async fn delete_one(ops: &Ops, target: &str, source: &str) -> Result<Response, S
 fn answer(result: Result<Response, String>) -> Response {
     result.unwrap_or_else(|e| {
         tracing::error!(error = e.as_str(), "export grants: the store failed");
-        problem(StatusCode::INTERNAL_SERVER_ERROR, "the grant store failed")
+        ngsi_problem(StatusCode::INTERNAL_SERVER_ERROR, "the grant store failed")
     })
 }
 
 fn not_found() -> Response {
-    problem(StatusCode::NOT_FOUND, "no such grant")
-}
-
-fn problem(status: StatusCode, detail: &str) -> Response {
-    let kind = match status {
-        StatusCode::BAD_REQUEST => "BadRequestData",
-        StatusCode::NOT_FOUND => "ResourceNotFound",
-        _ => "InternalError",
-    };
-    (
-        status,
-        [(axum::http::header::CONTENT_TYPE, "application/problem+json")],
-        json!({
-            "type": format!("https://uri.etsi.org/ngsi-ld/errors/{kind}"),
-            "title": kind,
-            "status": status.as_u16(),
-            "detail": detail,
-        })
-        .to_string(),
-    )
-        .into_response()
+    ngsi_problem(StatusCode::NOT_FOUND, "no such grant")
 }
 
 #[cfg(test)]

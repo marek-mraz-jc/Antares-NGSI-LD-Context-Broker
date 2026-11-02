@@ -55,7 +55,7 @@ pub fn stamp_instances(v: &mut Value, ts: &str) {
 /// write the gateway did not send leaves none.
 pub fn stamp_by(instance: &mut Map<String, Value>) {
     instance.remove(MODIFIED_BY_KEY);
-    if let Some(by) = crate::history::modified_by() {
+    if let Some(by) = crate::provenance::modified_by_now() {
         instance.insert(MODIFIED_BY_KEY.into(), by);
     }
 }

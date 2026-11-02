@@ -195,7 +195,7 @@ async fn write_attrs(
     )
     .await?;
     #[cfg(feature = "views")]
-    crate::schema_writes::admits(st, &tenant, id, &fragment, &pre.types).await?;
+    crate::views::schema_admits(st, &tenant, id, &fragment, &pre.types).await?;
     let cond = Condition::of(&granted);
     #[cfg(feature = "views")]
     let guard =
@@ -955,7 +955,7 @@ async fn partial_update_inner(
     )
     .await?;
     #[cfg(feature = "views")]
-    crate::schema_writes::admits(
+    crate::views::schema_admits(
         st,
         &tenant,
         id,
@@ -1171,7 +1171,7 @@ pub async fn replace_attr(
         )
         .await?;
         #[cfg(feature = "views")]
-        crate::schema_writes::admits(&st, &tenant, &id, &fragment, &pre.types).await?;
+        crate::views::schema_admits(&st, &tenant, &id, &fragment, &pre.types).await?;
         let cond = Condition::of(&granted);
         #[cfg(feature = "views")]
         let guard =
@@ -1379,7 +1379,7 @@ async fn set_attr_value_inner(
     judged?;
     #[cfg(feature = "views")]
     if let Some(j) = &judged {
-        crate::schema_writes::admits(st, &tenant, id, j, &pre.types).await?;
+        crate::views::schema_admits(st, &tenant, id, j, &pre.types).await?;
     }
     let cond = Condition::of(&granted);
     #[cfg(feature = "views")]

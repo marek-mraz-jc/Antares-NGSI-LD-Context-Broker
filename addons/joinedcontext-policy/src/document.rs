@@ -3,7 +3,7 @@
 //! once at load: every name expanded, every query parsed, every pattern
 //! compiled, so a decision only compares.
 
-use antares_api::metadata::Metadata;
+use antares_api::policy::metadata::Metadata;
 use antares_api::policy::{Rule, TimeBound, Window};
 use antares_ql::geo::GeoQuery;
 use chrono::{DateTime, Duration, Utc};

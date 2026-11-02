@@ -125,7 +125,7 @@ async fn create_entity_inner(
     #[cfg(feature = "views")]
     crate::views::admits_new(st, &tenant, &expanded).await?;
     #[cfg(feature = "views")]
-    crate::schema_writes::admits_typed(st, &tenant, &expanded, true)?;
+    crate::views::schema_admits_typed(st, &tenant, &expanded, true)?;
     let regs = match crate::federation::write_plan(st, &tenant, &spec, &parsed.ctx, params, headers)
         .await?
     {
@@ -2675,7 +2675,7 @@ async fn merge_entity_inner(
     )
     .await?;
     #[cfg(feature = "views")]
-    crate::schema_writes::admits(st, &tenant, id, &fragment, &pre.types).await?;
+    crate::views::schema_admits(st, &tenant, id, &fragment, &pre.types).await?;
     let cond = crate::policy::Condition::of(&granted);
     #[cfg(feature = "views")]
     let guard = crate::views::WriteGuard::of(
@@ -3349,7 +3349,7 @@ pub async fn replace_entity(
                 return Err(NgsiError::BadRequestData("entity id mismatch".into()).into());
             }
             #[cfg(feature = "views")]
-            crate::schema_writes::admits_typed(&st, &tenant, &expanded, true)?;
+            crate::views::schema_admits_typed(&st, &tenant, &expanded, true)?;
             let ts = now_iso();
             stamp_new(&mut expanded, &ts);
             #[cfg(feature = "views")]
@@ -3415,7 +3415,7 @@ pub async fn replace_entity(
             return Err(NgsiError::BadRequestData("entity id mismatch".into()).into());
         }
         #[cfg(feature = "views")]
-        crate::schema_writes::admits_typed(&st, &tenant, &expanded, true)?;
+        crate::views::schema_admits_typed(&st, &tenant, &expanded, true)?;
         let mut parts = Vec::new();
         let proxies: Vec<&crate::federation::FedReg> =
             regs.iter().filter(|r| r.is_proxy()).collect();

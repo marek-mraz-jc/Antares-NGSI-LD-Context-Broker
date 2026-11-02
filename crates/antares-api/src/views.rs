@@ -311,7 +311,7 @@ pub fn compose(a: &Filter, b: Filter) -> Result<Filter, Denied> {
         restricted: a.restricted || b.restricted,
         warning: Warning::join(a.warning.as_ref(), b.warning),
         temporal: [&a.temporal[..], &b.temporal[..]].concat().into(),
-        metadata: crate::metadata::Metadata::both(a.metadata.as_deref(), b.metadata),
+        metadata: crate::policy::Metadata::both(a.metadata.as_deref(), b.metadata),
     })
 }
 
@@ -1148,6 +1148,87 @@ pub(crate) fn relationship_targets(doc: &serde_json::Value) -> Vec<&str> {
         }
     }
     out
+}
+
+/// [`schema_admits`] for a document whose `type` names the Entity's types (a
+/// create, a replace, a batch member): no store read.
+pub(crate) fn schema_admits_typed(
+    st: &crate::state::AppState,
+    tenant: &antares_model::TenantId,
+    doc: &serde_json::Value,
+    whole: bool,
+) -> Result<(), antares_model::NgsiError> {
+    let hook = &st.views.schema_writes;
+    let Some(check) = hook.check.get() else {
+        return Ok(());
+    };
+    let mode = hook.mode();
+    if mode == crate::schema_writes::Mode::Off {
+        return Ok(());
+    }
+    let Some(schema) = st.views.schema(tenant.as_str()) else {
+        return Ok(());
+    };
+    match check(schema.revision, &schema.bytes, doc, whole) {
+        Ok(()) => Ok(()),
+        Err(why) if mode == crate::schema_writes::Mode::Enforce => {
+            Err(antares_model::NgsiError::BadRequestData(why))
+        }
+        Err(why) => {
+            tracing::warn!(tenant = %tenant, refusal = %why, "a write breaks the Tenant's schema (reported, not refused)");
+            Ok(())
+        }
+    }
+}
+
+/// Rule T-5912 for a write to the Entity `id`: `doc` (expanded) keeps to
+/// the Tenant's schema. A fragment that names no `type` is judged by
+/// `types` (the stored types the policy gate read) or, when the gate read
+/// none, by the stored Entity's, read only when a check and a schema are
+/// there to use them.
+pub(crate) async fn schema_admits(
+    st: &crate::state::AppState,
+    tenant: &antares_model::TenantId,
+    id: &str,
+    doc: &serde_json::Value,
+    types: &[String],
+) -> Result<(), antares_model::NgsiError> {
+    if doc.get("type").is_some() {
+        return schema_admits_typed(st, tenant, doc, false);
+    }
+    let hook = &st.views.schema_writes;
+    if hook.check.get().is_none()
+        || hook.mode() == crate::schema_writes::Mode::Off
+        || st.views.schema(tenant.as_str()).is_none()
+    {
+        return Ok(());
+    }
+    let types: Vec<serde_json::Value> = if types.is_empty() {
+        let stored = st
+            .store
+            .get(tenant, antares_store::Kind::Entity, id)
+            .await?;
+        stored
+            .as_ref()
+            .and_then(|d| d.get("type"))
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        types
+            .iter()
+            .cloned()
+            .map(serde_json::Value::String)
+            .collect()
+    };
+    if types.is_empty() {
+        return Ok(());
+    }
+    let mut typed = doc.clone();
+    if let Some(o) = typed.as_object_mut() {
+        o.insert("type".to_owned(), serde_json::Value::Array(types));
+    }
+    schema_admits_typed(st, tenant, &typed, false)
 }
 
 #[cfg(test)]

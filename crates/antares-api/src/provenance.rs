@@ -18,6 +18,13 @@
 use axum::http::HeaderMap;
 use serde_json::{json, Value};
 
+// The provenance of the request in flight rides its task, as the history
+// buffer does; wasm has no tokio task-locals.
+#[cfg(not(target_arch = "wasm32"))]
+tokio::task_local! {
+    pub(crate) static PROVENANCE: Value;
+}
+
 #[cfg(feature = "jc")]
 /// The channels a write may name (ADR-N-054 2.3); anything else is `api`.
 const CHANNELS: &[&str] = &["pipeline", "api", "ui", "import", "backfill", "mqtt"];
@@ -167,6 +174,15 @@ pub fn modified_by(provenance: &Value) -> Option<Value> {
         .filter_map(|k| Some((k.to_owned(), provenance.get(k)?.clone())))
         .collect();
     (!by.is_empty()).then_some(Value::Object(by))
+}
+
+/// The `modifiedBy` of the request in flight (DM-138); `None` outside a
+/// request and for a write the gateway did not send.
+pub(crate) fn modified_by_now() -> Option<Value> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return PROVENANCE.try_with(modified_by).ok().flatten();
+    #[cfg(target_arch = "wasm32")]
+    None
 }
 
 /// `provenance` with its `operation`.

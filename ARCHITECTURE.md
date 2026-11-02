@@ -113,7 +113,7 @@ module's header comment.
 | `provenance.rs` | who and what wrote a request's history (platform ADR-N-054 2.3): the gateway's `JC-Provenance-*`, `JC-Reason` and `X-Request-Id` headers, believed only from the mesh identity `ANTARES_PROVENANCE_FROM` names in `l5d-client-id`; otherwise `channel: api` with no actor |
 | `erasure.rs` | erasure of personal data (ADR-N-054 2.6) from the current state, every history version and the dead letters; `antares-ops` `views/erasure.rs` serves `/q/erasures/{tenant}`, keeps the content-free tombstone and re-applies it on start |
 | `stamp.rs` | 4.8, 5.2.4 system attributes of a write: `createdAt`/`modifiedAt` on the entity and on every attribute instance |
-| `metadata.rs` | the metadata members a read's engine passes per Attribute (platform ADR-N-066 2.4): `Metadata` on a `Filter`, held by the gate for the layer that refuses a `q`/`orderBy`/`timeproperty` on a stripped member (400) and strips the answer once, whichever surface asked; `strip_entity` for a notification |
+| `policy/metadata.rs` | the metadata members a read's engine passes per Attribute (platform ADR-N-066 2.4): `Metadata` on a `Filter`, held by the gate for the layer that refuses a `q`/`orderBy`/`timeproperty` on a stripped member (400) and strips the answer once, whichever surface asked; `strip_entity` for a notification |
 | `mirror.rs` | the change event and the two document mirrors (`Change`, `DocMirror`, `SubMirror`, `TenantIndex`) that state, notify and history share, with the registration index (`reg_keys`, `bucketed`, `matching`) the federation read path selects candidates through; names no other module |
 | `bounds.rs` | every cap: body, URI, JSON depth, batch, fan-out, in-flight, regex program size, and the notification pipeline's queue depth and delivery widths; all reported by `/q/health`, which a test over this module's own source keeps true |
 | `egress.rs` | SSRF wall and per-destination circuit breakers for notifications, forwards, `@context` fetches |
@@ -123,7 +123,7 @@ module's header comment.
 | `state.rs` | `AppState`: store, bus flag, mirror, HTTP clients, delivery policy, sinks, surfaces, hooks, the forward transport, and the endpoint view a state is narrowed to (feature `views`), and the task-local @context a surface calls in (`call_in_context`) |
 | `fuzzing.rs` | the request parsers the `fuzz/` targets drive, behind the `fuzzing` feature that no broker build enables (T-3463) |
 | `views.rs` | feature `views` (ADR-0023, ADR-0027 section 5): `CompiledView` and the composition `gate!` applies after the engine answers, effective = view ∧ engine, neither side widening, rule pairs keeping both id narrowings (G2); `WriteGuard`, rule 7 checked inside the store's read-modify-write; the `ViewTable` a pod serves from (views and each Tenant's schema bytes with their revision) and the `Kind::View` documents under `antares-views`; never in a vanilla build |
-| `schema_writes.rs` | feature `views` (T-5912): the hook every NGSI-LD write route asks after its policy gate whether the expanded Entity or fragment keeps to its Tenant's `LinkML` schema; the check is a fn a schema-reading surface registers (`Ops::check_writes`, `linkml_model::check`), so a vanilla build links no protocol crate; `ANTARES_SCHEMA_WRITES` `enforce`/`report`/`off` |
+| `schema_writes.rs` | feature `views` (T-5912): the hook behind `views::schema_admits`, which every NGSI-LD write route asks after its policy gate whether the expanded Entity or fragment keeps to its Tenant's `LinkML` schema; the check is a fn a schema-reading surface registers (`Ops::check_writes`, `linkml_model::check`), so a vanilla build links no protocol crate; `ANTARES_SCHEMA_WRITES` `enforce`/`report`/`off` |
 Geoquery evaluation, the `q=` evaluator and the caches of compiled client
 query text are not in that table because they are not this crate's: they are
 `antares_ql::geo`, `::eval` and `::regex`, named by those paths at every call
@@ -518,6 +518,29 @@ Stated so they are not rediscovered. Each is measured, not guessed.
   and `at` read fewer attribute kinds than iCal's (no `vocab`, lists or
   `json`): merging them changes what a feed shows, so they stay two until
   that change is its own task.
+- Re-measured 2026-11-02 (T-6497) after a week of merges: xray run
+  41522025780 stood at 102 clones over 1245 lines, 47 signature groups, 114
+  names and a largest `antares-api` cycle of 28. Merged:
+  `antares_ops::outputs::is_uri` (SensorThings and its MQTT bridge held one
+  copy each) and `antares_ops::ngsi_problem` (the `/grants` and
+  decided-question routes), which leaves 100 clones over 1217 lines. Cut: the
+  cycle is back at 22. `metadata` is `policy::metadata`, since it is a member
+  of the policy `Filter`; `schema_admits` lives in `views`, so `schema_writes`
+  holds only the hook and every write route stays out of it; the request's
+  provenance task-local lives in `provenance`, so `stamp` reads no `history`;
+  and a `notify` test reads a Subscription through the route, which took
+  `subscriptions`, `distsub` and `contexts` out. Signature groups stand at 46
+  and names at 113, recorded as measured. Of the 16 names left, SensorThings'
+  residual engine (T-5918) brought `order`, `rank`, `sort`, `navigation`,
+  `references` and `expanded` beside OData's. `sort` and `rank` were read side
+  by side with OData's `sort` and `compare` and rank values of two kinds
+  differently (JSON text, kind order), and `model_refusal` passes a stripped
+  metadata member on OData and not on OGC, so those stay two. The rest, such
+  as `connect` (NATS, MQTT) and `publish` (notifier, WebSocket bridge), sit
+  in crates of different jobs.
+  `dev/preflight.sh` runs `dev/module-graph.py` since this fix, so a cycle
+  stops at the branch; the duplication gate needs a workspace rustdoc and
+  stays weekly.
 
 ## 9. To change X, touch Y
 
