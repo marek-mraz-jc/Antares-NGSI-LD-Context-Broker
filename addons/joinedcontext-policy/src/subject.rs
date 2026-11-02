@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 /// The headers this engine reads, in the order
 /// `ANTARES_POLICY_SUBJECT_HEADERS` lists them.
-pub const HEADERS: [&str; 7] = [
+pub const HEADERS: [&str; 8] = [
     "x-jc-subject",
     "x-jc-groups",
     "x-jc-roles",
@@ -16,6 +16,7 @@ pub const HEADERS: [&str; 7] = [
     "x-jc-restricted",
     "x-jc-did",
     "x-jc-read-only",
+    "x-jc-organization",
 ];
 
 /// The prefix of an Endpoint caller role, `endpoint:{project}/{name}` (AP-97).
@@ -49,6 +50,10 @@ pub struct Platform {
     /// and never writes (platform S-49). Only `true` is ever sent; any other value is a
     /// malformed marker and still holds the caller to reads (deny by default).
     pub read_only: bool,
+    /// `x-jc-organization`: the Organization of the Endpoint's project, sent only when the
+    /// token's verified `jc_org` names it (ADR-N-067 2.3). Never held by an anonymous caller or
+    /// a data-space participant.
+    pub organization: Option<String>,
 }
 
 impl Caller {
@@ -103,6 +108,11 @@ impl Caller {
             did: one("x-jc-did"),
             restricted: get("x-jc-restricted").is_some_and(|v| v.eq_ignore_ascii_case("true")),
             read_only: get("x-jc-read-only").is_some(),
+            organization: if anonymous || participant {
+                None
+            } else {
+                one("x-jc-organization")
+            },
             user,
             client,
         })
@@ -135,6 +145,7 @@ impl Platform {
             Kind::Role => self.roles.contains(id),
             Kind::ServiceAccount => self.client.as_deref() == Some(id),
             Kind::Did => self.did.as_deref() == Some(id),
+            Kind::Organization => self.organization.is_some(),
         }
     }
 }

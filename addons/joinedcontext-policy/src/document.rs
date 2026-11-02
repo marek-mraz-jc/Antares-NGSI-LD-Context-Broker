@@ -58,7 +58,9 @@ enum Effect {
 pub struct Assignee {
     /// What `id` names.
     pub kind: Kind,
-    /// The user, group, role, service account or DID.
+    /// The user, group, role, service account or DID; empty for an `organization`, which
+    /// names none (ADR-N-067 2.3).
+    #[serde(default)]
     pub id: String,
 }
 
@@ -76,6 +78,9 @@ pub enum Kind {
     ServiceAccount,
     /// No header carries one yet: matches nobody.
     Did,
+    /// `x-jc-organization`: a member of the Organization of the Endpoint's project, as the
+    /// gateway verified it from the token's `jc_org` (ADR-N-067 2.3). Carries no id.
+    Organization,
 }
 
 #[derive(Deserialize)]
@@ -447,6 +452,10 @@ fn policy(p: PolicyDoc) -> Result<Vec<Policy>, String> {
     let why = |what: String| format!("policy {id:?}: {what}");
     if id.is_empty() {
         return Err("a policy has an empty id".into());
+    }
+    if p.assignee.kind == Kind::Organization && !p.assignee.id.is_empty() {
+        // An id the engine would not compare would widen the grant to every member.
+        return Err(why("an organization assignee names no id".into()));
     }
     if p.operations.is_empty() {
         return Err(why("names no operation".into()));
