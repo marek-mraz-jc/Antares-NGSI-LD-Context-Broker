@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! Part 1 Core: `/collections` and `/collections/{c}` (mapping rows C5 to C7, M1, M8).
 
-use crate::common::{fixture, get, href, send};
+use crate::common::{fixture, fixture_with, get, href, schemas_on, send};
+use antares_ops::policy::{
+    Decision, DecisionFuture, NotifyDecision, Operation, PolicyEngine, Subject,
+};
+use antares_ops::test_kit::TestBroker;
 use axum::http::StatusCode;
 use serde_json::Value;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn lists_the_view_types_only() -> Result<(), String> {
@@ -296,5 +302,44 @@ async fn a_collection_past_the_extent_read_states_no_extent() -> Result<(), Stri
         "{}",
         list.body
     );
+    Ok(())
+}
+
+/// Counts the queries a request reaches the Policy with, one per store read of a page.
+#[derive(Default)]
+struct Queries(AtomicUsize);
+
+impl PolicyEngine for Queries {
+    fn name(&self) -> &'static str {
+        "queries"
+    }
+
+    fn decide<'a>(&'a self, _: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
+        if op.clause == "5.7.2" {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        Box::pin(std::future::ready(Decision::Allow))
+    }
+
+    fn pre_notify(&self, _: &Subject, _: &Value, _: &mut Value) -> NotifyDecision {
+        NotifyDecision::Deliver
+    }
+}
+
+/// T-6508: `/collections` costs one store read per collection with a geometry per minute, so a
+/// view of many collections stays within the gateway's read cut: Stop has no geometry, and a
+/// second list within the minute reads nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_collections_list_reads_each_geometry_collection_once() -> Result<(), String> {
+    schemas_on();
+    let queries = Arc::new(Queries::default());
+    let f = fixture_with(TestBroker::new().await?.with_policy(queries.clone())).await?;
+    queries.0.store(0, Ordering::SeqCst);
+    let list = get(&f.app, "/x/views/city/ogc/features/collections").await;
+    assert_eq!(list.status, StatusCode::OK, "{}", list.body);
+    assert_eq!(queries.0.load(Ordering::SeqCst), 1);
+    let again = get(&f.app, "/x/views/city/ogc/features/collections").await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.body);
+    assert_eq!(queries.0.load(Ordering::SeqCst), 1);
     Ok(())
 }
