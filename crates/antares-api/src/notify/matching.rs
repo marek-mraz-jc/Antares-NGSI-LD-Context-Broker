@@ -12,7 +12,7 @@ pub(super) async fn subs_for(
     types: &[&str],
     changed: &[&str],
     queued: u64,
-) -> Vec<Arc<Value>> {
+) -> Vec<(Arc<Value>, Arc<str>)> {
     match &st.sub_mirror {
         Some(m) => m.candidates_before(tenant.as_str(), types, changed, queued),
         // ponytail: the scan reads subscriptions as they are now, so a change
@@ -21,7 +21,13 @@ pub(super) async fn subs_for(
         // "this tenant has no subscriptions" either: that is the silence
         // the mirror seed refuses to install.
         None => match st.store.list(tenant, Kind::Subscription).await {
-            Ok(subs) => subs.into_iter().map(Arc::new).collect(),
+            Ok(subs) => subs
+                .into_iter()
+                .map(|doc| {
+                    let shape = crate::mirror::conditions_shape(&doc);
+                    (Arc::new(doc), shape)
+                })
+                .collect(),
             Err(e) => {
                 tracing::error!(
                     "subscription scan failed for tenant {}: {e}; no candidate matched this change",
@@ -552,8 +558,16 @@ pub(super) async fn matches_for(
     let views = st.views.snapshot();
     #[cfg(feature = "views")]
     let mut seen_memo: SeenMemo = HashMap::new();
-    for sub in subs {
+    // The shapes this change rejected: 1 000 sockets on 20 conditions walked
+    // the whole check 1 000 times per change to reach 20 verdicts, half of the
+    // broker's CPU in a fan-out (T-6371). A shape stays here from its first
+    // look until a Subscription of it passes every condition.
+    let mut rejected: std::collections::HashSet<Arc<str>> = std::collections::HashSet::new();
+    for (sub, shape) in subs {
         if !is_active(&sub) || sub.get("timeInterval").is_some() {
+            continue;
+        }
+        if !rejected.insert(shape.clone()) {
             continue;
         }
         // ADR-0023 rule 9: a Subscription made through a view matches what
@@ -629,6 +643,7 @@ pub(super) async fn matches_for(
         {
             continue;
         }
+        rejected.remove(&shape);
         if throttled(&sub) {
             continue;
         }
