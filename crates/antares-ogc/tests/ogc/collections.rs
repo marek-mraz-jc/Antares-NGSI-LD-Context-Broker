@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! Part 1 Core: `/collections` and `/collections/{c}` (mapping rows C5 to C7, M1, M8).
 
-use crate::common::{fixture, fixture_with, get, href, send};
+use crate::common::{fixture, fixture_with, get, href, schemas_on, send};
 use antares_ops::policy::{
     Decision, DecisionFuture, NotifyDecision, Operation, PolicyEngine, Subject,
 };
@@ -331,6 +331,7 @@ impl PolicyEngine for Queries {
 /// second list within the minute reads nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_collections_list_reads_each_geometry_collection_once() -> Result<(), String> {
+    schemas_on();
     let queries = Arc::new(Queries::default());
     let f = fixture_with(TestBroker::new().await?.with_policy(queries.clone())).await?;
     queries.0.store(0, Ordering::SeqCst);
