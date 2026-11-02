@@ -54,7 +54,7 @@ impl Mode {
 /// The check a surface registered and the mode, held by the view table.
 #[derive(Debug, Default)]
 pub struct Hook {
-    check: OnceLock<SchemaCheck>,
+    pub(crate) check: OnceLock<SchemaCheck>,
     mode: OnceLock<Mode>,
 }
 

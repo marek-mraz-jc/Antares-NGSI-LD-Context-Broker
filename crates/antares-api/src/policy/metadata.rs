@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! The metadata members an engine's grants pass per Attribute (platform
 //! ADR-N-066 2.4, DM-139, DM-151): [`Metadata`] on a read's
-//! [`Filter`](crate::policy::Filter).
+//! [`Filter`].
 //!
 //! One layer around the NGSI-LD API applies it after the handler, so every
 //! answer the broker renders from an NGSI-LD read is stripped once: the
