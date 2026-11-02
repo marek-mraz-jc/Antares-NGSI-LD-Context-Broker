@@ -128,6 +128,14 @@ the same limit the broker accepts on inbound bodies. A grouped delivery
 over the cap is split at whole-entity boundaries into several
 notifications; a single entity larger than the cap is sent alone.
 
+A WebSocket or other in-process delivery leaves first and is counted with
+its Subscription's other notifications of the same second, so one statement
+books them and `timesSent` moves by their number. Retrieve Subscription and
+Query Subscriptions write what is waiting before they read, and a shutdown
+drain writes it too; a crash loses at most that second of `timesSent`, never a
+notification. A Subscription with `throttling` or `timeInterval` books before
+it sends, because both read `lastNotification`.
+
 ## Periodic delivery: `timeInterval`
 
 ```json
