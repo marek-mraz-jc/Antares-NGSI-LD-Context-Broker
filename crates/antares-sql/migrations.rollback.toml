@@ -128,3 +128,7 @@ note = "entity_values_on_update writes only the rows that changed; an older rele
 [0030]
 rollback = "compatible"
 note = "an older release never reads bare and does not clear it on a write: after a roll-forward, an Entity marked bare that gained history during the rollback stays out of temporal query pages until its next write or the sweep's next pass over it"
+
+[0031]
+rollback = "compatible"
+note = "drops the unused tenant_update policy on attr_versions; an older release never updates a version row, so it runs unchanged without it"
