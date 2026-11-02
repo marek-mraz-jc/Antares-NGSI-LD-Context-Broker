@@ -1961,7 +1961,7 @@ mod subject_from_tests {
     #[test]
     fn a_set_key_names_at_least_one_identity() {
         assert_eq!(
-            parse_subject_from(" a.b , c.d,").unwrap(),
+            parse_subject_from(" a.b , c.d,").expect("two identities"),
             vec!["a.b".to_owned(), "c.d".to_owned()]
         );
         for blank in ["", " ", " , "] {
