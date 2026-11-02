@@ -4,7 +4,7 @@
 
 use crate::document::{context, covers, scope_paths, Policy, Table};
 use crate::subject::{Caller, Platform};
-use antares_api::metadata::Metadata;
+use antares_api::policy::metadata::Metadata;
 use antares_api::policy::{
     Decision, Filter, Operation, Rule, Warning, FILTERABLE, NAME_READS, WHOLE_TENANT, WRITE_BY_ID,
 };
