@@ -3202,14 +3202,14 @@ mod coalesced_delivery {
         subscription(&st, &tenant, a).await;
         subscription(&st, &tenant, b).await;
         let (t1, t2) = ("2026-01-01T00:00:01.000Z", "2026-01-01T00:00:02.000Z");
-        let attempts: Vec<(String, String)> = [
+        let attempts: Vec<(String, String, i64)> = [
             (a, t1),
             (b, t1),
             (a, t2),
             ("urn:ngsi-ld:Subscription:gone", t1),
         ]
         .iter()
-        .map(|(id, t)| ((*id).to_owned(), (*t).to_owned()))
+        .map(|(id, t)| ((*id).to_owned(), (*t).to_owned(), 1))
         .collect();
         let booked = book(&st, &tenant, &attempts).await;
         let prev: Vec<Option<Option<Value>>> = booked
@@ -3496,5 +3496,267 @@ mod csource_fanout_share {
             .await
             .expect("a paged read is never refused for volume");
         assert_eq!(kept.len(), n.div_ceil(2));
+    }
+}
+
+/// T-6371: an in-process delivery leaves before its stamp, and its window
+/// books what a reader of 5.2.14.2 must see.
+mod booking_window {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct Socket {
+        sent: AtomicUsize,
+        refuses: AtomicBool,
+    }
+
+    /// A binding that opens no socket, like the WebSocket one.
+    struct InProcess(Arc<Socket>);
+
+    impl antares_notifier::NotificationSink for InProcess {
+        fn schemes(&self) -> &'static [&'static str] {
+            &["x-window"]
+        }
+        fn parse_endpoint(
+            &self,
+            _uri: &str,
+            _notifier_info: &[(&str, &str)],
+        ) -> Result<(), antares_model::NgsiError> {
+            Ok(())
+        }
+        fn network(&self) -> bool {
+            false
+        }
+        fn deliver<'a>(
+            &'a self,
+            _uri: &'a str,
+            _out: &'a antares_notifier::Outbound,
+            _timeout: std::time::Duration,
+        ) -> antares_notifier::DeliveryFuture<'a> {
+            let refused = self.0.refuses.load(Ordering::SeqCst);
+            self.0
+                .sent
+                .fetch_add(usize::from(!refused), Ordering::SeqCst);
+            Box::pin(async move {
+                if refused {
+                    Err(antares_notifier::DeliveryError::failed("queue overflowed"))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    const ID: &str = "urn:ngsi-ld:Subscription:window";
+
+    fn window_state(alias: &str) -> (AppState, Arc<Socket>) {
+        let socket = Arc::new(Socket::default());
+        let mut st = AppState::new(alias.into()).with_sink(Box::new(InProcess(socket.clone())));
+        st.sub_mirror = Some(Arc::default());
+        (st, socket)
+    }
+
+    async fn subscribed(st: &AppState, tenant: &TenantId, extra: Value) -> Value {
+        let mut sub = json!({
+            "id": ID,
+            "type": "Subscription",
+            "status": "active",
+            "createdAt": "2020-01-01T00:00:00Z",
+            "notification": {"endpoint": {"uri": "x-window:1"}},
+        });
+        if let (Some(s), Some(e)) = (sub.as_object_mut(), extra.as_object()) {
+            s.extend(e.clone());
+        }
+        st.store
+            .create(tenant, Kind::Subscription, ID, sub.clone())
+            .await
+            .expect("subscription row");
+        if let Some(m) = &st.sub_mirror {
+            m.apply(tenant.as_str(), ID, Some(sub.clone()));
+        }
+        sub
+    }
+
+    async fn send(st: &AppState, tenant: &TenantId, sub: &Value) {
+        let ctx = st.loader.core();
+        deliver(
+            st,
+            tenant,
+            sub,
+            vec![json!({"id": "urn:ngsi-ld:V:1"})],
+            &ctx,
+        )
+        .await;
+    }
+
+    async fn stored(st: &AppState, tenant: &TenantId) -> Value {
+        st.store
+            .get(tenant, Kind::Subscription, ID)
+            .await
+            .expect("read")
+            .expect("subscription")["notification"]
+            .clone()
+    }
+
+    fn tenant() -> TenantId {
+        TenantId::new("default").expect("tenant")
+    }
+
+    #[tokio::test]
+    async fn a_window_books_its_notifications_once_after_they_left() {
+        let (st, socket) = window_state("antares-window-merge");
+        let tenant = tenant();
+        let sub = subscribed(&st, &tenant, json!({})).await;
+        for _ in 0..3 {
+            send(&st, &tenant, &sub).await;
+        }
+        assert_eq!(socket.sent.load(Ordering::SeqCst), 3, "none waited");
+        assert_eq!(stored(&st, &tenant).await.get("timesSent"), None);
+        settle_bookings(&st, &tenant).await;
+        let booked = stored(&st, &tenant).await;
+        assert_eq!(booked["timesSent"], json!(3));
+        assert_eq!(booked["status"], json!("ok"));
+        assert!(booked["lastNotification"].is_string());
+        let mirrored = st
+            .sub_mirror
+            .as_ref()
+            .expect("mirror")
+            .docs(tenant.as_str());
+        assert_eq!(mirrored[0]["notification"]["timesSent"], json!(3));
+    }
+
+    #[tokio::test]
+    async fn the_window_writes_itself_and_holds_the_shutdown_drain_until_it_did() {
+        let (st, _socket) = window_state("antares-window-timer");
+        let tenant = tenant();
+        let sub = subscribed(&st, &tenant, json!({})).await;
+        send(&st, &tenant, &sub).await;
+        assert_eq!(
+            st.pending_changes.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while st.pending_changes.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the window closes");
+        assert_eq!(stored(&st, &tenant).await["timesSent"], json!(1));
+    }
+
+    /// Who holds a notification reads a `timesSent` that counts it.
+    #[tokio::test]
+    async fn retrieve_subscription_reads_what_already_left() {
+        let (st, _socket) = window_state("antares-window-read");
+        let tenant = tenant();
+        let sub = subscribed(&st, &tenant, json!({})).await;
+        send(&st, &tenant, &sub).await;
+        let answer = crate::subscriptions::retrieve(
+            &st,
+            Kind::Subscription,
+            ID,
+            &HashMap::new(),
+            &axum::http::HeaderMap::new(),
+        )
+        .await
+        .expect("retrieve");
+        let body = axum::body::to_bytes(
+            axum::response::IntoResponse::into_response(answer).into_body(),
+            usize::MAX,
+        )
+        .await
+        .expect("body");
+        let doc: Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(doc["notification"]["timesSent"], json!(1), "{doc}");
+    }
+
+    /// The failure lands on top of the window: a later statement of the
+    /// window cannot turn `failed` back to `ok`, and `lastSuccess` falls back
+    /// to the last notification that did leave.
+    #[tokio::test]
+    async fn a_failed_attempt_lands_on_top_of_its_window() {
+        let (st, socket) = window_state("antares-window-failure");
+        let tenant = tenant();
+        let sub = subscribed(&st, &tenant, json!({})).await;
+        send(&st, &tenant, &sub).await;
+        send(&st, &tenant, &sub).await;
+        socket.refuses.store(true, Ordering::SeqCst);
+        send(&st, &tenant, &sub).await;
+        let booked = stored(&st, &tenant).await;
+        assert_eq!(
+            booked["timesSent"],
+            json!(3),
+            "the attempt counts: {booked}"
+        );
+        assert_eq!(booked["timesFailed"], json!(1));
+        assert_eq!(booked["status"], json!("failed"));
+        assert!(booked["lastSuccess"].is_string(), "{booked}");
+        settle_bookings(&st, &tenant).await;
+        assert_eq!(stored(&st, &tenant).await["status"], json!("failed"));
+    }
+
+    /// `throttling` reads `lastNotification`, so its stamp cannot wait.
+    #[tokio::test]
+    async fn a_throttled_subscription_is_booked_before_it_leaves() {
+        let (st, socket) = window_state("antares-window-throttled");
+        let tenant = tenant();
+        let sub = subscribed(&st, &tenant, json!({"throttling": 60})).await;
+        send(&st, &tenant, &sub).await;
+        assert_eq!(socket.sent.load(Ordering::SeqCst), 1);
+        assert_eq!(stored(&st, &tenant).await["timesSent"], json!(1));
+        let mirrored = st
+            .sub_mirror
+            .as_ref()
+            .expect("mirror")
+            .docs(tenant.as_str());
+        assert!(matches!(mirrored.first(), Some(d) if throttled(d)));
+    }
+
+    /// 5.8.6: nothing is sent for a Subscription the broker no longer holds.
+    #[tokio::test]
+    async fn a_deleted_subscription_is_not_notified_and_its_window_books_nothing() {
+        let (st, socket) = window_state("antares-window-deleted");
+        let tenant = tenant();
+        let sub = subscribed(&st, &tenant, json!({})).await;
+        send(&st, &tenant, &sub).await;
+        st.store
+            .delete(&tenant, Kind::Subscription, ID)
+            .await
+            .expect("delete");
+        st.sub_mirror
+            .as_ref()
+            .expect("mirror")
+            .apply(tenant.as_str(), ID, None);
+        send(&st, &tenant, &sub).await;
+        assert_eq!(socket.sent.load(Ordering::SeqCst), 1);
+        settle_bookings(&st, &tenant).await;
+        assert!(
+            st.sub_mirror
+                .as_ref()
+                .expect("mirror")
+                .docs(tenant.as_str())
+                .is_empty(),
+            "a window never brings a deleted Subscription back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_window_is_its_tenants_alone() {
+        let (st, _socket) = window_state("antares-window-tenants");
+        let (a, b) = (tenant(), TenantId::new("window-b").expect("tenant"));
+        let (sub_a, sub_b) = (
+            subscribed(&st, &a, json!({})).await,
+            subscribed(&st, &b, json!({})).await,
+        );
+        send(&st, &a, &sub_a).await;
+        send(&st, &a, &sub_a).await;
+        send(&st, &b, &sub_b).await;
+        settle_bookings(&st, &a).await;
+        assert_eq!(stored(&st, &a).await["timesSent"], json!(2));
+        assert_eq!(stored(&st, &b).await.get("timesSent"), None);
+        settle_bookings(&st, &b).await;
+        assert_eq!(stored(&st, &b).await["timesSent"], json!(1));
     }
 }
