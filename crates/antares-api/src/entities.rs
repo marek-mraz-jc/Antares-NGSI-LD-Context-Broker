@@ -3540,7 +3540,10 @@ async fn retrieve_attr_inner(
     headers: &HeaderMap,
 ) -> ApiResult<Response> {
     let tenant = tenant_from(headers)?;
-    check_params(params, &["options", "format", "lang", "datasetId", "local"])?;
+    check_params(
+        params,
+        &["options", "format", "lang", "datasetId", "local", "type"],
+    )?;
     let ctx = request_context(&st.loader, headers).await?;
     let filter = gate!(
         st, &tenant, headers, "5.7.1",
@@ -3564,11 +3567,32 @@ async fn retrieve_attr_inner(
     if !crate::repr::policy_admits(st, &tenant, &ctx, repr.policy_reach.as_deref(), &doc).await {
         return Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into());
     }
+    // TS 104 175 10.4.4.4: no Entity "whose id (URI), and where specified
+    // type, is equivalent" — the ?type selector (7.2.2) narrows the target.
+    if !crate::negotiate::matches_type_param(&doc, params, &ctx) {
+        return Err(NgsiError::ResourceNotFound(format!(
+            "entity {id} does not match the type selector"
+        ))
+        .into());
+    }
     let attr_iri = antares_jsonld::expand_attr_name(attr, &ctx)?;
     // One answer for an Attribute the Entity lacks and one the narrowing
     // hides (ADR-0023 rule 2).
     let lacks = || NgsiError::ResourceNotFound(format!("entity {id} has no attribute {attr}"));
     let node = doc.get(&attr_iri).ok_or_else(lacks)?;
+    // 10.4.4.4: without ?datasetId the Attribute is found only by its
+    // default instance, the one carrying no datasetId.
+    let default_instance = |i: &Value| i.get("datasetId").is_none();
+    let has_default = match node {
+        Value::Array(a) => a.iter().any(default_instance),
+        one => default_instance(one),
+    };
+    if !params.contains_key("datasetId") && !has_default {
+        return Err(NgsiError::ResourceNotFound(format!(
+            "entity {id} has no default instance of attribute {attr}; ask one by datasetId"
+        ))
+        .into());
+    }
     // Compact through the entity pipeline so the attribute serializes exactly
     // as it would inside a full retrieve.
     let mini = serde_json::json!({

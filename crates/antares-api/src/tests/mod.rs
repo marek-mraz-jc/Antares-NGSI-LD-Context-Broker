@@ -1509,6 +1509,70 @@ async fn ts104179_5_2_3_nested_sealed_attribute_round_trips_through_merge() {
     assert_eq!(doc["parkedAt"]["value"], "P1");
 }
 
+/// TS 104 175 10.4.4.4 (062_05_02, 062_07_01, 062_07_02): the ?type
+/// selector narrows the target Entity, and without ?datasetId an Attribute
+/// with no default instance is not found.
+#[tokio::test]
+async fn retrieve_attr_type_selector_and_default_instance_10_4_4() {
+    let app = app();
+    let entity = serde_json::json!({
+        "id": "urn:ngsi-ld:Vehicle:r1", "type": "Vehicle",
+        "name": {"type": "Property", "value": "Bus"},
+        "speed": [
+            {"type": "Property", "value": 55, "datasetId": "urn:ngsi-ld:Property:gps"},
+            {"type": "Property", "value": 54, "datasetId": "urn:ngsi-ld:Property:speedometer"}
+        ]
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/ngsi-ld/v1/entities")
+                .header("Content-Type", "application/json")
+                .header("Content-Length", entity.to_string().len())
+                .body(Body::from(entity.to_string()))
+                .expect("req"),
+        )
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let get = |path: &str| {
+        let app = app.clone();
+        let uri = format!("/ngsi-ld/v1/entities/urn:ngsi-ld:Vehicle:r1/attrs/{path}");
+        async move {
+            let resp = app
+                .oneshot(Request::get(uri).body(Body::empty()).expect("req"))
+                .await
+                .expect("resp");
+            let status = resp.status();
+            (status, body_json(resp).await)
+        }
+    };
+    let (status, doc) = get("name?type=Vehicle").await;
+    assert_eq!(status, StatusCode::OK, "{doc}");
+    assert_eq!(doc["value"], "Bus");
+    let (status, doc) = get("name?type=Building").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{doc}");
+    assert!(
+        doc["type"]
+            .as_str()
+            .is_some_and(|t| t.ends_with("ResourceNotFound")),
+        "{doc}"
+    );
+    let (status, doc) = get("speed").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no default instance: {doc}");
+    assert!(
+        doc["type"]
+            .as_str()
+            .is_some_and(|t| t.ends_with("ResourceNotFound")),
+        "{doc}"
+    );
+    let (status, doc) = get("speed/value").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no default instance: {doc}");
+    let (status, doc) = get("speed?datasetId=urn:ngsi-ld:Property:speedometer").await;
+    assert_eq!(status, StatusCode::OK, "{doc}");
+    assert_eq!(doc["value"], 54);
+}
+
 #[tokio::test]
 async fn preadoptions_attr_get_value_options_head() {
     // 2.0 pre-adoptions: #14 GET .../attrs/{attrId},
