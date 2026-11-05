@@ -42,12 +42,18 @@ jobs:
     # Deploy on a RED full run too: the badges and report page must
     # turn red, not silently go stale on the last green numbers. Only
     # cancellation and skipping are non-events.
+    # The site (antaresbroker.joinedcontext.com) is the Pages site of
+    # joinedcontext/Antares-NGSI-LD-Context-Broker; a custom domain belongs
+    # to one Pages site only, so every other copy of this repository (the
+    # working repo, forks) skips the job instead of failing on a 404 from
+    # a Pages site that does not exist there.
     if: >
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.event != 'pull_request' &&
-       github.event.workflow_run.head_repository.full_name == github.repository &&
-       (github.event.workflow_run.conclusion == 'success' ||
-        github.event.workflow_run.conclusion == 'failure'))
+      github.repository == 'joinedcontext/Antares-NGSI-LD-Context-Broker' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.event != 'pull_request' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        (github.event.workflow_run.conclusion == 'success' ||
+         github.event.workflow_run.conclusion == 'failure')))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
