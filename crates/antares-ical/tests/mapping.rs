@@ -106,6 +106,15 @@ fn an_offset_is_written_in_utc_and_an_end_before_the_start_skips_the_event() {
 }
 
 #[test]
+fn an_instant_end_equal_to_its_start_is_an_event_without_dtend() {
+    // bbsk-podujatia:0ff29da973d56cc4 on dev (T-6596): startDate and endDate one instant.
+    let at = "2026-11-15T17:00:00+01:00";
+    let l = feed(&[("startDate", prop(json!(at))), ("endDate", prop(json!(at)))]);
+    assert!(has(&l, "DTSTART:20261115T160000Z"), "{l:?}");
+    assert!(!l.iter().any(|x| x.starts_with("DTEND")), "{l:?}");
+}
+
+#[test]
 fn a_utc_start_with_a_date_or_floating_end_ends_in_utc_read_in_bratislava() {
     let start = ("startDate", prop(json!("2026-10-20T18:00:00Z")));
     // the last day 21 October ends at its local midnight, 22:00Z in CEST

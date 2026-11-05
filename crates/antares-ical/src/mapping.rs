@@ -12,8 +12,9 @@
 //! in UTC: no floating time leaves the feed. No mapping is the `sdm-event` preset: `startDate`,
 //! `endDate` (the last day, so a date `DTEND` is the day after it), `name`, `description`,
 //! `address`, `location`, `url` and `organizer` (`{name, url}` as `ORGANIZER;CN=`). An Entity
-//! with no value for `DTSTART` or `SUMMARY`, a date it cannot read, a `DTEND` not after
-//! `DTSTART`, a `GEO` off the globe or a `URL` that is not
+//! with no value for `DTSTART` or `SUMMARY`, a date it cannot read, a `DTEND` before
+//! `DTSTART` (a date one not after it; an instant end equal to an instant start is written
+//! without `DTEND`), a `GEO` off the globe or a `URL` that is not
 //! http(s) is no `VEVENT` at all, and its reason is counted (EP-126).
 
 use chrono::{DateTime, Days, NaiveDate, NaiveDateTime, NaiveTime, TimeZone as _, Utc};
@@ -491,7 +492,7 @@ pub mod reason {
     pub const UNPARSABLE_DATE: &str = "unparsable-date";
     /// `DURATION` holds a value that is no RFC 5545 duration.
     pub const UNPARSABLE_DURATION: &str = "unparsable-duration";
-    /// `DTEND` is not after `DTSTART`.
+    /// `DTEND` is before an instant `DTSTART`, or not after a date one.
     pub const END_NOT_AFTER_START: &str = "dtend-not-after-dtstart";
     /// A `GEO` point outside -90..90 / -180..180.
     pub const GEO_OUT_OF_RANGE: &str = "geo-out-of-range";
@@ -1108,10 +1109,12 @@ impl Plan {
             .and_then(|c| c.remap.end_inclusive)
             .unwrap_or(false);
         let end = start.end_like(end, inclusive, self.zone);
-        if end.utc_key(self.zone) > start.utc_key(self.zone) {
-            Ok(Some(end))
-        } else {
-            Err(reason::END_NOT_AFTER_START)
+        match end.utc_key(self.zone).cmp(&start.utc_key(self.zone)) {
+            std::cmp::Ordering::Greater => Ok(Some(end)),
+            // An instant event without `DTEND` ends at its start (RFC 5545 3.6.1): a source that
+            // ends it there gets no `DTEND`, since 3.8.2.2 wants one later than `DTSTART`.
+            std::cmp::Ordering::Equal if !matches!(start, When::Date(_)) => Ok(None),
+            _ => Err(reason::END_NOT_AFTER_START),
         }
     }
 

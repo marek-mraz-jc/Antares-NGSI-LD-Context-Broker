@@ -84,7 +84,8 @@ An Entity the mapping cannot render is no `VEVENT`: the feed never serves an inv
 `antares_surface_records_skipped_total{surface="ical",reason}` (EP-126) and the response's
 `antares-skipped-records` header counts them. The reasons: `missing-dtstart`, `missing-summary` (no value),
 `unparsable-date` (a mapped date field holds no date), `unparsable-duration` (no RFC 5545 `dur-value`),
-`dtend-not-after-dtstart`, `geo-out-of-range` (a Point outside -90..90 / -180..180), `url-not-http` (not http(s) or
+`dtend-not-after-dtstart` (an end before the start, or a date end not after a date start; an instant end equal to an
+instant start is a zero-length event and is written without `DTEND`, RFC 5545 3.6.1), `geo-out-of-range` (a Point outside -90..90 / -180..180), `url-not-http` (not http(s) or
 holding white space).
 
 ## 5. Output
