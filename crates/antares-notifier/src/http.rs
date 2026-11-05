@@ -3,9 +3,9 @@
 //!
 //! A notification is an HTTP POST to `notification.endpoint.uri`. The MIME
 //! type is `endpoint.accept`, defaulting to `"application/json"`; for
-//! `"application/json"` (and, as this broker serves it, for
-//! `"application/geo+json"`) the request carries a Link header naming the
-//! JSON-LD `@context`. Each `endpoint.receiverInfo` pair becomes one custom
+//! `"application/json"` (and for `"application/geo+json"` with a
+//! receiverInfo `Prefer: body=json`) the request carries a Link header
+//! naming the JSON-LD `@context` (TS 104 176 6.5.2). Each `endpoint.receiverInfo` pair becomes one custom
 //! header.
 
 use crate::{DeliveryError, DeliveryFuture, NotificationSink, Outbound};
@@ -104,15 +104,25 @@ impl NotificationSink for HttpSink {
     }
 }
 
-/// 6.3.8: the headers one notification POST carries. `application/ld+json`
-/// holds its `@context` in the payload body and takes no Link header; the
-/// other two MIME types carry it in the header. Every `receiverInfo` pair
-/// (and the tenant/snapshot markers the caller appended to it) becomes one
-/// custom header.
+/// TS 104 176 6.5.2: the headers one notification POST carries.
+/// `application/json` carries the `@context` in a Link header;
+/// `application/ld+json` holds it in the payload body and takes none, and so
+/// does `application/geo+json` unless a receiverInfo pair `Prefer:
+/// body=json` asks for the Link instead. Every `receiverInfo` pair (and the
+/// tenant/snapshot markers the caller appended to it) becomes one custom
+/// header.
 fn headers(out: &Outbound) -> Vec<(String, String)> {
     let mut h = Vec::with_capacity(out.receiver_info.len() + 2);
     h.push(("Content-Type".to_owned(), out.accept.clone()));
-    if out.accept != "application/ld+json" {
+    let link = match out.accept.as_str() {
+        "application/ld+json" => false,
+        "application/geo+json" => out
+            .receiver_info
+            .iter()
+            .any(|(k, v)| k == "Prefer" && v == "body=json"),
+        _ => true,
+    };
+    if link {
         h.push(("Link".to_owned(), out.link.clone()));
     }
     // The client APPENDS every header it is handed, so a receiverInfo pair
@@ -186,8 +196,9 @@ mod tests {
         )
     }
 
-    /// 6.3.8: json and geo+json carry the @context in a Link header,
-    /// ld+json carries it in the body and takes none.
+    /// TS 104 176 6.5.2: json carries the @context in a Link header; ld+json
+    /// and geo+json carry it in the body and take none, unless geo+json's
+    /// receiverInfo prefers body=json (046_44_01, 046_44_02).
     #[test]
     fn link_header_follows_the_target_mime_type() {
         let names = |o: &Outbound| {
@@ -200,9 +211,14 @@ mod tests {
             names(&out("application/json", &[])),
             ["Content-Type", "Link"]
         );
+        assert_eq!(names(&out("application/geo+json", &[])), ["Content-Type"]);
         assert_eq!(
-            names(&out("application/geo+json", &[])),
-            ["Content-Type", "Link"]
+            names(&out("application/geo+json", &[("Prefer", "body=json")])),
+            ["Content-Type", "Link", "Prefer"]
+        );
+        assert_eq!(
+            names(&out("application/geo+json", &[("Prefer", "body=ld+json")])),
+            ["Content-Type", "Prefer"]
         );
         assert_eq!(names(&out("application/ld+json", &[])), ["Content-Type"]);
     }
@@ -222,7 +238,7 @@ mod tests {
     }
 
     /// 6.3.8 fixes the MIME type of the POST to `endpoint.accept` and, for
-    /// the other two types, mandates the Link header carrying the @context
+    /// json (and geo+json preferring body=json), mandates the Link header carrying the @context
     /// reference. The client appends each header it is handed, so a
     /// receiverInfo pair keyed like either one travels BESIDE the
     /// binding's: two Content-Type fields make the request malformed (IETF
@@ -230,15 +246,17 @@ mod tests {
     /// leaves the receiver two @context references to choose between.
     #[test]
     fn receiver_info_cannot_double_the_headers_the_binding_owns() {
-        for accept in ["application/json", "application/geo+json"] {
-            let h = headers(&out(
-                accept,
-                &[
-                    ("content-type", "text/plain"),
-                    ("LINK", "<https://evil>"),
-                    ("X-Kept", "yes"),
-                ],
-            ));
+        for (accept, prefer) in [
+            ("application/json", None),
+            ("application/geo+json", Some(("Prefer", "body=json"))),
+        ] {
+            let mut pairs = vec![
+                ("content-type", "text/plain"),
+                ("LINK", "<https://evil>"),
+                ("X-Kept", "yes"),
+            ];
+            pairs.extend(prefer);
+            let h = headers(&out(accept, &pairs));
             let named = |n: &str| {
                 h.iter()
                     .filter(|(k, _)| k.eq_ignore_ascii_case(n))
