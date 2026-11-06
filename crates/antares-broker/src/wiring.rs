@@ -384,25 +384,35 @@ pub async fn wire_nats(
                     // what it references. Kept, not deleted, and taken out of
                     // the next page by the same stamp.
                     let mut retained: Vec<(TenantId, i64)> = Vec::new();
+                    let mut events: Vec<ChangeEvent> = Vec::with_capacity(rows.len());
                     for (seq, _tenant, event) in rows {
                         match serde_json::from_value::<ChangeEvent>(event) {
                             Ok(mut ev) => {
                                 ev.seq = seq;
-                                let checked = ev.claim_checked_at(antares_bus::CLAIM_CHECK_BYTES);
-                                match bus_for_drain.publish(&ev).await {
-                                    Ok(()) if checked => retained.push((ev.tenant, seq)),
-                                    Ok(()) => acked.push(seq),
-                                    Err(e) => {
-                                        tracing::warn!("outbox publish of seq {seq} failed: {e}");
-                                        break; // retry from here next round
-                                    }
-                                }
+                                events.push(ev);
                             }
                             Err(e) => {
                                 // an undecodable row would wedge the drain forever
                                 tracing::error!("outbox row {seq} undecodable ({e}) — skipped");
                                 acked.push(seq);
                             }
+                        }
+                    }
+                    // The whole page is written before its acks are awaited
+                    // (T-6608); what the stream did not acknowledge stays in
+                    // the outbox and is retried from there next round.
+                    let (published, failed) = bus_for_drain.publish_all(&events).await;
+                    if let Some(e) = failed {
+                        tracing::warn!(
+                            "outbox publish failed after {published} of {}: {e}",
+                            events.len()
+                        );
+                    }
+                    for ev in events.into_iter().take(published) {
+                        if ev.claim_checked_at(antares_bus::CLAIM_CHECK_BYTES) {
+                            retained.push((ev.tenant, ev.seq));
+                        } else {
+                            acked.push(ev.seq);
                         }
                     }
                     // Retain BEFORE ack: both statements are separate
