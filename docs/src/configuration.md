@@ -130,7 +130,7 @@ here).
 | Variable | Default | Effect |
 |---|---|---|
 | `ANTARES_HEADER_READ_TIMEOUT_MS` | `10000` | A connection that has not finished its request HEAD within this window is closed (slow-loris bound). |
-| `ANTARES_MAX_CONNECTIONS` | `10000` | Concurrent-connection ceiling; further accepts are dropped. Counts keep-alive and LB health-check connections too — size accordingly. |
+| `ANTARES_MAX_CONNECTIONS` | `10000` | Concurrent-connection ceiling; a further connection reads `503` with `Retry-After: 1` and is closed (at most 256 such answers at once, past that it is dropped). Counts keep-alive and LB health-check connections too — size accordingly. |
 | `ANTARES_DISCOVERY_SCAN_MAX` | `100000` | Documents one unpaginated whole-tenant fold may read or hold: the `/types`/`/attributes` discovery folds (5.7.5-5.7.10 define no pagination) the registration query (5.10.2.4 filters before it pages, so the whole match set is held) and the candidate walk of a paged geoquery or `scopeQ` (T-5088). Past it the answer is 403 TooManyResults (5.5.6) instead of an unbounded scan. Published as `maxFoldDocs` in `/q/health`. |
 | `ANTARES_DRAIN_DELAY_MS` | `2000` | Rolling update, step 2: keep serving this long after `/q/health` flips to 503 — the load balancer's notice window, sized so a health poll actually observes the 503 before the socket goes. |
 | `ANTARES_DRAIN_DEADLINE_SECS` | `20` | Bound on waiting for in-flight connections during drain. Container `stop_grace_period` / `terminationGracePeriodSeconds` MUST exceed delay + deadline. |
