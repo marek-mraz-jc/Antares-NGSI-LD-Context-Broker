@@ -411,6 +411,8 @@ async fn every_query_shape_reads_an_index_under_rls() {
         ("q at most probe", probe("attr = 'https://x/speed' AND (f <= 1 OR f = 'NaN')"), "i_entity_values_num"),
         ("q string probe", probe("attr = 'https://x/brand' AND (txt = 'b7' OR f = 'NaN')"), "i_entity_values_txt"),
         ("attrs probe", probe("attr = ANY(ARRAY['https://x/rare'])"), "i_entity_values_num"),
+        // T-6610: a scopeQ's probe of the scope rows (0032, `scope_probe`)
+        ("scopeQ probe", probe("attr = 'scope' AND (txt = '/A' OR (txt >= '/A/' AND txt < '/A0') OR f = 'NaN')"), "i_entity_values_txt"),
         (
             "geo near",
             format!(
