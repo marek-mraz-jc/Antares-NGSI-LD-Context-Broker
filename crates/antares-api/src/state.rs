@@ -1553,23 +1553,24 @@ struct HitSlot {
 }
 
 impl HitBatch {
-    async fn bump<F, Fut>(&self, tenant: Option<&antares_model::TenantId>, url: &str, write: F) -> bool
+    async fn bump<F, Fut>(
+        &self,
+        tenant: Option<&antares_model::TenantId>,
+        url: &str,
+        write: F,
+    ) -> bool
     where
         F: FnOnce(u64) -> Fut,
         Fut: std::future::Future<Output = bool>,
     {
         use std::sync::atomic::Ordering;
         let key: HitKey = (tenant.cloned(), url.to_owned());
-        let slot = Arc::clone(
-            self.lock()
-                .entry(key.clone())
-                .or_insert_with(|| {
-                    Arc::new(HitSlot {
-                        pending: std::sync::atomic::AtomicU64::new(0),
-                        write: tokio::sync::Mutex::new(true),
-                    })
-                }),
-        );
+        let slot = Arc::clone(self.lock().entry(key.clone()).or_insert_with(|| {
+            Arc::new(HitSlot {
+                pending: std::sync::atomic::AtomicU64::new(0),
+                write: tokio::sync::Mutex::new(true),
+            })
+        }));
         slot.pending.fetch_add(1, Ordering::AcqRel);
         let exists = {
             let mut last = slot.write.lock().await;
@@ -1718,7 +1719,11 @@ mod jsonld_context_locality_5_13 {
         crate::negotiate::request_context_quiet(&st.loader, &headers)
             .await
             .expect("quiet resolve");
-        assert_eq!(hits().await, serde_json::json!(1), "a second look counts no hit");
+        assert_eq!(
+            hits().await,
+            serde_json::json!(1),
+            "a second look counts no hit"
+        );
         crate::negotiate::request_context(&st.loader, &headers)
             .await
             .expect("counted resolve");
@@ -2112,8 +2117,11 @@ mod hit_batch {
         let writes = Arc::new(AtomicU64::new(0));
         let mut tasks = Vec::new();
         for _ in 0..64 {
-            let (batch, written, writes) =
-                (Arc::clone(&batch), Arc::clone(&written), Arc::clone(&writes));
+            let (batch, written, writes) = (
+                Arc::clone(&batch),
+                Arc::clone(&written),
+                Arc::clone(&writes),
+            );
             tasks.push(tokio::spawn(async move {
                 let w = Arc::clone(&written);
                 let exists = batch
