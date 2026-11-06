@@ -160,6 +160,47 @@ pub async fn connect(url: &str, max_connections: u32) -> Result<PgPool, sqlx::Er
 /// before it is dropped instead of going back to the pool (T-4298).
 pub const RELEASE_PING: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long a pooled connection may sit idle before an acquire pings it
+/// first (T-6606). One released inside this window answered its release
+/// ping that long ago at most.
+pub const ACQUIRE_PING_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A liveness ping bounded by [`RELEASE_PING`]: `true` keeps the connection.
+///
+/// A failed ping answers `false`, never `Err` (T-6000). On `Err` sqlx closes
+/// "hard": it only flushes and shuts the socket, and over TLS (sqlx 0.9
+/// rustls) a flush with nothing to write waits to READ, which on a healthy
+/// idle server never comes: the slot was held for good (prod 2026-10-28, 13
+/// of 13, each session idle after the ROLLBACK of a request dropped while
+/// its statement failed). On `false` sqlx sends Terminate first, the server
+/// closes, and the read ends. A ping that ran out may sit on a stalled
+/// stream, where no Terminate gets through either: the hook holds the
+/// connection only by reference, so a fresh one takes its place and the
+/// stalled socket is dropped unflushed; sqlx then closes the fresh one.
+async fn bounded_ping(
+    conn: &mut sqlx::PgConnection,
+    connect: &sqlx::postgres::PgConnectOptions,
+) -> bool {
+    use sqlx::Connection;
+    match tokio::time::timeout(RELEASE_PING, conn.ping()).await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            tracing::debug!(%e, "pooled connection failed its ping; closing it");
+            false
+        }
+        Err(_) => {
+            tracing::debug!("pooled connection did not answer its ping; closing it");
+            let fresh =
+                tokio::time::timeout(RELEASE_PING, sqlx::PgConnection::connect_with(connect))
+                    .await;
+            if let Ok(Ok(fresh)) = fresh {
+                drop(std::mem::replace(conn, fresh));
+            }
+            false
+        }
+    }
+}
+
 /// How long the server keeps a broker session that sits idle outside a
 /// transaction (`idle_session_timeout`, T-6000). A pooled connection never
 /// gets there: the pool closes an idle one after [`POOL_IDLE`], and its
@@ -275,41 +316,29 @@ fn options(
         // bounded; one that fails or runs out drops the socket at once, and
         // the slot opens a fresh connection on demand. sqlx's own ping after
         // it costs one more round trip on a connection that just answered.
-        //
-        // A failed ping answers `Ok(false)`, never `Err` (T-6000). On `Err`
-        // sqlx closes "hard": it only flushes and shuts the socket, and over
-        // TLS (sqlx 0.9 rustls) a flush with nothing to write waits to READ,
-        // which on a healthy idle server never comes: the slot was held for
-        // good (prod 2026-10-28, 13 of 13, each session idle after the
-        // ROLLBACK of a request dropped while its statement failed). On
-        // `Ok(false)` sqlx sends Terminate first, the server closes, and the
-        // read ends. A ping that ran out may sit on a stalled stream, where
-        // no Terminate gets through either: the hook holds the connection
-        // only by reference, so a fresh one takes its place and the stalled
-        // socket is dropped unflushed; sqlx then closes the fresh one.
-        .after_release(move |conn, _meta| {
+        // How a failed or stalled ping is closed: [`bounded_ping`] (T-6000).
+        .after_release({
+            let connect = connect.clone();
+            move |conn, _meta| {
+                let connect = connect.clone();
+                Box::pin(async move { Ok(bounded_ping(conn, &connect).await) })
+            }
+        })
+        // sqlx's own acquire test is the same unbounded ping, run on every
+        // acquire, so a connection released a moment ago, and pinged twice
+        // then, paid a third round trip before its next statement (T-6606,
+        // R2-003). The hook below pings only a connection idle for
+        // [`ACQUIRE_PING_IDLE`] or longer, the one a server restart or a
+        // stalled stream may have taken while it sat in the pool, and bounds
+        // that ping as the release hook does.
+        .test_before_acquire(false)
+        .before_acquire(move |conn, meta| {
             let connect = connect.clone();
             Box::pin(async move {
-                use sqlx::Connection;
-                match tokio::time::timeout(RELEASE_PING, conn.ping()).await {
-                    Ok(Ok(())) => Ok(true),
-                    Ok(Err(e)) => {
-                        tracing::debug!(%e, "released connection failed its ping; closing it");
-                        Ok(false)
-                    }
-                    Err(_) => {
-                        tracing::debug!("released connection did not answer its ping; closing it");
-                        let fresh = tokio::time::timeout(
-                            RELEASE_PING,
-                            sqlx::PgConnection::connect_with(&connect),
-                        )
-                        .await;
-                        if let Ok(Ok(fresh)) = fresh {
-                            drop(std::mem::replace(conn, fresh));
-                        }
-                        Ok(false)
-                    }
+                if meta.idle_for < ACQUIRE_PING_IDLE {
+                    return Ok(true);
                 }
+                Ok(bounded_ping(conn, &connect).await)
             })
         })
         .after_connect(move |conn, _meta| {
