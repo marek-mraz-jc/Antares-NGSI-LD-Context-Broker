@@ -1386,6 +1386,27 @@ impl<S: Surface> antares_api::ApiSurface for Mounted<S> {
     }
 }
 
+/// The length of `v`'s compact JSON text (what `v.to_string()` holds), counted as it is written
+/// so no text is built: a surface sizing each row against its answer budget serialised it once
+/// to measure and again to answer (T-6612, R3-016).
+#[must_use]
+pub fn json_len(v: &serde_json::Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    // A Value always serialises; a write into the counter cannot fail.
+    let _ = serde_json::to_writer(&mut count, v);
+    count.0
+}
+
 /// A broker over the built-in store, for a surface's integration tests.
 #[cfg(feature = "test-kit")]
 pub mod test_kit {
@@ -1706,6 +1727,18 @@ pub fn default_instance<'a>(
 
 #[cfg(test)]
 mod tests {
+
+    /// T-6612, R3-016: the counted length is the text's length, escapes and non-ASCII included.
+    #[test]
+    fn json_len_is_the_length_of_the_text() {
+        for v in [
+            serde_json::json!(null),
+            serde_json::json!({"a": [1, 2.5, "x\"y\n"], "ä": {"b": true}}),
+            serde_json::json!("€ and \u{1}"),
+        ] {
+            assert_eq!(super::json_len(&v), v.to_string().len(), "{v}");
+        }
+    }
     use super::*;
 
     /// F-ANT5-009: a named instance listed first is not the member's value; with only
