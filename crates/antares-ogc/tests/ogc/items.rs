@@ -783,8 +783,17 @@ async fn a_further_page_states_no_count_and_ends_exactly() -> Result<(), String>
     let first = get(&f.app, &format!("{CARS}?bbox=170,-1,-170,1&limit=1")).await;
     let link = href(&first.body, "next").ok_or("no next link")?;
     let rest = get(&f.app, &local(&link).replace("limit=1", "limit=2")).await;
-    assert_eq!(ids(&rest.body), ["urn:ngsi-ld:Car:4", "urn:ngsi-ld:Car:3"], "{}", rest.body);
+    assert_eq!(
+        ids(&rest.body),
+        ["urn:ngsi-ld:Car:4", "urn:ngsi-ld:Car:3"],
+        "{}",
+        rest.body
+    );
     assert_eq!(rest.body.get("numberMatched"), None);
-    assert_eq!(href(&rest.body, "next"), None, "the collection ended exactly");
+    assert_eq!(
+        href(&rest.body, "next"),
+        None,
+        "the collection ended exactly"
+    );
     Ok(())
 }

@@ -764,21 +764,7 @@ impl Cursor {
             None => self.enter(part)?,
         };
         let size = room.min(view.page_size());
-        // An uncounted page reads one Entity past its end to know whether a `next` follows.
-        let ahead = !self.counted && r.residual.is_none() && size == room;
-        let page = self.store_page(&r, size.saturating_add(usize::from(ahead)));
-        let (mut docs, mut next, count) = match &r.residual {
-            None => scanned(view.scan(caller, &r.pushdown, None, page).await)?,
-            Some(program) => scanned(
-                view.scan_within(caller, &r.pushdown, program, page, &mut r.budget)
-                    .await,
-            )?,
-        };
-        if ahead {
-            let more = docs.len() > size;
-            docs.truncate(size);
-            next = more.then(|| r.pos.saturating_add(size));
-        }
+        let (docs, next, count) = self.read_part(view, caller, &mut r, size, room).await?;
         let got = docs.len();
         self.served = self.served.saturating_add(got);
         r.first = false;
@@ -847,6 +833,33 @@ impl Cursor {
         }
     }
 
+    /// One store read of the part `r` reads, at most `size` Entities of the page's `room`;
+    /// an uncounted read that ends the page asks one more, whose presence is its `next`.
+    async fn read_part(
+        &self,
+        view: &ViewOps,
+        caller: &Caller,
+        r: &mut Reading,
+        size: usize,
+        room: usize,
+    ) -> Result<Read, Problem> {
+        let ahead = !self.counted && r.residual.is_none() && size == room;
+        let page = self.store_page(r, size.saturating_add(usize::from(ahead)));
+        let (mut docs, mut next, count) = match &r.residual {
+            None => scanned(view.scan(caller, &r.pushdown, None, page).await)?,
+            Some(program) => scanned(
+                view.scan_within(caller, &r.pushdown, program, page, &mut r.budget)
+                    .await,
+            )?,
+        };
+        if ahead {
+            let more = docs.len() > size;
+            docs.truncate(size);
+            next = more.then(|| r.pos.saturating_add(size));
+        }
+        Ok((docs, next, count))
+    }
+
     /// Part `i` on an uncounted page with no room left: nothing read before the token's
     /// part, and past a full page one Entity of the part, whose presence starts the `next`
     /// page there (R3-001: a count of every part was the old answer).
@@ -862,14 +875,7 @@ impl Cursor {
         }
         if let (None, Some(part)) = (&self.next, self.parts.get(i)) {
             let mut r = self.enter(part)?;
-            let one = self.store_page(&r, 1);
-            let (docs, _, _) = match &r.residual {
-                None => scanned(view.scan(caller, &r.pushdown, None, one).await)?,
-                Some(program) => scanned(
-                    view.scan_within(caller, &r.pushdown, program, one, &mut r.budget)
-                        .await,
-                )?,
-            };
+            let (docs, _, _) = self.read_part(view, caller, &mut r, 1, usize::MAX).await?;
             self.next = (!docs.is_empty()).then(|| token(i, r.pos, self.digest));
         }
         self.part = if self.next.is_some() {
