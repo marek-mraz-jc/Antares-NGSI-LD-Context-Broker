@@ -406,6 +406,8 @@ impl TimeBound {
     /// The bound at `now` in milliseconds, the precision 4.11 accepts: a
     /// start (`up`) rounds up and an end down, so rounding only narrows.
     fn render(self, now: chrono::DateTime<chrono::Utc>, up: bool) -> String {
+        #[cfg(test)]
+        RENDERS.with(|n| n.set(n.get().saturating_add(1)));
         let t = self.at(now);
         let sub = i64::from(t.timestamp_subsec_nanos() % 1_000_000);
         let t = if up && sub > 0 {
@@ -420,17 +422,51 @@ impl TimeBound {
     }
 }
 
+/// The [`TimeBound::render`] calls of this thread, for the tests that count them.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A [`Window`] with its bounds resolved against one `now`, each as its
+/// [`antares_model::dt_key`]: a request resolves them once and compares
+/// every instance against the keys (T-6612, R1-021: each instance rendered
+/// and keyed both bounds again).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    from: Option<String>,
+    to: Option<String>,
+}
+
+impl Resolved {
+    /// Whether an instance observed at `observed_at` falls inside; 4.11's
+    /// half-open comparison.
+    #[must_use]
+    pub fn admits(&self, observed_at: &str) -> bool {
+        let t = antares_model::dt_key(observed_at);
+        self.from.as_ref().is_none_or(|b| t >= *b) && self.to.as_ref().is_none_or(|b| t < *b)
+    }
+}
+
 impl Window {
+    /// The bounds resolved against `now`.
+    #[must_use]
+    pub fn resolve(&self, now: chrono::DateTime<chrono::Utc>) -> Resolved {
+        Resolved {
+            from: self
+                .from
+                .map(|b| antares_model::dt_key(&b.render(now, true))),
+            to: self
+                .to
+                .map(|b| antares_model::dt_key(&b.render(now, false))),
+        }
+    }
+
     /// Whether an instance observed at `observed_at` falls inside, the
     /// bounds resolved against `now`; 4.11's half-open comparison.
     #[must_use]
     pub fn admits(&self, observed_at: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
-        let t = antares_model::dt_key(observed_at);
-        self.from
-            .is_none_or(|b| t >= antares_model::dt_key(&b.render(now, true)))
-            && self
-                .to
-                .is_none_or(|b| t < antares_model::dt_key(&b.render(now, false)))
+        self.resolve(now).admits(observed_at)
     }
 
     /// Whether every instance observed at or after `start` is past this
