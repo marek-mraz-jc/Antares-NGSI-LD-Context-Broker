@@ -4,7 +4,8 @@
 
 use crate::context::Context;
 use crate::pinned::{
-    core_context, is_pinned, merge_context_value, pinned, CORE_CONTEXT, MAX_CONTEXT_BYTES, MAX_CONTEXT_URLS,
+    core_context, is_pinned, merge_context_value, pinned, CORE_CONTEXT, MAX_CONTEXT_BYTES,
+    MAX_CONTEXT_URLS,
 };
 use antares_model::{NgsiError, TenantId};
 use serde_json::Value;
