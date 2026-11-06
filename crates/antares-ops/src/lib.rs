@@ -68,7 +68,7 @@ use axum::response::Response;
 use axum::Router;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 /// The policy seam's public types (ADR-0020), so a surface names no
 /// `antares-api` item.
@@ -482,18 +482,15 @@ impl Ops {
         // Only views loaded now stay cached: a removed one goes with the
         // next sweep. A changed view is a new `CompiledView`, so a handle
         // of the old one is never served again.
-        let (made, gone) = self
-            .views
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_or_build(
-                id,
-                |held| Arc::ptr_eq(&held.view, view),
-                |k| table.contains_key(k),
-                std::time::Instant::now(),
-                view_cache::idle(),
-                build,
-            );
+        let (made, gone) = view_cache::ViewCache::get_or_build(
+            &self.views,
+            id,
+            |held| Arc::ptr_eq(&held.view, view),
+            |k| table.contains_key(k),
+            std::time::Instant::now(),
+            view_cache::idle(),
+            build,
+        );
         view_cache::release(gone);
         made
     }
