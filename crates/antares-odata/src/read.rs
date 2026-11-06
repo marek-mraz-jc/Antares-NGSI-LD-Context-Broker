@@ -1538,10 +1538,8 @@ fn asked<'s>(set: &'s Set, names: &'s [&str]) -> impl Iterator<Item = &'s crate:
 /// context: a term the filter defined, else the core name.
 fn key_of(iri: &str, filter: &Translated) -> String {
     filter
-        .context
-        .iter()
-        .find(|(_, defined)| defined.as_str() == Some(iri))
-        .map_or_else(|| core_name(iri), |(term, _)| term.clone())
+        .term_of(iri)
+        .map_or_else(|| core_name(iri), ToOwned::to_owned)
 }
 
 /// An expanded navigation member: references to the Relationship's
