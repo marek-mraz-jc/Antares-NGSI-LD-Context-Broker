@@ -157,7 +157,7 @@ async fn respond(ops: &Ops, req: Request) -> Response {
         None
     };
     let visible = visible.as_ref();
-    let Some((edm, csdl, metadata_etag)) = model(&id, &view, visible, version) else {
+    let Some((edm, csdl, metadata_etag, metadata)) = model(&id, &view, visible, version) else {
         return not_found();
     };
     // A 4.0 document serves an Untyped member as a dynamic property of an open type (CSDL XML
@@ -171,7 +171,7 @@ async fn respond(ops: &Ops, req: Request) -> Response {
     let url_model = (version == CsdlVersion::V4_0 && open)
         .then(|| model(&id, &view, visible, CsdlVersion::V4_01))
         .flatten()
-        .map(|(_, csdl, _)| csdl);
+        .map(|(_, csdl, ..)| csdl);
     let state = Arc::new(ODataState {
         model: csdl,
         url_model,
@@ -185,6 +185,7 @@ async fn respond(ops: &Ops, req: Request) -> Response {
         csdl_limits: odata_csdl::Limits::strict(),
         max_header_len: MAX_HEADER_LEN,
         metadata_etag,
+        metadata,
         custom_options: read::NGSILD_OPTIONS
             .iter()
             .map(|name| (*name).to_owned())
@@ -305,8 +306,14 @@ async fn query_in_body(req: Request, max: usize) -> Result<Request, ODataErrorRe
 /// `representations.odata` as written, and whether it offers the Temporal Query (T-5908).
 type ModelKey = (String, edm::Shown, edm::Writable, u64, bool, String, bool);
 
-/// A built model, its CSDL document and that document's `ETag`.
-type Built = (Arc<edm::Edm>, Arc<odata_csdl::Model>, Option<String>);
+/// A built model, its CSDL document, that document's `ETag` and its metadata documents as
+/// written (T-6619 R3-014: written once per built key, not per request).
+type Built = (
+    Arc<edm::Edm>,
+    Arc<odata_csdl::Model>,
+    Option<String>,
+    Arc<odata_axum::MetadataDocuments>,
+);
 
 /// What the caller may read through `view`: asked as the type details the
 /// LinkML surface asks for its schema documents, else as the reads the model
@@ -410,13 +417,16 @@ fn model(
         schema_revision = revision,
         "the view's OData model was built"
     );
-    let etag = odata_axum::metadata_etag(&edm.csdl, &odata_csdl::Limits::strict());
-    let mut xml = Vec::new();
-    // ponytail: the document is written a second time for its weight, once per built key.
-    let weight = odata_csdl::write_xml(&edm.csdl, &odata_csdl::Limits::strict(), &mut xml)
-        .map_or(u32::MAX, |()| u32::try_from(xml.len()).unwrap_or(u32::MAX))
+    let documents = Arc::new(odata_axum::MetadataDocuments::default());
+    // The XML document `$metadata` serves, written here once: its tag and its weight.
+    let xml = documents.xml(&edm.csdl, &odata_csdl::Limits::strict());
+    let etag = xml.map(|w| w.etag.clone());
+    let weight = xml
+        .map_or(u32::MAX, |w| {
+            u32::try_from(w.body.len()).unwrap_or(u32::MAX)
+        })
         .max(4096);
-    let built = (Arc::new(edm.clone()), Arc::new(edm.csdl), etag);
+    let built = (Arc::new(edm.clone()), Arc::new(edm.csdl), etag, documents);
     CACHE.insert(key, (built.clone(), weight));
     Some(built)
 }
