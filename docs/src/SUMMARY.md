@@ -42,6 +42,7 @@
 - [OGC API - Features and Tiles compliance](ogc-compliance.md)
 - [SensorThings API compliance](sta-compliance.md)
 - [Performance](performance.md)
+- [Request cost](request-cost.md)
 - [Performance baseline](perf-baseline.md)
 - [Load on every surface](load-surfaces.md)
 - [Coverage](coverage.md)

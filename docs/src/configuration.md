@@ -135,6 +135,7 @@ here).
 | `ANTARES_DRAIN_DELAY_MS` | `2000` | Rolling update, step 2: keep serving this long after `/q/health` flips to 503 — the load balancer's notice window, sized so a health poll actually observes the 503 before the socket goes. |
 | `ANTARES_DRAIN_DEADLINE_SECS` | `20` | Bound on waiting for in-flight connections during drain. Container `stop_grace_period` / `terminationGracePeriodSeconds` MUST exceed delay + deadline. |
 | `ANTARES_TELEMETRY` | off | Any value but an off spelling enables the metrics recorder and, with the endpoint, the OTLP span and log pipelines. |
+| `ANTARES_REQUEST_COST` | `off` | `on` adds `Server-Timing` and `JC-Request-Cost` to every answer and keeps per-tenant cost counters on `/q/metrics` (counters need `ANTARES_TELEMETRY`); any other value is fatal at boot. Off measures nothing. See [Request cost](request-cost.md). |
 | `ANTARES_OTLP_ENDPOINT` | unset | OTLP/HTTP collector for traces and logs, e.g. `http://collector:4318/v1/traces`; log records go to the `v1/logs` twin of that URL with the same resource attributes. Unset costs nothing. |
 
 Compile-time bounds (no variable sets them; spec-shaped rejections): URI
