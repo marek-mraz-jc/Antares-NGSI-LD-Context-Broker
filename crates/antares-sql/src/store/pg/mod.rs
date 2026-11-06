@@ -191,8 +191,7 @@ async fn bounded_ping(
         Err(_) => {
             tracing::debug!("pooled connection did not answer its ping; closing it");
             let fresh =
-                tokio::time::timeout(RELEASE_PING, sqlx::PgConnection::connect_with(connect))
-                    .await;
+                tokio::time::timeout(RELEASE_PING, sqlx::PgConnection::connect_with(connect)).await;
             if let Ok(Ok(fresh)) = fresh {
                 drop(std::mem::replace(conn, fresh));
             }
@@ -468,7 +467,7 @@ pub async fn set_service(tx: &mut Transaction<'_, Postgres>) -> Result<(), sqlx:
 /// creation inserts its row in the same transaction as the document"). Two
 /// things ride on it being IN the document's transaction rather than before
 /// it: the tenant row and the rows it accounts for commit together, and the
-/// claim holds a row lock the purge's `SELECT … FOR UPDATE` conflicts with,
+/// claim holds a lock the purge's exclusive one conflicts with,
 /// so the purge waits for an in-flight write instead of stepping over it.
 /// Committed separately, a write racing a purge leaves rows behind for a
 /// tenant the inventory no longer names — readable to whoever sends that
@@ -477,36 +476,39 @@ pub async fn set_service(tx: &mut Transaction<'_, Postgres>) -> Result<(), sqlx:
 /// The lock is SHARED. An upsert whose `DO UPDATE` re-set the tenant id took
 /// the exclusive lock and wrote a row version on every write, so writes in
 /// one tenant serialised behind each other and a table with one row per
-/// tenant collected one dead tuple per write in the broker. `FOR SHARE`
-/// conflicts with `FOR UPDATE` exactly as the exclusive lock did, and is
+/// tenant collected one dead tuple per write in the broker. A shared lock
+/// conflicts with the purge's exclusive one exactly as that did, and is
 /// compatible with itself, so concurrent writers hold it together.
 ///
 /// Idempotent, so two concurrent first writes both succeed (vs Scorpio's
 /// CREATE DATABASE + Flyway deadlock).
+/// The purge's side of the tenant fence [`claim_tenant`] holds shared: one
+/// bound parameter, the tenant id.
+pub const PURGE_FENCE_SQL: &str =
+    "SELECT pg_advisory_xact_lock(hashtext('antares.tenant'), hashtext($1))";
+
 pub async fn claim_tenant(
     tx: &mut Transaction<'_, Postgres>,
     tenant: &TenantId,
 ) -> Result<(), sqlx::Error> {
-    // ponytail: shared row lock, so many concurrent writers in one tenant
-    // register on one row; if multixact contention on that row ever shows up
-    // in `pg_stat_activity`, the upgrade is a shared advisory lock keyed by
-    // the tenant, which the purge takes exclusively and which touches no heap
-    // page at all.
-    let claimed =
-        sqlx::query_scalar::<_, i32>("SELECT 1 FROM tenants WHERE tenant_id = $1 FOR SHARE")
-            .bind(tenant.as_str())
-            .fetch_optional(&mut **tx)
-            .await?
-            .is_some();
-    if claimed {
-        return Ok(());
-    }
-    // First write for this tenant. `DO UPDATE` rather than `DO NOTHING`:
-    // a concurrent first write must block here until the winner commits,
-    // and `DO NOTHING` would return without taking its lock.
+    // A shared advisory lock keyed by the tenant fences the write from a
+    // purge, which takes it exclusively (`AnyStore::purge_tenant`). It
+    // replaced `FOR SHARE` on the tenant's row (T-6606, R2-005): a row lock
+    // writes the locker into the tuple's xmax, so every write of a busy
+    // tenant dirtied the one `tenants` page and, with several writers at
+    // once, minted a multixact; the advisory lock touches no heap page.
+    //
+    // One statement: the lock is taken before the INSERT checks its
+    // conflict, and that check reads the index as it stands now, not the
+    // statement's snapshot, so a purge that committed while this waited
+    // finds its row re-inserted here. `DO NOTHING` takes no row lock and
+    // writes nothing for a tenant that exists; a concurrent first write
+    // waits on the winner's uncommitted index entry, then does nothing.
     sqlx::query(
-        "INSERT INTO tenants (tenant_id) VALUES ($1) \
-         ON CONFLICT (tenant_id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id",
+        "INSERT INTO tenants (tenant_id) \
+         SELECT $1 FROM (SELECT pg_advisory_xact_lock_shared(\
+             hashtext('antares.tenant'), hashtext($1))) AS fence \
+         ON CONFLICT (tenant_id) DO NOTHING",
     )
     .bind(tenant.as_str())
     .execute(&mut **tx)

@@ -1635,6 +1635,14 @@ impl AnyStore {
             AnyStore::Pg(p) => {
                 async {
                     let mut tx = tenant_tx(p, tenant).await?;
+                    // Waits for every write holding the tenant's shared
+                    // fence (`pg::claim_tenant`) and holds later ones off
+                    // until this commits.
+                    sqlx::query(crate::store::pg::PURGE_FENCE_SQL)
+                        .bind(tenant.as_str())
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db)?;
                     let known = sqlx::query_scalar::<_, i32>(
                         "SELECT 1 FROM tenants WHERE tenant_id = $1 FOR UPDATE",
                     )
