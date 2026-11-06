@@ -273,7 +273,7 @@ async fn respond(ops: &Ops, caller: &Caller, parts: &Parts, body: Body) -> Reply
     let Some(view) = ops.view(id) else {
         return not_found();
     };
-    let Some(collections) = collections(&view, id) else {
+    let Some(collections) = collections(&view) else {
         return not_found();
     };
     // W4: a resource's methods are the reads and the writes the view offers on it.
@@ -481,72 +481,10 @@ fn parsed(
         .ok()
 }
 
-/// The collections of a view as built for one compilation and schema revision.
-type Built = std::sync::Arc<BTreeMap<String, Collection>>;
-
-/// A view's [`Built`] collections and what they were built from.
-struct KeptModel {
-    /// The view compilation: a rule, representation or operation change makes a new one.
-    view: std::sync::Weak<dyn std::any::Any + Send + Sync>,
-    revision: u64,
-    all: Built,
-}
-
-/// The built collections per (Tenant, view id). An entry whose compilation is gone is dropped
-/// on the next insert, so the map holds at most one entry per live view.
-static MODELS: std::sync::LazyLock<
-    std::sync::RwLock<std::collections::HashMap<(String, String), KeptModel>>,
-> = std::sync::LazyLock::new(std::sync::RwLock::default);
-
-/// `build`'s collections for `key`, built once per view compilation and schema revision on this
-/// pod (T-6612, R3-006: every page, tile and item read rebuilt every collection of the view).
-/// The collections hold no caller data: the Policy narrows reads, never the model.
-fn kept(
-    key: (String, String),
-    view: std::sync::Weak<dyn std::any::Any + Send + Sync>,
-    revision: u64,
-    build: impl FnOnce() -> Option<BTreeMap<String, Collection>>,
-) -> Option<Built> {
-    use std::sync::PoisonError;
-    let hit = MODELS
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(&key)
-        .filter(|k| k.revision == revision && std::sync::Weak::ptr_eq(&k.view, &view))
-        .map(|k| k.all.clone());
-    if hit.is_some() {
-        return hit;
-    }
-    let all: Built = build()?.into();
-    let mut models = MODELS.write().unwrap_or_else(PoisonError::into_inner);
-    models.retain(|_, k| k.view.strong_count() > 0);
-    models.insert(
-        key,
-        KeptModel {
-            view,
-            revision,
-            all: all.clone(),
-        },
-    );
-    Some(all)
-}
-
-/// The collections of the view `id`, if its Tenant has a schema this surface reads.
-fn collections(view: &ViewOps, id: &str) -> Option<Built> {
+/// The collections of the view, if its Tenant has a schema this surface reads.
+fn collections(view: &ViewOps) -> Option<BTreeMap<String, Collection>> {
     let (revision, bytes) = view.schema()?;
-    let key = (view.tenant().to_owned(), id.to_owned());
-    kept(key, view.generation(), revision, || {
-        build(view, revision, &bytes)
-    })
-}
-
-/// The collections of the view built from its schema `bytes` at `revision`.
-fn build(
-    view: &ViewOps,
-    revision: u64,
-    bytes: &std::sync::Arc<[u8]>,
-) -> Option<BTreeMap<String, Collection>> {
-    let schema = parsed(revision, bytes)?;
+    let schema = parsed(revision, &bytes)?;
     // A view of `*` names no type; it shows the whole schema (ADR-0023 rule 12).
     let mut all = if view.shows_every_name() {
         model::build(&schema, &schema.slot_iris_by_class())
@@ -1130,46 +1068,6 @@ fn listed(features: &[Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// T-6612, R3-006: a view's collections are built once per compilation and revision, and
-    /// again after either moves.
-    #[test]
-    fn the_collections_are_built_once_per_compilation_and_revision() {
-        let builds = std::cell::Cell::new(0_u32);
-        let build = || {
-            builds.set(builds.get().saturating_add(1));
-            Some(BTreeMap::new())
-        };
-        let key = || ("t6612".to_owned(), "once".to_owned());
-        let first: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(1_u8);
-        let one = std::sync::Arc::downgrade(&first);
-        let a = kept(key(), one.clone(), 1, build);
-        let b = kept(key(), one.clone(), 1, build);
-        assert!(a
-            .zip(b)
-            .is_some_and(|(a, b)| std::sync::Arc::ptr_eq(&a, &b)));
-        assert_eq!(builds.get(), 1);
-        kept(key(), one, 2, build);
-        assert_eq!(builds.get(), 2, "a new schema revision builds again");
-        let second: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(2_u8);
-        kept(key(), std::sync::Arc::downgrade(&second), 2, build);
-        assert_eq!(builds.get(), 3, "a new view compilation builds again");
-        drop(second);
-        kept(
-            ("t6612".to_owned(), "other".to_owned()),
-            std::sync::Arc::downgrade(&first),
-            1,
-            build,
-        );
-        let held = MODELS
-            .read()
-            .map(|m| m.contains_key(&key()))
-            .unwrap_or(true);
-        assert!(
-            !held,
-            "the entry of a dropped compilation goes on the next insert"
-        );
-    }
 
     /// F-ANT5-017: two requests over one revision share one parse.
     #[test]
