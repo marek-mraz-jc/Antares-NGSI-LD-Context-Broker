@@ -948,6 +948,13 @@ antares-broker v0.3.0
 │   │   │       ├── ngsild-model feature "default" (*)
 │   │   │       ├── serde_json feature "default" (*)
 │   │   │       ├── serde_json feature "raw_value" (*)
+│   │   │       ├── tokio feature "default" (*)
+│   │   │       ├── tokio feature "macros" (*)
+│   │   │       ├── tokio feature "net" (*)
+│   │   │       ├── tokio feature "rt-multi-thread" (*)
+│   │   │       ├── tokio feature "signal" (*)
+│   │   │       ├── tokio feature "sync" (*)
+│   │   │       ├── tokio feature "time" (*)
 │   │   │       ├── async-trait feature "default"
 │   │   │       │   └── async-trait v0.1.92 (proc-macro)
 │   │   │       │       ├── proc-macro2 feature "default" (*)
@@ -2295,22 +2302,95 @@ antares-broker v0.3.0
 │   │   │                           ├── rustls v0.23.46 (*)
 │   │   │                           └── rustls-webpki feature "ring"
 │   │   │                               └── rustls-webpki v0.103.16 (*)
-│   │   └── sqlx feature "uuid"
-│   │       ├── sqlx v0.9.0 (*)
-│   │       ├── sqlx-core feature "uuid"
-│   │       │   └── sqlx-core v0.9.0 (*)
-│   │       ├── sqlx-macros feature "uuid"
-│   │       │   ├── sqlx-macros v0.9.0 (proc-macro) (*)
-│   │       │   └── sqlx-macros-core feature "uuid"
-│   │       │       ├── sqlx-macros-core v0.9.0 (*)
-│   │       │       ├── sqlx-core feature "uuid"
-│   │       │       │   └── sqlx-core v0.9.0 (*)
-│   │       │       └── sqlx-postgres feature "uuid"
-│   │       │           ├── sqlx-postgres v0.9.0 (*)
-│   │       │           └── sqlx-core feature "uuid" (*)
-│   │       └── sqlx-postgres feature "uuid"
-│   │           ├── sqlx-postgres v0.9.0 (*)
-│   │           └── sqlx-core feature "uuid" (*)
+│   │   ├── sqlx feature "uuid"
+│   │   │   ├── sqlx v0.9.0 (*)
+│   │   │   ├── sqlx-core feature "uuid"
+│   │   │   │   └── sqlx-core v0.9.0 (*)
+│   │   │   ├── sqlx-macros feature "uuid"
+│   │   │   │   ├── sqlx-macros v0.9.0 (proc-macro) (*)
+│   │   │   │   └── sqlx-macros-core feature "uuid"
+│   │   │   │       ├── sqlx-macros-core v0.9.0 (*)
+│   │   │   │       ├── sqlx-core feature "uuid"
+│   │   │   │       │   └── sqlx-core v0.9.0 (*)
+│   │   │   │       └── sqlx-postgres feature "uuid"
+│   │   │   │           ├── sqlx-postgres v0.9.0 (*)
+│   │   │   │           └── sqlx-core feature "uuid" (*)
+│   │   │   └── sqlx-postgres feature "uuid"
+│   │   │       ├── sqlx-postgres v0.9.0 (*)
+│   │   │       └── sqlx-core feature "uuid" (*)
+│   │   ├── tracing-subscriber feature "default"
+│   │   │   ├── tracing-subscriber v0.3.23
+│   │   │   │   ├── tracing v0.1.44 (*)
+│   │   │   │   ├── tracing-core v0.1.36 (*)
+│   │   │   │   ├── smallvec feature "default" (*)
+│   │   │   │   ├── once_cell feature "default" (*)
+│   │   │   │   ├── regex-automata feature "std" (*)
+│   │   │   │   ├── matchers feature "default"
+│   │   │   │   │   └── matchers v0.2.0
+│   │   │   │   │       ├── regex-automata feature "dfa-build"
+│   │   │   │   │       │   ├── regex-automata v0.4.16 (*)
+│   │   │   │   │       │   ├── regex-automata feature "dfa-search"
+│   │   │   │   │       │   │   └── regex-automata v0.4.16 (*)
+│   │   │   │   │       │   └── regex-automata feature "nfa-thompson" (*)
+│   │   │   │   │       ├── regex-automata feature "dfa-search" (*)
+│   │   │   │   │       └── regex-automata feature "syntax" (*)
+│   │   │   │   ├── nu-ansi-term feature "default"
+│   │   │   │   │   ├── nu-ansi-term v0.50.3
+│   │   │   │   │   └── nu-ansi-term feature "std"
+│   │   │   │   │       └── nu-ansi-term v0.50.3
+│   │   │   │   ├── sharded-slab feature "default"
+│   │   │   │   │   └── sharded-slab v0.1.7
+│   │   │   │   │       └── lazy_static feature "default"
+│   │   │   │   │           └── lazy_static v1.5.0
+│   │   │   │   ├── thread_local feature "default"
+│   │   │   │   │   └── thread_local v1.1.10
+│   │   │   │   │       └── cfg-if feature "default" (*)
+│   │   │   │   ├── tracing-log feature "log-tracer"
+│   │   │   │   │   └── tracing-log v0.2.0
+│   │   │   │   │       ├── log feature "default" (*)
+│   │   │   │   │       ├── tracing-core feature "default"
+│   │   │   │   │       │   ├── tracing-core v0.1.36 (*)
+│   │   │   │   │       │   └── tracing-core feature "std" (*)
+│   │   │   │   │       └── once_cell feature "default" (*)
+│   │   │   │   └── tracing-log feature "std"
+│   │   │   │       ├── tracing-log v0.2.0 (*)
+│   │   │   │       └── log feature "std"
+│   │   │   │           └── log v0.4.33
+│   │   │   ├── tracing-subscriber feature "ansi"
+│   │   │   │   ├── tracing-subscriber v0.3.23 (*)
+│   │   │   │   ├── tracing-subscriber feature "fmt"
+│   │   │   │   │   ├── tracing-subscriber v0.3.23 (*)
+│   │   │   │   │   ├── tracing-subscriber feature "registry"
+│   │   │   │   │   │   ├── tracing-subscriber v0.3.23 (*)
+│   │   │   │   │   │   ├── tracing-subscriber feature "sharded-slab"
+│   │   │   │   │   │   │   └── tracing-subscriber v0.3.23 (*)
+│   │   │   │   │   │   ├── tracing-subscriber feature "std"
+│   │   │   │   │   │   │   ├── tracing-subscriber v0.3.23 (*)
+│   │   │   │   │   │   │   ├── tracing-core feature "std" (*)
+│   │   │   │   │   │   │   └── tracing-subscriber feature "alloc"
+│   │   │   │   │   │   │       └── tracing-subscriber v0.3.23 (*)
+│   │   │   │   │   │   └── tracing-subscriber feature "thread_local"
+│   │   │   │   │   │       └── tracing-subscriber v0.3.23 (*)
+│   │   │   │   │   └── tracing-subscriber feature "std" (*)
+│   │   │   │   └── tracing-subscriber feature "nu-ansi-term"
+│   │   │   │       └── tracing-subscriber v0.3.23 (*)
+│   │   │   ├── tracing-subscriber feature "fmt" (*)
+│   │   │   ├── tracing-subscriber feature "smallvec"
+│   │   │   │   └── tracing-subscriber v0.3.23 (*)
+│   │   │   ├── tracing-subscriber feature "std" (*)
+│   │   │   └── tracing-subscriber feature "tracing-log"
+│   │   │       └── tracing-subscriber v0.3.23 (*)
+│   │   ├── tracing-subscriber feature "env-filter"
+│   │   │   ├── tracing-subscriber v0.3.23 (*)
+│   │   │   ├── tracing-subscriber feature "matchers"
+│   │   │   │   └── tracing-subscriber v0.3.23 (*)
+│   │   │   ├── tracing-subscriber feature "once_cell"
+│   │   │   │   └── tracing-subscriber v0.3.23 (*)
+│   │   │   ├── tracing-subscriber feature "std" (*)
+│   │   │   ├── tracing-subscriber feature "thread_local" (*)
+│   │   │   └── tracing-subscriber feature "tracing"
+│   │   │       └── tracing-subscriber v0.3.23 (*)
+│   │   └── tracing-subscriber feature "registry" (*)
 │   ├── sha2 v0.10.9 (*)
 │   ├── ngsild-jsonld feature "default" (*)
 │   ├── ngsild-jsonld feature "fetch" (*)
@@ -2326,6 +2406,7 @@ antares-broker v0.3.0
 │   ├── reqwest feature "query" (*)
 │   ├── reqwest feature "rustls-no-provider" (*)
 │   ├── futures-util feature "std" (*)
+│   ├── http-body-util feature "default" (*)
 │   ├── tokio feature "default" (*)
 │   ├── tokio feature "macros" (*)
 │   ├── tokio feature "net" (*)
@@ -2732,6 +2813,9 @@ antares-broker v0.3.0
 │   └── antares-sql v0.3.0 (*)
 ├── antares-store feature "default" (*)
 ├── metrics feature "default" (*)
+├── tracing-subscriber feature "default" (*)
+├── tracing-subscriber feature "env-filter" (*)
+├── tracing-subscriber feature "registry" (*)
 ├── axum feature "default" (*)
 ├── antares-bus feature "default"
 │   └── antares-bus v0.3.0
@@ -3054,82 +3138,9 @@ antares-broker v0.3.0
 │   └── opentelemetry-appender-tracing v0.32.0
 │       ├── tracing-core v0.1.36 (*)
 │       ├── tracing feature "std" (*)
-│       ├── opentelemetry feature "logs" (*)
-│       ├── tracing-subscriber feature "registry"
-│       │   ├── tracing-subscriber v0.3.23
-│       │   │   ├── tracing v0.1.44 (*)
-│       │   │   ├── tracing-core v0.1.36 (*)
-│       │   │   ├── smallvec feature "default" (*)
-│       │   │   ├── once_cell feature "default" (*)
-│       │   │   ├── regex-automata feature "std" (*)
-│       │   │   ├── matchers feature "default"
-│       │   │   │   └── matchers v0.2.0
-│       │   │   │       ├── regex-automata feature "dfa-build"
-│       │   │   │       │   ├── regex-automata v0.4.16 (*)
-│       │   │   │       │   ├── regex-automata feature "dfa-search"
-│       │   │   │       │   │   └── regex-automata v0.4.16 (*)
-│       │   │   │       │   └── regex-automata feature "nfa-thompson" (*)
-│       │   │   │       ├── regex-automata feature "dfa-search" (*)
-│       │   │   │       └── regex-automata feature "syntax" (*)
-│       │   │   ├── nu-ansi-term feature "default"
-│       │   │   │   ├── nu-ansi-term v0.50.3
-│       │   │   │   └── nu-ansi-term feature "std"
-│       │   │   │       └── nu-ansi-term v0.50.3
-│       │   │   ├── sharded-slab feature "default"
-│       │   │   │   └── sharded-slab v0.1.7
-│       │   │   │       └── lazy_static feature "default"
-│       │   │   │           └── lazy_static v1.5.0
-│       │   │   ├── thread_local feature "default"
-│       │   │   │   └── thread_local v1.1.10
-│       │   │   │       └── cfg-if feature "default" (*)
-│       │   │   ├── tracing-log feature "log-tracer"
-│       │   │   │   └── tracing-log v0.2.0
-│       │   │   │       ├── log feature "default" (*)
-│       │   │   │       ├── tracing-core feature "default"
-│       │   │   │       │   ├── tracing-core v0.1.36 (*)
-│       │   │   │       │   └── tracing-core feature "std" (*)
-│       │   │   │       └── once_cell feature "default" (*)
-│       │   │   └── tracing-log feature "std"
-│       │   │       ├── tracing-log v0.2.0 (*)
-│       │   │       └── log feature "std"
-│       │   │           └── log v0.4.33
-│       │   ├── tracing-subscriber feature "sharded-slab"
-│       │   │   └── tracing-subscriber v0.3.23 (*)
-│       │   ├── tracing-subscriber feature "std"
-│       │   │   ├── tracing-subscriber v0.3.23 (*)
-│       │   │   ├── tracing-core feature "std" (*)
-│       │   │   └── tracing-subscriber feature "alloc"
-│       │   │       └── tracing-subscriber v0.3.23 (*)
-│       │   └── tracing-subscriber feature "thread_local"
-│       │       └── tracing-subscriber v0.3.23 (*)
-│       └── tracing-subscriber feature "std" (*)
-├── tracing-subscriber feature "default"
-│   ├── tracing-subscriber v0.3.23 (*)
-│   ├── tracing-subscriber feature "ansi"
-│   │   ├── tracing-subscriber v0.3.23 (*)
-│   │   ├── tracing-subscriber feature "fmt"
-│   │   │   ├── tracing-subscriber v0.3.23 (*)
-│   │   │   ├── tracing-subscriber feature "registry" (*)
-│   │   │   └── tracing-subscriber feature "std" (*)
-│   │   └── tracing-subscriber feature "nu-ansi-term"
-│   │       └── tracing-subscriber v0.3.23 (*)
-│   ├── tracing-subscriber feature "fmt" (*)
-│   ├── tracing-subscriber feature "smallvec"
-│   │   └── tracing-subscriber v0.3.23 (*)
-│   ├── tracing-subscriber feature "std" (*)
-│   └── tracing-subscriber feature "tracing-log"
-│       └── tracing-subscriber v0.3.23 (*)
-├── tracing-subscriber feature "env-filter"
-│   ├── tracing-subscriber v0.3.23 (*)
-│   ├── tracing-subscriber feature "matchers"
-│   │   └── tracing-subscriber v0.3.23 (*)
-│   ├── tracing-subscriber feature "once_cell"
-│   │   └── tracing-subscriber v0.3.23 (*)
-│   ├── tracing-subscriber feature "std" (*)
-│   ├── tracing-subscriber feature "thread_local" (*)
-│   └── tracing-subscriber feature "tracing"
-│       └── tracing-subscriber v0.3.23 (*)
-├── tracing-subscriber feature "registry" (*)
+│       ├── tracing-subscriber feature "registry" (*)
+│       ├── tracing-subscriber feature "std" (*)
+│       └── opentelemetry feature "logs" (*)
 ├── opentelemetry-otlp feature "http-proto"
 │   ├── opentelemetry-otlp v0.32.0
 │   │   ├── opentelemetry v0.32.0 (*)
@@ -3301,9 +3312,9 @@ antares-broker v0.3.0
     │   ├── smallvec feature "default" (*)
     │   ├── tracing feature "std" (*)
     │   ├── tracing-core feature "default" (*)
-    │   ├── opentelemetry feature "trace" (*)
     │   ├── tracing-subscriber feature "registry" (*)
-    │   └── tracing-subscriber feature "std" (*)
+    │   ├── tracing-subscriber feature "std" (*)
+    │   └── opentelemetry feature "trace" (*)
     ├── tracing-opentelemetry feature "metrics"
     │   ├── tracing-opentelemetry v0.33.0 (*)
     │   ├── opentelemetry feature "metrics" (*)
