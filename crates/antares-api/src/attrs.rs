@@ -1363,7 +1363,12 @@ async fn set_attr_value_inner(
             .transpose()
             .map(|i| i.map(|i| serde_json::json!({ attr_iri.clone(): [i] })))
     });
-    let pre = crate::policy::pre_image(st, &tenant, id, None).await?;
+    // the gate's pre-image is the read above: a second read outside the
+    // store's operation would answer the same document a round trip later
+    let pre = match st.policy {
+        Some(_) => crate::policy::image(stored, None),
+        None => crate::policy::PreImage::default(),
+    };
     let granted = gate!(
         st, &tenant, headers, "5.6.19",
         ids: &[id],
