@@ -44,6 +44,7 @@ use axum::routing::any;
 use axum::Router;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
+use std::borrow::Cow;
 use std::sync::{Arc, LazyLock};
 use tower::ServiceExt as _;
 
@@ -195,6 +196,35 @@ fn rpc_refusal(status: StatusCode, code: i32, message: &str) -> Response {
     (status, axum::Json(body)).into_response()
 }
 
+/// The one member of a JSON-RPC message the door reads; every other member is
+/// skipped, never built, since rmcp parses the body again (R3-011).
+#[derive(serde::Deserialize)]
+struct Head<'a> {
+    #[serde(borrow)]
+    jsonrpc: Option<Cow<'a, str>>,
+}
+
+/// Why `body` is no single JSON-RPC 2.0 message, as its error code and text.
+fn shape_refusal(body: &[u8]) -> Option<(i32, &'static str)> {
+    const NOT_JSON: (i32, &str) = (-32700, "the body is not JSON");
+    const NOT_RPC: (i32, &str) = (-32600, "not a JSON-RPC 2.0 message");
+    if body.trim_ascii_start().first() == Some(&b'[') {
+        return Some(
+            match serde_json::from_slice::<serde::de::IgnoredAny>(body) {
+                Ok(_) => (-32600, "a JSON-RPC batch is not served"),
+                Err(_) => NOT_JSON,
+            },
+        );
+    }
+    match serde_json::from_slice::<Head<'_>>(body) {
+        Ok(Head { jsonrpc: Some(v) }) if v == "2.0" => None,
+        // another version, none, or JSON that is no object
+        Ok(_) => Some(NOT_RPC),
+        Err(e) if e.is_data() => Some(NOT_RPC),
+        Err(_) => Some(NOT_JSON),
+    }
+}
+
 async fn serve(ops: &Ops, id: &str, caller: Caller, req: Request) -> Response {
     // a view of another model too: its reads run through the mapping
     let Some(view) = ops.mapped_view(id) else {
@@ -212,15 +242,7 @@ async fn serve(ops: &Ops, id: &str, caller: Caller, req: Request) -> Response {
     // section 5.1 wants an error frame. MC6: batching left MCP in 2025-06-18,
     // so an array is an invalid request, refused whole.
     if parts.method == Method::POST {
-        let refusal = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-            Err(_) => Some((-32700, "the body is not JSON")),
-            Ok(v) if v.is_array() => Some((-32600, "a JSON-RPC batch is not served")),
-            Ok(v) if v.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") => {
-                Some((-32600, "not a JSON-RPC 2.0 message"))
-            }
-            Ok(_) => None,
-        };
-        if let Some((code, message)) = refusal {
+        if let Some((code, message)) = shape_refusal(&bytes) {
             return rpc_refusal(StatusCode::BAD_REQUEST, code, message);
         }
     }
@@ -240,6 +262,34 @@ async fn serve(ops: &Ops, id: &str, caller: Caller, req: Request) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the door refuses before rmcp reads the body, as `serde_json::Value` did.
+    #[test]
+    fn a_body_is_refused_by_its_shape() {
+        let rpc = Some((-32600, "not a JSON-RPC 2.0 message"));
+        let json = Some((-32700, "the body is not JSON"));
+        let batch = Some((-32600, "a JSON-RPC batch is not served"));
+        for (body, want) in [
+            (
+                r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{"a":[1,{"b":null}]}}"#,
+                None,
+            ),
+            (r#" {"id":1,"jsonrpc":"2\u002e0"}"#, None),
+            (r#"{"jsonrpc":"1.0","id":1}"#, rpc),
+            (r#"{"jsonrpc":2,"id":1}"#, rpc),
+            (r#"{"id":1,"method":"ping"}"#, rpc),
+            ("7", rpc),
+            ("null", rpc),
+            (r#"{"jsonrpc":"2.0","jsonrpc":"2.0"}"#, rpc),
+            (r#"{"jsonrpc": "2.0", broken"#, json),
+            (r#"{"jsonrpc":"2.0"} trailing"#, json),
+            ("", json),
+            (r#" [{"jsonrpc":"2.0","id":1,"method":"ping"}]"#, batch),
+            ("[1,", json),
+        ] {
+            assert_eq!(shape_refusal(body.as_bytes()), want, "{body}");
+        }
+    }
 
     #[test]
     fn a_list_names_its_trimmed_members_or_nothing() {

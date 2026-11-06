@@ -324,6 +324,7 @@ dependencies = [
  "http-body-util",
  "metrics",
  "rmcp",
+ "serde",
  "serde_json",
  "tokio",
  "tower",
