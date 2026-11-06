@@ -315,7 +315,10 @@ async fn a_batch_upsert_event_carries_the_document_of_its_own_id() {
     for (id, _) in &items {
         let _ = store.delete(&t, id).await;
     }
-    store.batch_upsert_replace(&t, &items).await.expect("upsert");
+    store
+        .batch_upsert_replace(&t, &items)
+        .await
+        .expect("upsert");
     let page = outbox::peek(&pool, 10_000).await.expect("peek");
     let mut seen: Vec<(String, i64)> = page
         .iter()
