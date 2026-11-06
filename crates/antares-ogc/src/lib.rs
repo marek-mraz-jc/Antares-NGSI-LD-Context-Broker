@@ -501,7 +501,7 @@ static MODELS: std::sync::LazyLock<
 /// `build`'s collections for `key`, built once per view compilation and schema revision on this
 /// pod (T-6612, R3-006: every page, tile and item read rebuilt every collection of the view).
 /// The collections hold no caller data: the Policy narrows reads, never the model.
-fn held_collections(
+fn kept(
     key: (String, String),
     view: std::sync::Weak<dyn std::any::Any + Send + Sync>,
     revision: u64,
@@ -535,13 +535,13 @@ fn held_collections(
 fn collections(view: &ViewOps, id: &str) -> Option<Built> {
     let (revision, bytes) = view.schema()?;
     let key = (view.tenant().to_owned(), id.to_owned());
-    held_collections(key, view.generation(), revision, || {
-        build_collections(view, revision, &bytes)
+    kept(key, view.generation(), revision, || {
+        build(view, revision, &bytes)
     })
 }
 
 /// The collections of the view built from its schema `bytes` at `revision`.
-fn build_collections(
+fn build(
     view: &ViewOps,
     revision: u64,
     bytes: &std::sync::Arc<[u8]>,
@@ -1143,19 +1143,19 @@ mod tests {
         let key = || ("t6612".to_owned(), "once".to_owned());
         let first: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(1_u8);
         let one = std::sync::Arc::downgrade(&first);
-        let a = held_collections(key(), one.clone(), 1, build);
-        let b = held_collections(key(), one.clone(), 1, build);
+        let a = kept(key(), one.clone(), 1, build);
+        let b = kept(key(), one.clone(), 1, build);
         assert!(a
             .zip(b)
             .is_some_and(|(a, b)| std::sync::Arc::ptr_eq(&a, &b)));
         assert_eq!(builds.get(), 1);
-        held_collections(key(), one, 2, build);
+        kept(key(), one, 2, build);
         assert_eq!(builds.get(), 2, "a new schema revision builds again");
         let second: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(2_u8);
-        held_collections(key(), std::sync::Arc::downgrade(&second), 2, build);
+        kept(key(), std::sync::Arc::downgrade(&second), 2, build);
         assert_eq!(builds.get(), 3, "a new view compilation builds again");
         drop(second);
-        held_collections(
+        kept(
             ("t6612".to_owned(), "other".to_owned()),
             std::sync::Arc::downgrade(&first),
             1,
