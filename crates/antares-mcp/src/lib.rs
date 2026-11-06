@@ -248,8 +248,9 @@ async fn serve(ops: &Ops, id: &str, caller: Caller, req: Request) -> Response {
     }
     let req = Request::from_parts(parts, axum::body::Body::from(bytes));
     let server = server::Server::new(view, caller, id);
-    // ponytail: one service per request; the factory and its schema cache
-    // live as long as the request, which a stateless endpoint needs anyway.
+    // ponytail: one service per request, which keeps the caller out of
+    // shared state; building it costs ~0.3 us (R3-011), the per-view tool
+    // listing it serves is cached in `server`.
     let service = StreamableHttpService::new(
         move || Ok(server.clone()),
         Arc::new(NeverSessionManager::default()),
