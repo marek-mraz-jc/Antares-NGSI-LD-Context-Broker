@@ -36,6 +36,8 @@ pub struct Double {
     tenant_probes: AtomicUsize,
     wedged: AtomicBool,
     size_scan_fails: AtomicBool,
+    entity_gets: AtomicUsize,
+    entity_batches: AtomicUsize,
 }
 
 impl Double {
@@ -60,6 +62,8 @@ impl Double {
             tenant_probes: AtomicUsize::new(0),
             wedged: AtomicBool::new(false),
             size_scan_fails: AtomicBool::new(false),
+            entity_gets: AtomicUsize::new(0),
+            entity_batches: AtomicUsize::new(0),
         }
     }
 
@@ -85,6 +89,8 @@ impl Double {
             tenant_probes: AtomicUsize::new(0),
             wedged: AtomicBool::new(false),
             size_scan_fails: AtomicBool::new(false),
+            entity_gets: AtomicUsize::new(0),
+            entity_batches: AtomicUsize::new(0),
         }
     }
 
@@ -110,6 +116,8 @@ impl Double {
             tenant_probes: AtomicUsize::new(0),
             wedged: AtomicBool::new(false),
             size_scan_fails: AtomicBool::new(false),
+            entity_gets: AtomicUsize::new(0),
+            entity_batches: AtomicUsize::new(0),
         }
     }
 
@@ -137,6 +145,8 @@ impl Double {
             tenant_probes: AtomicUsize::new(0),
             wedged: AtomicBool::new(false),
             size_scan_fails: AtomicBool::new(false),
+            entity_gets: AtomicUsize::new(0),
+            entity_batches: AtomicUsize::new(0),
         }
     }
 
@@ -176,6 +186,8 @@ impl Double {
             tenant_probes: AtomicUsize::new(0),
             wedged: AtomicBool::new(false),
             size_scan_fails: AtomicBool::new(false),
+            entity_gets: AtomicUsize::new(0),
+            entity_batches: AtomicUsize::new(0),
         }
     }
 
@@ -201,6 +213,8 @@ impl Double {
             tenant_probes: AtomicUsize::new(0),
             wedged: AtomicBool::new(false),
             size_scan_fails: AtomicBool::new(false),
+            entity_gets: AtomicUsize::new(0),
+            entity_batches: AtomicUsize::new(0),
         }
     }
 
@@ -226,6 +240,8 @@ impl Double {
             tenant_probes: AtomicUsize::new(0),
             wedged: AtomicBool::new(false),
             size_scan_fails: AtomicBool::new(false),
+            entity_gets: AtomicUsize::new(0),
+            entity_batches: AtomicUsize::new(0),
         }
     }
 
@@ -270,6 +286,33 @@ impl Double {
     /// statistics' guess still answers.
     pub fn fail_size_scan(&self) {
         self.size_scan_fails.store(true, Ordering::SeqCst);
+    }
+
+    /// Single Entity reads (`get` of one Entity) and several-Entity reads
+    /// (`get_entities`) so far: a walk that reads per target shows in the
+    /// first, one that reads a depth at once in the second (R1-009).
+    pub fn entity_reads(&self) -> (usize, usize) {
+        (
+            self.entity_gets.load(Ordering::SeqCst),
+            self.entity_batches.load(Ordering::SeqCst),
+        )
+    }
+
+    /// `get` without the counters: what both read entry points do.
+    async fn read_one(
+        &self,
+        tenant: &TenantId,
+        kind: Kind,
+        id: &str,
+    ) -> Result<Option<Value>, NgsiError> {
+        self.pool_wall()?;
+        self.refused(kind, id)?;
+        let doc = self.inner.get(tenant, kind, id).await?;
+        if self.delete_on_get && doc.is_some() {
+            self.inner.delete(tenant, kind, id).await?;
+        }
+        self.race(tenant, kind, id).await?;
+        Ok(doc)
     }
 
     /// How many times a caller asked whether a Tenant exists.
@@ -421,14 +464,26 @@ impl CurrentStateDriver for Double {
         kind: Kind,
         id: &str,
     ) -> Result<Option<Value>, NgsiError> {
-        self.pool_wall()?;
-        self.refused(kind, id)?;
-        let doc = self.inner.get(tenant, kind, id).await?;
-        if self.delete_on_get && doc.is_some() {
-            self.inner.delete(tenant, kind, id).await?;
+        if kind == Kind::Entity {
+            self.entity_gets.fetch_add(1, Ordering::SeqCst);
         }
-        self.race(tenant, kind, id).await?;
-        Ok(doc)
+        self.read_one(tenant, kind, id).await
+    }
+    /// The trait's default, one read per id, so every refusal a single read
+    /// carries applies here too; only the counter tells the two apart.
+    async fn get_entities(
+        &self,
+        tenant: &TenantId,
+        ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, Value>, NgsiError> {
+        self.entity_batches.fetch_add(1, Ordering::SeqCst);
+        let mut found = std::collections::HashMap::with_capacity(ids.len());
+        for id in ids {
+            if let Some(doc) = self.read_one(tenant, Kind::Entity, id).await? {
+                found.insert((*id).to_owned(), doc);
+            }
+        }
+        Ok(found)
     }
     async fn delete(&self, tenant: &TenantId, kind: Kind, id: &str) -> Result<bool, NgsiError> {
         self.pool_wall()?;

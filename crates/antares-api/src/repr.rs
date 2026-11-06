@@ -7,7 +7,6 @@ use crate::state::AppState;
 use antares_jsonld::{compact_entity, compact_entity_shallow, Context};
 use antares_model::NgsiError;
 use antares_model::{is_meta, TenantId};
-use antares_store::Kind;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
@@ -1298,16 +1297,30 @@ async fn inline_join_walk(
     let mut frontier = vec![(String::new(), repr.clone(), level)];
     while !frontier.is_empty() {
         let mut next = Vec::new();
-        for (at, repr, level) in frontier {
-            let slots = match compacted.pointer(&at) {
-                Some(doc) => slots_of(ctx, &repr, doc, &at),
-                None => continue,
-            };
+        let level_slots: Vec<(Vec<Slot>, usize)> = frontier
+            .into_iter()
+            .filter_map(|(at, repr, level)| {
+                let doc = compacted.pointer(&at)?;
+                Some((slots_of(ctx, &repr, doc, &at), level))
+            })
+            .collect();
+        let found = prefetch(
+            st,
+            tenant,
+            level_slots
+                .iter()
+                .flat_map(|(slots, _)| slots)
+                .flat_map(|slot| &slot.targets)
+                .map(String::as_str),
+            walk.budget,
+        )
+        .await;
+        for (slots, level) in level_slots {
             for slot in slots {
                 let mut joined = Vec::new();
                 for id in &slot.targets {
                     if let Some(found) =
-                        lookup_joined(st, tenant, ctx, &slot, id, level, walk).await
+                        lookup_joined(st, tenant, ctx, &slot, id, level, walk, &found).await
                     {
                         joined.push(found);
                     }
@@ -1364,10 +1377,41 @@ async fn inline_join_walk(
     }
 }
 
+/// The locally stored Linked Entities one depth of a walk names, read in one
+/// store call (Postgres: one transaction, T-4085) instead of one read per
+/// target (R1-009). Only the first `budget` distinct ids are read: the walk
+/// cannot spend more than that on this depth. A failed read reads as absent,
+/// as the single read did.
+async fn prefetch<'a>(
+    st: &AppState,
+    tenant: &TenantId,
+    ids: impl Iterator<Item = &'a str>,
+    budget: usize,
+) -> std::collections::HashMap<String, Value> {
+    let mut wanted: Vec<&str> = Vec::new();
+    let mut unique = std::collections::HashSet::new();
+    for id in ids {
+        if wanted.len() >= budget {
+            break;
+        }
+        if unique.insert(id) {
+            wanted.push(id);
+        }
+    }
+    if wanted.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    st.store
+        .get_entities(tenant, &wanted)
+        .await
+        .unwrap_or_default()
+}
+
 /// One Linked Entity read under the walk's budget and the narrowing: the
 /// compacted target, and whether its own links are expanded (the first time
 /// it is met, while depth remains). A target outside the narrowing reads as
-/// absent, like a dangling link.
+/// absent, like a dangling link. `found` is the depth's [`prefetch`].
+#[allow(clippy::too_many_arguments)] // one param per piece of the traversal's state
 async fn lookup_joined(
     st: &AppState,
     tenant: &TenantId,
@@ -1376,6 +1420,7 @@ async fn lookup_joined(
     id: &str,
     level: usize,
     walk: &mut JoinWalk,
+    found: &std::collections::HashMap<String, Value>,
 ) -> Option<(Value, bool)> {
     if walk.budget == 0 {
         walk.complete = false;
@@ -1383,8 +1428,7 @@ async fn lookup_joined(
     }
     walk.budget = walk.budget.saturating_sub(1);
     let child = &slot.child;
-    let local = st.store.get(tenant, Kind::Entity, id).await.ok().flatten();
-    let target = match local {
+    let target = match found.get(id).cloned() {
         Some(t) => t,
         None => remote_target(st, tenant, ctx, slot, id, walk).await?,
     };
@@ -1524,82 +1568,107 @@ async fn collect_flat_walk(
     let mut frontier = vec![(internal_doc.clone(), repr.clone(), level)];
     while !frontier.is_empty() {
         let mut next = Vec::new();
-        for (doc, repr, level) in &frontier {
-            let Some(obj) = doc.as_object() else {
-                continue;
-            };
-            let shown = shown(repr.policy_types.as_deref(), doc)
-                .unwrap_or_else(crate::policy::Shown::nothing);
-            for (k, v) in obj {
-                if is_meta(k) {
+        let level_targets: Vec<(crate::repr::Repr, Vec<String>, usize)> = frontier
+            .iter()
+            .flat_map(|(doc, repr, level)| {
+                flat_targets(doc, repr)
+                    .into_iter()
+                    .map(move |(child, ids)| (child, ids, *level))
+            })
+            .collect();
+        let found = prefetch(
+            st,
+            tenant,
+            level_targets
+                .iter()
+                .flat_map(|(_, ids, _)| ids)
+                .map(String::as_str)
+                .filter(|id| !walk.seen.contains(*id)),
+            walk.budget,
+        )
+        .await;
+        for (child, ids, level) in level_targets {
+            for id in ids {
+                if walk.seen.contains(&id) {
                     continue;
                 }
-                // only traverse relationships that survive THIS doc's projection
-                if let Some(pick) = &repr.pick {
-                    if !pick.iter().any(|n| n.iri == *k || n.raw == *k) {
-                        continue;
-                    }
+                if walk.budget == 0 {
+                    walk.complete = false;
+                    return;
                 }
-                if let Some(omit) = &repr.omit {
-                    if omit
-                        .iter()
-                        .any(|n| (n.iri == *k || n.raw == *k) && n.children.is_none())
-                    {
-                        continue;
-                    }
-                }
-                // a Relationship the subject may not see is not a road either
-                if !policy_projected(repr.policy_pick.as_deref(), repr.policy_omit.as_deref(), k)
-                    || !shown.allows(k)
-                {
-                    continue;
-                }
-                let Some(instances) = v.as_array() else {
+                walk.budget = walk.budget.saturating_sub(1);
+                let Some(target) = found.get(&id).cloned() else {
                     continue;
                 };
-                let child = joined_repr(repr, k, k);
-                for inst in instances {
-                    // Relationship objects plus ListRelationship objectList targets
-                    // (internal form stores bare URIs) — 4.5.23.3 appends both kinds
-                    // of Linked Entities to the flattened array.
-                    let targets: Vec<&str> = match (inst.get("object"), inst.get("objectList")) {
-                        (Some(Value::String(id)), _) => vec![id.as_str()],
-                        (Some(Value::Array(a)), _) => a.iter().filter_map(Value::as_str).collect(),
-                        (None, Some(Value::Array(a))) => {
-                            a.iter().filter_map(Value::as_str).collect()
-                        }
-                        _ => continue,
-                    };
-                    for id in targets {
-                        if walk.seen.contains(id) {
-                            continue;
-                        }
-                        if walk.budget == 0 {
-                            walk.complete = false;
-                            return;
-                        }
-                        walk.budget = walk.budget.saturating_sub(1);
-                        let Some(target) =
-                            st.store.get(tenant, Kind::Entity, id).await.ok().flatten()
-                        else {
-                            continue;
-                        };
-                        if !policy_admits(st, tenant, ctx, child.policy_reach.as_deref(), &target)
-                            .await
-                        {
-                            continue;
-                        }
-                        walk.seen.insert(id.to_owned());
-                        out.insert(id.to_owned(), (target.clone(), child.clone()));
-                        if *level > 1 {
-                            next.push((target, child.clone(), level.saturating_sub(1)));
-                        }
-                    }
+                if !policy_admits(st, tenant, ctx, child.policy_reach.as_deref(), &target).await {
+                    continue;
+                }
+                walk.seen.insert(id.clone());
+                out.insert(id, (target.clone(), child.clone()));
+                if level > 1 {
+                    next.push((target, child.clone(), level.saturating_sub(1)));
                 }
             }
         }
         frontier = next;
     }
+}
+
+/// The Linked Entity ids one stored document names for the flattened walk,
+/// per Relationship with the child representation that applies to it: only
+/// Relationships that survive the document's projection and the subject's
+/// policy are roads (4.5.23.3).
+fn flat_targets(doc: &Value, repr: &crate::repr::Repr) -> Vec<(crate::repr::Repr, Vec<String>)> {
+    let Some(obj) = doc.as_object() else {
+        return Vec::new();
+    };
+    let shown =
+        shown(repr.policy_types.as_deref(), doc).unwrap_or_else(crate::policy::Shown::nothing);
+    let mut out = Vec::new();
+    for (k, v) in obj {
+        if is_meta(k) {
+            continue;
+        }
+        // only traverse relationships that survive THIS doc's projection
+        if let Some(pick) = &repr.pick {
+            if !pick.iter().any(|n| n.iri == *k || n.raw == *k) {
+                continue;
+            }
+        }
+        if let Some(omit) = &repr.omit {
+            if omit
+                .iter()
+                .any(|n| (n.iri == *k || n.raw == *k) && n.children.is_none())
+            {
+                continue;
+            }
+        }
+        // a Relationship the subject may not see is not a road either
+        if !policy_projected(repr.policy_pick.as_deref(), repr.policy_omit.as_deref(), k)
+            || !shown.allows(k)
+        {
+            continue;
+        }
+        let Some(instances) = v.as_array() else {
+            continue;
+        };
+        let child = joined_repr(repr, k, k);
+        let mut ids = Vec::new();
+        for inst in instances {
+            // Relationship objects plus ListRelationship objectList targets
+            // (internal form stores bare URIs) — 4.5.23.3 appends both kinds
+            // of Linked Entities to the flattened array.
+            match (inst.get("object"), inst.get("objectList")) {
+                (Some(Value::String(id)), _) => ids.push(id.clone()),
+                (Some(Value::Array(a)), _) | (None, Some(Value::Array(a))) => {
+                    ids.extend(a.iter().filter_map(Value::as_str).map(str::to_owned));
+                }
+                _ => {}
+            }
+        }
+        out.push((child, ids));
+    }
+    out
 }
 
 /// 4.5.16.2 GeoJSON Feature, members per Table 5.2.29-1 (5.2.29 Feature):
