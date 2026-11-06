@@ -50,6 +50,8 @@ metrics = { workspace = true }
 # the code above is identical either way.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true }
+# T-6615: counts a measured answer's body bytes without losing its size hint
+http-body-util = { workspace = true }
 reqwest = { workspace = true }
 axum = { workspace = true }
 
@@ -108,6 +110,8 @@ flate2 = { workspace = true }
 brotli = { workspace = true }
 # a paused clock runs a test to a 60 s deadline at once (T-4102)
 tokio = { workspace = true, features = ["test-util"] }
+# T-6615: the cost counters, read through a thread-local recorder
+metrics-exporter-prometheus = { workspace = true }
 # capturing subscriber: the tests that prove a credential is not logged
 tracing-subscriber = { workspace = true }
 
@@ -122,6 +126,11 @@ path = "tests/it.rs"
 # own process: sets the global tracing subscriber that counts statements
 name = "read_statement_budget"
 path = "tests/read_statement_budget.rs"
+
+[[test]]
+# own process: sets the global tracing subscriber that feeds request cost (T-6615)
+name = "request_cost_pg"
+path = "tests/request_cost_pg.rs"
 
 [[test]]
 # own process: sets the global tracing subscriber that counts Entity rows read

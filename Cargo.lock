@@ -97,6 +97,7 @@ dependencies = [
  "icu_collator",
  "icu_locale_core",
  "metrics",
+ "metrics-exporter-prometheus",
  "ngsild-jsonld",
  "ngsild-matcher",
  "ngsild-model",

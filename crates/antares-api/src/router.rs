@@ -183,11 +183,19 @@ pub fn api_routes() -> Vec<(&'static str, MethodRouter<AppState>)> {
 /// serves `/entities/{id}/attrs/` as `/entities/{id}/attrs`, the form 5.6.2
 /// and 5.6.3 forwards are sent in (T-3701).
 pub fn router(state: AppState) -> Router {
+    #[cfg(not(target_arch = "wasm32"))]
+    let request_cost = state.request_cost;
     let served = routes(state);
-    Router::new().fallback_service(tower::util::MapRequest::new(
+    let router = Router::new().fallback_service(tower::util::MapRequest::new(
         served,
         trim_trailing_slash::<axum::body::Body>,
-    ))
+    ));
+    // T-6615: off builds no layer, so nothing is measured.
+    #[cfg(not(target_arch = "wasm32"))]
+    if request_cost {
+        return router.layer(axum::middleware::from_fn(request_cost::measure));
+    }
+    router
 }
 
 /// gzip or br for a client whose Accept-Encoding asks for it (T-5847), laid

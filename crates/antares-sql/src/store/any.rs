@@ -105,7 +105,7 @@ async fn tenant_tx(
     p: &PgBackend,
     tenant: &TenantId,
 ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, NgsiError> {
-    let mut tx = p.docs.pool().begin().await.map_err(db)?;
+    let mut tx = crate::store::pg::begin(p.docs.pool()).await.map_err(db)?;
     crate::store::pg::set_tenant(&mut tx, tenant)
         .await
         .map_err(db)?;

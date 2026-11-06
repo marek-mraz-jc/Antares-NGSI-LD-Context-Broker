@@ -18,6 +18,8 @@
 /// it panics on a store that breaks an invariant — that is the point.
 #[allow(clippy::expect_used)]
 pub mod contract;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod cost;
 pub mod filter;
 
 use antares_model::{NgsiError, TenantId};

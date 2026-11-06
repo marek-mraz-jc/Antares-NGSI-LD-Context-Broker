@@ -1054,7 +1054,7 @@ impl PgDocStore {
         doc: &Value,
         kind: &str,
     ) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = super::begin(&self.pool).await?;
         set_context_tenant(&mut tx, tenant).await?;
         // `xmax` is zero on a fresh row and the locking transaction's id
         // on the conflict path: the eviction then runs only when the table
@@ -1097,7 +1097,7 @@ impl PgDocStore {
         tenant: Option<&TenantId>,
         id: &str,
     ) -> Result<Option<Value>, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = super::begin(&self.pool).await?;
         set_context_tenant(&mut tx, tenant).await?;
         let row = sqlx::query(
             "SELECT body FROM jsonld_contexts
@@ -1119,7 +1119,7 @@ impl PgDocStore {
         id: &str,
         f: impl FnOnce(&mut Value) -> Result<(), ()> + Send,
     ) -> Result<Option<Result<(), ()>>, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = super::begin(&self.pool).await?;
         set_context_tenant(&mut tx, tenant).await?;
         let row = sqlx::query(
             "SELECT body FROM jsonld_contexts
@@ -1150,7 +1150,7 @@ impl PgDocStore {
         tenant: Option<&TenantId>,
         id: &str,
     ) -> Result<bool, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = super::begin(&self.pool).await?;
         set_context_tenant(&mut tx, tenant).await?;
         let gone = sqlx::query(
             "DELETE FROM jsonld_contexts
@@ -1175,7 +1175,7 @@ impl PgDocStore {
         &self,
         tenant: Option<&TenantId>,
     ) -> Result<Vec<Value>, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = super::begin(&self.pool).await?;
         set_context_tenant(&mut tx, tenant).await?;
         let rows = sqlx::query(
             "SELECT body - 'body' FROM jsonld_contexts

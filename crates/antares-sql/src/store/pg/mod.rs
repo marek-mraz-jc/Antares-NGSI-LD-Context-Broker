@@ -411,7 +411,10 @@ pub(crate) async fn begin(
 ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
     let t0 = std::time::Instant::now();
     let tx = pool.begin().await;
-    metrics::histogram!("antares_pg_transaction_begin_seconds").record(t0.elapsed().as_secs_f64());
+    let waited = t0.elapsed();
+    metrics::histogram!("antares_pg_transaction_begin_seconds").record(waited.as_secs_f64());
+    // T-6615: the pool wait of the request this task serves, if measured.
+    antares_store::cost::add_pool(waited);
     tx
 }
 

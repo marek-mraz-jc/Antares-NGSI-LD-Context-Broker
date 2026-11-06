@@ -149,13 +149,28 @@ pub fn init() -> Result<Option<MetricsRender>, Box<dyn std::error::Error>> {
     #[cfg(not(all(feature = "console", tokio_unstable)))]
     let console: Option<tracing_subscriber::layer::Identity> = None;
 
-    tracing_subscriber::registry()
-        .with(env_filter)
-        .with(fmt)
-        .with(otlp)
-        .with(logs)
-        .with(console)
-        .init();
+    // T-6615: with ANTARES_REQUEST_COST=on, sqlx's per-statement events feed
+    // each request's cost. They are DEBUG, so the env filter is per layer
+    // (it filters the log and export layers exactly as it filtered the whole
+    // stack before) and the statement layer enables them for itself alone.
+    let request_cost = antares_api::request_cost::parse(
+        std::env::var(antares_api::request_cost::ENV)
+            .ok()
+            .as_deref(),
+    )?;
+    let statements = request_cost.then(antares_sql::cost::statement_layer);
+    {
+        use tracing_subscriber::Layer as _;
+        tracing_subscriber::registry()
+            .with(
+                fmt.and_then(otlp)
+                    .and_then(logs)
+                    .and_then(console)
+                    .with_filter(env_filter),
+            )
+            .with(statements)
+            .init();
+    }
 
     if !enabled() {
         // An endpoint without the switch is a configuration the operator

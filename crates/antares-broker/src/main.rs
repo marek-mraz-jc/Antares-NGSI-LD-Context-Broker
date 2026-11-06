@@ -187,6 +187,8 @@ const KNOWN_KEYS: &[&str] = &[
     // Run the DDL on this process; off keeps replicas from racing the
     // migration on boot.
     "ANTARES_MIGRATE",
+    // T-6615: per-request cost headers and per-tenant counters (off | on).
+    "ANTARES_REQUEST_COST",
 ];
 
 /// The keys of each surface this binary was built with, listed by the crate
@@ -1156,6 +1158,11 @@ async fn run(
         .unwrap_or("all")
         .parse()?;
     state.profile = antares_api::Profile::from_env()?;
+    state.request_cost = antares_api::request_cost::parse(
+        std::env::var(antares_api::request_cost::ENV)
+            .ok()
+            .as_deref(),
+    )?;
     #[cfg(feature = "jc")]
     {
         state.provenance_from = std::env::var("ANTARES_PROVENANCE_FROM")

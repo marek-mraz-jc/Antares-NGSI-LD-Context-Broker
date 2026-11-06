@@ -20,6 +20,8 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 pub mod compile;
+#[cfg(all(feature = "postgres", not(target_arch = "wasm32")))]
+pub mod cost;
 /// Re-export for integration tests that need raw SQL against the pool.
 #[cfg(feature = "postgres")]
 pub use sqlx;

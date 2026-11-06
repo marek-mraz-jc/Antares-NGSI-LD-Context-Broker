@@ -490,6 +490,9 @@ pub struct Shared {
     pub temporal_record: TemporalRecord,
     /// Behaviour profile keys ([`Profile`]); the broker sets it from the env.
     pub profile: Profile,
+    /// `ANTARES_REQUEST_COST=on` (T-6615): every answer says what it cost
+    /// ([`crate::request_cost`]). Off by default; read when the router is built.
+    pub request_cost: bool,
     /// The mesh identity of the gateway whose provenance headers the broker
     /// believes (ANTARES_PROVENANCE_FROM, T-4665); `None` believes nobody.
     pub provenance_from: Option<String>,
@@ -846,6 +849,7 @@ impl AppState {
                 nats: false,
                 temporal_record: TemporalRecord::All,
                 profile: Profile::default(),
+                request_cost: false,
                 provenance_from: None,
                 subject_required: false,
                 history_off: HistoryOff::default(),
@@ -1358,10 +1362,18 @@ impl AppState {
         }
         let st = self.clone();
         let view = view.map(str::to_owned);
+        // T-6615: the task's work is part of the measured request's cost.
+        let cost = antares_store::cost::current();
         let task = tokio::spawn(INPROCESS_DEPTH.scope(in_process_depth(), async move {
-            match view {
-                Some(id) => crate::policy::through_view(&id, st.call(&caller, req)).await,
-                None => st.call(&caller, req).await,
+            let answer = async move {
+                match view {
+                    Some(id) => crate::policy::through_view(&id, st.call(&caller, req)).await,
+                    None => st.call(&caller, req).await,
+                }
+            };
+            match cost {
+                Some(cost) => antares_store::cost::measured(cost, answer).await,
+                None => answer.await,
             }
         }));
         let _abort = AbortOnDrop(task.abort_handle());

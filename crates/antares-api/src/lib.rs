@@ -98,6 +98,9 @@ pub mod policy;
 pub mod provenance;
 pub(crate) mod registry;
 pub(crate) mod repr;
+// T-6615: what each request cost, behind ANTARES_REQUEST_COST (native only).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod request_cost;
 /// The one GeoJSON geometry rule (T-5208), for the surfaces that write GeoJSON.
 pub use repr::{geometry_of, rewound};
 pub mod secret;
