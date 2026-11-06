@@ -49,7 +49,8 @@ pub type DecisionsFuture<'a> = Pin<Box<dyn Future<Output = Vec<Decision>> + Send
 /// denies. Deployment knob (`ANTARES_POLICY_TIMEOUT_MS`), read once at
 /// first use. The default is short on purpose: the seam sits in front of
 /// every request, and an engine that cannot answer inside it is an outage
-/// either way — failing closed at 250 ms is the difference between a 403
+/// either way — failing closed at 250 ms is the difference between a 503
+/// with `Retry-After` (negotiate.rs: a timeout is overload, never a 403)
 /// and a broker that stops accepting.
 pub static TIMEOUT: LazyLock<Duration> = LazyLock::new(|| {
     let env = std::env::var("ANTARES_POLICY_TIMEOUT_MS").ok();

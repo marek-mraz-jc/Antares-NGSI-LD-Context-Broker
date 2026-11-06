@@ -94,6 +94,13 @@ impl From<crate::policy::Denied> for ApiError {
         if d.0 == crate::views::TOO_MANY_RULES {
             return Self::Ngsi(NgsiError::BadRequestData(d.0));
         }
+        // An engine that did not answer in time is overload, not a verdict:
+        // the request is still refused (fail closed), but as 503 with
+        // Retry-After, so a client backs off instead of reading a 403 as
+        // "no access" (T-6614, R1-019).
+        if d.0 == crate::policy::ENGINE_TIMED_OUT {
+            return Self::Overloaded(POLICY_RETRY_AFTER_SECONDS);
+        }
         Self::Denied(d.0)
     }
 }
@@ -103,6 +110,11 @@ impl From<crate::policy::Denied> for ApiError {
 /// the same wall; one second past it is the first moment the queue can have
 /// moved.
 pub(crate) const RETRY_AFTER_SECONDS: u64 = 6;
+
+/// How long a client is told to wait after the policy engine timed out. The
+/// engine's own wait is [`crate::policy::TIMEOUT`] (250 ms by default), so a
+/// retry one second later meets a queue that has had four timeouts to move.
+pub(crate) const POLICY_RETRY_AFTER_SECONDS: u64 = 1;
 
 impl From<NgsiError> for ApiError {
     fn from(e: NgsiError) -> Self {
@@ -1236,6 +1248,27 @@ mod clause_5_5_3 {
         .await
         .expect("json + Link is the sanctioned pair");
         assert!(ok.value.get("@context").is_none());
+    }
+
+    /// T-6614 (R1-019): an engine that did not answer in time is overload:
+    /// still refused, but 503 with Retry-After, never a 403 a client reads
+    /// as "no access". An engine's own refusal stays 403.
+    #[test]
+    fn a_policy_timeout_answers_503_and_a_refusal_403() {
+        use crate::policy::{Denied, ENGINE_FAILED, ENGINE_TIMED_OUT};
+        let timed_out = ApiError::from(Denied(ENGINE_TIMED_OUT.to_owned())).into_response();
+        assert_eq!(timed_out.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            timed_out
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        for why in ["not yours", ENGINE_FAILED] {
+            let refused = ApiError::from(Denied(why.to_owned())).into_response();
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{why}");
+        }
     }
 
     /// RFC 9110 clause 5.3: a list-type field may be split over any number of
