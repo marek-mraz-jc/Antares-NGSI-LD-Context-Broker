@@ -652,22 +652,47 @@ fn body_context_member(v: &Value) -> Option<Value> {
 }
 
 /// Context for GET/DELETE requests: Link header or core (6.3.5; the
-/// no-@context fallback to the Core @context is 5.5.5).
+/// no-@context fallback to the Core @context is 5.5.5). Counts one use of
+/// each @context it names (5.13.3.5 numberOfHits).
 pub(crate) async fn request_context(
     loader: &Loader,
     headers: &HeaderMap,
 ) -> ApiResult<Arc<Context>> {
+    resolve_request_context(loader, headers, true).await
+}
+
+/// [`request_context`] for a second look at the same request's @context (a
+/// gate before the handler, a layer after it): the handler's own resolve
+/// counts the use, so this one does not, or one request counted two or
+/// three hits and paid a shared-row bump for each (T-6605).
+pub(crate) async fn request_context_quiet(
+    loader: &Loader,
+    headers: &HeaderMap,
+) -> ApiResult<Arc<Context>> {
+    resolve_request_context(loader, headers, false).await
+}
+
+async fn resolve_request_context(
+    loader: &Loader,
+    headers: &HeaderMap,
+    count: bool,
+) -> ApiResult<Arc<Context>> {
+    let resolve = |tenant: TenantId, user: Arc<Value>| async move {
+        if count {
+            loader.resolve_for(&tenant, &user).await
+        } else {
+            loader.resolve_quiet_for(&tenant, &user).await
+        }
+    };
     #[cfg(feature = "views")]
     if let Some(context) = crate::state::inprocess_context() {
-        return Ok(loader.resolve_for(&tenant_from(headers)?, &context).await?);
+        return Ok(resolve(tenant_from(headers)?, context).await?);
     }
     match link_context(headers)? {
         // 5.5.10: the Tenant bounds what the operation may see, and a locally
         // stored @context (5.13.1) is information related to the Tenant that
         // stored it — so the URL resolves only for that Tenant.
-        Some(url) => Ok(loader
-            .resolve_for(&tenant_from(headers)?, &Value::String(url))
-            .await?),
+        Some(url) => Ok(resolve(tenant_from(headers)?, Arc::new(Value::String(url))).await?),
         None => Ok(loader.core()),
     }
 }

@@ -1539,7 +1539,7 @@ impl ReadMembers {
         if st.policy.is_none() {
             return Self::default();
         }
-        match request_context(&st.loader, headers).await {
+        match crate::negotiate::request_context_quiet(&st.loader, headers).await {
             Ok(ctx) => Self::with_ctx(st, params, &ctx),
             Err(_) => Self::default(),
         }

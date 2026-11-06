@@ -682,51 +682,16 @@ impl AppState {
         // have no row and are never evicted.
         {
             let store = store.clone();
+            let hits = Arc::new(HitBatch::default());
             loader.set_usage_bump(Arc::new(move |tenant, url| {
                 let store = store.clone();
+                let hits = Arc::clone(&hits);
                 Box::pin(async move {
                     if Loader::is_pinned_core(url) {
                         return true;
                     }
-                    let id = match hosted_row_id(&*store, tenant, url).await {
-                        Some(id) => id,
-                        None => uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, url.as_bytes())
-                            .to_string(),
-                    };
-                    // under the row lock: a bump racing a delete leaves the row
-                    // deleted, and two racing bumps both count
-                    let bumped = store
-                        .context_mutate(
-                            tenant,
-                            &id,
-                            Box::new(|row| {
-                                let o = row.as_object_mut().ok_or(())?;
-                                let hits = o
-                                    .get("numberOfHits")
-                                    .and_then(serde_json::Value::as_u64)
-                                    .unwrap_or(0)
-                                    .saturating_add(1);
-                                o.insert("numberOfHits".into(), serde_json::json!(hits));
-                                o.insert("lastUsage".into(), serde_json::json!(now_iso()));
-                                Ok(())
-                            }),
-                        )
-                        .await;
-                    match bumped {
-                        Ok(Some(Ok(()))) => true,
-                        // a row that cannot carry the counters is left
-                        // uncounted, and still exists: it must not be evicted
-                        Ok(Some(Err(()))) => true,
-                        Ok(None) => false,
-                        // a store hiccup must never evict a healthy cache entry
-                        Err(e) => {
-                            tracing::warn!(
-                                "@context hit bump failed for {}: {e}",
-                                antares_notifier::redact_userinfo(url)
-                            );
-                            true
-                        }
-                    }
+                    hits.bump(tenant, url, |n| bump_row(&*store, tenant, url, n))
+                        .await
                 })
             }));
         }
@@ -1513,6 +1478,125 @@ async fn hosted_row_id(
     hosted_row(store, tenant, url).await.map(|(id, _)| id)
 }
 
+/// Add `n` counted uses to the shared row of `url` (5.13.3.5) and answer
+/// whether the row still exists: `false` is a delete through another
+/// instance, so the loader drops its warm copies (5.13.5.4).
+async fn bump_row(
+    store: &dyn CurrentStateDriver,
+    tenant: Option<&antares_model::TenantId>,
+    url: &str,
+    n: u64,
+) -> bool {
+    let id = match hosted_row_id(store, tenant, url).await {
+        Some(id) => id,
+        None => uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, url.as_bytes()).to_string(),
+    };
+    // under the row lock: a bump racing a delete leaves the row
+    // deleted, and two racing bumps both count
+    let bumped = store
+        .context_mutate(
+            tenant,
+            &id,
+            Box::new(move |row| {
+                let o = row.as_object_mut().ok_or(())?;
+                let hits = o
+                    .get("numberOfHits")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+                    .saturating_add(n);
+                o.insert("numberOfHits".into(), serde_json::json!(hits));
+                o.insert("lastUsage".into(), serde_json::json!(now_iso()));
+                Ok(())
+            }),
+        )
+        .await;
+    match bumped {
+        Ok(Some(Ok(()))) => true,
+        // a row that cannot carry the counters is left
+        // uncounted, and still exists: it must not be evicted
+        Ok(Some(Err(()))) => true,
+        Ok(None) => false,
+        // a store hiccup must never evict a healthy cache entry
+        Err(e) => {
+            tracing::warn!(
+                "@context hit bump failed for {}: {e}",
+                antares_notifier::redact_userinfo(url)
+            );
+            true
+        }
+    }
+}
+
+/// Group commit of @context hits (T-6605). Every request naming a hosted or
+/// Cached @context bumped its ONE shared row under the row lock, so all of
+/// them queued on that row in Postgres, each holding a pool connection. Here
+/// a bump adds its hit to the (Tenant, URL) slot and waits for the slot's
+/// one writer: whoever holds the slot writes every hit queued so far in one
+/// update, and the queued requests return on that write. Each request still
+/// returns only after its own hit is on the shared row, so a peer instance
+/// reads the same numberOfHits as before (5.13.3.5 behind a load balancer)
+/// and a delete through a peer is still seen on the next use (5.13.5.4).
+/// Keyed by Tenant: a hit is written with the Tenant that made it.
+#[derive(Default)]
+struct HitBatch {
+    slots: std::sync::Mutex<std::collections::HashMap<HitKey, Arc<HitSlot>>>,
+}
+
+type HitKey = (Option<antares_model::TenantId>, String);
+
+struct HitSlot {
+    /// Hits added and not yet taken by a writer.
+    pending: std::sync::atomic::AtomicU64,
+    /// Held while one update is in flight; holds what the last update said
+    /// of the row (true: it exists).
+    write: tokio::sync::Mutex<bool>,
+}
+
+impl HitBatch {
+    async fn bump<F, Fut>(&self, tenant: Option<&antares_model::TenantId>, url: &str, write: F) -> bool
+    where
+        F: FnOnce(u64) -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        use std::sync::atomic::Ordering;
+        let key: HitKey = (tenant.cloned(), url.to_owned());
+        let slot = Arc::clone(
+            self.lock()
+                .entry(key.clone())
+                .or_insert_with(|| {
+                    Arc::new(HitSlot {
+                        pending: std::sync::atomic::AtomicU64::new(0),
+                        write: tokio::sync::Mutex::new(true),
+                    })
+                }),
+        );
+        slot.pending.fetch_add(1, Ordering::AcqRel);
+        let exists = {
+            let mut last = slot.write.lock().await;
+            // zero: the writer before us took our hit and wrote it already
+            let n = slot.pending.swap(0, Ordering::AcqRel);
+            if n > 0 {
+                *last = write(n).await;
+            }
+            *last
+        };
+        // the last user of an idle slot drops it, so the map holds only
+        // the (Tenant, URL) pairs in use right now; the count is read under
+        // the map lock, which every new user of the slot takes first
+        let mut slots = self.lock();
+        if Arc::strong_count(&slot) == 2 {
+            slots.remove(&key);
+        }
+        exists
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<HitKey, Arc<HitSlot>>> {
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// Server-managed timestamp, ISO 8601 UTC with milliseconds.
 pub fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
@@ -1602,6 +1686,43 @@ mod jsonld_context_locality_5_13 {
             serde_json::json!(2),
             "both counted uses land on the shared row (5.13.3.5)"
         );
+    }
+
+    /// T-6605 (R1-001): a query resolved its Link @context in the gate,
+    /// in the handler and in the metadata layer, and each resolve counted a
+    /// hit and bumped the shared row. Only the handler's resolve counts now.
+    #[tokio::test]
+    async fn a_second_look_at_the_request_context_counts_no_hit() {
+        let st = AppState::new("me".into());
+        let (url, _fetches) = context_server("/ngsi-ld/v1/jsonldContexts/quiet-ctx");
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::LINK,
+            format!("<{url}>; rel=\"http://www.w3.org/ns/json-ld#context\"; type=\"application/ld+json\"")
+                .parse()
+                .expect("header"),
+        );
+        let id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, url.as_bytes()).to_string();
+        let hits = || async {
+            st.store
+                .context_get(None, &id)
+                .await
+                .expect("store")
+                .expect("row")["numberOfHits"]
+                .clone()
+        };
+        crate::negotiate::request_context(&st.loader, &headers)
+            .await
+            .expect("counted resolve");
+        assert_eq!(hits().await, serde_json::json!(1));
+        crate::negotiate::request_context_quiet(&st.loader, &headers)
+            .await
+            .expect("quiet resolve");
+        assert_eq!(hits().await, serde_json::json!(1), "a second look counts no hit");
+        crate::negotiate::request_context(&st.loader, &headers)
+            .await
+            .expect("counted resolve");
+        assert_eq!(hits().await, serde_json::json!(2));
     }
 
     /// F-ANT4-002: the default Tenant's Hosted @context is not fetched for
@@ -1973,5 +2094,61 @@ mod clone_cost {
         let mut c = a.clone();
         c.max_limit = 1;
         assert_eq!(call(&c).await, axum::http::StatusCode::FORBIDDEN);
+    }
+}
+
+#[cfg(test)]
+mod hit_batch {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// T-6605 (R2-015): 64 requests on one @context ran 64 locked updates of
+    /// its row. Under a slow writer they now share a few updates, every hit
+    /// is written, and none returns before its own hit is on the row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_hits_on_one_context_share_one_write_and_all_count() {
+        let batch = Arc::new(HitBatch::default());
+        let written = Arc::new(AtomicU64::new(0));
+        let writes = Arc::new(AtomicU64::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..64 {
+            let (batch, written, writes) =
+                (Arc::clone(&batch), Arc::clone(&written), Arc::clone(&writes));
+            tasks.push(tokio::spawn(async move {
+                let w = Arc::clone(&written);
+                let exists = batch
+                    .bump(None, "https://ctx.example/a.jsonld", |n| async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        writes.fetch_add(1, Ordering::SeqCst);
+                        w.fetch_add(n, Ordering::SeqCst);
+                        true
+                    })
+                    .await;
+                // at least this request's own hit is written when it returns
+                (exists, written.load(Ordering::SeqCst))
+            }));
+        }
+        for t in tasks {
+            let (exists, seen) = t.await.expect("join");
+            assert!(exists);
+            assert!(seen >= 1);
+        }
+        assert_eq!(written.load(Ordering::SeqCst), 64, "every hit is counted");
+        let writes = writes.load(Ordering::SeqCst);
+        assert!(writes < 16, "64 hits took {writes} writes");
+        assert!(batch.lock().is_empty(), "an idle slot is dropped");
+    }
+
+    /// The batch is per Tenant: one Tenant's hits never land on another's
+    /// row, and a row gone for one Tenant says so to that Tenant only.
+    #[tokio::test]
+    async fn hits_are_written_per_tenant() {
+        let batch = HitBatch::default();
+        let a = antares_model::TenantId::new("a").expect("tenant");
+        let b = antares_model::TenantId::new("b").expect("tenant");
+        let url = "https://ctx.example/shared.jsonld";
+        assert!(!batch.bump(Some(&a), url, |_| async { false }).await);
+        assert!(batch.bump(Some(&b), url, |_| async { true }).await);
+        assert!(batch.bump(None, url, |n| async move { n == 1 }).await);
     }
 }
