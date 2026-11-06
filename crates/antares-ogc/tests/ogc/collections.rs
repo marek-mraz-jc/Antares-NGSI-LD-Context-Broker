@@ -357,18 +357,27 @@ async fn a_rule_change_after_a_read_reaches_the_collections() -> Result<(), Stri
             .filter_map(|c| c.get("id").and_then(Value::as_str).map(str::to_owned))
             .collect()
     };
-    let a = get(&f.app, "/x/views/city/ogc/features/collections").await;
+    // A view of its own: the other tests read `city` and the pod's caches are keyed by
+    // (Tenant, view id).
+    let put = |rules: Value| {
+        let view = serde_json::json!({
+            "id": "t6612", "tenant": "city", "selector": ["Car", "Stop"],
+            "rules": rules, "operations": ["query_entities"]
+        });
+        let app = f.app.clone();
+        async move { send(&app, "PUT", "/q/views/t6612", &view.to_string(), &[]).await }
+    };
+    let both = serde_json::json!([{"types": ["Car"], "attributes": ["speed"]},
+                                  {"types": ["Stop"], "attributes": ["name"]}]);
+    let a = put(both).await;
+    assert!(a.status.is_success(), "{} {}", a.status, a.body);
+    let a = get(&f.app, "/x/views/t6612/ogc/features/collections").await;
     assert_eq!(listed(&a.body), ["Car", "Stop"], "{}", a.body);
-    let view = serde_json::json!({
-        "id": "city", "tenant": "city", "selector": ["Car", "Stop"],
-        "rules": [{"types": ["Car"], "attributes": ["speed", "location"]}],
-        "operations": ["query_entities"]
-    });
-    let put = send(&f.app, "PUT", "/q/views/city", &view.to_string(), &[]).await;
-    assert!(put.status.is_success(), "{} {}", put.status, put.body);
-    let a = get(&f.app, "/x/views/city/ogc/features/collections").await;
+    let a = put(serde_json::json!([{"types": ["Car"], "attributes": ["speed"]}])).await;
+    assert!(a.status.is_success(), "{} {}", a.status, a.body);
+    let a = get(&f.app, "/x/views/t6612/ogc/features/collections").await;
     assert_eq!(listed(&a.body), ["Car"], "{}", a.body);
-    let a = get(&f.app, "/x/views/city/ogc/features/collections/Stop").await;
+    let a = get(&f.app, "/x/views/t6612/ogc/features/collections/Stop").await;
     assert_eq!(a.status, StatusCode::NOT_FOUND, "{}", a.body);
     Ok(())
 }
