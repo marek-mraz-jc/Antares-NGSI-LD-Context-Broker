@@ -1536,10 +1536,29 @@ fn asked<'s>(set: &'s Set, names: &'s [&str]) -> impl Iterator<Item = &'s crate:
 
 /// The key of an Attribute in an answer compacted under the request's
 /// context: a term the filter defined, else the core name.
+/// Found through the context's index by IRI, built on the first member of an answer
+/// (T-6619 R3-018), or by a scan when the context grew since.
 fn key_of(iri: &str, filter: &Translated) -> String {
-    filter
-        .term_of(iri)
-        .map_or_else(|| core_name(iri), ToOwned::to_owned)
+    let (len, keys) = filter.keys.0.get_or_init(|| {
+        let mut keys = std::collections::HashMap::with_capacity(filter.context.len());
+        for (term, defined) in &filter.context {
+            if let Some(defined) = defined.as_str() {
+                keys.entry(defined.to_owned())
+                    .or_insert_with(|| term.clone());
+            }
+        }
+        (filter.context.len(), keys)
+    });
+    let found = if *len == filter.context.len() {
+        keys.get(iri).cloned()
+    } else {
+        filter
+            .context
+            .iter()
+            .find(|(_, defined)| defined.as_str() == Some(iri))
+            .map(|(term, _)| term.clone())
+    };
+    found.unwrap_or_else(|| core_name(iri))
 }
 
 /// An expanded navigation member: references to the Relationship's
@@ -2288,6 +2307,36 @@ pub(crate) fn written(method: &Method, uri: &ODataUri, version: ODataVersion) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// T-6619 R3-018: a member's term is found by IRI in the index, the term a scan of the
+    /// context finds first, and a term minted after the index was built is still found.
+    #[test]
+    fn a_term_is_found_by_iri_and_a_minted_one_after_the_index() {
+        let mut t = Translated::default();
+        for n in 0..200 {
+            crate::filter::mint(&mut t.context, &format!("https://example.org/a{n}"));
+        }
+        t.context
+            .insert("again".into(), Value::from("https://example.org/a7"));
+        assert_eq!(key_of("https://example.org/a199", &t), "t199");
+        let scanned = t
+            .context
+            .iter()
+            .find(|(_, defined)| defined.as_str() == Some("https://example.org/a7"))
+            .map(|(term, _)| term.clone());
+        assert_eq!(
+            Some(key_of("https://example.org/a7", &t)),
+            scanned,
+            "the scan's term"
+        );
+        assert_eq!(
+            key_of("https://example.org/none", &t),
+            core_name("https://example.org/none")
+        );
+        let late = crate::filter::mint(&mut t.context, "https://example.org/late");
+        assert_eq!(key_of("https://example.org/late", &t), late);
+        assert_eq!(key_of("https://example.org/a3", &t), "t3");
+    }
     use crate::edm::Member;
     use serde_json::json;
     use std::collections::BTreeMap;

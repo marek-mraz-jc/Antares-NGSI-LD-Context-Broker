@@ -119,7 +119,9 @@ pub(crate) struct Translated {
 /// [`Translated::context`] by IRI, built on the first read with the length of the context
 /// it read: [`mint`] only adds terms, so a context grown since is read again.
 #[derive(Debug, Default)]
-pub(crate) struct Keys(std::sync::OnceLock<(usize, std::collections::HashMap<String, String>)>);
+pub(crate) struct Keys(
+    pub(crate) std::sync::OnceLock<(usize, std::collections::HashMap<String, String>)>,
+);
 
 /// An index of the context equals any other: it is derived, never compared.
 impl PartialEq for Keys {
@@ -129,27 +131,6 @@ impl PartialEq for Keys {
 }
 
 impl Translated {
-    /// The term `context` defines for `iri`, the first by the context's order.
-    pub(crate) fn term_of(&self, iri: &str) -> Option<&str> {
-        let (len, keys) = self.keys.0.get_or_init(|| {
-            let mut keys = std::collections::HashMap::with_capacity(self.context.len());
-            for (term, defined) in &self.context {
-                if let Some(defined) = defined.as_str() {
-                    keys.entry(defined.to_owned())
-                        .or_insert_with(|| term.clone());
-                }
-            }
-            (self.context.len(), keys)
-        });
-        if *len == self.context.len() {
-            return keys.get(iri).map(String::as_str);
-        }
-        self.context
-            .iter()
-            .find(|(_, defined)| defined.as_str() == Some(iri))
-            .map(|(term, _)| term.as_str())
-    }
-
     /// What selects the Entities, without the order, the residual or the
     /// surface sort: the base of a count that asks about the same answer.
     pub(crate) fn probe(&self) -> Self {
@@ -1697,33 +1678,6 @@ fn escape(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::functions::STRING;
-
-    /// T-6619 R3-018: a member's term is found by IRI in the index, the term a scan of the
-    /// context finds first, and a term minted after the index was built is still found.
-    #[test]
-    fn a_term_is_found_by_iri_and_a_minted_one_after_the_index() {
-        let mut t = Translated::default();
-        for n in 0..200 {
-            mint(&mut t.context, &format!("https://example.org/a{n}"));
-        }
-        t.context
-            .insert("again".into(), Value::from("https://example.org/a7"));
-        assert_eq!(t.term_of("https://example.org/a199"), Some("t199"));
-        let scanned = t
-            .context
-            .iter()
-            .find(|(_, defined)| defined.as_str() == Some("https://example.org/a7"))
-            .map(|(term, _)| term.as_str());
-        assert_eq!(
-            t.term_of("https://example.org/a7"),
-            scanned,
-            "the scan's term"
-        );
-        assert_eq!(t.term_of("https://example.org/none"), None);
-        let late = mint(&mut t.context, "https://example.org/late");
-        assert_eq!(t.term_of("https://example.org/late"), Some(late.as_str()));
-        assert_eq!(t.term_of("https://example.org/a3"), Some("t3"));
-    }
 
     fn translate(
         filter: &Expr,
