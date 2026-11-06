@@ -383,7 +383,7 @@ impl Server {
         asks: bool,
     ) -> CallToolResponse {
         let given = request.arguments.unwrap_or_default();
-        if let Err(why) = schema::check_all(tool.args, &given, &self.names()) {
+        if let Err(why) = schema::check_all(tool.args, &given, self.names()) {
             return refused(&why).into();
         }
         if !asks {
@@ -448,7 +448,7 @@ impl Server {
         tool: &'static ToolDef,
         given: &serde_json::Map<String, Value>,
     ) -> CallToolResult {
-        let mut args = match schema::check_all(tool.args, given, &self.names()) {
+        let mut args = match schema::check_all(tool.args, given, self.names()) {
             Ok(args) => args,
             Err(why) => return refused(&why),
         };
@@ -518,7 +518,7 @@ impl Server {
         tool: &'static ToolDef,
         given: &serde_json::Map<String, Value>,
     ) -> CallToolResult {
-        let args = match schema::check_all(tool.args, given, &self.names()) {
+        let args = match schema::check_all(tool.args, given, self.names()) {
             Ok(args) => args,
             Err(why) => return refused(&why),
         };
@@ -691,7 +691,7 @@ impl Server {
         given: &serde_json::Map<String, Value>,
     ) -> CallToolResult {
         let names = self.names();
-        let Some(Checked::One(entity_type)) = schema::check_all(tool.args, given, &names)
+        let Some(Checked::One(entity_type)) = schema::check_all(tool.args, given, names)
             .ok()
             .and_then(|mut args| args.remove("type"))
         else {
@@ -710,7 +710,7 @@ impl Server {
             }
             answer = CallToolResult::structured(json!({}));
         }
-        let Some((text, guide)) = crate::guide::describe(&names, &entity_type, chrono::Utc::now())
+        let Some((text, guide)) = crate::guide::describe(names, &entity_type, chrono::Utc::now())
         else {
             let none = format!("No query guide for {entity_type}; its Attributes follow.");
             answer.content.insert(0, ContentBlock::text(none));
@@ -734,7 +734,7 @@ impl Server {
         given: &serde_json::Map<String, Value>,
     ) -> CallToolResult {
         let names = self.names();
-        let mut args = match schema::check_all(tool.args, given, &names) {
+        let mut args = match schema::check_all(tool.args, given, names) {
             Ok(args) => args,
             Err(why) => return refused(&why),
         };
@@ -742,7 +742,7 @@ impl Server {
             tool.op,
             OperationId::QueryEntities | OperationId::RetrieveEntity
         ) {
-            crate::guide::lean(&mut args, &names);
+            crate::guide::lean(&mut args, names);
         }
         let cursor = args.remove("cursor");
         let digest = cursor::digest(tool.name, &args);
@@ -1389,7 +1389,7 @@ impl ServerHandler for Server {
             arg.into(),
             Value::String(value.ok_or_else(unknown_resource)?),
         );
-        let args = schema::check_all(tool.args, &given, &names).map_err(|_| unknown_resource())?;
+        let args = schema::check_all(tool.args, &given, names).map_err(|_| unknown_resource())?;
         if !self.offers(op).await {
             return Err(unknown_resource());
         }
