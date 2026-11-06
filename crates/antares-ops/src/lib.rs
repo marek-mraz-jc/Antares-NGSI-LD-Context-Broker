@@ -340,6 +340,23 @@ impl OpsRequest {
         self
     }
 
+    /// Every header of `all` as [`Self::header`] adds one, moved rather than
+    /// cloned one by one (R3-024).
+    #[must_use]
+    pub fn headers(mut self, all: HeaderMap) -> Self {
+        let mut last: Option<HeaderName> = None;
+        for (name, value) in all {
+            // a repeated header's later values come without their name
+            if let Some(name) = name {
+                last = Some(name);
+            }
+            if let Some(name) = last.as_ref().filter(|n| !outer_only(n)) {
+                self.headers.append(name, value);
+            }
+        }
+        self
+    }
+
     /// The @context the request's names are read under, in place of the
     /// outer request's `Link` header (a read's `q`, `attrs`, `type`): a
     /// surface that names Attributes outside the core @context defines its
@@ -2015,6 +2032,27 @@ mod tests {
         assert_eq!(req.headers.len(), 1);
         assert_eq!(req.headers["content-type"], "application/json");
         assert_eq!(axum::body::HttpBody::size_hint(&req.body).exact(), Some(2));
+    }
+
+    /// R3-024: a moved header map keeps what one header at a time kept,
+    /// every value of a repeated header, and drops the outer ones.
+    #[test]
+    fn a_moved_header_map_keeps_what_one_header_at_a_time_keeps() {
+        let mut all = HeaderMap::new();
+        all.append("accept", HeaderValue::from_static("a"));
+        all.append("ngsild-tenant", HeaderValue::from_static("evil"));
+        all.append("ngsild-tenant", HeaderValue::from_static("evil2"));
+        all.append("accept", HeaderValue::from_static("b"));
+        all.append("x-a", HeaderValue::from_static("c"));
+        let one_by_one = all
+            .iter()
+            .fold(OpsRequest::new(Method::GET, "/x"), |r, (n, v)| {
+                r.header(n.clone(), v.clone())
+            });
+        let moved = OpsRequest::new(Method::GET, "/x").headers(all);
+        assert_eq!(moved.headers, one_by_one.headers);
+        assert_eq!(moved.headers.get_all("accept").iter().count(), 2);
+        assert!(!moved.headers.contains_key("ngsild-tenant"));
     }
 
     /// `read_only`: `OPTIONS` names the methods, a write is the surface's refusal with `Allow`,
