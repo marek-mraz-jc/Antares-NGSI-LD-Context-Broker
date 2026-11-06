@@ -160,7 +160,7 @@ mod tests {
 
     const CAR: &str = "https://uri.etsi.org/ngsi-ld/default-context/Car";
 
-    fn table(policies: Value) -> Result<Arc<Table>, String> {
+    fn table(policies: &Value) -> Result<Arc<Table>, String> {
         compile(&json!({ "policies": policies })).map(Arc::new)
     }
 
@@ -209,7 +209,7 @@ mod tests {
     /// R1-008: the same read twice is one decision and one `Arc`.
     #[test]
     fn the_same_read_is_answered_with_the_same_filter() -> Result<(), String> {
-        let t = table(json!([grant("city")]))?;
+        let t = table(&json!([grant("city")]))?;
         let s = subject("t6618-same", "city")?;
         let types = [CAR.to_owned()];
         let op = Operation {
@@ -224,12 +224,26 @@ mod tests {
         Ok(())
     }
 
+    fn near() -> Result<GeoQuery, String> {
+        let area: std::collections::HashMap<String, String> = [
+            ("georel", "near;maxDistance==10"),
+            ("geometry", "Point"),
+            ("coordinates", "[1,2]"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        GeoQuery::from_params(&area)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "no geoquery".to_owned())
+    }
+
     /// Each member of the input is a key: another caller, Tenant, clause or
     /// Operation member is decided afresh (and its repeat kept), and a caller
     /// without the grant is refused although the last answer allowed.
     #[test]
     fn another_input_is_decided_afresh() -> Result<(), String> {
-        let t = table(json!([grant("city")]))?;
+        let t = table(&json!([grant("city")]))?;
         let (types, bus) = ([CAR.to_owned()], [CAR.replace("Car", "Bus")]);
         let op = || Operation {
             types: &types,
@@ -239,17 +253,7 @@ mod tests {
         let city = subject("t6618-other", "city")?;
         let (stranger, elsewhere) = (subject("t6618-other", "x")?, subject("t6618-else", "city")?);
         let q = antares_ql::parse_q("speed>1").map_err(|e| e.to_string())?;
-        let area: std::collections::HashMap<String, String> = [
-            ("georel", "near;maxDistance==10"),
-            ("geometry", "Point"),
-            ("coordinates", "[1,2]"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
-        .collect();
-        let geo = GeoQuery::from_params(&area)
-            .map_err(|e| e.to_string())?
-            .ok_or("no geoquery")?;
+        let geo = near()?;
         let (body, stored) = (json!({"q": "x"}), StoredImage::default());
         let (ids, attrs) = (["urn:ngsi-ld:Car:1"], [CAR.replace("Car", "speed")]);
         let asked: [(&Subject, Operation<'_>); 11] = [
@@ -350,9 +354,9 @@ mod tests {
             ..Operation::new("5.7.2")
         };
         let (now, runs) = (Utc::now(), Cell::new(0));
-        let granted = table(json!([grant("city")]))?;
+        let granted = table(&json!([grant("city")]))?;
         filter(&ask(&granted, &s, &op, now, &runs))?;
-        let revoked = table(json!([grant("other")]))?;
+        let revoked = table(&json!([grant("other")]))?;
         assert!(matches!(
             ask(&revoked, &s, &op, now, &runs),
             Decision::Deny(_)
@@ -370,7 +374,7 @@ mod tests {
         if let Some(o) = timed.as_object_mut() {
             o.insert("validity".into(), json!({"to": end.to_rfc3339()}));
         }
-        let t = table(json!([timed]))?;
+        let t = table(&json!([timed]))?;
         let s = subject("t6618-expiry", "city")?;
         let types = [CAR.to_owned()];
         let op = Operation {
