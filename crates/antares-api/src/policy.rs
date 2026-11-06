@@ -422,9 +422,9 @@ impl TimeBound {
     }
 }
 
-/// The [`TimeBound::render`] calls of this thread, for the tests that count them.
 #[cfg(test)]
 thread_local! {
+    /// The [`TimeBound::render`] calls of this thread, for the tests that count them.
     pub(crate) static RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
