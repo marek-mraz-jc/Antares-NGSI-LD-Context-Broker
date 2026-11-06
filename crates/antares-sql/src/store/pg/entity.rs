@@ -2026,16 +2026,22 @@ impl PgEntityStore {
         .await?;
         let mut created: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
         let mut events = Vec::new();
+        // by id, the first item of each as `find` took it: a scan of
+        // `items` per row was quadratic, 1.5 ms of a 1 000-item batch
+        // against 45 us (T-6607, R2-029)
+        let mut docs: std::collections::HashMap<&str, &Value> = std::collections::HashMap::new();
+        if self.outbox_on() {
+            for (i, d) in items {
+                docs.entry(i.as_str()).or_insert(d);
+            }
+        }
         for r in &rows {
             let id: String = r.get(0);
             let inserted: bool = r.get(1);
             // the id came out of `items`, so the lookup answers; an
             // outbox row for a document that is not there would carry no
             // payload, so there is nothing to emit either way
-            if let (true, Some(doc)) = (
-                self.outbox_on(),
-                items.iter().find(|(i, _)| *i == id).map(|(_, d)| d),
-            ) {
+            if let Some(doc) = docs.get(id.as_str()).copied() {
                 let e = extract(doc);
                 events.push(change_event(
                     tenant,
