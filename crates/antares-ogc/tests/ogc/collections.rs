@@ -343,3 +343,32 @@ async fn the_collections_list_reads_each_geometry_collection_once() -> Result<()
     assert_eq!(queries.0.load(Ordering::SeqCst), 1);
     Ok(())
 }
+
+/// T-6612, R3-006: the collections are built once per view compilation, so a rule change made
+/// after a read is served at the next read, never the model built before it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rule_change_after_a_read_reaches_the_collections() -> Result<(), String> {
+    let f = fixture().await?;
+    let listed = |body: &Value| -> Vec<String> {
+        body.get("collections")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect()
+    };
+    let a = get(&f.app, "/x/views/city/ogc/features/collections").await;
+    assert_eq!(listed(&a.body), ["Car", "Stop"], "{}", a.body);
+    let view = serde_json::json!({
+        "id": "city", "tenant": "city", "selector": ["Car", "Stop"],
+        "rules": [{"types": ["Car"], "attributes": ["speed", "location"]}],
+        "operations": ["query_entities"]
+    });
+    let put = send(&f.app, "PUT", "/q/views/city", &view.to_string(), &[]).await;
+    assert!(put.status.is_success(), "{} {}", put.status, put.body);
+    let a = get(&f.app, "/x/views/city/ogc/features/collections").await;
+    assert_eq!(listed(&a.body), ["Car"], "{}", a.body);
+    let a = get(&f.app, "/x/views/city/ogc/features/collections/Stop").await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND, "{}", a.body);
+    Ok(())
+}
