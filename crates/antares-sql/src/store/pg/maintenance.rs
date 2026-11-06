@@ -1036,8 +1036,9 @@ pub async fn mark_bare(
 }
 
 /// The Entities of every Tenant that carry their own history retention
-/// (DM-97), served by the partial index of migration 0010 on the literal
-/// key, so the sweep reads them without scanning `entities`.
+/// (DM-97), served by the partial index of migration 0032 on the
+/// `history_retention` flag, so the sweep reads them without scanning
+/// `entities`.
 pub async fn history_overrides(
     pool: &PgPool,
     limit: usize,
@@ -1047,7 +1048,7 @@ pub async fn history_overrides(
     let rows = sqlx::query(
         "SELECT tenant_id, id, entity -> 'https://uri.etsi.org/ngsi-ld/default-context/historyRetention' AS own
          FROM entities
-         WHERE entity ? 'https://uri.etsi.org/ngsi-ld/default-context/historyRetention'
+         WHERE history_retention
          LIMIT $1",
     )
     .bind(i64::try_from(limit).unwrap_or(i64::MAX))

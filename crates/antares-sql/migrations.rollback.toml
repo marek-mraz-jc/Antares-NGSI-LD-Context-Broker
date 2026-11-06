@@ -132,3 +132,7 @@ note = "an older release never reads bare and does not clear it on a write: afte
 [0031]
 rollback = "compatible"
 note = "drops the unused tenant_update policy on attr_versions; an older release never updates a version row, so it runs unchanged without it"
+
+[0032]
+rollback = "compatible"
+note = "the history_retention flag is kept by a trigger, so an older release's writes keep it current; its retention sweep asks entity ? historyRetention, which no index serves after 0032, and reads entities once a minute until the roll-forward"
