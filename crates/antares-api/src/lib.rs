@@ -57,7 +57,6 @@ macro_rules! gate {
                         },
                     )
                     .await
-                    .map(std::sync::Arc::new)
                 }
             };
             // A state served through an endpoint view adds the view's

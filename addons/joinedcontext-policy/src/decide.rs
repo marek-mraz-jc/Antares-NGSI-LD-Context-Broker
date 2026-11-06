@@ -11,6 +11,7 @@ use antares_api::policy::{
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 /// Writes judged on the Entity they create, so a conditional policy is
 /// judged on the request body.
@@ -122,11 +123,14 @@ pub fn decide(
     }
     if read {
         match read_filter(&grants, op, (&types, &refused), withheld, platform) {
-            Decision::Allow if metadata.is_some() => Decision::Filter(Filter {
+            Decision::Allow if metadata.is_some() => Decision::Filter(Arc::new(Filter {
                 metadata,
                 ..Filter::default()
-            }),
-            Decision::Filter(f) => Decision::Filter(Filter { metadata, ..f }),
+            })),
+            Decision::Filter(f) => Decision::Filter(Arc::new(Filter {
+                metadata,
+                ..Arc::unwrap_or_clone(f)
+            })),
             other => other,
         }
     } else if WHOLE_TENANT.contains(&op.clause) {
@@ -388,11 +392,11 @@ fn names(table: &Table, caller: &Platform, now: DateTime<Utc>) -> Decision {
     if !query().any(|p| p.prohibit) && query().any(|p| !p.prohibit && unconditional_whole(p)) {
         return Decision::Allow;
     }
-    Decision::Filter(Filter {
+    Decision::Filter(Arc::new(Filter {
         rules: vec![Rule::default()],
         restricted: caller.restricted,
         ..Filter::default()
-    })
+    }))
 }
 
 /// A read: one rule per selector of every grant (ADR-0023 rule 11), none of which shows a type
@@ -411,12 +415,12 @@ fn read_filter(
         if withheld.is_empty() {
             return Decision::Allow;
         }
-        return Decision::Filter(Filter {
+        return Decision::Filter(Arc::new(Filter {
             warning: left_out(&[], op, types, &withheld),
             omit_by_type: withheld,
             restricted: caller.restricted,
             ..Filter::default()
-        });
+        }));
     }
     let mut rules: Vec<Rule> = Vec::new();
     for p in grants {
@@ -454,13 +458,13 @@ fn read_filter(
             rules.push(Rule::default());
         }
     }
-    Decision::Filter(Filter {
+    Decision::Filter(Arc::new(Filter {
         warning: left_out(&rules, op, types, &withheld),
         omit_by_type: withheld,
         rules,
         restricted: caller.restricted,
         ..Filter::default()
-    })
+    }))
 }
 
 /// The advisory naming the types the request's filter leaves out (map K18, MP-02), as the
@@ -1150,7 +1154,7 @@ mod tests {
         let Decision::Filter(f) = decide(Some(&t), &caller(), &op, Utc::now()) else {
             return Err("a read by selector is a filter".into());
         };
-        Ok(f.warning.map(|w| w.texts().join("; ")))
+        Ok(f.warning.as_ref().map(|w| w.texts().join("; ")))
     }
 
     const WAS: &str = "was not queried: this request selects or orders on an attribute they do \
@@ -1348,7 +1352,7 @@ mod tests {
     #[test]
     fn a_capability_block_passes_metadata_members_per_attribute() -> Result<(), String> {
         let members = |d: Decision| match d {
-            Decision::Filter(f) => Ok(f.metadata),
+            Decision::Filter(f) => Ok(f.metadata.clone()),
             other => Err(format!("{other:?}")),
         };
         let blockless = table(&json!({"operations": ["5.7.2"]}))?;
@@ -1371,10 +1375,11 @@ mod tests {
             ])
         );
         // a type list carries no data, so it strips nothing
-        assert!(matches!(
-            on(&t, "5.7.6", None),
-            Decision::Allow | Decision::Filter(Filter { metadata: None, .. })
-        ));
+        assert!(match on(&t, "5.7.6", None) {
+            Decision::Allow => true,
+            Decision::Filter(f) => f.metadata.is_none(),
+            _ => false,
+        });
         let with_prohibition = compile(&json!({"policies": [
             {"id": "p", "assignee": {"kind": "role", "id": "r"}, "operations": ["5.7.2"],
              "information": [{"entities": [{"type": "Car"}]}]},
