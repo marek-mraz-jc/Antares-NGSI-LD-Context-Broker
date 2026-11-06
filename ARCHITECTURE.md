@@ -109,6 +109,7 @@ module's header comment.
 | `contexts.rs` | 5.13 `/jsonldContexts` |
 | `conformance.rs` | 6.3.21 version negotiation |
 | `repr.rs` | 6.3.7, 4.5.4 representations: normalized, concise, keyValues, sysAttrs; 4.5.23 Linked Entity Retrieval (inline and flat, the lookup budget) and the 4.5.16 GeoJSON Feature/FeatureCollection shapes — what every module needs to render a document |
+| `request_cost.rs` | T-6615 per-request cost (`ANTARES_REQUEST_COST`, native only): the layer over `router` that adds `Server-Timing` and `JC-Request-Cost` and the per-tenant `antares_request_cost_*` counters; the accumulator lives in antares-store `cost`, the statement hook in antares-sql `cost` |
 | `history.rs` | the producer side of temporal recording: the per-request change buffer and the 4.5.7/4.5.8 delete mirrors that record a deleted Entity or Attribute in history |
 | `provenance.rs` | who and what wrote a request's history (platform ADR-N-054 2.3): the gateway's `JC-Provenance-*`, `JC-Reason` and `X-Request-Id` headers, believed only from the mesh identity `ANTARES_PROVENANCE_FROM` names in `l5d-client-id`; otherwise `channel: api` with no actor |
 | `erasure.rs` | erasure of personal data (ADR-N-054 2.6) from the current state, every history version and the dead letters; `antares-ops` `views/erasure.rs` serves `/q/erasures/{tenant}`, keeps the content-free tombstone and re-applies it on start |

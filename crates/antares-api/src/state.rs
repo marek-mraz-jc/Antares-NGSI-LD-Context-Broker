@@ -491,7 +491,7 @@ pub struct Shared {
     /// Behaviour profile keys ([`Profile`]); the broker sets it from the env.
     pub profile: Profile,
     /// `ANTARES_REQUEST_COST=on` (T-6615): every answer says what it cost
-    /// ([`crate::request_cost`]). Off by default; read when the router is built.
+    /// (module `request_cost`). Off by default; read when the router is built.
     pub request_cost: bool,
     /// The mesh identity of the gateway whose provenance headers the broker
     /// believes (ANTARES_PROVENANCE_FROM, T-4665); `None` believes nobody.

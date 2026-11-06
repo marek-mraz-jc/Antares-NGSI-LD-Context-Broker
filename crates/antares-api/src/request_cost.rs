@@ -11,8 +11,8 @@
 //! time spent inside the request future's polls, `db` the wall time of the
 //! store statements it awaited, `pool` the wait for a pool connection,
 //! `total` the wall time to the response headers. One layer over
-//! [`crate::router()`] covers every surface: they all reach data through
-//! [`AppState::call`], and an inner call finds the outer request's
+//! the router covers every surface: they all reach data through
+//! `AppState::call`, and an inner call finds the outer request's
 //! accumulator already in place, so it adds to that one and answers no
 //! header of its own. Off (the default) builds no layer at all.
 
@@ -48,8 +48,8 @@ pub fn parse(raw: Option<&str>) -> Result<bool, String> {
     }
 }
 
-/// The layer over [`crate::router()`]: measures a request unless an outer
-/// one is measured already (an in-process [`AppState::call`]).
+/// The layer over the router: measures a request unless an outer one is
+/// measured already (an in-process `AppState::call`).
 pub(crate) async fn measure(req: Request, next: Next) -> Response {
     if cost::current().is_some() {
         return next.run(req).await;
