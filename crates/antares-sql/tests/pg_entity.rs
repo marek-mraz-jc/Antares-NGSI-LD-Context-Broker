@@ -1732,12 +1732,19 @@ async fn a_value_update_is_hot_and_the_retention_flag_follows_the_key() {
         .await
         .expect("update")
         .get(0);
-    let n: i64 = sqlx::query_scalar(hot).fetch_one(&mut *tx).await.expect("hot");
+    let n: i64 = sqlx::query_scalar(hot)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("hot");
     assert_eq!((n, flag), (1, false), "a value update must be HOT");
 
     let mut own = doc(id, 3);
     own[KEY] = json!([{"type": "Property", "value": "P7D"}]);
-    let flag: bool = update(own).fetch_one(&mut *tx).await.expect("update").get(0);
+    let flag: bool = update(own)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("update")
+        .get(0);
     assert!(flag, "the trigger sets the flag when the key arrives");
     let flag: bool = update(doc(id, 4))
         .fetch_one(&mut *tx)
