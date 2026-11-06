@@ -1447,9 +1447,9 @@ mod t6612 {
             }],
             ..Filter::default()
         };
-        let instances: Vec<Value> = (0..1_000)
+        let instances: Vec<Value> = (0_u32..1_000)
             .map(|i| {
-                let day = if i % 2 == 0 {
+                let day = if i.checked_rem(2) == Some(0) {
                     "2025-12-31"
                 } else {
                     "2026-01-02"
