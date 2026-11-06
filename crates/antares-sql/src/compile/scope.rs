@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: EUPL-1.2
 //! Scope Query Language (CIM 009 clause 4.19) compiled to SQL over the
-//! extracted `scopes text[]` column (GIN-indexed).
+//! extracted `scopes text[]` column. The predicate is a regex over
+//! `unnest(scopes)` inside `EXISTS`, which no index serves (migration 0001):
+//! a scope filter narrows rows another predicate selected, it does not
+//! select them itself.
 //!
 //! Same one-directional contract as `q` (see `compile::q`): this may only
 //! NARROW. `antares_api::scope_matches` stays the arbiter, so a predicate
