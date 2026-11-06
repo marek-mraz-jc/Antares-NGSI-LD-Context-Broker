@@ -844,16 +844,20 @@ pub(crate) fn list_context(ctx: &Context, accept: Accept) -> Option<Value> {
 /// One Entity of a streamed list as written ([`respond_frames`]), with
 /// `ld_ctx` ([`list_context`]) as its `@context`.
 pub(crate) fn list_frame(doc: Value, ld_ctx: Option<&Value>) -> axum::body::Bytes {
-    let doc = match (ld_ctx, doc) {
-        (Some(ctx_val), Value::Object(mut o)) => {
-            o.insert("@context".into(), ctx_val.clone());
-            Value::Object(o)
-        }
-        (_, other) => other,
-    };
     let mut buf = Vec::new();
     // serializing a Value into a Vec cannot fail
-    let _ = serde_json::to_writer(&mut buf, &SpecOrder(&doc));
+    let _ = match (ld_ctx, doc) {
+        (Some(ctx), Value::Object(mut o)) => {
+            // a placeholder holds the member's place in the map's order; the
+            // shared @context is written in its stead, never cloned (R1-016)
+            o.insert("@context".into(), Value::Null);
+            serde_json::to_writer(
+                &mut buf,
+                &antares_model::SpecOrderWithContext { doc: &o, ctx },
+            )
+        }
+        (_, other) => serde_json::to_writer(&mut buf, &SpecOrder(&other)),
+    };
     axum::body::Bytes::from(buf)
 }
 
@@ -1352,6 +1356,33 @@ mod negotiation {
     use axum::extract::FromRequestParts;
     use axum::http::HeaderValue;
     use serde_json::json;
+
+    /// R1-016: a list frame writes the page's one @context in the place an
+    /// inserted clone took, byte for byte.
+    #[test]
+    fn a_list_frame_is_the_clone_it_replaced() {
+        let ctx = json!(["https://a/c.jsonld", {"x": "https://x/"}]);
+        for doc in [
+            json!({"type": "T", "id": "urn:ngsi-ld:T:1", "a": {"type": "Property", "value": 1}, "0": 1}),
+            json!({"id": "urn:ngsi-ld:T:2", "@context": "old", "z": 2}),
+            json!({}),
+            json!(3),
+        ] {
+            let old = match doc.clone() {
+                Value::Object(mut o) => {
+                    o.insert("@context".into(), ctx.clone());
+                    Value::Object(o)
+                }
+                other => other,
+            };
+            let want = serde_json::to_vec(&SpecOrder(&old)).unwrap_or_default();
+            assert_eq!(
+                list_frame(doc.clone(), Some(&ctx)).as_ref(),
+                want.as_slice(),
+                "{doc}"
+            );
+        }
+    }
 
     fn hdr(name: &'static str, value: &str) -> HeaderMap {
         let mut h = HeaderMap::new();

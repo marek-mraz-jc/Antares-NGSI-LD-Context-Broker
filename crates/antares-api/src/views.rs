@@ -912,7 +912,7 @@ impl WriteGuard {
                 && shown.as_ref().is_some_and(|s| s.allows(k));
             if frame || attribute {
                 k.hash(&mut hasher);
-                v.to_string().hash(&mut hasher);
+                hash_json(v, &mut hasher);
             }
         }
         format!("\"{:016x}\"", hasher.finish())
@@ -1231,6 +1231,24 @@ pub(crate) async fn schema_admits(
     schema_admits_typed(st, tenant, &typed, false)
 }
 
+/// `v.to_string().hash(h)` without the String: the text streams into the
+/// hasher, then the `0xff` that `str`'s Hash writes after it, so every
+/// entity tag keeps its value (R1-016).
+fn hash_json(v: &serde_json::Value, h: &mut impl std::hash::Hasher) {
+    struct Into<'a, H>(&'a mut H);
+    impl<H: std::hash::Hasher> std::io::Write for Into<'_, H> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.write(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    // writing a Value into a sink that never fails cannot fail
+    let _ = serde_json::to_writer(Into(&mut *h), v);
+    h.write_u8(0xff);
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1244,6 +1262,24 @@ mod tests {
     use serde_json::{json, Value};
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    /// R1-016: the streamed hash is the one the String gave, so a tag a
+    /// client holds from before still matches.
+    #[test]
+    fn the_streamed_hash_is_the_one_the_text_gave() {
+        use std::hash::{Hash, Hasher};
+        for v in [
+            serde_json::json!({"type": "Property", "value": [1, "a\"b", {"x": null}]}),
+            serde_json::json!("ü"),
+            serde_json::json!(1.5),
+        ] {
+            let mut old = std::hash::DefaultHasher::new();
+            v.to_string().hash(&mut old);
+            let mut new = std::hash::DefaultHasher::new();
+            hash_json(&v, &mut new);
+            assert_eq!(old.finish(), new.finish(), "{v}");
+        }
+    }
 
     struct Narrowing(Filter);
 
