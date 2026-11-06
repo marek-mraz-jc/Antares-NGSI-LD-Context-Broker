@@ -172,19 +172,23 @@ async fn parse_batch(
 struct BatchOutcome {
     success: Vec<Value>,
     errors: Vec<Value>,
+    /// The ids in `success`, so [`Self::succeed`] keeps each once without
+    /// walking the list per member (R1-012).
+    succeeded: std::collections::HashSet<String>,
 }
 
 impl BatchOutcome {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             success: Vec::new(),
             errors: Vec::new(),
+            succeeded: std::collections::HashSet::new(),
         }
     }
 
     /// `id` joins S once, however many members or forwards succeeded for it.
     fn succeed(&mut self, id: &str) {
-        if !self.success.iter().any(|v| v.as_str() == Some(id)) {
+        if self.succeeded.insert(id.to_owned()) {
             self.success.push(Value::String(id.to_owned()));
         }
     }

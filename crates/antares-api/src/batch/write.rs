@@ -99,6 +99,7 @@ async fn batch_write(
         #[cfg(feature = "views")]
         known: HashMap::new(),
         created_ids: Vec::new(),
+        created_seen: std::collections::HashSet::new(),
         any_created: false,
     };
     // ADR-0023 rule 7 under an endpoint view: every batch write is decided
@@ -174,8 +175,11 @@ struct BatchRun<'a> {
     /// takes instead of reading them again (T-4085).
     #[cfg(feature = "views")]
     known: HashMap<String, Value>,
-    /// The ids the batch created, local and forwarded, each once (5.6.8.5).
+    /// The ids the batch created, local and forwarded, each once (5.6.8.5),
+    /// in order; `created_seen` holds the same ids so the once-check is not a
+    /// walk of the list per member (R1-012).
     created_ids: Vec<String>,
+    created_seen: std::collections::HashSet<String>,
     any_created: bool,
 }
 
@@ -662,7 +666,7 @@ impl BatchRun<'_> {
 
     fn created(&mut self, id: String) {
         self.any_created = true;
-        if !self.created_ids.contains(&id) {
+        if self.created_seen.insert(id.clone()) {
             self.created_ids.push(id);
         }
     }
@@ -989,9 +993,7 @@ async fn upsert_in_view(
         }
         match r {
             Some(Ok(())) => {
-                if !out.success.contains(&Value::String(id.clone())) {
-                    out.success.push(Value::String(id));
-                }
+                out.succeed(&id);
             }
             // a conditioned member never creates: absent or not selected,
             // it is not found
@@ -1024,8 +1026,8 @@ async fn upsert_in_view(
         if !ok {
             let e = NgsiError::AlreadyExists(format!("entity {id} already exists"));
             out.errors.push(err_entry(Some(&id), &e));
-        } else if !out.success.contains(&Value::String(id.clone())) {
-            out.success.push(Value::String(id.clone()));
+        } else if !out.succeeded.contains(&id) {
+            out.succeed(&id);
             created.push(id);
         }
     }

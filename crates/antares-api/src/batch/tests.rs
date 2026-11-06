@@ -758,3 +758,23 @@ async fn upsert_update_mode_through_a_view_replaces_the_named_instance() {
     let doc = get_entity(&plain, &format!("{id}?options=sysAttrs")).await;
     assert_instances_replaced(&before, &doc);
 }
+
+/// R1-012: the S array keeps each id once, and checking "already there" is
+/// not a walk of the list per member. 20,000 distinct ids walked as a list
+/// cost 2 * 10^8 comparisons (seconds in a debug build); as a set they cost
+/// milliseconds, so the bound below holds with room on a loaded host.
+#[test]
+fn the_success_list_keeps_each_id_once_without_a_walk_per_member() {
+    let mut out = super::BatchOutcome::new();
+    let ids: Vec<String> = (0..20_000).map(|i| format!("urn:ngsi-ld:T:{i}")).collect();
+    let start = std::time::Instant::now();
+    for id in ids.iter().chain(ids.iter().take(10)) {
+        out.succeed(id);
+    }
+    let took = start.elapsed();
+    assert_eq!(out.success.len(), 20_000, "a repeated id was listed twice");
+    assert!(
+        took < std::time::Duration::from_millis(1_500),
+        "20,000 members took {took:?}: the once-check walks the list"
+    );
+}
