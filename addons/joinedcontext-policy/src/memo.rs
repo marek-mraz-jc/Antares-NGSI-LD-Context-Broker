@@ -25,7 +25,7 @@ use std::cell::RefCell;
 use std::sync::{Arc, Weak};
 
 /// Decisions kept per thread: a worker thread serves a few callers in turn.
-// ponytail: a fixed ring scanned in order; a per-Table map when a thread
+// ponytail: a short list scanned in order, the last used first; a per-Table map when a thread
 // serves many more callers than this between two repeats.
 const SLOTS: usize = 8;
 
@@ -95,10 +95,11 @@ pub(crate) fn decided(
     let Some(table) = table.filter(|_| FILTERABLE.contains(&op.clause)) else {
         return decide();
     };
-    let hit = LAST.with_borrow(|last| {
-        last.iter()
-            .find(|s| s.holds(table, subject, op, now))
-            .map(|s| s.decision.clone())
+    // a hit moves to the front, so the reads a thread repeats stay kept
+    let hit = LAST.with_borrow_mut(|last| {
+        let at = last.iter().position(|s| s.holds(table, subject, op, now))?;
+        last.get_mut(..=at)?.rotate_right(1);
+        last.first().map(|s| s.decision.clone())
     });
     if let Some(hit) = hit {
         return hit;
@@ -223,35 +224,111 @@ mod tests {
         Ok(())
     }
 
-    /// Another caller, Tenant, type, `q` or clause is decided afresh, and a
-    /// caller without the grant is refused although the last answer allowed.
+    /// Each member of the input is a key: another caller, Tenant, clause or
+    /// Operation member is decided afresh (and its repeat kept), and a caller
+    /// without the grant is refused although the last answer allowed.
     #[test]
     fn another_input_is_decided_afresh() -> Result<(), String> {
         let t = table(json!([grant("city")]))?;
-        let types = [CAR.to_owned()];
-        let op = Operation {
+        let (types, bus) = ([CAR.to_owned()], [CAR.replace("Car", "Bus")]);
+        let op = || Operation {
             types: &types,
             ..Operation::new("5.7.2")
         };
         let (now, runs) = (Utc::now(), Cell::new(0));
         let city = subject("t6618-other", "city")?;
-        filter(&ask(&t, &city, &op, now, &runs))?;
-        let stranger = subject("t6618-other", "stranger")?;
+        let (stranger, elsewhere) = (subject("t6618-other", "x")?, subject("t6618-else", "city")?);
+        let q = antares_ql::parse_q("speed>1").map_err(|e| e.to_string())?;
+        let area: std::collections::HashMap<String, String> = [
+            ("georel", "near;maxDistance==10"),
+            ("geometry", "Point"),
+            ("coordinates", "[1,2]"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let geo = GeoQuery::from_params(&area)
+            .map_err(|e| e.to_string())?
+            .ok_or("no geoquery")?;
+        let (body, stored) = (json!({"q": "x"}), StoredImage::default());
+        let (ids, attrs) = (["urn:ngsi-ld:Car:1"], [CAR.replace("Car", "speed")]);
+        let asked: [(&Subject, Operation<'_>); 11] = [
+            (
+                &city,
+                Operation {
+                    clause: "5.7.1",
+                    ..op()
+                },
+            ),
+            (&stranger, op()),
+            (&elsewhere, op()),
+            (
+                &city,
+                Operation {
+                    types: &bus,
+                    ..op()
+                },
+            ),
+            (
+                &city,
+                Operation {
+                    q: Some(&q),
+                    ..op()
+                },
+            ),
+            (
+                &city,
+                Operation {
+                    attrs: &attrs,
+                    ..op()
+                },
+            ),
+            (&city, Operation { ids: &ids, ..op() }),
+            (
+                &city,
+                Operation {
+                    scope_q: Some("/a"),
+                    ..op()
+                },
+            ),
+            (
+                &city,
+                Operation {
+                    geo: Some(&geo),
+                    ..op()
+                },
+            ),
+            (
+                &city,
+                Operation {
+                    body: Some(&body),
+                    ..op()
+                },
+            ),
+            (
+                &city,
+                Operation {
+                    stored: Some(&stored),
+                    ..op()
+                },
+            ),
+        ];
+        // each right after the read it differs from by one member, so that
+        // read's slot is there to answer wrongly
+        ask(&t, &city, &op(), now, &runs);
+        for (n, (s, other)) in (2u32..).zip(&asked) {
+            ask(&t, &city, &op(), now, &runs);
+            let first = ask(&t, s, other, now, &runs);
+            assert_eq!(ask(&t, s, other, now, &runs), first);
+            assert_eq!(runs.get(), n, "{n}: {other:?}");
+        }
+        // eight are kept: the stranger's read was dropped, and is decided
+        // (and refused) again
         assert!(matches!(
-            ask(&t, &stranger, &op, now, &runs),
+            ask(&t, &stranger, &op(), now, &runs),
             Decision::Deny(_)
         ));
-        assert!(matches!(
-            ask(&t, &subject("t6618-else", "city")?, &op, now, &runs),
-            Decision::Filter(_)
-        ));
-        let bus = ["https://uri.etsi.org/ngsi-ld/default-context/Bus".to_owned()];
-        assert!(matches!(
-            ask(&t, &city, &Operation { types: &bus, ..op }, now, &runs),
-            Decision::Deny(_) | Decision::Filter(_)
-        ));
-        let q = antares_ql::parse_q("speed>1").map_err(|e| e.to_string())?;
-        ask(&t, &city, &Operation { q: Some(&q), ..op }, now, &runs);
+        assert_eq!(runs.get(), 13);
         // a write is never kept
         let write = Operation {
             types: &types,
@@ -259,7 +336,7 @@ mod tests {
         };
         ask(&t, &city, &write, now, &runs);
         ask(&t, &city, &write, now, &runs);
-        assert_eq!(runs.get(), 7);
+        assert_eq!(runs.get(), 15);
         Ok(())
     }
 
@@ -305,6 +382,9 @@ mod tests {
         filter(&ask(&t, &s, &op, now + Duration::seconds(29), &runs))?;
         assert_eq!(runs.get(), 1);
         assert!(matches!(ask(&t, &s, &op, end, &runs), Decision::Deny(_)));
+        assert_eq!(runs.get(), 2);
+        // a refusal kept from `end` on never answers for a time before it
+        filter(&ask(&t, &s, &op, now, &runs))?;
         assert_eq!(runs.get(), 2);
         assert_eq!(steady(&t, now), (None, Some(end)));
         assert_eq!(steady(&t, end), (Some(end), None));
