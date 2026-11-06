@@ -27,8 +27,10 @@ use rmcp::model::{
 use rmcp::service::{RequestContext, SubscriptionContext};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde_json::{json, Value};
+use std::any::Any;
 use std::borrow::Cow;
-use std::sync::{Arc, LazyLock};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError, Weak};
 
 /// The protocol revisions served: 2026-07-28 stateless, and the legacy
 /// `initialize` of 2025-11-25 and 2025-06-18 (D-8).
@@ -101,27 +103,143 @@ pub(crate) struct Server {
     view: ViewOps,
     caller: Caller,
     id: Arc<str>,
+    listing: Arc<Listing>,
+}
+
+/// What a view shows every caller, built once per view compilation and UTC day
+/// (R3-011): its names and every tool it can offer, described and with its input
+/// schema. A request only filters the tools by what the engine offers its caller.
+struct Listing {
+    names: Names,
+    /// [`TOOLS`] with `describe_type` at its place in name order, each beside its row.
+    tools: Vec<(&'static ToolDef, Tool)>,
+    /// The guide text names the week holding this day.
+    day: chrono::NaiveDate,
+}
+
+/// (Tenant, view id): a view's [`Listing`] holds no caller's data.
+type ListingKey = (String, String);
+
+/// A cached value and the view compilation it was built from.
+struct Kept<T> {
+    view: Weak<dyn Any + Send + Sync>,
+    value: Arc<T>,
+}
+
+static LISTINGS: LazyLock<Mutex<HashMap<ListingKey, Kept<Listing>>>> =
+    LazyLock::new(Mutex::default);
+
+/// The value `cache` keeps for `key` while `view` is the compilation it was built
+/// from and `fresh` holds, else `build`'s, kept in its place. A view's rule change
+/// makes a new compilation (`ViewOps::generation`), so an old value is never served;
+/// entries of dropped compilations go on each insert, so the cache holds at most
+/// one entry per loaded view.
+fn kept<T>(
+    cache: &Mutex<HashMap<ListingKey, Kept<T>>>,
+    key: ListingKey,
+    view: Weak<dyn Any + Send + Sync>,
+    fresh: impl Fn(&T) -> bool,
+    build: impl FnOnce() -> T,
+) -> Arc<T> {
+    let held = cache
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&key)
+        .filter(|k| Weak::ptr_eq(&k.view, &view) && fresh(&k.value))
+        .map(|k| Arc::clone(&k.value));
+    if let Some(value) = held {
+        return value;
+    }
+    let value = Arc::new(build());
+    let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    cache.retain(|_, k| k.view.strong_count() > 0);
+    cache.insert(
+        key,
+        Kept {
+            view,
+            value: Arc::clone(&value),
+        },
+    );
+    value
+}
+
+/// The names a caller of `view` uses.
+fn names_of(view: &ViewOps) -> Names {
+    // a view of another model is named by its target model alone (G18)
+    if let Some((types, attributes)) = view.target_names() {
+        return Names::new(types, attributes);
+    }
+    if view.shows_every_name() {
+        return Names::every();
+    }
+    let (types, attributes) = view.shown_names();
+    Names::new(types, attributes)
+}
+
+impl Listing {
+    fn new(names: Names, now: chrono::DateTime<chrono::Utc>) -> Self {
+        // The read tools carry how to ask each type the view names (T-4486).
+        let guide = crate::guide::text(&names, now);
+        let mut tools: Vec<(&'static ToolDef, Tool)> = TOOLS
+            .iter()
+            .map(|t| {
+                let mut description: Cow<'static, str> = Cow::Borrowed(t.description);
+                if let Some(limits) = limits_note(t.name) {
+                    description = Cow::Owned(format!("{description} {limits}"));
+                }
+                if let Some(guide) = guide
+                    .as_ref()
+                    .filter(|_| matches!(t.name, "query_entities" | "query_temporal"))
+                {
+                    description = Cow::Owned(format!("{description}\n\n{guide}"));
+                }
+                let tool = Tool::new(
+                    t.name,
+                    description,
+                    Arc::new(schema::input_schema(t.args, &names)),
+                );
+                (t, tool.annotate(annotations(t)))
+            })
+            .collect();
+        // `describe_type` is `get_type` answered with its guide: offered with it,
+        // in the table's name order, as every other tool
+        if let Some(t) = TOOLS.iter().find(|t| t.name == "get_type") {
+            let at = tools.partition_point(|(_, tool)| *tool.name < *DESCRIBE_TYPE);
+            let tool = Tool::new(
+                DESCRIBE_TYPE,
+                DESCRIBE_TYPE_DESCRIPTION,
+                Arc::new(schema::input_schema(t.args, &names)),
+            );
+            tools.insert(at, (t, tool.annotate(annotations(t))));
+        }
+        Self {
+            names,
+            tools,
+            day: now.date_naive(),
+        }
+    }
 }
 
 impl Server {
     pub(crate) fn new(view: ViewOps, caller: Caller, id: &str) -> Self {
+        let now = chrono::Utc::now();
+        let listing = kept(
+            &LISTINGS,
+            (view.tenant().to_owned(), id.to_owned()),
+            view.generation(),
+            |l| l.day == now.date_naive(),
+            || Listing::new(names_of(&view), now),
+        );
         Self {
             view,
             caller,
             id: id.into(),
+            listing,
         }
     }
 
-    fn names(&self) -> Names {
-        // a view of another model is named by its target model alone (G18)
-        if let Some((types, attributes)) = self.view.target_names() {
-            return Names::new(types, attributes);
-        }
-        if self.view.shows_every_name() {
-            return Names::every();
-        }
-        let (types, attributes) = self.view.shown_names();
-        Names::new(types, attributes)
+    fn names(&self) -> &Names {
+        &self.listing.names
     }
 
     /// The tools the view and the engine offer this caller (D-3).
@@ -473,7 +591,7 @@ impl Server {
     async fn area_types(&self) -> Result<Vec<String>, CallToolResult> {
         let names = self.names();
         if !names.every {
-            return Ok(names.types);
+            return Ok(names.types.clone());
         }
         let types = Built {
             method: Method::GET,
@@ -1149,47 +1267,14 @@ impl ServerHandler for Server {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let names = self.names();
-        // The read tools carry how to ask each type the view names (T-4486).
-        let guide = crate::guide::text(&names, chrono::Utc::now());
         let offered = self.offered().await;
-        // `describe_type` is `get_type` answered with its guide: offered with it
-        let describe = offered
+        let tools: Vec<Tool> = self
+            .listing
+            .tools
             .iter()
-            .copied()
-            .find(|t| t.name == "get_type")
-            .map(|t| (DESCRIBE_TYPE, t));
-        let mut tools: Vec<Tool> = offered
-            .into_iter()
-            .map(|t| {
-                let mut description: Cow<'static, str> = Cow::Borrowed(t.description);
-                if let Some(limits) = limits_note(t.name) {
-                    description = Cow::Owned(format!("{description} {limits}"));
-                }
-                if let Some(guide) = guide
-                    .as_ref()
-                    .filter(|_| matches!(t.name, "query_entities" | "query_temporal"))
-                {
-                    description = Cow::Owned(format!("{description}\n\n{guide}"));
-                }
-                Tool::new(
-                    t.name,
-                    description,
-                    Arc::new(schema::input_schema(t.args, &names)),
-                )
-                .annotate(annotations(t))
-            })
+            .filter(|(def, _)| offered.iter().any(|o| std::ptr::eq(*o, *def)))
+            .map(|(_, tool)| tool.clone())
             .collect();
-        if let Some((name, t)) = describe {
-            // in the table's name order, as every other tool
-            let at = tools.partition_point(|tool| *tool.name < *name);
-            let tool = Tool::new(
-                name,
-                DESCRIBE_TYPE_DESCRIPTION,
-                Arc::new(schema::input_schema(t.args, &names)),
-            );
-            tools.insert(at, tool.annotate(annotations(t)));
-        }
         Ok(ListToolsResult::with_all_items(tools)
             .with_ttl_ms(TOOLS_TTL_MS)
             .with_cache_scope(CacheScope::Private))
@@ -1242,7 +1327,7 @@ impl ServerHandler for Server {
         let resources = if self.offers(OperationId::RetrieveEntityTypeInfo).await {
             self.names()
                 .types
-                .into_iter()
+                .iter()
                 .map(|t| {
                     Resource::new(format!("ngsi-ld://{}/types/{t}", self.id), t)
                         .with_mime_type("application/json")
@@ -1550,5 +1635,60 @@ mod tests {
         assert_eq!(percent_decoded("%2"), None);
         assert_eq!(percent_decoded("%zz"), None);
         assert_eq!(percent_decoded("%ff"), None);
+    }
+
+    /// R3-011: a view's listing is built once per compilation, rebuilt after a rule
+    /// change or a new day, and a dropped compilation's entry goes on the next insert.
+    #[test]
+    fn a_listing_is_built_once_per_view_compilation() {
+        let cache: Mutex<HashMap<ListingKey, Kept<u32>>> = Mutex::default();
+        let key = || ("tenant".to_owned(), "view".to_owned());
+        let builds = std::cell::Cell::new(0_u32);
+        let build = || {
+            builds.set(builds.get().saturating_add(1));
+            builds.get()
+        };
+        let compiled: Arc<dyn Any + Send + Sync> = Arc::new(());
+        let first = kept(&cache, key(), Arc::downgrade(&compiled), |_| true, build);
+        let again = kept(&cache, key(), Arc::downgrade(&compiled), |_| true, build);
+        assert!(Arc::ptr_eq(&first, &again));
+        assert_eq!(builds.get(), 1);
+        // a new day: the guide names another week
+        let stale = kept(&cache, key(), Arc::downgrade(&compiled), |_| false, build);
+        assert_eq!((*stale, builds.get()), (2, 2));
+        // a rule change compiles the view anew
+        let recompiled: Arc<dyn Any + Send + Sync> = Arc::new(());
+        let changed = kept(&cache, key(), Arc::downgrade(&recompiled), |_| true, build);
+        assert_eq!((*changed, builds.get()), (3, 3));
+        // the other Tenant's view of the same id is its own entry
+        let other = ("other".to_owned(), "view".to_owned());
+        let theirs = kept(&cache, other, Arc::downgrade(&compiled), |_| true, build);
+        assert_eq!(*theirs, 4);
+        drop(compiled);
+        let gone: Arc<dyn Any + Send + Sync> = Arc::new(());
+        let _ = kept(
+            &cache,
+            ("t".into(), "v".into()),
+            Arc::downgrade(&gone),
+            |_| true,
+            build,
+        );
+        let held = cache.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(held.len(), 2, "the dropped compilation's entry went");
+    }
+
+    /// The listing offers `describe_type` in name order with `get_type`'s row, and the
+    /// guide on the two read tools that carry it.
+    #[test]
+    fn a_listing_holds_every_tool_in_name_order() {
+        let names = Names::new(vec!["AirQualityObserved".into()], vec!["pm10".into()]);
+        let listing = Listing::new(names, chrono::Utc::now());
+        let shown: Vec<&str> = listing.tools.iter().map(|(_, t)| &*t.name).collect();
+        let mut sorted = shown.clone();
+        sorted.sort_unstable();
+        assert_eq!(shown, sorted);
+        assert_eq!(shown.len(), TOOLS.len().saturating_add(1));
+        let describe = listing.tools.iter().find(|(_, t)| t.name == DESCRIBE_TYPE);
+        assert_eq!(describe.map(|(d, _)| d.name), Some("get_type"));
     }
 }
