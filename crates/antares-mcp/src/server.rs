@@ -134,7 +134,7 @@ static LISTINGS: LazyLock<Mutex<HashMap<ListingKey, Kept<Listing>>>> =
 /// makes a new compilation (`ViewOps::generation`), so an old value is never served;
 /// entries of dropped compilations go on each insert, so the cache holds at most
 /// one entry per loaded view.
-fn kept<T>(
+fn listing_of<T>(
     cache: &Mutex<HashMap<ListingKey, Kept<T>>>,
     key: ListingKey,
     view: Weak<dyn Any + Send + Sync>,
@@ -223,7 +223,7 @@ impl Listing {
 impl Server {
     pub(crate) fn new(view: ViewOps, caller: Caller, id: &str) -> Self {
         let now = chrono::Utc::now();
-        let listing = kept(
+        let listing = listing_of(
             &LISTINGS,
             (view.tenant().to_owned(), id.to_owned()),
             view.generation(),
@@ -1649,24 +1649,24 @@ mod tests {
             builds.get()
         };
         let compiled: Arc<dyn Any + Send + Sync> = Arc::new(());
-        let first = kept(&cache, key(), Arc::downgrade(&compiled), |_| true, build);
-        let again = kept(&cache, key(), Arc::downgrade(&compiled), |_| true, build);
+        let first = listing_of(&cache, key(), Arc::downgrade(&compiled), |_| true, build);
+        let again = listing_of(&cache, key(), Arc::downgrade(&compiled), |_| true, build);
         assert!(Arc::ptr_eq(&first, &again));
         assert_eq!(builds.get(), 1);
         // a new day: the guide names another week
-        let stale = kept(&cache, key(), Arc::downgrade(&compiled), |_| false, build);
+        let stale = listing_of(&cache, key(), Arc::downgrade(&compiled), |_| false, build);
         assert_eq!((*stale, builds.get()), (2, 2));
         // a rule change compiles the view anew
         let recompiled: Arc<dyn Any + Send + Sync> = Arc::new(());
-        let changed = kept(&cache, key(), Arc::downgrade(&recompiled), |_| true, build);
+        let changed = listing_of(&cache, key(), Arc::downgrade(&recompiled), |_| true, build);
         assert_eq!((*changed, builds.get()), (3, 3));
         // the other Tenant's view of the same id is its own entry
         let other = ("other".to_owned(), "view".to_owned());
-        let theirs = kept(&cache, other, Arc::downgrade(&compiled), |_| true, build);
+        let theirs = listing_of(&cache, other, Arc::downgrade(&compiled), |_| true, build);
         assert_eq!(*theirs, 4);
         drop(compiled);
         let gone: Arc<dyn Any + Send + Sync> = Arc::new(());
-        let _ = kept(
+        let _ = listing_of(
             &cache,
             ("t".into(), "v".into()),
             Arc::downgrade(&gone),
