@@ -1161,7 +1161,10 @@ mod tests {
             1,
             build,
         );
-        let held = MODELS.read().map_or(true, |m| m.contains_key(&key()));
+        let held = MODELS
+            .read()
+            .map(|m| m.contains_key(&key()))
+            .unwrap_or(true);
         assert!(
             !held,
             "the entry of a dropped compilation goes on the next insert"
