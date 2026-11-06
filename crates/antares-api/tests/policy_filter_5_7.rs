@@ -1860,3 +1860,31 @@ async fn an_entity_map_under_a_narrowed_q_past_a_peers_cap_is_the_callers_map() 
         asked.len()
     );
 }
+
+/// R2-032: rule 8 reads the state of every Entity on a history page in one
+/// store call, not one read per history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_narrowed_history_page_reads_the_states_now_in_one_store_call() {
+    let mut st = state(slow()).await;
+    seed(&st).await;
+    seed_history(&st).await;
+    let spy = Arc::new(crate::common::Double::passthrough(st.store.clone()));
+    st.store = spy.clone();
+    let before = spy.entity_reads();
+    let (code, list) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/temporal/entities?type=Vehicle&timerel=after&timeAt=1970-01-01T00:00:00Z",
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{list}");
+    assert_eq!(
+        ids(&list),
+        vec!["urn:ngsi-ld:Vehicle:slow".to_owned()],
+        "{list}"
+    );
+    let after = spy.entity_reads();
+    assert_eq!(after.0, before.0, "one state read per history");
+    assert_eq!(after.1 - before.1, 1, "the states were not read together");
+}
