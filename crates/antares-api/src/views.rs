@@ -200,11 +200,11 @@ pub fn with_view(
         // Rule 7: the handler checks the view on the stored Entity before
         // and after the write (`WriteGuard`); the engine's own answer
         // still refuses a narrowed write, as it does without a view.
-        return match resolve(clause, Decision::Filter(Arc::unwrap_or_clone(engine?))) {
+        return match resolve(clause, Decision::Filter(engine?)) {
             Decision::Deny(why) => Err(Denied(why)),
             // 5.8.4 lists the view's own and keeps the engine's selection
             // among them (T-3673)
-            Decision::Filter(f) if crate::policy::RECORD_LISTS.contains(&clause) => Ok(Arc::new(f)),
+            Decision::Filter(f) if crate::policy::RECORD_LISTS.contains(&clause) => Ok(f),
             _ => Ok(crate::policy::unnarrowed()),
         };
     }
@@ -236,37 +236,50 @@ pub fn with_view(
 /// `views`, T-3778): the last answer is kept per thread and handed out again
 /// while the same view, clause and engine narrowing come back. It is keyed
 /// by the whole input (the view's `Arc` itself, held so its address cannot
-/// be reused; the clause; the engine's `Filter` by value), so it never
-/// answers for another (O16). A filter unequal to itself (a NaN) misses.
+/// be reused; the clause; the engine's `Filter`, the same `Arc` or an equal
+/// value), so it never answers for another (O16). An engine that hands out
+/// the same `Arc` again (T-6618) is found by pointer, without comparing the
+/// rules. A filter unequal to itself (a NaN) misses.
 /// The answer is the same `Arc` on a hit, so `repr::narrow_repr` finds its
 /// reach by pointer as well.
 fn paired(view: &CompiledView, clause: &str, engine: Arc<Filter>) -> Result<Arc<Filter>, Denied> {
-    type Last = (Arc<Filter>, String, Filter, Result<Arc<Filter>, Denied>);
+    type Last = (
+        Arc<Filter>,
+        String,
+        Arc<Filter>,
+        Result<Arc<Filter>, Denied>,
+    );
     thread_local! {
         static LAST: std::cell::RefCell<Option<Last>> = const { std::cell::RefCell::new(None) };
     }
     let hit = LAST.with_borrow(|last| {
         last.as_ref()
-            .filter(|l| Arc::ptr_eq(&l.0, &view.narrowing) && l.1 == clause && l.2 == *engine)
+            .filter(|l| {
+                Arc::ptr_eq(&l.0, &view.narrowing)
+                    && l.1 == clause
+                    && (Arc::ptr_eq(&l.2, &engine) || *l.2 == *engine)
+            })
             .map(|l| l.3.clone())
     });
     if let Some(hit) = hit {
         return hit;
     }
-    let key = Filter::clone(&engine);
+    let key = engine.clone();
     let composed = if *engine == Filter::default() {
         Ok(Filter::clone(view.narrowing()))
     } else {
         compose(view.narrowing(), Arc::unwrap_or_clone(engine))
     };
-    let answer = composed.and_then(
-        |composed| match resolve(clause, Decision::Filter(composed)) {
-            Decision::Allow => Ok(crate::policy::unnarrowed()),
-            // `resolve` makes no condition of a filter
-            Decision::Filter(f) | Decision::AllowIf(f) => Ok(Arc::new(f)),
-            Decision::Deny(why) => Err(Denied(why)),
-        },
-    );
+    let answer =
+        composed.and_then(
+            |composed| match resolve(clause, Decision::Filter(Arc::new(composed))) {
+                Decision::Allow => Ok(crate::policy::unnarrowed()),
+                // `resolve` makes no condition of a filter
+                Decision::Filter(f) => Ok(f),
+                Decision::AllowIf(f) => Ok(Arc::new(f)),
+                Decision::Deny(why) => Err(Denied(why)),
+            },
+        );
     LAST.set(Some((
         view.narrowing.clone(),
         clause.to_owned(),
@@ -1253,7 +1266,7 @@ mod tests {
         }
         fn decide<'a>(&'a self, _s: &'a Subject, op: &'a Operation<'a>) -> DecisionFuture<'a> {
             let answer = if FILTERABLE.contains(&op.clause) {
-                Decision::Filter(self.0.clone())
+                Decision::Filter(std::sync::Arc::new(self.0.clone()))
             } else {
                 Decision::Allow
             };

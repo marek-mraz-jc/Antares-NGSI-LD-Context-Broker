@@ -739,9 +739,7 @@ impl ViewOps {
                 };
                 let gated = antares_api::policy::gate(engine, &self.tenant, &caller.0, &asked);
                 // The engine learns the view in process (T-3702), as for a run.
-                antares_api::policy::through_view(self.view.id(), gated)
-                    .await
-                    .map(Arc::new)
+                antares_api::policy::through_view(self.view.id(), gated).await
             }
         };
         antares_api::views::with_view(Some(&self.view), clause, engine)

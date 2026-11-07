@@ -277,8 +277,10 @@ pub enum Decision {
     /// access-denied error, so this is an Antares decision.
     Deny(String),
     /// Allowed over less. The caller cannot tell a hidden entity from an
-    /// absent one.
-    Filter(Filter),
+    /// absent one. Shared: an engine that answers the same input again may
+    /// hand out the same `Arc`, and the broker's per-thread memos (views,
+    /// repr) then find their answer by pointer (T-6618).
+    Filter(std::sync::Arc<Filter>),
     /// Allowed only if the stored Entity the write lands on is one the
     /// filter selects (gap G12): its `q`, `scopeQ`, areas and the types and
     /// conditions of its `rules`, judged on stored values, which the
@@ -1729,16 +1731,20 @@ pub async fn gate(
     tenant: &antares_model::TenantId,
     headers: &HeaderMap,
     op: &Operation<'_>,
-) -> Result<Filter, Denied> {
+) -> Result<std::sync::Arc<Filter>, Denied> {
     match decide(engine, &subject_of(tenant, headers), op).await {
-        Decision::Allow => Ok(Filter::default()),
+        Decision::Allow => Ok(unnarrowed()),
         // On a write by id the filter is the condition ([`Condition::of`]);
         // `resolve` lets an `AllowIf` through nowhere else, and turns a
         // `Filter` there into a deny, so a handler of such a clause reads
         // what it gets back as the condition and nothing else.
-        Decision::Filter(f) | Decision::AllowIf(f) => {
+        Decision::Filter(f) => {
             metadata::hold(f.metadata.as_deref())?;
             Ok(f)
+        }
+        Decision::AllowIf(f) => {
+            metadata::hold(f.metadata.as_deref())?;
+            Ok(std::sync::Arc::new(f))
         }
         Decision::Deny(why) => Err(Denied(why)),
     }
@@ -2631,11 +2637,13 @@ mod tests {
             "narrowing"
         }
         fn decide<'a>(&'a self, _s: &'a Subject, _o: &'a Operation<'a>) -> DecisionFuture<'a> {
-            Box::pin(std::future::ready(Decision::Filter(Filter {
-                omit: vec!["brand".into()],
-                restricted: true,
-                ..Filter::default()
-            })))
+            Box::pin(std::future::ready(Decision::Filter(std::sync::Arc::new(
+                Filter {
+                    omit: vec!["brand".into()],
+                    restricted: true,
+                    ..Filter::default()
+                },
+            ))))
         }
         fn pre_notify(&self, _s: &Subject, _sub: &Value, n: &mut Value) -> NotifyDecision {
             if let Some(data) = n.get_mut("data").and_then(Value::as_array_mut) {
@@ -2741,10 +2749,10 @@ mod tests {
 
     #[test]
     fn narrowing_a_whole_tenant_operation_is_a_refusal() {
-        let narrowed = Decision::Filter(Filter {
+        let narrowed = Decision::Filter(std::sync::Arc::new(Filter {
             omit: vec!["speed".into()],
             ..Filter::default()
-        });
+        }));
         for clause in WHOLE_TENANT {
             assert!(matches!(
                 resolve(clause, narrowed.clone()),
@@ -2765,14 +2773,14 @@ mod tests {
     /// dropped, and nothing more.
     #[test]
     fn a_filterable_read_keeps_its_narrowing() {
-        let narrowed = Decision::Filter(Filter {
+        let narrowed = Decision::Filter(std::sync::Arc::new(Filter {
             omit: vec!["speed".into()],
             ..Filter::default()
-        });
-        let selected = Decision::Filter(Filter {
+        }));
+        let selected = Decision::Filter(std::sync::Arc::new(Filter {
             scope_q: Some("/mine".into()),
             ..Filter::default()
-        });
+        }));
         for clause in FILTERABLE {
             assert_eq!(resolve(clause, selected.clone()), selected, "{clause}");
             if RECORD_LISTS.contains(&clause) {
@@ -2790,7 +2798,10 @@ mod tests {
     #[test]
     fn an_empty_filter_on_a_whole_tenant_operation_is_not_a_refusal() {
         assert_eq!(
-            resolve("5.6.21", Decision::Filter(Filter::default())),
+            resolve(
+                "5.6.21",
+                Decision::Filter(std::sync::Arc::new(Filter::default()))
+            ),
             Decision::Allow
         );
     }
