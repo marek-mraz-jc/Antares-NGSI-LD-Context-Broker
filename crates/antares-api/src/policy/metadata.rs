@@ -289,7 +289,7 @@ pub(crate) async fn layer(
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
     let query = req.uri().query().unwrap_or_default().to_owned();
-    let headers = req.headers().clone();
+    let headers = context_headers(req.headers());
     let (resp, held) = HELD
         .scope(std::cell::RefCell::new(None), async {
             let resp = next.run(req).await;
@@ -332,6 +332,24 @@ pub(crate) async fn layer(
     axum::response::Response::from_parts(parts, axum::body::Body::from(doc.to_string()))
 }
 
+/// The two headers [`crate::negotiate::request_context`] reads (Link and
+/// NGSILD-Tenant), every value kept so a repeated header is refused as
+/// before: copied before the handler takes the request, without cloning
+/// every other header of it (R1-020).
+#[cfg(not(target_arch = "wasm32"))]
+fn context_headers(all: &axum::http::HeaderMap) -> axum::http::HeaderMap {
+    let mut kept = axum::http::HeaderMap::new();
+    for name in [
+        axum::http::header::LINK,
+        axum::http::HeaderName::from_static("ngsild-tenant"),
+    ] {
+        for v in all.get_all(&name) {
+            kept.append(name.clone(), v.clone());
+        }
+    }
+    kept
+}
+
 /// No task-locals on wasm: [`hold`] refuses instead, so nothing to strip.
 #[cfg(target_arch = "wasm32")]
 pub(crate) async fn layer(
@@ -353,6 +371,34 @@ mod tests {
 
     fn core() -> &'static Context {
         crate::repr::policy_context()
+    }
+
+    /// R1-020: the layer copies only what `request_context` reads, every
+    /// value of it, so a repeated NGSILD-Tenant is still refused.
+    #[test]
+    fn the_layer_keeps_only_the_link_and_tenant_headers() {
+        use axum::http::{header, HeaderMap, HeaderValue};
+        let mut all = HeaderMap::new();
+        for i in 0..10 {
+            all.insert(
+                axum::http::HeaderName::try_from(format!("x-other-{i}")).unwrap_or(header::FROM),
+                HeaderValue::from_static("v"),
+            );
+        }
+        all.append(
+            header::LINK,
+            HeaderValue::from_static("<https://a/c.jsonld>"),
+        );
+        all.append("ngsild-tenant", HeaderValue::from_static("a"));
+        all.append("ngsild-tenant", HeaderValue::from_static("b"));
+        let kept = context_headers(&all);
+        assert_eq!(kept.len(), 3, "{kept:?}");
+        assert_eq!(kept.get_all("ngsild-tenant").iter().count(), 2);
+        assert!(crate::negotiate::tenant_from(&kept).is_err());
+        assert_eq!(
+            crate::negotiate::link_context(&kept).ok().flatten(),
+            crate::negotiate::link_context(&all).ok().flatten()
+        );
     }
 
     fn set(members: &[&str]) -> BTreeSet<String> {
