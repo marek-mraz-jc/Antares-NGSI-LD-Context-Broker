@@ -68,6 +68,9 @@ pub(crate) struct Translated {
     pub(crate) order: Option<String>,
     /// The terms `q` and `orderBy` use, term to IRI.
     pub(crate) context: Map<String, Value>,
+    /// `context` read the other way, IRI to term, for the members of every Entity of an
+    /// answer (T-6619 R3-018).
+    pub(crate) keys: Keys,
     /// How many Relationships deep `q` follows one (F24, T-5906), 0 for none: the broker
     /// evaluates a hop only under a `join` at least that deep (5.7.2.4).
     pub(crate) linked: usize,
@@ -111,6 +114,20 @@ pub(crate) struct Translated {
     /// The Attribute terms the computed values read, for the pushdown's
     /// `attrs`.
     pub(crate) computed_reads: Vec<String>,
+}
+
+/// [`Translated::context`] by IRI, built on the first read with the length of the context
+/// it read: [`mint`] only adds terms, so a context grown since is read again.
+#[derive(Debug, Default)]
+pub(crate) struct Keys(
+    pub(crate) std::sync::OnceLock<(usize, std::collections::HashMap<String, String>)>,
+);
+
+/// An index of the context equals any other: it is derived, never compared.
+impl PartialEq for Keys {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 impl Translated {

@@ -1349,7 +1349,7 @@ mod tests {
     fn kept(datetime: &str, events: &[(&str, Option<&str>)]) -> (Option<String>, Vec<usize>) {
         let terms = Terms {
             context: Map::new(),
-            by_iri: vec![("s".into(), "s".into()), ("e".into(), "e".into())],
+            by_iri: [("s".into(), "s".into()), ("e".into(), "e".into())].into(),
         };
         let range = super::datetime(datetime).unwrap_or_default();
         let time = Time::Interval(Some("s".into()), Some("e".into()));
@@ -1414,7 +1414,7 @@ mod tests {
     fn the_time_query_keeps_features_without_time() {
         let terms = Terms {
             context: Map::new(),
-            by_iri: vec![("s".into(), "s".into()), ("e".into(), "e".into())],
+            by_iri: [("s".into(), "s".into()), ("e".into(), "e".into())].into(),
         };
         let at = "2026-01-02T00:00:00Z".to_owned();
         let range = (Some(at.clone()), Some(at));
