@@ -166,7 +166,7 @@ pub enum Feature {
     PathInExpression,
     /// `has` (F13).
     Has,
-    /// `totalseconds`, `geo.distance`, `geo.length`, `hassubset`, `hassubsequence`, `case`
+    /// `totalseconds`, `geo.length`, `hassubset`, `hassubsequence`, `case`
     /// (F18, F19, F30).
     Method,
     /// `cast`, `isof` (F19).

@@ -416,7 +416,14 @@ fn selection(set: &Set, filter: &Translated) -> String {
         q.push_str(&encode(text));
     }
     if let Some((property, coordinates)) = &filter.geo {
-        q.push_str("&georel=intersects&geometry=Polygon&coordinates=");
+        match &filter.near {
+            Some(georel) => {
+                q.push_str("&georel=");
+                q.push_str(&encode(georel));
+                q.push_str("&geometry=Point&coordinates=");
+            }
+            None => q.push_str("&georel=intersects&geometry=Polygon&coordinates="),
+        }
         q.push_str(&encode(coordinates));
         q.push_str("&geoproperty=");
         q.push_str(&encode(property));
@@ -1856,7 +1863,11 @@ pub(crate) fn ngsild(
         }
     }
     if geo && filter.geo.take().is_some() {
-        // the request's one geoQ is the caller's; the OData conjunct is evaluated
+        // the request's one geoQ is the caller's; the OData conjunct is evaluated, and a
+        // distance has no evaluator (F30)
+        if filter.near.take().is_some() {
+            return Err(not_implemented("geo.distance beside ngsild.georel", version));
+        }
         filter.residual.extend(filter.geo_residual.take());
     }
     Ok(projection)
