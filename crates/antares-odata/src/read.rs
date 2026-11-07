@@ -1866,7 +1866,10 @@ pub(crate) fn ngsild(
         // the request's one geoQ is the caller's; the OData conjunct is evaluated, and a
         // distance has no evaluator (F30)
         if filter.near.take().is_some() {
-            return Err(not_implemented("geo.distance beside ngsild.georel", version));
+            return Err(not_implemented(
+                "geo.distance beside ngsild.georel",
+                version,
+            ));
         }
         filter.residual.extend(filter.geo_residual.take());
     }

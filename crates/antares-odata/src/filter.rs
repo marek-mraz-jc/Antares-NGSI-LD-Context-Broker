@@ -896,13 +896,13 @@ impl<'a> Terms<'a> {
     /// either side) as a top-level conjunct: the GeoProperty's term, the point and the
     /// `georel`, `None` for any other conjunct. The distance is in metres, as NGSI-LD `near`
     /// measures (7.2.4) and as a SRID 4326 geography distance is read by SQL Server and
-    /// PostGIS; `maxDistance` holds at the bound itself, so `lt` admits a point exactly `m`
+    /// `PostGIS`; `maxDistance` holds at the bound itself, so `lt` admits a point exactly `m`
     /// away. `eq`, `ne`, a negative or non-finite bound and another SRID stay 501.
-    fn near(&mut self, e: &Expr) -> Result<Option<(String, Value, String)>, Refused> {
-        let Expr::Compare(l, op, r) = e else {
+    fn near(&mut self, conjunct: &Expr) -> Result<Option<(String, Value, String)>, Refused> {
+        let Expr::Compare(left, op, right) = conjunct else {
             return Ok(None);
         };
-        let (call, op, bound) = match (&**l, &**r) {
+        let (call, op, bound) = match (&**left, &**right) {
             (Expr::Call(Method::GeoDistance, args), other) => (args, *op, other),
             (other, Expr::Call(Method::GeoDistance, args)) => (args, mirrored(*op), other),
             _ => return Ok(None),
@@ -922,9 +922,10 @@ impl<'a> Terms<'a> {
             CompareOp::Gt | CompareOp::Ge => format!("near;minDistance=={bound}"),
             CompareOp::Eq | CompareOp::Ne => return Err(Refused::Later),
         };
-        let (member, point) = match call.as_slice() {
-            [m @ Expr::Member(_), p] | [p, m @ Expr::Member(_)] => (m, p),
-            _ => return Err(Refused::Later),
+        let ([member @ Expr::Member(_), point] | [point, member @ Expr::Member(_)]) =
+            call.as_slice()
+        else {
+            return Err(Refused::Later);
         };
         let point = match literal(point, self.aliases)? {
             Literal::Geography(Geography {
@@ -933,7 +934,12 @@ impl<'a> Terms<'a> {
             }) => position
                 .0
                 .iter()
-                .map(|n| n.parse::<f64>().ok().filter(|n| n.is_finite()).map(Value::from))
+                .map(|n| {
+                    n.parse::<f64>()
+                        .ok()
+                        .filter(|n| n.is_finite())
+                        .map(Value::from)
+                })
                 .collect::<Option<Vec<_>>>()
                 .ok_or(Refused::Bad)?,
             Literal::Geography(_) => return Err(Refused::Later),
@@ -1233,7 +1239,8 @@ impl<'a> Terms<'a> {
             return Err(Refused::Later);
         };
         // F23: the base member `scope`, a collection of strings the read serves
-        if matches!(path.as_slice(), [name] if name == "scope" && !self.set.members.contains_key(name)) {
+        if matches!(path.as_slice(), [name] if name == "scope" && !self.set.members.contains_key(name))
+        {
             return Ok((RExpr::Path(Path::Scope), "Edm.String"));
         }
         let Some((None, member)) = self.leaf(path) else {
@@ -1725,7 +1732,8 @@ fn value(lit: &Literal) -> Result<String, Refused> {
     match lit {
         Literal::Bool(b) => Ok(b.to_string()),
         Literal::Int(n) if (-MAX_EXACT..=MAX_EXACT).contains(n) => Ok(n.to_string()),
-        Literal::Int(_) => Err(Refused::Bad),
+        // a geometry meets no member (F27)
+        Literal::Int(_) | Literal::Geometry(_) => Err(Refused::Bad),
         // INF, -INF and NaN have no NGSI-LD number: the residual compares them (T-5905)
         Literal::Decimal(raw) if matches!(raw.as_str(), "INF" | "-INF" | "NaN") => {
             Err(Refused::Later)
@@ -1748,7 +1756,6 @@ fn value(lit: &Literal) -> Result<String, Refused> {
         | Literal::TimeOfDay(_)
         | Literal::Duration(_)
         | Literal::Binary(_) => Err(Refused::Later),
-        Literal::Geometry(_) => Err(Refused::Bad),
     }
 }
 
@@ -2464,15 +2471,35 @@ mod tests {
             twice,
             Expr::Or(Box::new(within.clone()), Box::new(within.clone())),
             Expr::Not(Box::new(within.clone())),
-            cmp(distance(vec![m("location"), point(4326)]), CompareOp::Eq, lit(Literal::Int(1))),
-            cmp(distance(vec![m("location"), point(0)]), CompareOp::Lt, lit(Literal::Int(1))),
-            cmp(distance(vec![m("location"), point(4326)]), CompareOp::Lt, lit(Literal::Int(-1))),
+            cmp(
+                distance(vec![m("location"), point(4326)]),
+                CompareOp::Eq,
+                lit(Literal::Int(1)),
+            ),
+            cmp(
+                distance(vec![m("location"), point(0)]),
+                CompareOp::Lt,
+                lit(Literal::Int(1)),
+            ),
+            cmp(
+                distance(vec![m("location"), point(4326)]),
+                CompareOp::Lt,
+                lit(Literal::Int(-1)),
+            ),
         ];
         for e in later {
-            assert_eq!(translate(&e, &set(), &BTreeMap::new(), &[]), Err(Refused::Later), "{e:?}");
+            assert_eq!(
+                translate(&e, &set(), &BTreeMap::new(), &[]),
+                Err(Refused::Later),
+                "{e:?}"
+            );
         }
         let bad = [
-            cmp(distance(vec![m("speed"), point(4326)]), CompareOp::Lt, lit(Literal::Int(1))),
+            cmp(
+                distance(vec![m("speed"), point(4326)]),
+                CompareOp::Lt,
+                lit(Literal::Int(1)),
+            ),
             cmp(
                 distance(vec![m("location"), point(4326)]),
                 CompareOp::Lt,
@@ -2480,7 +2507,11 @@ mod tests {
             ),
         ];
         for e in bad {
-            assert_eq!(translate(&e, &set(), &BTreeMap::new(), &[]), Err(Refused::Bad), "{e:?}");
+            assert_eq!(
+                translate(&e, &set(), &BTreeMap::new(), &[]),
+                Err(Refused::Bad),
+                "{e:?}"
+            );
         }
     }
 
@@ -2496,7 +2527,11 @@ mod tests {
             cmp(m("speed"), CompareOp::Eq, flat()),
             call_of(Method::GeoIntersects, vec![m("location"), flat()]),
         ] {
-            assert_eq!(translate(&e, &set(), &BTreeMap::new(), &[]), Err(Refused::Bad), "{e:?}");
+            assert_eq!(
+                translate(&e, &set(), &BTreeMap::new(), &[]),
+                Err(Refused::Bad),
+                "{e:?}"
+            );
         }
     }
 
@@ -2517,7 +2552,10 @@ mod tests {
             assert_eq!((t.q, t.residual.len()), (None, 1), "{e:?}");
         }
         // a history row carries no system member
-        assert_eq!(residual_whole(&created, &set(), &[]).map(|t| t.residual.len()), Err(Refused::Later));
+        assert_eq!(
+            residual_whole(&created, &set(), &[]).map(|t| t.residual.len()),
+            Err(Refused::Later)
+        );
     }
 
     #[test]
@@ -2646,7 +2684,12 @@ mod tests {
         let scalar = any(&["name"], cmp(x(), CompareOp::Eq, a()));
         assert_eq!(q(&scalar), Err(Refused::Bad), "no list to range over");
         // F23: `scope` is the residual's, a lone string read as a list of one
-        let scoped = translate(&any(&["scope"], cmp(x(), CompareOp::Eq, a())), &set(), &BTreeMap::new(), &[("a".into(), Literal::String("/a".into()))]);
+        let scoped = translate(
+            &any(&["scope"], cmp(x(), CompareOp::Eq, a())),
+            &set(),
+            &BTreeMap::new(),
+            &[("a".into(), Literal::String("/a".into()))],
+        );
         assert_eq!(scoped.map(|t| (t.q, t.residual.len())), Ok((None, 1)));
         for refused in [
             any(&["hidden"], cmp(x(), CompareOp::Eq, a())),

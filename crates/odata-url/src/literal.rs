@@ -820,8 +820,13 @@ mod tests {
             })
         );
         let area = ok("Geometry'SRID=0;Polygon((0 0,1 0,1 1,0 0))'");
-        assert!(matches!(&area, Literal::Geometry(Geography { shape: Shape::Polygon(r), .. }) if r.len() == 1));
-        assert_eq!(area.to_string(), "geometry'SRID=0;Polygon((0%200,1%200,1%201,0%200))'");
+        assert!(
+            matches!(&area, Literal::Geometry(Geography { shape: Shape::Polygon(r), .. }) if r.len() == 1)
+        );
+        assert_eq!(
+            area.to_string(),
+            "geometry'SRID=0;Polygon((0%200,1%200,1%201,0%200))'"
+        );
         for bad in ["geometry'Point(1 2)'", "geometry'SRID=1;Point(1 2)"] {
             assert!(read(bad).is_err(), "{bad}");
         }
