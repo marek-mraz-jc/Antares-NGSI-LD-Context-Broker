@@ -1036,7 +1036,7 @@ pub async fn mark_bare(
 }
 
 /// The Entities of every Tenant that carry their own history retention
-/// (DM-97), served by the partial index of migration 0032 on the
+/// (DM-97), served by the partial index of migration 0033 on the
 /// `history_retention` flag, so the sweep reads them without scanning
 /// `entities`.
 pub async fn history_overrides(

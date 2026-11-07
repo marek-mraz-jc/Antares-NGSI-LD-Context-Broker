@@ -1692,7 +1692,7 @@ async fn a_slice_of_a_tenant_past_the_ceiling_is_served() {
 }
 
 /// R2-004 (T-6607): an update that changes only attribute values is HOT, so
-/// it writes no index entry and keeps the row on its page. Before 0032 the
+/// it writes no index entry and keeps the row on its page. Before 0033 the
 /// predicate of 0010's partial index read `entity`, which every write sets,
 /// so no Entity update could be HOT. The SET list is the store's update
 /// (store/pg/entity.rs), every extracted column written with its old value.

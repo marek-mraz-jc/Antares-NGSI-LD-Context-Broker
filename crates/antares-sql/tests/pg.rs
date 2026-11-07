@@ -269,6 +269,72 @@ async fn entity_values_follow_create_update_replace_and_delete() {
     assert!(keyed().await.is_empty(), "a deleted Entity leaves no row");
 }
 
+/// T-6610: an Entity's scopes are `entity_values` rows too (0032), attr
+/// `scope`, normalised (`A//B/` is `/A/B`), kept on every write, and a
+/// `scopeQ` read finds the Entity through their probe.
+#[tokio::test]
+async fn entity_values_key_the_scopes_and_scope_q_finds_them() {
+    use antares_sql::store::pg::entity::{EntityFilter, PgEntityStore};
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    let t = TenantId::new("pg_entity_scopes").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let store = PgEntityStore::new(pool.clone());
+    let id = "urn:ngsi-ld:V:scoped";
+    let _ = store.delete(&t, id).await.expect("clear");
+    let doc = |scope: serde_json::Value| serde_json::json!({"id": id, "type": "V", "scope": scope});
+    assert!(store
+        .create(&t, id, &doc(serde_json::json!(["A//B/", "/C"])))
+        .await
+        .expect("create"));
+    let scopes = || async {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT txt FROM entity_values WHERE tenant_id = $1 AND id = $2 AND attr = 'scope' ORDER BY txt",
+        )
+        .bind(t.as_str())
+        .bind(id)
+        .fetch_all(&pool)
+        .await
+        .expect("rows");
+        rows
+    };
+    let finds = |sq: &'static str| {
+        let (store, t) = (&store, &t);
+        async move {
+            let expand = |term: &str| term.to_owned();
+            let f = EntityFilter {
+                scope_q: Some(sq),
+                expand: &expand,
+                ..Default::default()
+            };
+            store.query(t, &f).await.expect("query").rows.len()
+        }
+    };
+    assert_eq!(scopes().await, ["/A/B", "/C"]);
+    for (sq, n) in [
+        ("/A/B", 1),
+        ("/A/#", 1),
+        ("/A/+", 1),
+        ("/C;/A/B", 1),
+        ("/D,/C/#", 1),
+        ("/A", 0),
+        ("/B/#", 0),
+    ] {
+        assert_eq!(finds(sq).await, n, "{sq}");
+    }
+    store
+        .batch_upsert_replace(&t, &[(id.to_owned(), doc(serde_json::json!("/D")))])
+        .await
+        .expect("replace");
+    assert_eq!(scopes().await, ["/D"]);
+    assert_eq!((finds("/A/#").await, finds("/D").await), (0, 1));
+    assert!(store.delete(&t, id).await.expect("delete").is_some());
+    assert!(
+        scopes().await.is_empty(),
+        "a deleted Entity leaves no scope row"
+    );
+}
+
 /// T-5772: an update rewrites only the `entity_values` rows that changed
 /// (0029). A document move that keeps every value (a new `observedAt`)
 /// leaves every row in place, a changed value replaces that Attribute's row
