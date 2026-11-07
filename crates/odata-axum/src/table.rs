@@ -35,7 +35,9 @@ impl FromRef<Tables> for Arc<ODataState> {
 }
 
 /// The service document, `$metadata` and each of `tables` read-only: `GET /{set}` (a page of at
-/// most `max_page` rows, a `nextLink` to the next), `GET /{set}/$count` and `GET /{set}('key')`.
+/// most `max_page` rows, a `nextLink` to the next), `GET /{set}/$count`, `GET /{set}('key')`,
+/// `GET /{set}/$export` (every matching row as a plain JSON array, at most `100 * max_page`) and
+/// `GET /{set}/$allowed?op=<operation>&key=<key>` (the decision the call would run, as JSON).
 /// The model of `state` holds every set.
 ///
 /// A request reads the [`Scope`] its caller's middleware put in the request extensions

@@ -1,57 +1,99 @@
 // SPDX-License-Identifier: EUPL-1.2
-//! One entity set, `Things`, served by `table_router` on `127.0.0.1:<port>/odata/`, for the
-//! conformance suites (joinedcontext-conformance tests/odata) and the .NET client check:
+//! Two entity sets from one `Service` definition, served by `table_router` on
+//! `127.0.0.1:<port>/odata/`: `Things` from memory, or `Files` from a Git repository at one
+//! commit when one is given (one set per run: the .NET check reads a service's first set). For the conformance suites (joinedcontext-conformance tests/odata) and the
+//! .NET client check; `openapi` writes the OpenAPI 3.1 document of the same definition.
 //!
 //! ```sh
-//! cargo run -p odata-axum --example tables -- 8090 memory
-//! cargo run -p odata-axum --example tables -- 8090 git <repository> <commit> 'things/*.yaml'
+//! cargo run -p odata-axum --example tables -- serve 8090
+//! cargo run -p odata-axum --example tables -- serve 8090 <repository> <commit> 'files/*.yaml'
+//! cargo run -p odata-axum --example tables -- openapi openapi.json
 //! ```
 
 use std::sync::Arc;
 
 use odata_axum::{metadata_etag, table_router, ODataState};
-use odata_csdl::{
-    CsdlVersion, EntityContainer, EntitySet, EntityType, Model, Property, Schema, TypeRef,
+use odata_table::{
+    open_rules, EntityDef, Field, FieldKind, GitLimits, GitTable, MemoryTable, Scope, Service,
+    Table,
 };
-use odata_table::{GitLimits, GitTable, MemoryTable, Scope, Table, TableInfo};
 use serde_json::json;
 
-fn model() -> Model {
-    let mut thing = EntityType::new("Thing");
-    thing.key = vec!["id".into()];
+fn service() -> Service {
     // a key is never null (CSDL 4.01 8.2)
-    let mut id = Property::new("id", TypeRef::single("Edm.String"));
+    let mut id = Field::new("id", FieldKind::String, "The key, e.g. t1");
     id.nullable = false;
-    thing.properties = vec![
-        id,
-        Property::new("name", TypeRef::single("Edm.String")),
-        Property::new("size", TypeRef::single("Edm.Int64")),
-    ];
-    let mut schema = Schema::new("Example");
-    schema.entity_types.push(thing);
-    let mut container = EntityContainer::new("Service");
-    container
-        .entity_sets
-        .push(EntitySet::new("Things", "Example.Thing"));
-    schema.entity_container = Some(container);
-    Model {
-        version: CsdlVersion::V4_01,
-        references: vec![],
-        schemas: vec![schema],
+    let set = |set: &str, type_name: &str, description: &str, fields: Vec<Field>| EntityDef {
+        set: set.into(),
+        type_name: type_name.into(),
+        description: description.into(),
+        key: "id".into(),
+        fields,
+        rules: open_rules(),
+    };
+    Service {
+        namespace: "Example".into(),
+        title: "odata-table example".into(),
+        sets: vec![
+            set(
+                "Things",
+                "Thing",
+                "A sample row held in memory",
+                vec![
+                    id.clone(),
+                    Field::new("name", FieldKind::String, "Its name, e.g. Alpha"),
+                    Field::new("size", FieldKind::Integer, "Its size, e.g. 3"),
+                ],
+            ),
+            set(
+                "Files",
+                "File",
+                "A YAML or JSON file of a Git repository",
+                vec![
+                    id,
+                    Field::new("title", FieldKind::String, "Its title, e.g. First"),
+                ],
+            ),
+        ],
     }
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: tables <port> memory | tables <port> git <repository> <commit> <pattern>";
-    let port: u16 = args.first().and_then(|p| p.parse().ok()).ok_or(usage)?;
-    let model = Arc::new(model());
-    let info = TableInfo::new(model.clone(), "Things").ok_or("no set Things")?;
-    let table: Arc<dyn Table> = match args.get(1..).unwrap_or_default() {
-        [source] if source == "memory" => Arc::new(
+    let usage =
+        "usage: tables serve <port> [<repository> <commit> <pattern>] | tables openapi <file>";
+    let mut service = service();
+    if let [mode, file] = args.as_slice() {
+        if mode == "openapi" {
+            let doc = service.openapi("http://127.0.0.1:8090/odata/");
+            return std::fs::write(file, doc.to_string()).map_err(|e| e.to_string());
+        }
+    }
+    let (port, git) = match args.as_slice() {
+        [mode, port] if mode == "serve" => (port, None),
+        [mode, port, repo, commit, pattern] if mode == "serve" => {
+            (port, Some((repo, commit, pattern)))
+        }
+        _ => return Err(usage.into()),
+    };
+    let port: u16 = port.parse().map_err(|_| usage)?;
+    let served = if git.is_some() { "Files" } else { "Things" };
+    service.sets.retain(|s| s.set == served);
+    let model = Arc::new(service.model());
+    let info = |set| {
+        service
+            .info(model.clone(), set)
+            .ok_or(format!("no set {set}"))
+    };
+    let table: Arc<dyn Table> = match git {
+        Some((repo, commit, pattern)) => Arc::new(
+            GitTable::open(info("Files")?, repo, commit, pattern, GitLimits::strict())
+                .map_err(|e| e.to_string())?,
+        ),
+        None => Arc::new(
             MemoryTable::new(
-                info,
+                info("Things")?,
                 vec![
                     json!({"id": "t1", "name": "Alpha", "size": 3}),
                     json!({"id": "t2", "name": "Beta", "size": 1}),
@@ -59,11 +101,6 @@ async fn main() -> Result<(), String> {
             )
             .map_err(|e| e.to_string())?,
         ),
-        [source, repo, commit, pattern] if source == "git" => Arc::new(
-            GitTable::open(info, repo, commit, pattern, GitLimits::strict())
-                .map_err(|e| e.to_string())?,
-        ),
-        _ => return Err(usage.into()),
     };
     let csdl_limits = odata_csdl::Limits::strict();
     let state = ODataState {
