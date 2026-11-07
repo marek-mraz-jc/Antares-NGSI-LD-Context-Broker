@@ -3,21 +3,22 @@
 
 use std::sync::Arc;
 
-use axum::extract::{FromRef, State};
+use axum::extract::{FromRef, FromRequestParts, State};
 use axum::http::header::{CONTENT_TYPE, ETAG};
 use axum::http::{Extensions, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use odata_json::{Ctx, EntityValue, Page, Resource};
-use odata_table::{query, Answer, Scope, Table, TableError, Value};
-use odata_url::{
-    CompareOp, Expr, Key, KeyValue, Literal, MemberPath, ODataUri, QueryOptions, Segment,
+use odata_table::{
+    allowed, export, key_options, query, Answer, Decision, Operation, Scope, Table, TableError,
+    Value,
 };
+use odata_url::{EdmModel, Key, KeyValue, Literal, ODataUri, QueryOptions, Segment};
 
 use crate::{
-    json_level, json_response, metadata_router, read_only, ODataErrorResponse, ODataRequest,
-    ODataState,
+    json_level, json_response, metadata_router, read_only, url_error, ODataErrorResponse,
+    ODataRequest, ODataState,
 };
 
 #[derive(Clone)]
@@ -82,7 +83,7 @@ pub fn table_router(state: Arc<ODataState>, tables: Vec<Arc<dyn Table>>, max_pag
     };
     metadata_router(state).merge(
         Router::new()
-            .route("/{*rest}", get(read).fallback(written))
+            .route("/{*rest}", get(dispatch).fallback(written))
             .with_state(served),
     )
 }
@@ -91,11 +92,29 @@ async fn written(request: ODataRequest) -> Response {
     read_only(request.version)
 }
 
-async fn read(
+/// `/{set}/$allowed` and `/{set}/$export` (outside the OData URL grammar), else an OData read.
+async fn dispatch(
     State(served): State<Tables>,
+    request: axum::extract::Request,
+) -> Result<Response, ODataErrorResponse> {
+    let (mut parts, _) = request.into_parts();
+    let path = parts.uri.path().trim_start_matches('/');
+    let raw = parts.uri.query().map(str::to_owned);
+    if let Some(set) = path.strip_suffix("/$allowed").filter(|s| !s.contains('/')) {
+        return may(&served, set, raw, &parts.extensions).await;
+    }
+    if let Some(set) = path.strip_suffix("/$export").filter(|s| !s.contains('/')) {
+        return exported(&served, set, raw, &parts.extensions).await;
+    }
+    let request = ODataRequest::from_request_parts(&mut parts, &served).await?;
+    read(&served, request, &parts.headers, &parts.extensions).await
+}
+
+async fn read(
+    served: &Tables,
     request: ODataRequest,
-    headers: HeaderMap,
-    extensions: Extensions,
+    headers: &HeaderMap,
+    extensions: &Extensions,
 ) -> Result<Response, ODataErrorResponse> {
     let version = request.version;
     let fail = |e: ODataErrorResponse| e.with_version(version);
@@ -121,6 +140,9 @@ async fn read(
     };
     let mut response = match rest {
         [] => {
+            decided(table.as_ref(), scope, Operation::Read, None)
+                .await
+                .map_err(fail)?;
             let answer = run(table.as_ref(), options, scope, served.max_page)
                 .await
                 .map_err(fail)?;
@@ -133,7 +155,7 @@ async fn read(
                 };
                 format!("{}{uri}", served.state.service_root)
             });
-            let level = json_level(&request, &headers, served.state.max_header_len)?;
+            let level = json_level(&request, headers, served.state.max_header_len)?;
             write(
                 &served.state,
                 set,
@@ -145,6 +167,9 @@ async fn read(
             )?
         }
         [Segment::Count] => {
+            decided(table.as_ref(), scope, Operation::Read, None)
+                .await
+                .map_err(fail)?;
             let counted = QueryOptions {
                 filter: options.filter.clone(),
                 aliases: options.aliases.clone(),
@@ -159,18 +184,19 @@ async fn read(
             counted_response(version, answer.count.unwrap_or(0))
         }
         [Segment::Key(Key::Single(KeyValue::Literal(key)))] => {
-            let by_key = by_key(&table.info().key, key, options);
+            let key = key_value(key).map_err(fail)?;
+            decided(table.as_ref(), scope, Operation::Read, Some(&key))
+                .await
+                .map_err(fail)?;
+            let by_key = key_options(table.info(), &key, options.select.clone())
+                .map_err(|e| fail(refused(e)))?;
             let answer = run(table.as_ref(), &by_key, scope, served.max_page)
                 .await
                 .map_err(fail)?;
             if answer.rows.is_empty() {
-                return Err(fail(ODataErrorResponse::new(
-                    StatusCode::NOT_FOUND,
-                    "NotFound",
-                    "the resource does not exist",
-                )));
+                return Err(fail(not_found()));
             }
-            let level = json_level(&request, &headers, served.state.max_header_len)?;
+            let level = json_level(&request, headers, served.state.max_header_len)?;
             write(&served.state, set, &answer, level, version, None, true)?
         }
         _ => return Err(fail(unsupported("this resource path"))),
@@ -193,23 +219,6 @@ fn counted_response(version: odata_json::ODataVersion, count: u64) -> Response {
     response
 }
 
-/// The options reading one entity: its key equal to `key`, the request's `$select` kept.
-fn by_key(key_property: &str, key: &Literal, options: &QueryOptions) -> QueryOptions {
-    QueryOptions {
-        filter: Some(Expr::Compare(
-            Box::new(Expr::Member(MemberPath {
-                variable: None,
-                path: vec![key_property.to_owned()],
-            })),
-            CompareOp::Eq,
-            Box::new(Expr::Literal(key.clone())),
-        )),
-        select: options.select.clone(),
-        top: Some(1),
-        ..QueryOptions::default()
-    }
-}
-
 async fn run(
     table: &dyn Table,
     options: &QueryOptions,
@@ -218,23 +227,187 @@ async fn run(
 ) -> Result<Answer, ODataErrorResponse> {
     query(table, options, scope, max_page)
         .await
-        .map_err(|e| match e {
-            TableError::NotImplemented(what) => unsupported(&what),
-            TableError::UnknownProperty(_) => ODataErrorResponse::new(
-                StatusCode::BAD_REQUEST,
-                "BadRequest",
-                "a query option names something this service does not have",
-            ),
-            TableError::BadRequest(why) => {
-                ODataErrorResponse::new(StatusCode::BAD_REQUEST, "BadRequest", &why)
+        .map_err(refused)
+}
+
+fn refused(e: TableError) -> ODataErrorResponse {
+    match e {
+        TableError::NotImplemented(what) => unsupported(&what),
+        TableError::UnknownProperty(_) => ODataErrorResponse::new(
+            StatusCode::BAD_REQUEST,
+            "BadRequest",
+            "a query option names something this service does not have",
+        ),
+        TableError::BadRequest(why) => {
+            ODataErrorResponse::new(StatusCode::BAD_REQUEST, "BadRequest", &why)
+        }
+        // the source's text stays out of the answer: it can name tables, paths or hosts
+        TableError::Source(_) => ODataErrorResponse::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            "the source of this entity set could not be read",
+        ),
+    }
+}
+
+/// The decision a call runs first: `Ok` when allowed, else the refusal it answers (404 for an
+/// entity the caller cannot see, as for a missing one; 403 otherwise).
+async fn decided(
+    table: &dyn Table,
+    scope: &Scope,
+    operation: Operation,
+    key: Option<&Value>,
+) -> Result<Decision, ODataErrorResponse> {
+    let decision = allowed(table, scope, operation, key)
+        .await
+        .map_err(refused)?;
+    if decision.allowed {
+        Ok(decision)
+    } else if decision.not_found {
+        Err(not_found())
+    } else {
+        Err(ODataErrorResponse::new(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            &decision.reason,
+        ))
+    }
+}
+
+fn not_found() -> ODataErrorResponse {
+    ODataErrorResponse::new(
+        StatusCode::NOT_FOUND,
+        "NotFound",
+        "the resource does not exist",
+    )
+}
+
+fn key_value(key: &Literal) -> Result<Value, ODataErrorResponse> {
+    match key {
+        Literal::String(s) => Ok(Value::String(s.clone())),
+        Literal::Int(i) => Ok(Value::from(*i)),
+        _ => Err(ODataErrorResponse::new(
+            StatusCode::BAD_REQUEST,
+            "BadRequest",
+            "a key is a string or an integer",
+        )),
+    }
+}
+
+/// The scope and the served set of a request outside the OData URL grammar.
+fn scoped<'s>(
+    served: &'s Tables,
+    set: &str,
+    extensions: &'s Extensions,
+) -> Result<(&'s dyn Table, &'s Scope), ODataErrorResponse> {
+    let scope = extensions.get::<Scope>().ok_or_else(|| {
+        ODataErrorResponse::new(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            "this request carries no read scope",
+        )
+    })?;
+    let table = served
+        .sets
+        .iter()
+        .find(|t| t.info().set == set)
+        .ok_or_else(not_found)?;
+    Ok((table.as_ref(), scope))
+}
+
+/// `GET /{set}/$allowed?op=<operation>[&key=<key>]`: the decision the call would run, as JSON.
+async fn may(
+    served: &Tables,
+    set: &str,
+    raw: Option<String>,
+    extensions: &Extensions,
+) -> Result<Response, ODataErrorResponse> {
+    let (table, scope) = scoped(served, set, extensions)?;
+    let bad = |m: &str| ODataErrorResponse::new(StatusCode::BAD_REQUEST, "BadRequest", m);
+    let (mut op, mut key) = (None, None);
+    for pair in raw
+        .as_deref()
+        .unwrap_or("")
+        .split('&')
+        .filter(|p| !p.is_empty())
+    {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let value = odata_url::percent_decoded(value)
+            .ok_or_else(|| bad("a parameter is not valid UTF-8"))?;
+        match name {
+            "op" => {
+                op = Some(
+                    Operation::parse(&value)
+                        .ok_or_else(|| bad("op is one of read, export, create, update, delete"))?,
+                );
             }
-            // the source's text stays out of the answer: it can name tables, paths or hosts
-            TableError::Source(_) => ODataErrorResponse::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "InternalServerError",
-                "the source of this entity set could not be read",
-            ),
+            "key" => key = Some(value),
+            _ => return Err(bad("$allowed takes op and key only")),
+        }
+    }
+    let op = op.ok_or_else(|| bad("op is required, e.g. op=update"))?;
+    let key = match key {
+        None => None,
+        Some(text) if integer_key(table) => Some(Value::from(
+            text.parse::<i64>()
+                .map_err(|_| bad("key is an integer here"))?,
+        )),
+        Some(text) => Some(Value::String(text)),
+    };
+    let decision = allowed(table, scope, op, key.as_ref())
+        .await
+        .map_err(refused)?;
+    let body = decision.to_json();
+    let mut response = (StatusCode::OK, body.to_string()).into_response();
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(response)
+}
+
+fn integer_key(table: &dyn Table) -> bool {
+    let info = table.info();
+    info.model
+        .entity_type(&info.entity_type)
+        .and_then(|ty| {
+            info.model
+                .lineage(ty)
+                .into_iter()
+                .find_map(|t| t.properties.iter().find(|p| p.name == info.key))
         })
+        .is_some_and(|p| {
+            matches!(
+                p.ty.name.as_str(),
+                "Edm.Int64" | "Edm.Int32" | "Edm.Int16" | "Edm.Byte" | "Edm.SByte"
+            )
+        })
+}
+
+/// `GET /{set}/$export?$filter=...`: every matching row as a plain JSON array.
+async fn exported(
+    served: &Tables,
+    set: &str,
+    raw: Option<String>,
+    extensions: &Extensions,
+) -> Result<Response, ODataErrorResponse> {
+    let (table, scope) = scoped(served, set, extensions)?;
+    decided(table, scope, Operation::Export, None).await?;
+    let relative = format!("{set}?{}", raw.unwrap_or_default());
+    let state = &served.state;
+    let uri = odata_url::parse(&relative, &EdmModel(state.url_model()), &state.url_limits)
+        .map_err(|e| url_error(&e, set.len()))?;
+    let ODataUri::Resource { options, .. } = uri else {
+        return Err(unsupported("this resource"));
+    };
+    let max_rows = usize::try_from(served.max_page.saturating_mul(100)).unwrap_or(usize::MAX);
+    let rows = export(table, &options, scope, served.max_page, max_rows)
+        .await
+        .map_err(refused)?;
+    let mut response = (StatusCode::OK, Value::Array(rows).to_string()).into_response();
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    Ok(response)
 }
 
 fn unsupported(construct: &str) -> ODataErrorResponse {

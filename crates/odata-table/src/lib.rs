@@ -49,6 +49,7 @@
 
 #![forbid(unsafe_code)]
 
+mod def;
 mod eval;
 #[cfg(feature = "git")]
 mod git;
@@ -61,6 +62,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+pub use def::{
+    allowed, open_rules, Decision, EntityDef, Field, FieldKind, Operation, Rule, Service,
+};
 pub use eval::{compare, matches};
 #[cfg(feature = "git")]
 pub use git::{GitLimits, GitTable};
@@ -87,6 +91,9 @@ pub struct TableInfo {
     pub key: String,
     /// The entity type's top-level properties, in declaration order: what a row answers.
     pub properties: Vec<String>,
+    /// The operations offered and the permission each needs ([`open_rules`] for a set built
+    /// from a bare model, the definition's for one built by [`Service::info`]).
+    pub rules: Vec<Rule>,
 }
 
 impl TableInfo {
@@ -115,6 +122,7 @@ impl TableInfo {
             set: set.to_owned(),
             key,
             properties,
+            rules: open_rules(),
             model,
         })
     }
@@ -130,20 +138,55 @@ pub struct Restriction {
     pub any_of: Vec<Value>,
 }
 
-/// The caller's row restriction, applied by the source before `$filter`: a row is visible when
-/// it meets every [`Restriction`]. A request without a scope is refused by the router (deny by
-/// default); [`Scope::all`] is the explicit grant of every row.
+/// The permissions a caller holds, checked against each operation's [`Rule`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Permissions {
+    /// Every permission.
+    All,
+    /// None: the default.
+    #[default]
+    None,
+    /// Only these.
+    Only(Vec<String>),
+}
+
+/// What a caller may read and do: the row restriction, applied by the source before `$filter`
+/// (a row is visible when it meets every [`Restriction`]), and the permissions it holds. A
+/// request without a scope is refused by the router (deny by default); [`Scope::all`] is the
+/// explicit grant of every row and every permission, and the default scope holds no permission.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Scope {
     /// Every condition a visible row meets.
     pub restrictions: Vec<Restriction>,
+    /// The permissions held.
+    pub permissions: Permissions,
 }
 
 impl Scope {
-    /// Every row: no restriction.
+    /// Every row and every permission.
     #[must_use]
     pub fn all() -> Self {
-        Self::default()
+        Self {
+            restrictions: Vec::new(),
+            permissions: Permissions::All,
+        }
+    }
+
+    /// This scope holding only `permissions`.
+    #[must_use]
+    pub fn holding(mut self, permissions: &[&str]) -> Self {
+        self.permissions = Permissions::Only(permissions.iter().map(|p| (*p).to_owned()).collect());
+        self
+    }
+
+    /// Whether the scope holds `permission`.
+    #[must_use]
+    pub fn holds(&self, permission: &str) -> bool {
+        match &self.permissions {
+            Permissions::All => true,
+            Permissions::None => false,
+            Permissions::Only(held) => held.iter().any(|p| p == permission),
+        }
     }
 
     /// Rows whose value at `path` is one of `any_of`, on top of this scope.
@@ -272,6 +315,75 @@ pub async fn query<T: Table + ?Sized>(
         next: more.then(|| plan.token.saturating_add(plan.limit)),
         select: plan.select,
     })
+}
+
+/// The options reading the one entity whose key is `key` (a string or an integer), keeping
+/// `select` when given.
+///
+/// # Errors
+///
+/// [`TableError::BadRequest`] when `key` is neither a string nor an integer.
+pub fn key_options(
+    info: &TableInfo,
+    key: &Value,
+    select: Option<Vec<odata_url::SelectItem>>,
+) -> Result<QueryOptions, TableError> {
+    let literal = match key {
+        Value::String(s) => odata_url::Literal::String(s.clone()),
+        Value::Number(n) => n
+            .as_i64()
+            .map(odata_url::Literal::Int)
+            .ok_or_else(|| TableError::BadRequest("a key is a string or an integer".into()))?,
+        _ => {
+            return Err(TableError::BadRequest(
+                "a key is a string or an integer".into(),
+            ))
+        }
+    };
+    Ok(QueryOptions {
+        filter: Some(odata_url::Expr::Compare(
+            Box::new(odata_url::Expr::Member(odata_url::MemberPath {
+                variable: None,
+                path: vec![info.key.clone()],
+            })),
+            odata_url::CompareOp::Eq,
+            Box::new(odata_url::Expr::Literal(literal)),
+        )),
+        select,
+        top: Some(1),
+        ..QueryOptions::default()
+    })
+}
+
+/// Every row `options` matches within `scope`, page after page of `page` rows, as plain JSON
+/// objects; at most `max_rows`.
+///
+/// # Errors
+///
+/// What [`query`] answers, or [`TableError::BadRequest`] past `max_rows` rows.
+// ponytail: collected in memory up to max_rows; a streamed body when a set outgrows it.
+pub async fn export<T: Table + ?Sized>(
+    table: &T,
+    options: &QueryOptions,
+    scope: &Scope,
+    page: u64,
+    max_rows: usize,
+) -> Result<Vec<Value>, TableError> {
+    let mut options = options.clone();
+    let mut rows = Vec::new();
+    loop {
+        let answer = query(table, &options, scope, page.max(1)).await?;
+        rows.extend(answer.rows);
+        if rows.len() > max_rows {
+            return Err(TableError::BadRequest(format!(
+                "the export is over {max_rows} rows: narrow it with $filter"
+            )));
+        }
+        match answer.next {
+            Some(token) => options.skiptoken = Some(token.to_string()),
+            None => return Ok(rows),
+        }
+    }
 }
 
 /// `row` reduced to `names`, a missing one as `null`: every source answers the same members.
