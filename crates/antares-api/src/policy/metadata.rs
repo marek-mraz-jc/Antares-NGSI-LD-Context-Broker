@@ -300,7 +300,7 @@ pub(crate) async fn layer(
         return resp;
     };
     let fail = |e: antares_model::NgsiError| crate::negotiate::ApiError::from(e).into_response();
-    let ctx = match crate::negotiate::request_context(&st.loader, &headers).await {
+    let ctx = match crate::negotiate::request_context_quiet(&st.loader, &headers).await {
         Ok(ctx) => ctx,
         Err(e) => return e.into_response(),
     };
