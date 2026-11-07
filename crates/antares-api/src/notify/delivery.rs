@@ -514,42 +514,16 @@ pub(super) async fn record_failure(
     tenant: &TenantId,
     kind: Kind,
     sub_id: &str,
-    mut prev_success: Option<Value>,
+    prev_success: Option<Value>,
     ts: &str,
 ) -> Option<Value> {
-    let mut failed_doc: Option<Value> = None;
     st.store
-        .mutate(tenant, kind, sub_id, |doc| {
-            if let Some(o) = doc.as_object_mut() {
-                o.insert("status".into(), Value::String("failed".into()));
-            }
-            if let Some(n) = doc
-                .as_object_mut()
-                .and_then(|o| o.get_mut("notification"))
-                .and_then(Value::as_object_mut)
-            {
-                match prev_success.take() {
-                    Some(v) => n.insert("lastSuccess".into(), v),
-                    None => n.remove("lastSuccess"),
-                };
-                n.insert("lastFailure".into(), Value::String(ts.to_owned()));
-                // Table 5.2.14.2-1 timesFailed: "Number of times an
-                // unsuccessful response (or timeout) has been received
-                // when delivering the notification" — an output-only
-                // member implementations shall generate.
-                let failed = n.get("timesFailed").and_then(Value::as_i64).unwrap_or(0);
-                n.insert("timesFailed".into(), json!(failed.saturating_add(1)));
-                n.insert("status".into(), Value::String("failed".into()));
-            }
-            failed_doc = Some(doc.clone());
-            Ok::<(), antares_model::NgsiError>(())
-        })
+        .record_failure(tenant, kind, sub_id, prev_success, ts)
         .await
         .unwrap_or_else(|e| {
             tracing::warn!("failure-status writeback failed: {e}");
             None
-        });
-    failed_doc
+        })
 }
 
 /// A `KeyValuePair[]` member of `endpoint` (Table 5.2.15-1) as owned pairs.
