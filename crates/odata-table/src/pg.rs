@@ -44,7 +44,8 @@ impl PgTable {
     /// [`TableError::BadRequest`] when the relation or a property name is not a plain
     /// identifier (letters, digits, `_`, at most 63 bytes).
     pub fn new(info: TableInfo, pool: PgPool, relation: &str) -> Result<Self, TableError> {
-        let refused = |what: &str| TableError::BadRequest(format!("{what} is not a plain SQL identifier"));
+        let refused =
+            |what: &str| TableError::BadRequest(format!("{what} is not a plain SQL identifier"));
         let parts: Option<Vec<String>> = relation.split('.').map(identifier).collect();
         let relation = match parts {
             Some(parts) if (1..=2).contains(&parts.len()) => parts.join("."),
@@ -53,7 +54,11 @@ impl PgTable {
         if let Some(bad) = info.properties.iter().find(|p| identifier(p).is_none()) {
             return Err(refused(bad));
         }
-        Ok(Self { info, pool, relation })
+        Ok(Self {
+            info,
+            pool,
+            relation,
+        })
     }
 
     fn column(&self, name: &str) -> Result<String, TableError> {
@@ -107,7 +112,11 @@ impl PgTable {
             Cond::And(a, b) | Cond::Or(a, b) => {
                 qb.push("(");
                 self.cond(qb, a)?;
-                qb.push(if matches!(cond, Cond::And(..)) { " AND " } else { " OR " });
+                qb.push(if matches!(cond, Cond::And(..)) {
+                    " AND "
+                } else {
+                    " OR "
+                });
                 self.cond(qb, b)?;
                 qb.push(")");
             }
@@ -138,7 +147,10 @@ impl PgTable {
                         Ok(())
                     })?,
                     Value::Number(n) => self.typed(qb, path, "number", |qb| {
-                        qb.push("::numeric").push(op).push_bind(n.to_string()).push("::numeric");
+                        qb.push("::numeric")
+                            .push(op)
+                            .push_bind(n.to_string())
+                            .push("::numeric");
                         Ok(())
                     })?,
                     Value::Bool(b) => self.typed(qb, path, "boolean", |qb| {
@@ -167,7 +179,12 @@ impl PgTable {
         Ok(())
     }
 
-    fn filtered(&self, qb: &mut QueryBuilder<Postgres>, plan: &Plan, scope: &Scope) -> Result<(), TableError> {
+    fn filtered(
+        &self,
+        qb: &mut QueryBuilder<Postgres>,
+        plan: &Plan,
+        scope: &Scope,
+    ) -> Result<(), TableError> {
         qb.push(" FROM ").push(&self.relation).push(" t WHERE ");
         // the scope first: the filter can only narrow it
         self.cond(qb, &scope.cond())?;
@@ -183,7 +200,11 @@ impl PgTable {
         self.json(qb, &key.path)?;
         qb.push(") WHEN 'boolean' THEN 1 WHEN 'number' THEN 2 WHEN 'string' THEN 3 WHEN 'object' THEN 4 WHEN 'array' THEN 4 ELSE 0 END")
             .push(dir);
-        for (ty, cast) in [("boolean", "::boolean"), ("number", "::numeric"), ("string", "")] {
+        for (ty, cast) in [
+            ("boolean", "::boolean"),
+            ("number", "::numeric"),
+            ("string", ""),
+        ] {
             qb.push(", (CASE WHEN jsonb_typeof(");
             self.json(qb, &key.path)?;
             qb.push(") = '").push(ty).push("' THEN (");
@@ -210,7 +231,9 @@ impl PgTable {
                 if i > 0 {
                     qb.push(", ");
                 }
-                qb.push_bind(name.clone()).push("::text, t.").push(self.column(name)?);
+                qb.push_bind(name.clone())
+                    .push("::text, t.")
+                    .push(self.column(name)?);
             }
             qb.push(")");
         }
@@ -226,11 +249,19 @@ impl PgTable {
             .push_bind(i64::try_from(plan.fetch).unwrap_or(i64::MAX))
             .push(" OFFSET ")
             .push_bind(i64::try_from(plan.offset).unwrap_or(i64::MAX));
-        let rows: Vec<Json<Value>> = qb.build_query_scalar().fetch_all(&self.pool).await.map_err(failed)?;
+        let rows: Vec<Json<Value>> = qb
+            .build_query_scalar()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(failed)?;
         let count = if plan.count {
             let mut qb = QueryBuilder::<Postgres>::new("SELECT count(*)");
             self.filtered(&mut qb, plan, scope)?;
-            let n: i64 = qb.build_query_scalar().fetch_one(&self.pool).await.map_err(failed)?;
+            let n: i64 = qb
+                .build_query_scalar()
+                .fetch_one(&self.pool)
+                .await
+                .map_err(failed)?;
             Some(u64::try_from(n).unwrap_or(0))
         } else {
             None

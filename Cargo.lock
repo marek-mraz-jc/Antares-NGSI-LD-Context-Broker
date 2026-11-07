@@ -2734,7 +2734,9 @@ dependencies = [
  "http-body-util",
  "odata-csdl",
  "odata-json",
+ "odata-table",
  "odata-url",
+ "serde_json",
  "tokio",
  "tower",
 ]

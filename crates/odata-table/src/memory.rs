@@ -57,7 +57,9 @@ impl MemoryTable {
             .filter(|row| matches(row, &plan.filter))
             .collect();
         kept.sort_by(|a, b| ordered(a, b, &plan.order));
-        let count = plan.count.then(|| u64::try_from(kept.len()).unwrap_or(u64::MAX));
+        let count = plan
+            .count
+            .then(|| u64::try_from(kept.len()).unwrap_or(u64::MAX));
         let skip = usize::try_from(plan.offset).unwrap_or(usize::MAX);
         let take = usize::try_from(plan.fetch).unwrap_or(usize::MAX);
         Fetched {

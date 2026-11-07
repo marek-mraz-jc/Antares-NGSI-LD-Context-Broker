@@ -48,12 +48,23 @@ pub struct GitTable {
 
 /// A path pattern's segments: plain names and `*` wildcards within one segment.
 fn segments(pattern: &str) -> Result<Vec<&str>, TableError> {
-    let refused = || TableError::BadRequest(format!("the path pattern {pattern} leaves the repository root"));
-    if pattern.is_empty() || pattern.starts_with('/') || pattern.contains('\\') || pattern.contains('\0') {
+    let refused = || {
+        TableError::BadRequest(format!(
+            "the path pattern {pattern} leaves the repository root"
+        ))
+    };
+    if pattern.is_empty()
+        || pattern.starts_with('/')
+        || pattern.contains('\\')
+        || pattern.contains('\0')
+    {
         return Err(refused());
     }
     let parts: Vec<&str> = pattern.split('/').collect();
-    if parts.iter().any(|p| p.is_empty() || *p == "." || *p == "..") {
+    if parts
+        .iter()
+        .any(|p| p.is_empty() || *p == "." || *p == "..")
+    {
         return Err(refused());
     }
     Ok(parts)
@@ -121,16 +132,30 @@ impl GitTable {
         let repo = repo.into();
         let pattern = segments(pattern)?;
         if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(TableError::BadRequest("the commit must be a full hexadecimal object name".into()));
+            return Err(TableError::BadRequest(
+                "the commit must be a full hexadecimal object name".into(),
+            ));
         }
-        let listing = git(&repo, &["ls-tree", "-r", "-z", "--full-tree", "--end-of-options", commit])?;
+        let listing = git(
+            &repo,
+            &[
+                "ls-tree",
+                "-r",
+                "-z",
+                "--full-tree",
+                "--end-of-options",
+                commit,
+            ],
+        )?;
         let mut rows = Vec::new();
         let mut total = 0usize;
         for entry in listing.split(|b| *b == 0).filter(|e| !e.is_empty()) {
             let entry = String::from_utf8_lossy(entry);
             // "<mode> <type> <object>\t<path>"
             let Some((head, path)) = entry.split_once('\t') else {
-                return Err(TableError::Source("git ls-tree wrote an entry without a path".into()));
+                return Err(TableError::Source(
+                    "git ls-tree wrote an entry without a path".into(),
+                ));
             };
             if !matched(&pattern, path) {
                 continue;
@@ -138,13 +163,18 @@ impl GitTable {
             let mut fields = head.split(' ');
             let (mode, kind, object) = (fields.next(), fields.next(), fields.next().unwrap_or(""));
             if mode == Some("120000") {
-                return Err(TableError::BadRequest(format!("{path} is a symbolic link; a set reads files only")));
+                return Err(TableError::BadRequest(format!(
+                    "{path} is a symbolic link; a set reads files only"
+                )));
             }
             if kind != Some("blob") {
                 continue;
             }
             if rows.len() >= limits.max_files {
-                return Err(TableError::BadRequest(format!("more than {} files match", limits.max_files)));
+                return Err(TableError::BadRequest(format!(
+                    "more than {} files match",
+                    limits.max_files
+                )));
             }
             let size: usize = String::from_utf8_lossy(&git(&repo, &["cat-file", "-s", object])?)
                 .trim()
@@ -152,7 +182,9 @@ impl GitTable {
                 .map_err(|_| TableError::Source("git cat-file wrote no size".into()))?;
             total = total.saturating_add(size);
             if size > limits.max_file_bytes || total > limits.max_total_bytes {
-                return Err(TableError::BadRequest(format!("{path} is over the size this set reads")));
+                return Err(TableError::BadRequest(format!(
+                    "{path} is over the size this set reads"
+                )));
             }
             let bytes = git(&repo, &["cat-file", "blob", object])?;
             rows.push(parse(path, &bytes)?);
@@ -197,7 +229,9 @@ impl Table for GitTable {
     }
 
     fn fetch<'a>(&'a self, plan: &'a Plan, scope: &'a Scope) -> Fetching<'a> {
-        Box::pin(std::future::ready(Ok::<Fetched, TableError>(self.rows.answer(plan, scope))))
+        Box::pin(std::future::ready(Ok::<Fetched, TableError>(
+            self.rows.answer(plan, scope),
+        )))
     }
 
     fn etag(&self) -> Option<&str> {

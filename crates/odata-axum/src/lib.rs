@@ -31,6 +31,10 @@
 
 #![forbid(unsafe_code)]
 
+mod table;
+
+pub use table::table_router;
+
 use std::sync::Arc;
 
 use axum::extract::{FromRef, FromRequestParts, State};

@@ -136,11 +136,13 @@ pub fn plan(info: &TableInfo, options: &QueryOptions, max_page: u64) -> Result<P
     };
     let token = match &options.skiptoken {
         None => 0,
-        Some(text) => text
-            .parse::<u64>()
-            .map_err(|_| TableError::BadRequest("the $skiptoken is not one this service wrote".into()))?,
+        Some(text) => text.parse::<u64>().map_err(|_| {
+            TableError::BadRequest("the $skiptoken is not one this service wrote".into())
+        })?,
     };
-    let remaining = options.top.map_or(u64::MAX, |top| top.saturating_sub(token));
+    let remaining = options
+        .top
+        .map_or(u64::MAX, |top| top.saturating_sub(token));
     let limit = remaining.min(max_page);
     Ok(Plan {
         filter,
@@ -149,7 +151,11 @@ pub fn plan(info: &TableInfo, options: &QueryOptions, max_page: u64) -> Result<P
         offset: options.skip.unwrap_or(0).saturating_add(token),
         limit,
         // one more row tells whether a next page exists; none when `$top` ends at this page
-        fetch: if remaining > limit { limit.saturating_add(1) } else { limit },
+        fetch: if remaining > limit {
+            limit.saturating_add(1)
+        } else {
+            limit
+        },
         token,
         count: options.count == Some(true),
     })
@@ -192,10 +198,17 @@ impl Planner<'_> {
                     Some(Value::String(needle)) => Cond::Text { path, op, needle },
                     // contains(x, null) is null: no row
                     None => Cond::Const(false),
-                    Some(_) => return Err(TableError::BadRequest(format!("{} takes a string", method.name()))),
+                    Some(_) => {
+                        return Err(TableError::BadRequest(format!(
+                            "{} takes a string",
+                            method.name()
+                        )))
+                    }
                 }
             }
-            Expr::Member(_) => self.compare(expr, CompareOp::Eq, &Expr::Literal(Literal::Bool(true)))?,
+            Expr::Member(_) => {
+                self.compare(expr, CompareOp::Eq, &Expr::Literal(Literal::Bool(true)))?
+            }
             _ => return Err(TableError::NotImplemented(construct(expr).to_owned())),
         })
     }
@@ -205,7 +218,11 @@ impl Planner<'_> {
         let (path, op, literal) = match (left, right) {
             (Expr::Member(_), _) => (self.member(left)?, op, right),
             (_, Expr::Member(_)) => (self.member(right)?, flipped(op), left),
-            _ => return Err(TableError::NotImplemented("a comparison without a property".into())),
+            _ => {
+                return Err(TableError::NotImplemented(
+                    "a comparison without a property".into(),
+                ))
+            }
         };
         Ok(match (self.literal(literal)?, op) {
             (None, CompareOp::Eq) => Cond::IsNull { path },
@@ -237,14 +254,28 @@ impl Planner<'_> {
             match model.member(&ty, name) {
                 None => return Err(TableError::UnknownProperty(member.path.join("/"))),
                 Some(Member::Primitive { collection: false }) if last => {}
-                Some(Member::Complex { ty: next, collection: false }) if !last => ty = next.to_owned(),
+                Some(Member::Complex {
+                    ty: next,
+                    collection: false,
+                }) if !last => ty = next.to_owned(),
                 Some(Member::Navigation { .. }) => {
                     return Err(TableError::NotImplemented("navigation properties".into()))
                 }
-                Some(Member::Primitive { collection: true } | Member::Complex { collection: true, .. }) => {
-                    return Err(TableError::NotImplemented("collection-valued properties".into()))
+                Some(
+                    Member::Primitive { collection: true }
+                    | Member::Complex {
+                        collection: true, ..
+                    },
+                ) => {
+                    return Err(TableError::NotImplemented(
+                        "collection-valued properties".into(),
+                    ))
                 }
-                Some(_) => return Err(TableError::NotImplemented("a path ending in a complex property".into())),
+                Some(_) => {
+                    return Err(TableError::NotImplemented(
+                        "a path ending in a complex property".into(),
+                    ))
+                }
             }
         }
         Ok(member.path.clone())
@@ -261,10 +292,16 @@ impl Planner<'_> {
                         }
                     }
                     [_] => return Err(TableError::UnknownProperty(path.join("/"))),
-                    _ => return Err(TableError::NotImplemented("$select of a nested path".into())),
+                    _ => {
+                        return Err(TableError::NotImplemented(
+                            "$select of a nested path".into(),
+                        ))
+                    }
                 },
                 SelectItem::Annotation(_) => {
-                    return Err(TableError::NotImplemented("$select of an annotation".into()))
+                    return Err(TableError::NotImplemented(
+                        "$select of an annotation".into(),
+                    ))
                 }
                 SelectItem::Star => {}
             }
@@ -282,7 +319,9 @@ impl Planner<'_> {
                 .iter()
                 .find(|(n, _)| n == name)
                 .map(|(_, l)| l)
-                .ok_or_else(|| TableError::BadRequest(format!("the parameter alias {name} has no value")))?,
+                .ok_or_else(|| {
+                    TableError::BadRequest(format!("the parameter alias {name} has no value"))
+                })?,
             other => return Err(TableError::NotImplemented(construct(other).to_owned())),
         };
         if *literal == Literal::Null {
@@ -313,7 +352,9 @@ fn value(literal: &Literal) -> Result<Value, TableError> {
         | Literal::TimeOfDay(s)
         | Literal::Guid(s)
         | Literal::Duration(s) => Value::String(s.clone()),
-        Literal::Geography(_) => return Err(TableError::NotImplemented("geography literals".into())),
+        Literal::Geography(_) => {
+            return Err(TableError::NotImplemented("geography literals".into()))
+        }
         Literal::Binary(_) => return Err(TableError::NotImplemented("binary literals".into())),
     })
 }

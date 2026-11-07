@@ -84,7 +84,10 @@ pub fn compare(a: Option<&Value>, b: Option<&Value>) -> Ordering {
     rank(a).cmp(&rank(b)).then_with(|| match (a, b) {
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Number(x), Value::Number(y)) => {
-            let (x, y) = (x.as_f64().unwrap_or(f64::NAN), y.as_f64().unwrap_or(f64::NAN));
+            let (x, y) = (
+                x.as_f64().unwrap_or(f64::NAN),
+                y.as_f64().unwrap_or(f64::NAN),
+            );
             x.total_cmp(&y)
         }
         (Value::String(x), Value::String(y)) => x.as_bytes().cmp(y.as_bytes()),

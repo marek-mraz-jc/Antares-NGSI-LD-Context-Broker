@@ -21,9 +21,10 @@
 //! use std::sync::Arc;
 //! use odata_table::{query, MemoryTable, Scope, TableInfo};
 //! # use odata_csdl::{CsdlVersion, EntityContainer, EntitySet, EntityType, Model, Property, Schema, TypeRef};
+//! # fn main() -> Result<(), String> {
 //! # let mut ty = EntityType::new("Building");
 //! # ty.key = vec!["id".into()];
-//! # ty.properties = vec![Property::new("id", TypeRef::new("Edm.String")), Property::new("height", TypeRef::new("Edm.Int64"))];
+//! # ty.properties = vec![Property::new("id", TypeRef::single("Edm.String")), Property::new("height", TypeRef::single("Edm.Int64"))];
 //! # let mut city = Schema::new("City");
 //! # city.entity_types.push(ty);
 //! # let mut service = EntityContainer::new("Service");
@@ -36,16 +37,13 @@
 //!     serde_json::json!({"id": "b2", "height": 7}),
 //! ];
 //! let table = MemoryTable::new(info, rows).map_err(|e| e.to_string())?;
-//! let uri = odata_url::parse("Buildings?$filter=height gt 10", &odata_url::EdmModel(&model), &odata_url::Limits::strict())
-//!     .map_err(|e| e.to_string())?;
+//! let uri = odata_url::parse("Buildings?$filter=height%20gt%2010", &odata_url::EdmModel(&model), &odata_url::Limits::strict())
+//!     .map_err(|e| format!("{e:?}"))?;
 //! let odata_url::ODataUri::Resource { options, .. } = uri else { return Err("not a resource".into()) };
-//! # tokio_test(async move {
-//! let answer = query(&table, &options, &Scope::all(), 100).await.map_err(|e| e.to_string())?;
+//! let runtime = tokio::runtime::Builder::new_current_thread().build().map_err(|e| e.to_string())?;
+//! let answer = runtime.block_on(query(&table, &options, &Scope::all(), 100)).map_err(|e| e.to_string())?;
 //! assert_eq!(answer.rows, vec![serde_json::json!({"id": "b1", "height": 12})]);
-//! # Ok::<(), String>(()) })?;
-//! # Ok::<(), String>(())
-//! # fn tokio_test<F: std::future::Future<Output = Result<(), String>>>(f: F) -> Result<(), String> {
-//! #     tokio::runtime::Builder::new_current_thread().build().map_err(|e| e.to_string())?.block_on(f)
+//! # Ok(())
 //! # }
 //! ```
 
@@ -98,7 +96,12 @@ impl TableInfo {
         let entity_set = model.entity_set(set)?;
         let ty = model.entity_type(&entity_set.entity_type)?;
         let lineage = model.lineage(ty);
-        let key = lineage.iter().rev().find(|t| !t.key.is_empty())?.key.clone();
+        let key = lineage
+            .iter()
+            .rev()
+            .find(|t| !t.key.is_empty())?
+            .key
+            .clone();
         let [key] = <[String; 1]>::try_from(key).ok()?;
         let mut properties = Vec::new();
         for t in lineage.iter().rev() {
@@ -194,6 +197,10 @@ pub struct Answer {
     pub count: Option<u64>,
     /// The `$skiptoken` of the next page, when there is one.
     pub next: Option<u64>,
+    /// Each row's key value, in row order, whatever `$select` keeps.
+    pub keys: Vec<Value>,
+    /// The `$select`ed properties; `None` when every declared property is answered.
+    pub select: Option<Vec<String>>,
 }
 
 /// Why a query got no answer.
@@ -253,17 +260,17 @@ pub async fn query<T: Table + ?Sized>(
     let fetched = table.fetch(&plan, scope).await?;
     let more = u64::try_from(fetched.rows.len()).unwrap_or(u64::MAX) > plan.limit;
     let take = usize::try_from(plan.limit).unwrap_or(usize::MAX);
-    let names = plan.select.as_ref().unwrap_or(&table.info().properties);
-    let rows = fetched
-        .rows
-        .iter()
-        .take(take)
-        .map(|row| project(row, names))
-        .collect();
+    let info = table.info();
+    let names = plan.select.as_ref().unwrap_or(&info.properties);
+    let page = fetched.rows.iter().take(take);
     Ok(Answer {
-        rows,
+        rows: page.clone().map(|row| project(row, names)).collect(),
+        keys: page
+            .map(|row| row.get(&info.key).cloned().unwrap_or(Value::Null))
+            .collect(),
         count: fetched.count,
         next: more.then(|| plan.token.saturating_add(plan.limit)),
+        select: plan.select,
     })
 }
 
