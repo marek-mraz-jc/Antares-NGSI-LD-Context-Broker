@@ -11,7 +11,9 @@ use axum::routing::get;
 use axum::Router;
 use odata_json::{Ctx, EntityValue, Page, Resource};
 use odata_table::{query, Answer, Scope, Table, TableError, Value};
-use odata_url::{CompareOp, Expr, Key, KeyValue, MemberPath, ODataUri, QueryOptions, Segment};
+use odata_url::{
+    CompareOp, Expr, Key, KeyValue, Literal, MemberPath, ODataUri, QueryOptions, Segment,
+};
 
 use crate::{
     json_level, json_response, metadata_router, read_only, ODataErrorResponse, ODataRequest,
@@ -154,30 +156,10 @@ async fn read(
             let answer = run(table.as_ref(), &counted, scope, served.max_page)
                 .await
                 .map_err(fail)?;
-            let mut response =
-                (StatusCode::OK, answer.count.unwrap_or(0).to_string()).into_response();
-            response
-                .headers_mut()
-                .insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
-            response
-                .headers_mut()
-                .insert("odata-version", HeaderValue::from_static(version.as_str()));
-            response
+            counted_response(version, answer.count.unwrap_or(0))
         }
         [Segment::Key(Key::Single(KeyValue::Literal(key)))] => {
-            let by_key = QueryOptions {
-                filter: Some(Expr::Compare(
-                    Box::new(Expr::Member(MemberPath {
-                        variable: None,
-                        path: vec![table.info().key.clone()],
-                    })),
-                    CompareOp::Eq,
-                    Box::new(Expr::Literal(key.clone())),
-                )),
-                select: options.select.clone(),
-                top: Some(1),
-                ..QueryOptions::default()
-            };
+            let by_key = by_key(&table.info().key, key, options);
             let answer = run(table.as_ref(), &by_key, scope, served.max_page)
                 .await
                 .map_err(fail)?;
@@ -200,6 +182,32 @@ async fn read(
         response.headers_mut().insert(ETAG, tag);
     }
     Ok(response)
+}
+
+/// The `/$count` answer: the number as plain text.
+fn counted_response(version: odata_json::ODataVersion, count: u64) -> Response {
+    let mut response = (StatusCode::OK, count.to_string()).into_response();
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+    headers.insert("odata-version", HeaderValue::from_static(version.as_str()));
+    response
+}
+
+/// The options reading one entity: its key equal to `key`, the request's `$select` kept.
+fn by_key(key_property: &str, key: &Literal, options: &QueryOptions) -> QueryOptions {
+    QueryOptions {
+        filter: Some(Expr::Compare(
+            Box::new(Expr::Member(MemberPath {
+                variable: None,
+                path: vec![key_property.to_owned()],
+            })),
+            CompareOp::Eq,
+            Box::new(Expr::Literal(key.clone())),
+        )),
+        select: options.select.clone(),
+        top: Some(1),
+        ..QueryOptions::default()
+    }
 }
 
 async fn run(

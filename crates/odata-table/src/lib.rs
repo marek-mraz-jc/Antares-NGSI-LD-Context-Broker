@@ -6,7 +6,7 @@
 //! - `PgTable` (feature `postgres`): the plan pushed down to SQL with bound parameters only.
 //! - `GitTable` (feature `git`): the YAML and JSON files of a repository at one commit.
 //!
-//! [`plan`] turns parsed [`QueryOptions`] into a [`Plan`] once, for every source: a construct
+//! [`plan()`] turns parsed [`QueryOptions`] into a [`Plan`] once, for every source: a construct
 //! outside the supported subset answers [`TableError::NotImplemented`] and an unknown property
 //! [`TableError::UnknownProperty`] whichever source serves the set, so the sources cannot
 //! disagree on what they accept. A [`Scope`] is the caller's row restriction (organization,
@@ -249,7 +249,7 @@ pub trait Table: Send + Sync {
 ///
 /// # Errors
 ///
-/// [`TableError`]: what [`plan`] refuses, or the source's failure.
+/// [`TableError`]: what [`plan()`] refuses, or the source's failure.
 pub async fn query<T: Table + ?Sized>(
     table: &T,
     options: &QueryOptions,

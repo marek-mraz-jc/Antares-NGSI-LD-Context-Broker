@@ -374,7 +374,7 @@ async fn pages_follow_the_skiptoken_on_every_source() -> Result<(), String> {
             seen.extend(ids(&got).into_iter().map(str::to_owned));
             match got.next {
                 Some(token) => {
-                    q = format!("$orderby=size desc&$top=6&$count=true&$skiptoken={token}")
+                    q = format!("$orderby=size desc&$top=6&$count=true&$skiptoken={token}");
                 }
                 None => break,
             }
