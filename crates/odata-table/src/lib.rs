@@ -20,8 +20,8 @@
 //! The supported subset: `$filter` with `eq ne gt ge lt le and or not in`, `contains`,
 //! `startswith`, `endswith`, `tolower`/`toupper` around a property in `eq`, `ne`, `in` and
 //! those three (the case-blind search, T-6663), null comparisons and nested complex property
-//! paths; `$orderby` on primitive paths (nulls first ascending, last descending, the key breaking ties); `$select` of
-//! top-level properties; `$top`, `$skip`, `$count` and server-driven paging by `$skiptoken`.
+//! paths; `$orderby` on primitive paths (nulls first ascending, last descending, the key
+//! breaking ties); `$select` of top-level properties; `$top`, `$skip`, `$count` and server-driven paging by `$skiptoken`.
 //!
 //! ```
 //! use std::sync::Arc;
