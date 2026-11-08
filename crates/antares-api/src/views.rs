@@ -898,7 +898,8 @@ impl WriteGuard {
         st: &crate::state::AppState,
         written: impl IntoIterator<Item = &'a str>,
     ) -> Option<Self> {
-        let narrowing = st.view().as_deref()?.narrowing();
+        let view = st.view()?;
+        let narrowing = view.narrowing();
         Some(Self {
             sel: crate::policy::Condition::new(narrowing),
             written: written.into_iter().map(str::to_owned).collect(),

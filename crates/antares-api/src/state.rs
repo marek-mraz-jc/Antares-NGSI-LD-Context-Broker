@@ -548,6 +548,10 @@ impl std::ops::DerefMut for AppState {
         // the memoised in-process router captured the settings about to
         // change: a later call must build one over the new ones
         self.inbound = Arc::new(std::sync::OnceLock::new());
+        #[cfg(feature = "views")]
+        {
+            self.viewed = Arc::new(std::sync::OnceLock::new());
+        }
         Arc::make_mut(&mut self.shared)
     }
 }
@@ -2166,6 +2170,109 @@ mod clone_cost {
         let mut c = a.clone();
         c.max_limit = 1;
         assert_eq!(call(&c).await, axum::http::StatusCode::FORBIDDEN);
+    }
+}
+
+/// T-6677: every view calls through one router, which reads the view of
+/// the request it serves.
+#[cfg(all(test, feature = "views"))]
+mod shared_view_router {
+    use super::*;
+    use crate::policy::Rule;
+    use crate::views::CompiledView;
+    use axum::body::Body;
+    use axum::http::{HeaderMap, Request};
+
+    fn view_of(t: &str) -> Arc<CompiledView> {
+        Arc::new(
+            CompiledView::new(
+                &[t.into()],
+                None,
+                None,
+                None,
+                vec![Rule {
+                    types: vec![t.into()],
+                    attributes: vec!["speed".into()],
+                    ..Rule::default()
+                }],
+            )
+            .expect("a view")
+            .named(t),
+        )
+    }
+
+    async fn ids(st: &AppState) -> Vec<String> {
+        let req = Request::get("/ngsi-ld/v1/entities?type=Car,Bike&limit=100")
+            .body(Body::empty())
+            .expect("request");
+        let r = st.call(&HeaderMap::new(), req).await;
+        let bytes = axum::body::to_bytes(r.into_body(), 1 << 20)
+            .await
+            .expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let mut ids: Vec<String> = v
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e["id"].as_str().map(str::to_owned))
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    async fn seeded() -> AppState {
+        let st = AppState::new("antares-test".into());
+        for (id, t) in [("urn:ngsi-ld:Car:1", "Car"), ("urn:ngsi-ld:Bike:1", "Bike")] {
+            let body = serde_json::json!({"id": id, "type": t, "speed": {"type": "Property", "value": 1}});
+            let body = body.to_string();
+            let req = Request::post("/ngsi-ld/v1/entities")
+                .header("content-type", "application/json")
+                .header("content-length", body.len())
+                .body(Body::from(body))
+                .expect("request");
+            let r = st.call(&HeaderMap::new(), req).await;
+            assert!(r.status().is_success(), "{}", r.status());
+        }
+        st
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_view_sees_its_own_entities_through_the_one_router() {
+        let st = seeded().await;
+        let (cars, bikes) = (st.with_view(view_of("Car")), st.with_view(view_of("Bike")));
+        let runs: Vec<_> = (0..32)
+            .map(|i| {
+                let st = if i % 2 == 0 { cars.clone() } else { bikes.clone() };
+                tokio::spawn(async move { (i % 2, ids(&st).await) })
+            })
+            .collect();
+        for run in runs {
+            let (odd, got) = run.await.expect("joined");
+            let want = if odd == 0 { "urn:ngsi-ld:Car:1" } else { "urn:ngsi-ld:Bike:1" };
+            assert_eq!(got, vec![want.to_owned()]);
+        }
+        assert!(Arc::ptr_eq(&cars.viewed, &bikes.viewed), "one router cell");
+        assert!(cars.viewed.get().is_some(), "built once, by the first call");
+        assert!(cars.inbound.get().is_none(), "no router of the view's own");
+        assert_eq!(ids(&st).await.len(), 2, "the plain API is not narrowed");
+    }
+
+    /// Fail closed: the shared router's state outside the request whose
+    /// view it serves (a task it spawned) reads a view that shows nothing.
+    #[tokio::test]
+    async fn the_shared_state_without_its_request_shows_nothing() {
+        let st = seeded().await;
+        let mut shared = st.clone();
+        shared.per_request = true;
+        let seen = shared.view().expect("a view");
+        assert!(Arc::ptr_eq(&seen, &CompiledView::nothing()));
+        assert_eq!(ids(&shared).await, Vec::<String>::new());
+        let cars = view_of("Car");
+        let inside = REQUEST_VIEW
+            .scope(cars.clone(), async { shared.view() })
+            .await
+            .expect("a view");
+        assert!(Arc::ptr_eq(&inside, &cars), "inside the request: its view");
     }
 }
 
