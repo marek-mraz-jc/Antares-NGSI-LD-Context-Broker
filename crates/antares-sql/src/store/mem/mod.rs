@@ -1961,7 +1961,15 @@ mod tests {
             }
             tx.commit().expect("commit");
         };
-        let cases: [(&str, Table, &[u8], &[u8], &str); 4] = [
+        // (file, table, key, value, what the refusal names)
+        type Case = (
+            &'static str,
+            Table,
+            &'static [u8],
+            &'static [u8],
+            &'static str,
+        );
+        let cases: [Case; 4] = [
             (
                 "badkey",
                 T_ENTITIES,
