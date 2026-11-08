@@ -18,14 +18,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod common;
+#[path = "common/process.rs"]
+mod process;
 use common::free_port;
 
 struct Broker(Child);
 
 impl Drop for Broker {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        process::stop(&mut self.0);
     }
 }
 

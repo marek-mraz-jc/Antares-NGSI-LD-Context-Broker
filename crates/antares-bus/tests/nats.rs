@@ -461,3 +461,49 @@ async fn publish_all_keeps_page_order_and_acks_every_event() {
     let want: Vec<i64> = (1..=PAGES * PAGE).collect();
     assert_eq!(seqs, want, "every event once, in outbox order");
 }
+
+/// A server that is not there fails the connect at once with a message that
+/// says it is the bus, so the broker's startup dies naming the cause instead
+/// of serving without its change stream. Needs no server.
+#[tokio::test(flavor = "multi_thread")]
+async fn connecting_to_no_server_is_a_named_bus_error() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port();
+    let refused = tokio::time::timeout(
+        Duration::from_secs(20),
+        NatsBus::connect(&format!("nats://127.0.0.1:{port}")),
+    )
+    .await
+    .expect("a refused connect does not hang");
+    let shown = match refused {
+        Ok(_) => panic!("nothing listens on {port}"),
+        Err(e) => e.to_string(),
+    };
+    assert!(shown.starts_with("bus error: "), "{shown}");
+}
+
+/// The health facts and the topology check against a live server: a fresh
+/// bus is connected with no reconnect counted, a balanced durable that
+/// exists passes, and one that does not is fatal and named.
+#[tokio::test(flavor = "multi_thread")]
+async fn topology_names_a_missing_durable_and_health_reads_the_connection() {
+    let url = require_nats!();
+    let bus = NatsBus::connect(&url).await.expect("connect");
+    assert!(bus.connected());
+    assert_eq!(bus.reconnects(), 0, "the initial connect is no reconnect");
+    let durable = format!("topo-{}", nonce());
+    bus.consume_balanced(&durable).await.expect("durable");
+    bus.assert_topology(&[durable.as_str()])
+        .await
+        .expect("an existing durable passes");
+    let missing = format!("missing-{}", nonce());
+    let err = bus
+        .assert_topology(&[durable.as_str(), missing.as_str()])
+        .await
+        .expect_err("a missing durable is fatal")
+        .to_string();
+    assert!(err.contains(&missing), "{err}");
+}

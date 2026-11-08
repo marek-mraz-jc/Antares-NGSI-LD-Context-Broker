@@ -1132,4 +1132,147 @@ mod tests {
         // every other pair is still added, this one by the caller (6.3.22)
         assert_eq!(m["metadata"]["NGSILD-Tenant"], "acme");
     }
+
+    fn outbound(notifier_info: &[(&str, &str)]) -> crate::Outbound {
+        crate::Outbound {
+            body: json!({"id": "urn:n:1", "type": "Notification", "data": []}),
+            accept: "application/json".into(),
+            link: String::new(),
+            receiver_info: Vec::new(),
+            notifier_info: notifier_info
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        }
+    }
+
+    /// The registry seam (clause 7): creation refuses an unusable endpoint or
+    /// notifierInfo, delivery publishes through the pooled connection, a row
+    /// edited past validation fails as answered, and a broker that never
+    /// acknowledges fails as timed out, the one class the breaker counts.
+    #[tokio::test]
+    async fn the_sink_seam_validates_delivers_and_classifies_failures() {
+        use crate::NotificationSink;
+        let sink = MqttSink::new(2, Duration::from_millis(300));
+        let acking = format!("mqtt://127.0.0.1:{}/t", stub_broker(true).await);
+        let qos1 = [("MQTT-QoS", "1"), ("MQTT-Version", "mqtt3.1.1")];
+        sink.parse_endpoint(&acking, &qos1).expect("a valid endpoint");
+        assert!(sink.parse_endpoint("http://host/t", &qos1).is_err());
+        assert!(sink.parse_endpoint(&acking, &[("MQTT-QoS", "7")]).is_err());
+        let out = outbound(&qos1);
+        let timeout = Duration::from_secs(1);
+        sink.deliver(&acking, &out, timeout).await.expect("PUBACK delivers");
+
+        let e = sink
+            .deliver("mqtt://u:hunter2@", &out, timeout)
+            .await
+            .expect_err("a hand-edited endpoint");
+        assert!(!e.timed_out && !e.message.contains("hunter2"), "{e:?}");
+        let e = sink
+            .deliver(&acking, &outbound(&[("MQTT-QoS", "7")]), timeout)
+            .await
+            .expect_err("a hand-edited notifierInfo");
+        assert!(!e.timed_out && e.message.contains("notifierInfo"), "{e:?}");
+
+        let silent = format!("mqtt://127.0.0.1:{}/t", stub_broker(false).await);
+        let e = sink
+            .deliver(&silent, &out, timeout)
+            .await
+            .expect_err("no PUBACK");
+        assert!(e.timed_out, "{e:?}");
+    }
+
+    /// A refused socket and a QoS no MQTT version defines fail the one
+    /// delivery with a message naming the cause, for both protocol versions.
+    #[tokio::test]
+    async fn a_refused_broker_and_an_undefined_qos_fail_the_delivery() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .port();
+        let ep = MqttEndpoint::parse(&format!("mqtt://127.0.0.1:{closed}/t")).expect("parse");
+        let sink = MqttSink::new(2, Duration::from_secs(2));
+        for v5 in [false, true] {
+            let e = sink
+                .publish_message(&ep, MqttParams { qos: 0, v5 }, b"{}")
+                .await
+                .expect_err("nothing listens");
+            assert!(e.to_string().contains("mqtt connect"), "v5={v5}: {e}");
+        }
+        let acking =
+            MqttEndpoint::parse(&format!("mqtt://127.0.0.1:{}/t", stub_broker(true).await))
+                .expect("parse");
+        let e = sink
+            .publish_message(&acking, MqttParams { qos: 3, v5: false }, b"{}")
+            .await
+            .expect_err("QoS 3 does not exist");
+        assert!(e.to_string().contains("mqtt publish"), "{e}");
+    }
+
+    /// The pool stays within its cap: a third destination evicts the least
+    /// recently used connection, and every destination still delivers.
+    #[tokio::test]
+    async fn the_connection_pool_evicts_past_its_cap() {
+        let sink = MqttSink::new(1, Duration::from_secs(1));
+        let params = MqttParams { qos: 1, v5: false };
+        for _ in 0..3 {
+            let ep =
+                MqttEndpoint::parse(&format!("mqtt://127.0.0.1:{}/t", stub_broker(true).await))
+                    .expect("parse");
+            sink.publish_message(&ep, params, b"{}")
+                .await
+                .expect("delivered");
+            let pooled = sink
+                .pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len();
+            assert_eq!(pooled, 1, "the pool holds at most its cap");
+        }
+    }
+
+    /// A resolver slower than the sink's deadline is a denial, never a dial.
+    #[tokio::test]
+    async fn a_resolver_past_the_deadline_is_a_denial() {
+        let e = checked_addr("resolver-deadline.invalid", 1883, OPEN, Duration::ZERO)
+            .await
+            .expect_err("no time to resolve");
+        assert!(e.to_string().contains("timed out"), "{e}");
+    }
+
+    /// MQTT 5 against a real server: a QoS 1 notification reaches an inbound
+    /// bridge listening on the same topic under its shared subscription.
+    #[tokio::test]
+    async fn a_v5_notification_reaches_an_inbound_listener() {
+        let Ok(url) = std::env::var("ANTARES_TEST_MQTT_URL") else {
+            eprintln!("SKIP: ANTARES_TEST_MQTT_URL not set");
+            return;
+        };
+        let topic = format!("antares-notifier-{}", std::process::id());
+        let ep = MqttEndpoint::parse(&format!("{url}/{topic}")).expect("parse");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let timeout = Duration::from_secs(5);
+        let task = listen(&ep, "notifier-test", tx, timeout).await.expect("listen");
+        let sink = MqttSink::new(2, timeout);
+        let params = MqttParams { qos: 1, v5: true };
+        let got = tokio::time::timeout(Duration::from_secs(10), async {
+            // the SUBACK is not awaited by `listen`: publish until one lands
+            loop {
+                sink.publish_message(&ep, params, b"{\"n\":1}")
+                    .await
+                    .expect("delivered");
+                if let Ok(Some(m)) =
+                    tokio::time::timeout(Duration::from_millis(300), rx.recv()).await
+                {
+                    return m;
+                }
+            }
+        })
+        .await
+        .expect("the listener received the notification");
+        assert_eq!(got.topic, topic);
+        assert_eq!(got.payload, b"{\"n\":1}");
+        task.abort();
+    }
 }

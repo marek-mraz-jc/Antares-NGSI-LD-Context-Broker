@@ -11,14 +11,15 @@ use std::process::{Child, Command};
 use std::time::Duration;
 
 mod common;
+#[path = "common/process.rs"]
+mod process;
 use common::free_port;
 
 struct Broker(Child);
 
 impl Drop for Broker {
     fn drop(&mut self) {
-        let _killed = self.0.kill();
-        let _waited = self.0.wait();
+        process::stop(&mut self.0);
     }
 }
 
