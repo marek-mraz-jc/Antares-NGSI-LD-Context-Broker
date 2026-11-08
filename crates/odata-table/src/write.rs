@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //! Writes through the read filter (T-6659): an update or a delete names its rows by a key or a
-//! `$filter`, resolved by the same [`query`] inside the caller's [`Scope`]. Every matched row is
+//! `$filter`, resolved by the same [`query`](crate::query) inside the caller's [`Scope`]. Every matched row is
 //! checked against what the caller may change before anything changes; one row outside refuses
 //! the whole write. A dry run answers what would change and changes nothing.
 

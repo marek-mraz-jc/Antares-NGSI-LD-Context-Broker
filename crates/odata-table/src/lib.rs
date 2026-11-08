@@ -12,6 +12,11 @@
 //! disagree on what they accept. A [`Scope`] is the caller's row restriction (organization,
 //! project, Policy); each source applies it before `$filter`, so a filter can only narrow it.
 //!
+//! [`write()`] updates or deletes the rows the same filter matches inside the same scope (T-6659):
+//! each matched row is checked against what the caller may change ([`Scope::changes`]) before
+//! anything changes, one row outside refuses the whole write, a dry run answers the rows and
+//! changes nothing, and the source applies the [`Batch`] all or nothing.
+//!
 //! The supported subset: `$filter` with `eq ne gt ge lt le and or not in`, `contains`,
 //! `startswith`, `endswith`, null comparisons and nested complex property paths; `$orderby` on
 //! primitive paths (nulls first ascending, last descending, the key breaking ties); `$select` of
@@ -330,7 +335,7 @@ pub trait Table: Send + Sync {
 
     /// Applies `batch` all or nothing: each key's row must still be there and meet
     /// [`Batch::guard`] when the change is made, else nothing changes and the answer is
-    /// [`TableError::Conflict`]. [`write`] builds the batch; a source never decides access.
+    /// [`TableError::Conflict`]. [`write()`] builds the batch; a source never decides access.
     fn apply<'a>(&'a self, batch: &'a Batch) -> Applying<'a> {
         let set = self.info().set.clone();
         let _ = batch;
