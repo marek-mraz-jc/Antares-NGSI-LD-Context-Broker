@@ -1238,10 +1238,41 @@ mod tests {
     /// A resolver slower than the sink's deadline is a denial, never a dial.
     #[tokio::test]
     async fn a_resolver_past_the_deadline_is_a_denial() {
+        // a local NXDOMAIN can answer before a zero timer fires: either way
+        // the name never becomes an address to dial
         let e = checked_addr("resolver-deadline.invalid", 1883, OPEN, Duration::ZERO)
             .await
             .expect_err("no time to resolve");
-        assert!(e.to_string().contains("timed out"), "{e}");
+        let e = e.to_string();
+        assert!(
+            e.contains("mqtt egress: resolving resolver-deadline.invalid"),
+            "{e}"
+        );
+    }
+
+    /// An inbound bridge whose broker refuses the socket, or accepts it and
+    /// never sends a ConnAck, fails `listen` with a message naming the
+    /// broker instead of spawning a loop that would read nothing.
+    #[tokio::test]
+    async fn a_listener_without_a_connack_is_refused() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .port();
+        let silent = stub_broker(false).await;
+        for (port, cause) in [(closed, "mqtt connect"), (silent, "connect timeout")] {
+            let ep = MqttEndpoint::parse(&format!("mqtt://127.0.0.1:{port}/t")).expect("parse");
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            let e = listen(&ep, "notifier-test", tx, Duration::from_millis(500))
+                .await
+                .expect_err("no ConnAck");
+            let e = e.to_string();
+            assert!(
+                e.contains(&format!("127.0.0.1:{port}")) && e.contains(cause),
+                "{e}"
+            );
+        }
     }
 
     /// MQTT 5 against a real server: a QoS 1 notification reaches an inbound
