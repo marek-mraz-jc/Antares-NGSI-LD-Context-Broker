@@ -1273,6 +1273,12 @@ mod tests {
         .expect("the listener received the notification");
         assert_eq!(got.topic, topic);
         assert_eq!(got.payload, b"{\"n\":1}");
+        // MQTT 5 knows no QoS 3 either: the pooled v5 client refuses it
+        let e = sink
+            .publish_message(&ep, MqttParams { qos: 3, v5: true }, b"{}")
+            .await
+            .expect_err("QoS 3 does not exist");
+        assert!(e.to_string().contains("mqtt publish"), "{e}");
         task.abort();
     }
 }

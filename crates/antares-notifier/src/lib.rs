@@ -460,6 +460,25 @@ mod tests {
         }
     }
 
+    /// A delivery goes to the sink registered for the endpoint's scheme,
+    /// and an endpoint no sink serves finds none.
+    #[tokio::test]
+    async fn a_delivery_reaches_the_sink_of_its_scheme() {
+        let reg = registry();
+        let out = Outbound {
+            body: json!({"type": "Notification"}),
+            accept: "application/json".into(),
+            link: String::new(),
+            receiver_info: Vec::new(),
+            notifier_info: Vec::new(),
+        };
+        let sink = reg.sink_for_uri("https://h/n").expect("the http sink");
+        sink.deliver("https://h/n", &out, Duration::from_secs(1))
+            .await
+            .expect("delivered");
+        assert!(reg.sink_for_uri("ftp://h/n").is_none());
+    }
+
     fn registry() -> SinkRegistry {
         let mut reg = SinkRegistry::default();
         reg.register(Box::new(FakeHttp));
@@ -581,6 +600,10 @@ mod tests {
         );
 
         assert!(Outbound::from_dead_letter(&json!({"uri": "http://h/n"})).is_err());
+        // a legacy header list that is no list of pairs is unreadable, said so
+        let broken = json!({"uri": "http://h/n", "payload": body, "headers": {"Link": 1}});
+        let e = Outbound::from_dead_letter(&broken).expect_err("headers unreadable");
+        assert!(e.contains("headers unreadable"), "{e}");
     }
 
     /// Endpoint URIs may carry credentials (mqtt[s]://user:pass@host, 7.1);
