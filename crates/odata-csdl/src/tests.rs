@@ -484,3 +484,124 @@ fn lookups_resolve_aliases_bases_and_references() {
     assert_eq!(names("c.Tower"), ["Tower", "Building"]);
     assert_eq!(names("City.Loop"), ["Loop", "Loop", "Loop"]);
 }
+
+/// Unbound actions and functions with their imports (T-6657): parameters of each nullability,
+/// a function with and without the service-document flag, an action with and without a return.
+fn operations() -> Model {
+    let mut decision = ComplexType::new("Decision");
+    decision.open = true;
+    let mut access = Operation::new("Access", OperationKind::Function);
+    access.return_type = Some(TypeRef::single("o.Decision"));
+    let mut attributes = Operation::new("Attributes", OperationKind::Function);
+    attributes
+        .parameters
+        .push(Parameter::new("type", TypeRef::single("Edm.String")).required());
+    attributes.return_type = Some(TypeRef::collection("o.Decision"));
+    attributes.return_nullable = true;
+    let mut check = Operation::new("Check", OperationKind::Action);
+    check
+        .parameters
+        .push(Parameter::new("subject", TypeRef::single("Edm.Untyped")));
+    check.return_type = Some(TypeRef::single("o.Decision"));
+    let forget = Operation::new("Forget", OperationKind::Action);
+    let mut container = EntityContainer::new("Service");
+    let mut hidden = OperationImport::new("Hidden", "o.Attributes");
+    hidden.in_service_document = false;
+    container.imports = vec![
+        OperationImport::new("Access", "o.Access"),
+        hidden,
+        OperationImport::new("Check", "o.Check"),
+        OperationImport::new("Forget", "o.Forget"),
+    ];
+    let mut schema = Schema::new("o");
+    schema.complex_types = vec![decision];
+    schema.operations = vec![access, attributes, check, forget];
+    schema.entity_container = Some(container);
+    Model {
+        version: CsdlVersion::V4_01,
+        references: vec![],
+        schemas: vec![schema],
+    }
+}
+
+#[test]
+fn operations_and_imports_are_written_in_both_representations(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut xml, mut json) = (Vec::new(), Vec::new());
+    write_xml(&operations(), &Limits::strict(), &mut xml)?;
+    write_json(&operations(), &Limits::strict(), &mut json)?;
+    let (xml, json) = (String::from_utf8(xml)?, String::from_utf8(json)?);
+    for expected in [
+        r#"<Function Name="Access">"#,
+        r#"<ReturnType Type="o.Decision" Nullable="false"/>"#,
+        r#"<Parameter Name="type" Type="Edm.String" Nullable="false"/>"#,
+        r#"<ReturnType Type="Collection(o.Decision)" Nullable="true"/>"#,
+        r#"<Parameter Name="subject" Type="Edm.Untyped"/>"#,
+        r#"<Action Name="Forget"/>"#,
+        r#"<FunctionImport Name="Access" Function="o.Access" IncludeInServiceDocument="true"/>"#,
+        r#"<FunctionImport Name="Hidden" Function="o.Attributes"/>"#,
+        r#"<ActionImport Name="Check" Action="o.Check"/>"#,
+    ] {
+        assert!(xml.contains(expected), "{expected} missing from\n{xml}");
+    }
+    for expected in [
+        "\"Access\": [\n      {\n        \"$Kind\": \"Function\",\n        \"$ReturnType\": {\n          \"$Type\": \"o.Decision\"\n        }\n      }\n    ]",
+        "\"$Name\": \"subject\",\n            \"$Type\": \"Edm.Untyped\",\n            \"$Nullable\": true",
+        "\"Forget\": [\n      {\n        \"$Kind\": \"Action\"\n      }\n    ]",
+        "\"Access\": {\n        \"$Function\": \"o.Access\",\n        \"$IncludeInServiceDocument\": true\n      }",
+        "\"Hidden\": {\n        \"$Function\": \"o.Attributes\"\n      }",
+        "\"Check\": {\n        \"$Action\": \"o.Check\"\n      }",
+    ] {
+        assert!(json.contains(expected), "{expected} missing from\n{json}");
+    }
+    Ok(())
+}
+
+#[test]
+fn operations_are_validated() {
+    let problems = |change: fn(&mut Schema)| {
+        let mut model = operations();
+        if let Some(schema) = model.schemas.first_mut() {
+            change(schema);
+        }
+        match validate(&model, &Limits::strict()) {
+            Err(CsdlError::Invalid(problems)) => problems.into_iter().map(|p| p.problem).collect(),
+            _ => Vec::new(),
+        }
+    };
+    assert_eq!(
+        problems(
+            |s| s.operations.iter_mut().for_each(|o| if o.name == "Access" {
+                o.return_type = None;
+            })
+        ),
+        [Problem::FunctionWithoutReturnType]
+    );
+    assert_eq!(
+        problems(|s| if let Some(c) = s.entity_container.as_mut() {
+            c.imports.push(OperationImport::new("Gone", "o.Gone"));
+        }),
+        [Problem::UnknownImportOperation]
+    );
+    assert_eq!(
+        problems(|s| if let Some(c) = s.entity_container.as_mut() {
+            c.imports.push(OperationImport::new("Access", "o.Access"));
+        }),
+        [Problem::Duplicate]
+    );
+    assert_eq!(
+        problems(|s| s
+            .operations
+            .push(Operation::new("Decision", OperationKind::Action))),
+        [Problem::Duplicate]
+    );
+    assert_eq!(
+        problems(
+            |s| s.operations.iter_mut().for_each(|o| if o.name == "Check" {
+                o.parameters
+                    .push(Parameter::new("subject", TypeRef::single("o.Nowhere")));
+            })
+        ),
+        [Problem::Duplicate, Problem::UnknownType]
+    );
+}
