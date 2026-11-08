@@ -1126,7 +1126,6 @@ async fn the_entity_query_is_not_left_prepared() {
 /// Shapes copied from `query_sql`/`count_sql` (their unit tests pin the
 /// text); run as a non-superuser, since a superuser skips RLS and hides it.
 #[tokio::test]
-#[ignore = "flaky on dev: T-6610, runs 42513954812 42516827132 42532943337"]
 async fn a_type_page_reads_its_type_through_an_index_under_rls() {
     let url = require_db!();
     let pool = pg::connect(&url, 5).await.expect("connect");
