@@ -91,7 +91,7 @@ pub use antares_model::{EntityId, NgsiError, TenantId};
 /// WebSocket message never passes the HTTP bounds layer).
 pub mod bounds {
     pub use antares_api::bounds::{
-        json_depth, temporal_default_instances, temporal_instance_limit, HeldAnswer,
+        json_depth, temporal_default_instances, temporal_instance_limit, AnswerCharge, HeldAnswer,
         ANSWER_POOL_RETRY_SECONDS, ANSWER_TOO_LARGE, DEFAULT_LIMIT, MAX_ANSWER_BYTES,
         MAX_BATCH_ITEMS, MAX_BODY_BYTES, MAX_JSON_DEPTH, MAX_LIMIT, MEMORY_OVERLOADED,
     };
@@ -1588,6 +1588,13 @@ pub mod test_kit {
             antares_api::wire(&mut state).await;
             let reload = crate::views::install(&state).await?;
             Ok(Self { state, reload })
+        }
+
+        /// The broker's buffered-answer pool, for a test reading what it
+        /// holds (T-6666).
+        #[must_use]
+        pub fn answer_pool(&self) -> Arc<antares_api::bounds::AnswerPool> {
+            Arc::clone(&self.state.answer_pool)
         }
 
         /// The same broker with the forward transport `make` builds

@@ -93,6 +93,9 @@ struct Answer {
     /// The answer Links a next instance page (6.4.7.3).
     linked: bool,
     body: Value,
+    /// The answer pool share of the bytes `body` was parsed from, held
+    /// while `body` lives (T-6666).
+    _held: Option<antares_ops::bounds::AnswerCharge>,
 }
 
 /// The server of view `id` for `caller`.
@@ -184,7 +187,9 @@ impl Server {
         let body = match self.view.read_answer(response.into_body(), "mcp").await {
             // an empty body (a 204) is no JSON: `null`
             Ok(held) if held.bytes().len() <= MAX_INNER_BYTES => {
-                serde_json::from_slice(held.bytes()).unwrap_or(Value::Null)
+                let (bytes, charge) = held.into_parts();
+                let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                (body, charge)
             }
             Err(antares_ops::Refusal::Overloaded { .. }) => {
                 return Answer {
@@ -205,7 +210,8 @@ impl Server {
             created,
             range,
             linked,
-            body,
+            body: body.0,
+            _held: Some(body.1),
         }
     }
 
@@ -1532,6 +1538,7 @@ mod tests {
             range: None,
             linked: false,
             body: json!({"title": "BadRequestData", "detail": "secret speed<80"}),
+            _held: None,
         };
         let r = failed(&a);
         assert_eq!(r.is_error, Some(true));
