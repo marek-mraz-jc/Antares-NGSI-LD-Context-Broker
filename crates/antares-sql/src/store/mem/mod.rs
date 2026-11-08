@@ -1942,6 +1942,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A marked file whose rows this binary cannot decode refuses to start
+    /// and names what it could not read: a key without its tenant separator,
+    /// a value that is no JSON, a context id that is no UTF-8, a context that
+    /// is no JSON. Serving around them would be serving partial data. A file
+    /// that is no redb database at all is refused too.
+    #[test]
+    fn file_mode_refuses_rows_it_cannot_decode() {
+        let write = |dir: &std::path::Path, table: Table, key: &[u8], value: &[u8]| {
+            let db = Database::create(dir.join("antares.redb")).expect("db");
+            let mut tx = db.begin_write().expect("tx");
+            tx.set_durability(Durability::Immediate).expect("dur");
+            {
+                let mut meta = tx.open_table(T_META).expect("meta");
+                meta.insert("format", FORMAT_VERSION).expect("marker");
+                let mut t = tx.open_table(table).expect("table");
+                t.insert(key, value).expect("insert");
+            }
+            tx.commit().expect("commit");
+        };
+        let cases: [(&str, Table, &[u8], &[u8], &str); 4] = [
+            ("badkey", T_ENTITIES, b"no-separator", b"{}", "undecodable key"),
+            ("badvalue", T_ENTITIES, b"t\0urn:e:1", b"not json", "undecodable value"),
+            ("badctxid", T_JSONLD_CONTEXTS, &[0xff, 0xfe], b"{}", "undecodable context id"),
+            ("badctx", T_JSONLD_CONTEXTS, b"ctx-1", b"not json", "undecodable context ctx-1"),
+        ];
+        for (name, table, key, value, says) in cases {
+            let dir = tempdir(name);
+            write(&dir, table, key, value);
+            let err = match Store::open_file(&dir) {
+                Err(e) => e,
+                Ok(_) => panic!("{name}: must refuse an undecodable row"),
+            };
+            assert!(err.contains(says), "{name}: {err}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        let dir = tempdir("notredb");
+        std::fs::write(dir.join("antares.redb"), b"this is no redb file").expect("write");
+        let err = match Store::open_file(&dir) {
+            Err(e) => e,
+            Ok(_) => panic!("must refuse a file that is no database"),
+        };
+        assert!(err.contains("antares.redb"), "the file is named: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A file that HOLDS rows but carries no format marker was written by a
     /// binary whose key/value shape this one cannot vouch for. Refusing is
     /// the whole point of the marker — serving it would answer requests from
