@@ -71,12 +71,25 @@ CREATE OR REPLACE FUNCTION entity_value_rows(p_entity jsonb)
            WHERE jsonb_typeof(e) = 'string') k
 $$;
 
--- The scope rows of the stored Entities, under the service escape as 0024's
--- backfill: the 0024 triggers keep them from here on.
+-- The scope rows of the stored Entities. The service escape reads every
+-- Tenant's Entities, but entity_values is FORCE RLS since 0024 and its
+-- tenant_write INSERT policy takes no escape (0024 backfilled before RLS
+-- existed): an owner that is no superuser, as on dev, is refused the rows
+-- (T-6610, dev 2026-11-08 "new row violates row-level security policy").
+-- So each Tenant's rows go in under that Tenant's own scope, transaction
+-- local like set_tenant; the 0024 triggers keep them from here on.
 SELECT set_config('antares.service', 'on', true);
-INSERT INTO entity_values (tenant_id, id, attr, f, txt)
-  SELECT e.tenant_id, e.id, r.attr, r.f, r.txt
-    FROM entities e, entity_value_rows(e.entity) r
-   WHERE r.attr = 'scope' AND e.scopes IS NOT NULL;
+DO $$
+DECLARE t text;
+BEGIN
+  FOR t IN SELECT DISTINCT tenant_id FROM entities WHERE scopes IS NOT NULL LOOP
+    PERFORM set_config('antares.tenant', t, true);
+    INSERT INTO entity_values (tenant_id, id, attr, f, txt)
+      SELECT e.tenant_id, e.id, r.attr, r.f, r.txt
+        FROM entities e, entity_value_rows(e.entity) r
+       WHERE e.tenant_id = t AND e.scopes IS NOT NULL AND r.attr = 'scope';
+  END LOOP;
+  PERFORM set_config('antares.tenant', '', true);
+END $$;
 SELECT set_config('antares.service', '', true);
 ANALYZE entity_values;
