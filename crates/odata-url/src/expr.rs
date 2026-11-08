@@ -80,12 +80,10 @@ const ADDITIVE: [ArithOp; 2] = [ArithOp::Add, ArithOp::Sub];
 const MULTIPLICATIVE: [ArithOp; 4] = [ArithOp::Mul, ArithOp::DivBy, ArithOp::Div, ArithOp::Mod];
 
 /// Method names of `methodCallExpr` the parser does not implement: `totalseconds` reads a
-/// duration, which has no NGSI-LD value type (F27); `geo.distance` and `geo.length` measure,
-/// which ADR-0028 rule 8 keeps out of the residual; `hassubset`, `hassubsequence` and `case`
-/// have no evaluator.
-const OTHER_METHODS: [&str; 6] = [
+/// duration, which has no NGSI-LD value type (F27); `geo.length` measures a line, which no
+/// NGSI-LD value is; `hassubset`, `hassubsequence` and `case` have no evaluator.
+const OTHER_METHODS: [&str; 5] = [
     "totalseconds",
-    "geo.distance",
     "geo.length",
     "hassubset",
     "hassubsequence",

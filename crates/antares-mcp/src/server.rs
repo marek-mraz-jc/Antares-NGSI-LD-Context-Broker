@@ -758,7 +758,7 @@ fn fit(rows: Vec<Value>) -> (Vec<Value>, bool) {
     let mut kept = Vec::with_capacity(rows.len());
     let total = rows.len();
     for row in rows {
-        let size = row.to_string().len().saturating_add(1);
+        let size = antares_ops::json_len(&row).saturating_add(1);
         if used.saturating_add(size) > budget {
             break;
         }
@@ -775,7 +775,7 @@ fn whole(tool: &ToolDef, body: &Value, extra: serde_json::Map<String, Value>) ->
     let mut out = serde_json::Map::from_iter([(tool.key.to_owned(), body.clone())]);
     out.extend(extra);
     let out = Value::Object(out);
-    if out.to_string().len() > budget() {
+    if antares_ops::json_len(&out) > budget() {
         return too_large(tool);
     }
     CallToolResult::structured(out)

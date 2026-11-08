@@ -126,8 +126,6 @@ const OUTSIDE: &[&str] = &[
     "geometryMultiLineString",
     "geometryMultiPoint",
     "geometryMultiPolygon",
-    "geometryPoint",
-    "geometryPolygon",
 ];
 
 /// Cases the parser answers otherwise than the file, by input: whether it accepts them, and why
@@ -193,6 +191,25 @@ fn literal_rule(rule: &str) -> Option<fn(&Literal) -> bool> {
             matches!(
                 l,
                 Literal::Geography(Geography {
+                    shape: Shape::Polygon(_),
+                    ..
+                })
+            )
+        },
+        // F27: the geography shapes on a flat plane (T-6631)
+        "geometryPoint" => |l| {
+            matches!(
+                l,
+                Literal::Geometry(Geography {
+                    shape: Shape::Point(_),
+                    ..
+                })
+            )
+        },
+        "geometryPolygon" => |l| {
+            matches!(
+                l,
+                Literal::Geometry(Geography {
                     shape: Shape::Polygon(_),
                     ..
                 })

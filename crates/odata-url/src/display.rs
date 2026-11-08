@@ -395,6 +395,10 @@ impl Display for Literal {
                 f.write_char('\'')
             }
             Literal::Geography(geography) => write!(f, "{geography}"),
+            Literal::Geometry(geometry) => {
+                let text = geometry.to_string();
+                write!(f, "geometry{}", &text["geography".len()..])
+            }
             Literal::Duration(text) => write!(f, "duration'{}'", text.replace('+', "%2B")),
             Literal::Binary(text) => write!(f, "binary'{text}'"),
         }

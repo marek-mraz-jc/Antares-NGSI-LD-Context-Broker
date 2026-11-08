@@ -170,8 +170,9 @@ store write commits
    counts (antares_notification_changes_dropped_total, warn per thousand)
  → drain task: ONE task, batch → process_changes, the next batch taken
    only once this one's deliveries have all settled (which is what keeps
-   per-subscription order); every change in the batch is matched
-   sequentially on that task
+   per-subscription order); the changes of a batch are matched up to
+   MATCH_WIDTH at once (notify/throttle.rs: the cores, at most 8, T-6371)
+   and leave in change order
      match against SubMirror (in memory, per tenant; store list is the
      never-wired fallback), candidates handed over as shared documents and
      each `@context` resolved once per drain and per tenant → group per
@@ -341,9 +342,9 @@ Stated so they are not rediscovered. Each is measured, not guessed.
   does — its writers are threads in one interpreter. Delivery width does
   not govern it either: over a hundred-tenant shape, widths of 8 to 1 024
   deliver the same 7 027 matches/s and drop nothing, so the knob has
-  nothing to arbitrate while the offered load is absorbed whole. Matching
-  is still sequential on the single drain task above, which is where the
-  next lever sits if a deployment ever offers more than this harness can.
+  nothing to arbitrate while the offered load is absorbed whole. This run
+  predates T-6371: matching was then sequential on the single drain task,
+  and is now up to MATCH_WIDTH changes at once on that task's batch.
 - Goodput goes backwards past the write knee, and nothing sheds load
   before it. Against PostgreSQL the same ladder that delivers 1 671
   changes per second when offered 2 000 delivers 1 140 when offered

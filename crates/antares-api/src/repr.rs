@@ -806,7 +806,7 @@ pub fn apply(doc: &Value, r: &Repr) -> Value {
         {
             continue;
         }
-        let raw: Vec<Value> = v.as_array().cloned().unwrap_or_else(|| vec![v.clone()]);
+        let raw = v.as_array().map_or(std::slice::from_ref(v), Vec::as_slice);
         let kept: Vec<&Value> = raw
             .iter()
             .filter(|inst| match (&r.dataset_id, inst.get("datasetId")) {

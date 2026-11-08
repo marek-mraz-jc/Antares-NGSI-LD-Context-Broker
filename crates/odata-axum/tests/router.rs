@@ -49,6 +49,7 @@ fn state() -> ODataState {
         csdl_limits: odata_csdl::Limits::strict(),
         max_header_len: 64,
         metadata_etag: None,
+        metadata: Arc::default(),
         custom_options: Vec::new(),
     }
 }

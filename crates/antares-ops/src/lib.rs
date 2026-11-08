@@ -340,6 +340,23 @@ impl OpsRequest {
         self
     }
 
+    /// Every header of `all` as [`Self::header`] adds one, moved rather than
+    /// cloned one by one (R3-024).
+    #[must_use]
+    pub fn headers(mut self, all: HeaderMap) -> Self {
+        let mut last: Option<HeaderName> = None;
+        for (name, value) in all {
+            // a repeated header's later values come without their name
+            if let Some(name) = name {
+                last = Some(name);
+            }
+            if let Some(name) = last.as_ref().filter(|n| !outer_only(n)) {
+                self.headers.append(name, value);
+            }
+        }
+        self
+    }
+
     /// The @context the request's names are read under, in place of the
     /// outer request's `Link` header (a read's `q`, `attrs`, `type`): a
     /// surface that names Attributes outside the core @context defines its
@@ -739,9 +756,7 @@ impl ViewOps {
                 };
                 let gated = antares_api::policy::gate(engine, &self.tenant, &caller.0, &asked);
                 // The engine learns the view in process (T-3702), as for a run.
-                antares_api::policy::through_view(self.view.id(), gated)
-                    .await
-                    .map(Arc::new)
+                antares_api::policy::through_view(self.view.id(), gated).await
             }
         };
         antares_api::views::with_view(Some(&self.view), clause, engine)
@@ -1386,6 +1401,27 @@ impl<S: Surface> antares_api::ApiSurface for Mounted<S> {
     }
 }
 
+/// The length of `v`'s compact JSON text (what `v.to_string()` holds), counted as it is written
+/// so no text is built: a surface sizing each row against its answer budget serialised it once
+/// to measure and again to answer (T-6612, R3-016).
+#[must_use]
+pub fn json_len(v: &serde_json::Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    // A Value always serialises; a write into the counter cannot fail.
+    let _ = serde_json::to_writer(&mut count, v);
+    count.0
+}
+
 /// A broker over the built-in store, for a surface's integration tests.
 #[cfg(feature = "test-kit")]
 pub mod test_kit {
@@ -1706,6 +1742,18 @@ pub fn default_instance<'a>(
 
 #[cfg(test)]
 mod tests {
+
+    /// T-6612, R3-016: the counted length is the text's length, escapes and non-ASCII included.
+    #[test]
+    fn json_len_is_the_length_of_the_text() {
+        for v in [
+            serde_json::json!(null),
+            serde_json::json!({"a": [1, 2.5, "x\"y\n"], "ä": {"b": true}}),
+            serde_json::json!("€ and \u{1}"),
+        ] {
+            assert_eq!(super::json_len(&v), v.to_string().len(), "{v}");
+        }
+    }
     use super::*;
 
     /// F-ANT5-009: a named instance listed first is not the member's value; with only
@@ -2015,6 +2063,27 @@ mod tests {
         assert_eq!(req.headers.len(), 1);
         assert_eq!(req.headers["content-type"], "application/json");
         assert_eq!(axum::body::HttpBody::size_hint(&req.body).exact(), Some(2));
+    }
+
+    /// R3-024: a moved header map keeps what one header at a time kept,
+    /// every value of a repeated header, and drops the outer ones.
+    #[test]
+    fn a_moved_header_map_keeps_what_one_header_at_a_time_keeps() {
+        let mut all = HeaderMap::new();
+        all.append("accept", HeaderValue::from_static("a"));
+        all.append("ngsild-tenant", HeaderValue::from_static("evil"));
+        all.append("ngsild-tenant", HeaderValue::from_static("evil2"));
+        all.append("accept", HeaderValue::from_static("b"));
+        all.append("x-a", HeaderValue::from_static("c"));
+        let one_by_one = all
+            .iter()
+            .fold(OpsRequest::new(Method::GET, "/x"), |r, (n, v)| {
+                r.header(n.clone(), v.clone())
+            });
+        let moved = OpsRequest::new(Method::GET, "/x").headers(all);
+        assert_eq!(moved.headers, one_by_one.headers);
+        assert_eq!(moved.headers.get_all("accept").iter().count(), 2);
+        assert!(!moved.headers.contains_key("ngsild-tenant"));
     }
 
     /// `read_only`: `OPTIONS` names the methods, a write is the surface's refusal with `Allow`,
