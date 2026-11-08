@@ -130,7 +130,7 @@ pub struct Ops {
     /// The narrowed handle of each view served lately, so a request does
     /// not build the narrowed state and its in-process router anew; an
     /// idle one is dropped ([`view_cache`]).
-    views: Arc<Mutex<view_cache::ViewCache<ViewOps>>>,
+    views: Arc<view_cache::ViewCache<ViewOps>>,
     /// The surface these operations are run for, named on each one's log
     /// line (threat G10); `None` for the broker's own in-process forwards.
     surface: Option<Arc<str>>,
@@ -499,18 +499,14 @@ impl Ops {
         // Only views loaded now stay cached: a removed one goes with the
         // next sweep. A changed view is a new `CompiledView`, so a handle
         // of the old one is never served again.
-        let (made, gone) = self
-            .views
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_or_build(
-                id,
-                |held| Arc::ptr_eq(&held.view, view),
-                |k| table.contains_key(k),
-                std::time::Instant::now(),
-                view_cache::idle(),
-                build,
-            );
+        let (made, gone) = self.views.get_or_build(
+            id,
+            |held| Arc::ptr_eq(&held.view, view),
+            |k| table.contains_key(k),
+            std::time::Instant::now(),
+            view_cache::idle(),
+            build,
+        );
         view_cache::release(gone);
         made
     }

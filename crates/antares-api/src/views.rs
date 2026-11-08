@@ -120,6 +120,22 @@ impl CompiledView {
         }
     }
 
+    /// The view that shows nothing: one rule naming no type, which holds
+    /// for no Entity. What a state that lost its request's view reads as.
+    #[must_use]
+    pub fn nothing() -> Arc<Self> {
+        static NOTHING: std::sync::LazyLock<Arc<CompiledView>> = std::sync::LazyLock::new(|| {
+            Arc::new(CompiledView {
+                narrowing: Arc::new(Filter {
+                    rules: vec![crate::policy::Rule::default()],
+                    ..Filter::default()
+                }),
+                id: String::new(),
+            })
+        });
+        NOTHING.clone()
+    }
+
     /// Whether the view shows every name ([`Self::every`]): [`Self::new`]
     /// never compiles a view without rules.
     #[must_use]
@@ -882,7 +898,7 @@ impl WriteGuard {
         st: &crate::state::AppState,
         written: impl IntoIterator<Item = &'a str>,
     ) -> Option<Self> {
-        let narrowing = st.view.as_deref()?.narrowing();
+        let narrowing = st.view().as_deref()?.narrowing();
         Some(Self {
             sel: crate::policy::Condition::new(narrowing),
             written: written.into_iter().map(str::to_owned).collect(),

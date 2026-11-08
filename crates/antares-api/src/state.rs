@@ -293,6 +293,13 @@ pub(crate) fn inprocess_context() -> Option<Arc<serde_json::Value>> {
     INPROCESS_CONTEXT.try_with(Arc::clone).ok()
 }
 
+#[cfg(feature = "views")]
+tokio::task_local! {
+    /// The view the in-process request this task serves came through, which
+    /// the shared router's state reads as its own ([`AppState::view`]).
+    static REQUEST_VIEW: Arc<crate::views::CompiledView>;
+}
+
 /// How many [`AppState::call`] frames the running task is inside: zero
 /// outside an in-process call. A caller that must not reach the router past
 /// [`crate::bounds::MAX_IN_PROCESS_CALL_DEPTH`] reads it to answer for
@@ -321,9 +328,19 @@ tokio::task_local! {
 pub struct AppState {
     shared: Arc<Shared>,
     /// The endpoint view every operation through this state is narrowed to
-    /// (ADR-0023); `None` serves the NGSI-LD API as it is.
+    /// (ADR-0023); `None` serves the NGSI-LD API as it is. Read through
+    /// [`AppState::view`].
     #[cfg(feature = "views")]
-    pub view: Option<Arc<crate::views::CompiledView>>,
+    view: Option<Arc<crate::views::CompiledView>>,
+    /// This is the state of the router every view shares (T-6677): its view
+    /// is the request's, [`REQUEST_VIEW`], and outside one it shows nothing.
+    #[cfg(feature = "views")]
+    per_request: bool,
+    /// The one router narrowed states call through, built on the first such
+    /// call and shared by every clone and narrowed copy of the state it
+    /// hangs off (T-6677: a router per view cost ~246 KiB).
+    #[cfg(feature = "views")]
+    viewed: Arc<std::sync::OnceLock<axum::Router>>,
     /// The router [`AppState::call`] serves in-process requests through,
     /// built on first use. Empty until a façade actually calls: building it
     /// costs about 1.5 ms, which is worth memoizing per state and not worth
@@ -562,7 +579,7 @@ impl AppState {
     #[must_use]
     pub fn same(&self, other: &Self) -> bool {
         #[cfg(feature = "views")]
-        let view = match (&self.view, &other.view) {
+        let view = match (&self.view(), &other.view()) {
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
             (a, b) => a.is_none() && b.is_none(),
         };
@@ -760,6 +777,10 @@ impl AppState {
         Self {
             #[cfg(feature = "views")]
             view: None,
+            #[cfg(feature = "views")]
+            per_request: false,
+            #[cfg(feature = "views")]
+            viewed: Arc::new(std::sync::OnceLock::new()),
             inbound: Arc::new(std::sync::OnceLock::new()),
             shared: Arc::new(Shared {
                 store,
@@ -849,8 +870,26 @@ impl AppState {
     pub fn with_view(&self, view: Arc<crate::views::CompiledView>) -> Self {
         let mut st = self.clone();
         st.view = Some(view);
+        st.per_request = false;
         st.inbound = Arc::new(std::sync::OnceLock::new());
         st
+    }
+
+    /// The view every operation through this state is narrowed to, if any.
+    /// The shared router's state answers the view of the request it serves;
+    /// a task it spawned without that view sees a view that shows nothing,
+    /// never the whole Tenant (fail closed).
+    #[cfg(feature = "views")]
+    #[must_use]
+    pub fn view(&self) -> Option<Arc<crate::views::CompiledView>> {
+        if self.per_request {
+            return Some(
+                REQUEST_VIEW
+                    .try_with(Arc::clone)
+                    .unwrap_or_else(|_| crate::views::CompiledView::nothing()),
+            );
+        }
+        self.view.clone()
     }
 
     /// Every stored view document's (ADR-0023 rule 10) id and digest, the
@@ -1245,6 +1284,22 @@ impl AppState {
             ))
             .into_response();
         }
+        #[cfg(feature = "views")]
+        if let Some(view) = self.view() {
+            let router = self.viewed.get_or_init(|| {
+                // Built from a state that holds no view of its own and a
+                // fresh cell, for the reason the memo below gives.
+                let mut inner = self.clone();
+                inner.view = None;
+                inner.per_request = true;
+                inner.viewed = Arc::new(std::sync::OnceLock::new());
+                inner.inbound = Arc::new(std::sync::OnceLock::new());
+                crate::router(inner)
+            });
+            return REQUEST_VIEW
+                .scope(view, self.serve_in_process(depth, router, caller, req))
+                .await;
+        }
         let router = self.inbound.get_or_init(|| {
             // Every layer of a built router captured an `AppState` clone, so
             // the memo owns states. The clone it is built from must NOT be
@@ -1257,6 +1312,18 @@ impl AppState {
             inner.inbound = Arc::new(std::sync::OnceLock::new());
             crate::router(inner)
         });
+        self.serve_in_process(depth, router, caller, req).await
+    }
+
+    /// [`AppState::call`] past its depth check, through `router`.
+    async fn serve_in_process(
+        &self,
+        depth: usize,
+        router: &axum::Router,
+        caller: &axum::http::HeaderMap,
+        req: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse as _;
         let (mut parts, body) = req.into_parts();
         for name in &PROPAGATED {
             if parts.headers.contains_key(name) {
