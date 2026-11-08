@@ -1730,13 +1730,15 @@ mod tests {
                 }
             }
         }
+        /// A driver that breaks the batch contract: it reports every id
+        /// rejected without running the closure.
         async fn batch_mutate_boxed<'a>(
             &self,
             _t: &TenantId,
-            _ids: &[String],
+            ids: &[String],
             _f: BatchMutateFn<'a>,
         ) -> Result<Vec<Option<Result<(), ()>>>, NgsiError> {
-            unimplemented!()
+            Ok(vec![Some(Err(())); ids.len()])
         }
         async fn tenant_exists(&self, _t: &TenantId) -> Result<bool, NgsiError> {
             Ok(true)
@@ -1831,6 +1833,81 @@ mod tests {
             .expect("row present");
         assert_eq!(failed["notification"]["timesFailed"], 3, "{failed}");
         assert_eq!(failed["notification"]["lastFailure"], "2026-01-02T00:00:00Z");
+    }
+
+    /// The remaining defaults: no commit queue, never wedged, no
+    /// (type, attribute) index, Entities fetched one `get` at a time, and the
+    /// delivery bookkeeping as a `mutate` that counts each booked attempt.
+    #[tokio::test]
+    async fn the_read_and_delivery_defaults_go_through_get_and_mutate() {
+        let t = TenantId::new("t").expect("tenant");
+        let doc = serde_json::json!({"id": "urn:a", "notification": {"timesSent": 1}});
+        let d: std::sync::Arc<dyn CurrentStateDriver> =
+            std::sync::Arc::new(OneDoc(std::sync::Mutex::new(Some(doc.clone()))));
+        assert!(d.commit_queue().is_none());
+        assert!(!d.wedged().await);
+        assert!(d.entity_attr_pairs(&t).await.expect("pairs").is_none());
+        let found = d.get_entities(&t, &["urn:a"]).await.expect("get");
+        assert_eq!(found.get("urn:a"), Some(&doc));
+        let now = "2026-01-03T00:00:00Z";
+        let booked = d
+            .record_delivery(&t, Kind::Subscription, "urn:a", now)
+            .await
+            .expect("record")
+            .expect("row present");
+        assert_eq!(booked.doc["notification"]["timesSent"], 2, "{:?}", booked.doc);
+        assert!(booked.prev_success.is_none(), "never succeeded before");
+        let many = d
+            .record_deliveries(&t, Kind::Subscription, &[("urn:a", now, 3)])
+            .await
+            .expect("record");
+        let last = many[0].as_ref().expect("row present");
+        assert_eq!(last.doc["notification"]["timesSent"], 5, "{:?}", last.doc);
+        assert_eq!(last.prev_success, Some(Value::String(now.into())));
+    }
+
+    /// A batch driver that reports more rejections than the closure raised
+    /// has broken the contract: the batch fails instead of inventing an
+    /// error for the caller to read.
+    #[tokio::test]
+    async fn a_batch_driver_reporting_unraised_rejections_fails_the_batch() {
+        let t = TenantId::new("t").expect("tenant");
+        let d: std::sync::Arc<dyn CurrentStateDriver> =
+            std::sync::Arc::new(OneDoc(std::sync::Mutex::new(None)));
+        let e = d
+            .batch_mutate::<&str>(&t, &["urn:a".into()], |_, _| Ok(()))
+            .await
+            .expect_err("more rejections than raised");
+        assert_eq!(e.kind(), "InternalError");
+    }
+
+    /// A stored document that is not an object fails the one request.
+    #[test]
+    fn a_stored_document_that_is_no_object_is_an_internal_error() {
+        let mut v = serde_json::json!([1]);
+        assert_eq!(stored_object(&mut v).expect_err("array").kind(), "InternalError");
+        let mut o = serde_json::json!({"a": 1});
+        assert!(stored_object(&mut o).expect("object").contains_key("a"));
+    }
+
+    /// ADR-0021 row ownership: a `Cached` row is everybody's, an owned row
+    /// only its Tenant's, and a row without an owner the default Tenant's;
+    /// a call acting for no Tenant reaches only the cached rows.
+    #[test]
+    fn a_context_row_is_reached_only_by_its_owner_unless_cached() {
+        let acme = TenantId::new("acme").expect("tenant");
+        let default = TenantId::new(TenantId::DEFAULT).expect("tenant");
+        let cached = serde_json::json!({"kind": "Cached", "owner": "acme"});
+        let owned = serde_json::json!({"kind": "Hosted", "owner": "acme"});
+        let legacy = serde_json::json!({"kind": "Hosted"});
+        assert_eq!(context_row_owner(&cached), None);
+        assert_eq!(context_row_owner(&owned), Some("acme"));
+        assert_eq!(context_row_owner(&legacy), Some(TenantId::DEFAULT));
+        assert!(context_row_visible(&cached, None));
+        assert!(context_row_visible(&owned, Some(&acme)));
+        assert!(!context_row_visible(&owned, Some(&default)));
+        assert!(!context_row_visible(&owned, None));
+        assert!(context_row_visible(&legacy, Some(&default)));
     }
 
     #[tokio::test]
