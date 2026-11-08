@@ -280,9 +280,11 @@ async fn csr_tenant_federates_across_tenants_in_one_broker() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn health_reports_the_memory_mode() {
-    let broker = Broker::new();
-    let resp = broker.handle(req("GET", "/q/health", "")).await;
-    assert_eq!(resp.status(), 200);
-    let doc: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
-    assert_eq!(doc["store"], "memory");
+    // `Default` is the same broker as `new`: the in-memory store
+    for broker in [Broker::new(), Broker::default()] {
+        let resp = broker.handle(req("GET", "/q/health", "")).await;
+        assert_eq!(resp.status(), 200);
+        let doc: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(doc["store"], "memory");
+    }
 }
