@@ -4,7 +4,7 @@
 
 use crate::document::{context, covers, scope_paths, Policy, Table};
 use crate::subject::{Caller, Platform};
-use antares_api::policy::metadata::Metadata;
+use antares_api::policy::metadata::{Metadata, MEMBERS};
 use antares_api::policy::{
     Decision, Filter, Operation, Rule, Warning, FILTERABLE, NAME_READS, WHOLE_TENANT, WRITE_BY_ID,
 };
@@ -160,7 +160,6 @@ const METADATA_READS: [&str; 6] = ["5.7.1", "5.7.2", "5.7.3", "5.7.4", "5.14.4",
 /// `JC-Read-Versions`, and the gateway strips its `modifiedBy` and
 /// `provenance` (DM-140, DM-151).
 fn passed(applying: &[&Policy], clause: &str) -> Option<Box<Metadata>> {
-    const PLAIN: [&str; 4] = ["observedAt", "unitCode", "createdAt", "modifiedAt"];
     if !METADATA_READS.contains(&clause) {
         return None;
     }
@@ -194,7 +193,7 @@ fn passed(applying: &[&Policy], clause: &str) -> Option<Box<Metadata>> {
         .named
         .values()
         .chain([&out.rest])
-        .any(|m| PLAIN.iter().any(|p| !m.contains(*p)));
+        .any(|m| MEMBERS.iter().any(|p| !m.contains(*p)));
     narrows.then(|| Box::new(out))
 }
 
@@ -645,6 +644,7 @@ fn admits(p: &Policy, op: &Operation<'_>, types: &[String]) -> Vec<Admit> {
         .filter(|s| s.types.iter().any(|t| types.contains(t)))
         .filter(|s| op.ids.iter().all(|id| s.selects_id(id)))
         .filter(|s| s.attributes.is_empty() || op.attrs.iter().all(|a| s.attributes.contains(a)))
+        .filter(|s| removes_only_granted(s, op))
         .filter(|s| inside_scope(s, op.body))
         .filter(|s| inside_area(s, op.body))
         .filter_map(|s| {
@@ -666,6 +666,24 @@ fn admits(p: &Policy, op: &Operation<'_>, types: &[String]) -> Vec<Admit> {
             }
         })
         .collect()
+}
+
+/// The writes that remove what the stored Entity holds: a delete of the Entity (5.6.6, 5.6.10)
+/// and a replace (5.6.18, and an upsert, 5.6.8, whose mode the operation does not tell).
+const REMOVES_STORED: [&str; 4] = ["5.6.6", "5.6.8", "5.6.10", "5.6.18"];
+
+/// A grant listing Attributes admits a write that removes stored Attributes only when it lists
+/// every one the stored Entity holds (F-08): a replace naming one granted Attribute wipes the
+/// others, and a delete removes them all.
+fn removes_only_granted(s: &Rule, op: &Operation<'_>) -> bool {
+    s.attributes.is_empty()
+        || !REMOVES_STORED.contains(&op.clause)
+        || op.stored.is_none_or(|stored| {
+            stored
+                .attribute_names
+                .iter()
+                .all(|a| s.attributes.contains(a))
+        })
 }
 
 /// The body's `scope` lies inside the policy's scope tree (R29, R30).
