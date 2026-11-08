@@ -369,6 +369,13 @@ pub(crate) fn inprocess_context() -> Option<Arc<serde_json::Value>> {
     INPROCESS_CONTEXT.try_with(Arc::clone).ok()
 }
 
+#[cfg(feature = "views")]
+tokio::task_local! {
+    /// The view the in-process request this task serves came through, which
+    /// the shared router's state reads as its own ([`AppState::view`]).
+    static REQUEST_VIEW: Arc<crate::views::CompiledView>;
+}
+
 /// How many [`AppState::call`] frames the running task is inside: zero
 /// outside an in-process call. A caller that must not reach the router past
 /// [`crate::bounds::MAX_IN_PROCESS_CALL_DEPTH`] reads it to answer for
@@ -397,9 +404,19 @@ tokio::task_local! {
 pub struct AppState {
     shared: Arc<Shared>,
     /// The endpoint view every operation through this state is narrowed to
-    /// (ADR-0023); `None` serves the NGSI-LD API as it is.
+    /// (ADR-0023); `None` serves the NGSI-LD API as it is. Read through
+    /// [`AppState::view`].
     #[cfg(feature = "views")]
-    pub view: Option<Arc<crate::views::CompiledView>>,
+    view: Option<Arc<crate::views::CompiledView>>,
+    /// This is the state of the router every view shares (T-6677): its view
+    /// is the request's, [`REQUEST_VIEW`], and outside one it shows nothing.
+    #[cfg(feature = "views")]
+    per_request: bool,
+    /// The one router narrowed states call through, built on the first such
+    /// call and shared by every clone and narrowed copy of the state it
+    /// hangs off (T-6677: a router per view cost ~246 KiB).
+    #[cfg(feature = "views")]
+    viewed: Arc<std::sync::OnceLock<axum::Router>>,
     /// The router [`AppState::call`] serves in-process requests through,
     /// built on first use. Empty until a façade actually calls: building it
     /// costs about 1.5 ms, which is worth memoizing per state and not worth
@@ -607,6 +624,10 @@ impl std::ops::DerefMut for AppState {
         // the memoised in-process router captured the settings about to
         // change: a later call must build one over the new ones
         self.inbound = Arc::new(std::sync::OnceLock::new());
+        #[cfg(feature = "views")]
+        {
+            self.viewed = Arc::new(std::sync::OnceLock::new());
+        }
         Arc::make_mut(&mut self.shared)
     }
 }
@@ -638,7 +659,7 @@ impl AppState {
     #[must_use]
     pub fn same(&self, other: &Self) -> bool {
         #[cfg(feature = "views")]
-        let view = match (&self.view, &other.view) {
+        let view = match (&self.view(), &other.view()) {
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
             (a, b) => a.is_none() && b.is_none(),
         };
@@ -836,6 +857,10 @@ impl AppState {
         Self {
             #[cfg(feature = "views")]
             view: None,
+            #[cfg(feature = "views")]
+            per_request: false,
+            #[cfg(feature = "views")]
+            viewed: Arc::new(std::sync::OnceLock::new()),
             inbound: Arc::new(std::sync::OnceLock::new()),
             shared: Arc::new(Shared {
                 store,
@@ -925,8 +950,26 @@ impl AppState {
     pub fn with_view(&self, view: Arc<crate::views::CompiledView>) -> Self {
         let mut st = self.clone();
         st.view = Some(view);
+        st.per_request = false;
         st.inbound = Arc::new(std::sync::OnceLock::new());
         st
+    }
+
+    /// The view every operation through this state is narrowed to, if any.
+    /// The shared router's state answers the view of the request it serves;
+    /// a task it spawned without that view sees a view that shows nothing,
+    /// never the whole Tenant (fail closed).
+    #[cfg(feature = "views")]
+    #[must_use]
+    pub fn view(&self) -> Option<Arc<crate::views::CompiledView>> {
+        if self.per_request {
+            return Some(
+                REQUEST_VIEW
+                    .try_with(Arc::clone)
+                    .unwrap_or_else(|_| crate::views::CompiledView::nothing()),
+            );
+        }
+        self.view.clone()
     }
 
     /// Every stored view document's (ADR-0023 rule 10) id and digest, the
@@ -1321,6 +1364,22 @@ impl AppState {
             ))
             .into_response();
         }
+        #[cfg(feature = "views")]
+        if let Some(view) = self.view() {
+            let router = self.viewed.get_or_init(|| {
+                // Built from a state that holds no view of its own and a
+                // fresh cell, for the reason the memo below gives.
+                let mut inner = self.clone();
+                inner.view = None;
+                inner.per_request = true;
+                inner.viewed = Arc::new(std::sync::OnceLock::new());
+                inner.inbound = Arc::new(std::sync::OnceLock::new());
+                crate::router(inner)
+            });
+            return REQUEST_VIEW
+                .scope(view, self.serve_in_process(depth, router, caller, req))
+                .await;
+        }
         let router = self.inbound.get_or_init(|| {
             // Every layer of a built router captured an `AppState` clone, so
             // the memo owns states. The clone it is built from must NOT be
@@ -1333,6 +1392,18 @@ impl AppState {
             inner.inbound = Arc::new(std::sync::OnceLock::new());
             crate::router(inner)
         });
+        self.serve_in_process(depth, router, caller, req).await
+    }
+
+    /// [`AppState::call`] past its depth check, through `router`.
+    async fn serve_in_process(
+        &self,
+        depth: usize,
+        router: &axum::Router,
+        caller: &axum::http::HeaderMap,
+        req: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse as _;
         let (mut parts, body) = req.into_parts();
         for name in &PROPAGATED {
             if parts.headers.contains_key(name) {
@@ -2175,6 +2246,118 @@ mod clone_cost {
         let mut c = a.clone();
         c.max_limit = 1;
         assert_eq!(call(&c).await, axum::http::StatusCode::FORBIDDEN);
+    }
+}
+
+/// T-6677: every view calls through one router, which reads the view of
+/// the request it serves.
+#[cfg(all(test, feature = "views"))]
+mod shared_view_router {
+    use super::*;
+    use crate::policy::Rule;
+    use crate::views::CompiledView;
+    use axum::body::Body;
+    use axum::http::{HeaderMap, Request};
+
+    fn view_of(t: &str) -> Arc<CompiledView> {
+        Arc::new(
+            CompiledView::new(
+                &[t.into()],
+                None,
+                None,
+                None,
+                vec![Rule {
+                    types: vec![t.into()],
+                    attributes: vec!["speed".into()],
+                    ..Rule::default()
+                }],
+            )
+            .expect("a view")
+            .named(t),
+        )
+    }
+
+    async fn ids(st: &AppState) -> Vec<String> {
+        let req = Request::get("/ngsi-ld/v1/entities?type=Car,Bike&limit=100")
+            .body(Body::empty())
+            .expect("request");
+        let r = st.call(&HeaderMap::new(), req).await;
+        let bytes = axum::body::to_bytes(r.into_body(), 1 << 20)
+            .await
+            .expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let mut ids: Vec<String> = v
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e["id"].as_str().map(str::to_owned))
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    async fn seeded() -> AppState {
+        let st = AppState::new("antares-test".into());
+        for (id, t) in [("urn:ngsi-ld:Car:1", "Car"), ("urn:ngsi-ld:Bike:1", "Bike")] {
+            let body =
+                serde_json::json!({"id": id, "type": t, "speed": {"type": "Property", "value": 1}});
+            let body = body.to_string();
+            let req = Request::post("/ngsi-ld/v1/entities")
+                .header("content-type", "application/json")
+                .header("content-length", body.len())
+                .body(Body::from(body))
+                .expect("request");
+            let r = st.call(&HeaderMap::new(), req).await;
+            assert!(r.status().is_success(), "{}", r.status());
+        }
+        st
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_view_sees_its_own_entities_through_the_one_router() {
+        let st = seeded().await;
+        let (cars, bikes) = (st.with_view(view_of("Car")), st.with_view(view_of("Bike")));
+        let runs: Vec<_> = (0..32)
+            .map(|i| {
+                let st = if i % 2 == 0 {
+                    cars.clone()
+                } else {
+                    bikes.clone()
+                };
+                tokio::spawn(async move { (i % 2, ids(&st).await) })
+            })
+            .collect();
+        for run in runs {
+            let (odd, got) = run.await.expect("joined");
+            let want = if odd == 0 {
+                "urn:ngsi-ld:Car:1"
+            } else {
+                "urn:ngsi-ld:Bike:1"
+            };
+            assert_eq!(got, vec![want.to_owned()]);
+        }
+        assert!(Arc::ptr_eq(&cars.viewed, &bikes.viewed), "one router cell");
+        assert!(cars.viewed.get().is_some(), "built once, by the first call");
+        assert!(cars.inbound.get().is_none(), "no router of the view's own");
+        assert_eq!(ids(&st).await.len(), 2, "the plain API is not narrowed");
+    }
+
+    /// Fail closed: the shared router's state outside the request whose
+    /// view it serves (a task it spawned) reads a view that shows nothing.
+    #[tokio::test]
+    async fn the_shared_state_without_its_request_shows_nothing() {
+        let st = seeded().await;
+        let mut shared = st.clone();
+        shared.per_request = true;
+        let seen = shared.view().expect("a view");
+        assert!(Arc::ptr_eq(&seen, &CompiledView::nothing()));
+        assert_eq!(ids(&shared).await, Vec::<String>::new());
+        let cars = view_of("Car");
+        let inside = REQUEST_VIEW
+            .scope(cars.clone(), async { shared.view() })
+            .await
+            .expect("a view");
+        assert!(Arc::ptr_eq(&inside, &cars), "inside the request: its view");
     }
 }
 

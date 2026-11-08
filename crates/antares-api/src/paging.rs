@@ -84,7 +84,7 @@ pub(crate) fn keyset_allowed(params: &HashMap<String, String>) -> bool {
 /// API (a view never named still differs from it).
 #[cfg(feature = "views")]
 pub(crate) fn view_of(st: &AppState) -> String {
-    st.view
+    st.view()
         .as_deref()
         .map_or_else(String::new, |v| format!("view:{}", v.id()))
 }

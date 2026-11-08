@@ -68,7 +68,7 @@ use axum::response::Response;
 use axum::Router;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// The policy seam's public types (ADR-0020), so a surface names no
 /// `antares-api` item.
@@ -130,7 +130,7 @@ pub struct Ops {
     /// The narrowed handle of each view served lately, so a request does
     /// not build the narrowed state and its in-process router anew; an
     /// idle one is dropped ([`view_cache`]).
-    views: Arc<Mutex<view_cache::ViewCache<ViewOps>>>,
+    views: Arc<view_cache::ViewCache<ViewOps>>,
     /// The surface these operations are run for, named on each one's log
     /// line (threat G10); `None` for the broker's own in-process forwards.
     surface: Option<Arc<str>>,
@@ -499,8 +499,7 @@ impl Ops {
         // Only views loaded now stay cached: a removed one goes with the
         // next sweep. A changed view is a new `CompiledView`, so a handle
         // of the old one is never served again.
-        let (made, gone) = view_cache::ViewCache::get_or_build(
-            &self.views,
+        let (made, gone) = self.views.get_or_build(
             id,
             |held| Arc::ptr_eq(&held.view, view),
             |k| table.contains_key(k),

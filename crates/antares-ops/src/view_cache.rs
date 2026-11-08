@@ -7,13 +7,14 @@
 //!
 //! The handle is a cache of the table, never its source: the narrowing,
 //! operations and policy live in the view table and the engine, which
-//! eviction never touches. A build runs under its view's own build lock,
-//! outside the cache's lock (T-6611, R3-003): concurrent first requests for
-//! a view share one build and none answers before it is complete, while
-//! requests through every other view go on; a failed build caches nothing.
+//! eviction never touches. A build runs under its view's own lock, so
+//! concurrent first requests for a view share one build and none answers
+//! before it is complete, while requests for other views go on (T-6677); a
+//! failed build caches nothing.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 /// How long a view's handle is kept after the last request through it,
@@ -56,38 +57,60 @@ pub(crate) fn idle() -> Duration {
 }
 
 /// Built handles by view id, each with when a request last used it.
+///
+/// A hit takes the map's read lock only, so warm requests never queue
+/// behind a build (T-6677). A miss builds outside the map lock, under the
+/// key's own lock: concurrent first requests for one view share one build,
+/// and a cold build of one view delays no request for another.
 pub(crate) struct ViewCache<T> {
-    held: BTreeMap<String, (T, Instant)>,
-    swept: Option<Instant>,
-    /// The build lock of each view a request is building now.
-    building: BTreeMap<String, Arc<Mutex<()>>>,
+    held: RwLock<HashMap<String, Arc<Slot<T>>>>,
+    /// When the last sweep ran, in nanoseconds after `base`.
+    swept: AtomicU64,
+    base: Instant,
+}
+
+/// One view's handle, built at most once.
+struct Slot<T> {
+    made: OnceLock<T>,
+    /// Held while the handle is built, so a second request waits for it.
+    building: Mutex<()>,
+    /// When a request last used it, in nanoseconds after the cache's `base`.
+    used: AtomicU64,
 }
 
 impl<T> Default for ViewCache<T> {
     fn default() -> Self {
         Self {
-            held: BTreeMap::new(),
-            swept: None,
-            building: BTreeMap::new(),
+            held: RwLock::default(),
+            swept: AtomicU64::new(u64::MAX),
+            base: Instant::now(),
         }
     }
 }
 
-fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
+fn read<T>(l: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn write<T>(l: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl<T: Clone> ViewCache<T> {
+    fn at(&self, now: Instant) -> u64 {
+        u64::try_from(now.saturating_duration_since(self.base).as_nanos()).unwrap_or(u64::MAX - 1)
+    }
+
     /// The handle of `id` when one is held and `current` says it was built
     /// from the view the table holds now; else `build`'s, held from `now`
     /// on. `loaded` says which ids the table still holds: every other one,
-    /// and every handle idle for `idle`, is dropped on a build and at least
-    /// once a minute; the dropped handles are returned, for the caller to
-    /// free outside the lock (690 of them take ~140 ms). Builds are counted
-    /// on `antares_view_builds_total`. `cache`'s lock is never held over
-    /// `build`.
+    /// and every handle idle for `idle`, is dropped at least once a minute;
+    /// the dropped handles are returned, for the caller to free outside the
+    /// lock (690 of them take ~140 ms). A failed build holds nothing, so the
+    /// next request builds again. Builds are counted on
+    /// `antares_view_builds_total`.
     pub(crate) fn get_or_build(
-        cache: &Mutex<Self>,
+        &self,
         id: &str,
         current: impl Fn(&T) -> bool,
         loaded: impl Fn(&str) -> bool,
@@ -95,57 +118,79 @@ impl<T: Clone> ViewCache<T> {
         idle: Duration,
         build: impl FnOnce() -> Option<T>,
     ) -> (Option<T>, Vec<T>) {
-        let mut gone = Vec::new();
+        let at = self.at(now);
+        let gone = self.sweep_due(&loaded, at, idle);
+        let slot = read(&self.held).get(id).cloned();
+        if let Some(s) = &slot {
+            if let Some(held) = s.made.get().filter(|h| current(h)) {
+                s.used.fetch_max(at, Ordering::Relaxed);
+                return (Some(held.clone()), gone);
+            }
+        }
         let slot = {
-            let mut c = locked(cache);
-            if c.swept
-                .is_none_or(|at| now.saturating_duration_since(at) >= SWEEP_EVERY)
-            {
-                c.sweep(&loaded, now, idle, &mut gone);
+            let mut map = write(&self.held);
+            if let Some(s) = map.get(id).filter(|s| s.made.get().is_none_or(&current)) {
+                s.clone()
+            } else {
+                let s = Arc::new(Slot {
+                    made: OnceLock::new(),
+                    building: Mutex::new(()),
+                    used: AtomicU64::new(at),
+                });
+                map.insert(id.to_owned(), s.clone());
+                s
             }
-            if let Some(held) = c.hit(id, &current, now) {
-                return (Some(held), gone);
-            }
-            c.building.entry(id.to_owned()).or_default().clone()
         };
-        let _building = locked(&slot);
-        // a build that ran while this one waited for the slot
-        if let Some(held) = locked(cache).hit(id, &current, now) {
-            return (Some(held), gone);
+        let guard = slot.building.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(held) = slot.made.get().filter(|h| current(h)) {
+            slot.used.fetch_max(at, Ordering::Relaxed);
+            return (Some(held.clone()), gone);
         }
-        let made = build();
-        let mut c = locked(cache);
-        if c.building.get(id).is_some_and(|b| Arc::ptr_eq(b, &slot)) {
-            c.building.remove(id);
-        }
-        let Some(made) = made else {
+        let Some(made) = build() else {
+            drop(guard);
+            let mut map = write(&self.held);
+            if map.get(id).is_some_and(|s| Arc::ptr_eq(s, &slot)) {
+                map.remove(id);
+            }
             return (None, gone);
         };
         metrics::counter!("antares_view_builds_total").increment(1);
-        c.sweep(&loaded, now, idle, &mut gone);
-        c.held.insert(id.to_owned(), (made.clone(), now));
+        let _ = slot.made.set(made.clone());
+        slot.used.fetch_max(at, Ordering::Relaxed);
         (Some(made), gone)
     }
 
-    fn hit(&mut self, id: &str, current: &impl Fn(&T) -> bool, now: Instant) -> Option<T> {
-        let (held, used) = self.held.get_mut(id).filter(|(h, _)| current(h))?;
-        *used = now;
-        Some(held.clone())
+    /// Sweep when the last sweep is a minute old, else nothing.
+    fn sweep_due(&self, loaded: &impl Fn(&str) -> bool, at: u64, idle: Duration) -> Vec<T> {
+        let last = self.swept.load(Ordering::Relaxed);
+        let every = u64::try_from(SWEEP_EVERY.as_nanos()).unwrap_or(u64::MAX);
+        if last != u64::MAX && at.saturating_sub(last) < every {
+            return Vec::new();
+        }
+        // One request sweeps; the others go on.
+        if self
+            .swept
+            .compare_exchange(last, at, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return Vec::new();
+        }
+        let idle = u64::try_from(idle.as_nanos()).unwrap_or(u64::MAX);
+        let mut gone = Vec::new();
+        write(&self.held).retain(|id, s| {
+            let keep = loaded(id) && at.saturating_sub(s.used.load(Ordering::Relaxed)) < idle;
+            if !keep {
+                gone.extend(s.made.get().cloned());
+            }
+            keep
+        });
+        gone
     }
 
-    fn sweep(
-        &mut self,
-        loaded: &impl Fn(&str) -> bool,
-        now: Instant,
-        idle: Duration,
-        gone: &mut Vec<T>,
-    ) {
-        let (keep, drop): (BTreeMap<_, _>, BTreeMap<_, _>) = std::mem::take(&mut self.held)
-            .into_iter()
-            .partition(|(id, (_, used))| loaded(id) && now.saturating_duration_since(*used) < idle);
-        self.held = keep;
-        gone.extend(drop.into_values().map(|(h, _)| h));
-        self.swept = Some(now);
+    /// How many handles are held.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        read(&self.held).len()
     }
 }
 
@@ -166,20 +211,19 @@ pub(crate) fn release<T: Send + 'static>(gone: Vec<T>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Barrier;
 
     const HOUR: Duration = Duration::from_secs(3600);
 
     fn get(
-        c: &Mutex<ViewCache<u32>>,
+        c: &ViewCache<u32>,
         id: &str,
         version: u32,
         now: Instant,
         builds: &AtomicUsize,
     ) -> Option<u32> {
-        ViewCache::get_or_build(
-            c,
+        c.get_or_build(
             id,
             |held| *held == version,
             |_| true,
@@ -195,7 +239,7 @@ mod tests {
 
     #[test]
     fn concurrent_first_requests_build_once_and_all_get_the_view() {
-        let cache = Arc::new(Mutex::new(ViewCache::<u32>::default()));
+        let cache = Arc::new(ViewCache::<u32>::default());
         let builds = Arc::new(AtomicUsize::new(0));
         let start = Arc::new(Barrier::new(16));
         let now = Instant::now();
@@ -204,7 +248,21 @@ mod tests {
                 let (cache, builds, start) = (cache.clone(), builds.clone(), start.clone());
                 std::thread::spawn(move || {
                     start.wait();
-                    get(&cache, "cars", 7, now, &builds)
+                    cache
+                        .get_or_build(
+                            "cars",
+                            |held| *held == 7,
+                            |_| true,
+                            now,
+                            HOUR,
+                            || {
+                                builds.fetch_add(1, Ordering::SeqCst);
+                                // long enough that every thread arrives during the build
+                                std::thread::sleep(Duration::from_millis(50));
+                                Some(7)
+                            },
+                        )
+                        .0
                 })
             })
             .collect::<Vec<_>>()
@@ -215,53 +273,65 @@ mod tests {
         assert_eq!(got, vec![Some(7); 16]);
     }
 
-    /// A view building (cold, ~2 ms in prod) leaves a hit on another view
-    /// free to answer (T-6611, R3-003): on dev b683bfc3 the build ran under
-    /// the one cache lock every surface request takes.
+    /// T-6677: a flood of cold first requests must not serialise warm ones.
+    /// The build of `cold` waits until a warm request for `cars` has been
+    /// answered; under one cache lock around builds it never would be.
     #[test]
-    fn a_build_does_not_hold_up_a_hit_on_another_view() {
-        let cache = Arc::new(Mutex::new(ViewCache::<u32>::default()));
+    fn a_cold_build_does_not_hold_up_a_warm_request() {
+        let cache = Arc::new(ViewCache::<u32>::default());
         let builds = AtomicUsize::new(0);
         let now = Instant::now();
         assert_eq!(get(&cache, "cars", 1, now, &builds), Some(1));
-        let (building, release) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
-        let slow = {
-            let (cache, building, release) = (cache.clone(), building.clone(), release.clone());
-            std::thread::spawn(move || {
-                ViewCache::get_or_build(
-                    &cache,
-                    "bikes",
-                    |_| true,
-                    |_| true,
-                    now,
-                    HOUR,
-                    || {
-                        building.wait();
-                        release.wait();
-                        Some(2)
-                    },
-                )
-                .0
-            })
-        };
-        building.wait();
-        let (tx, rx) = std::sync::mpsc::channel();
-        {
+        let (warm_tx, warm_rx) = std::sync::mpsc::channel::<()>();
+        let (building_tx, building_rx) = std::sync::mpsc::channel::<()>();
+        let cold = {
             let cache = cache.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(get(&cache, "cars", 1, now, &AtomicUsize::new(0)));
-            });
-        }
-        let hit = rx.recv_timeout(Duration::from_secs(5));
-        release.wait();
-        assert_eq!(hit, Ok(Some(1)), "the hit waited for another view's build");
-        assert_eq!(slow.join().ok().flatten(), Some(2));
-        assert_eq!(builds.load(Ordering::SeqCst), 1);
+                cache
+                    .get_or_build(
+                        "cold",
+                        |_| true,
+                        |_| true,
+                        now,
+                        HOUR,
+                        || {
+                            let _ = building_tx.send(());
+                            warm_rx
+                                .recv_timeout(Duration::from_secs(5))
+                                .ok()
+                                .map(|()| 2)
+                        },
+                    )
+                    .0
+            })
+        };
+        building_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the cold build started");
+        let warm = {
+            let cache = cache.clone();
+            std::thread::spawn(move || {
+                let builds = AtomicUsize::new(0);
+                let hit = get(&cache, "cars", 1, now, &builds);
+                let _ = warm_tx.send(());
+                hit
+            })
+        };
+        assert_eq!(
+            warm.join().ok().flatten(),
+            Some(1),
+            "the warm hit was answered"
+        );
+        assert_eq!(
+            cold.join().ok().flatten(),
+            Some(2),
+            "and the cold build finished after it"
+        );
     }
 
     #[test]
     fn an_idle_view_is_dropped_and_reloads_the_current_version() {
-        let c = Mutex::new(ViewCache::default());
+        let c = ViewCache::default();
         let builds = AtomicUsize::new(0);
         let t0 = Instant::now();
         assert_eq!(get(&c, "cars", 1, t0, &builds), Some(1));
@@ -269,7 +339,7 @@ mod tests {
         assert_eq!(builds.load(Ordering::SeqCst), 1);
         // a request on another view an hour after the last use of `cars` sweeps it
         assert_eq!(get(&c, "bikes", 1, t0 + HOUR / 2 + HOUR, &builds), Some(1));
-        assert_eq!(locked(&c).held.len(), 1);
+        assert_eq!(c.len(), 1);
         // the view changed while evicted: the reload builds the table's version, not the old one
         assert_eq!(get(&c, "cars", 2, t0 + 2 * HOUR, &builds), Some(2));
         assert_eq!(builds.load(Ordering::SeqCst), 3);
@@ -277,7 +347,7 @@ mod tests {
 
     #[test]
     fn a_hit_sweeps_idle_views_once_a_minute() {
-        let c = Mutex::new(ViewCache::default());
+        let c = ViewCache::default();
         let builds = AtomicUsize::new(0);
         let t0 = Instant::now();
         get(&c, "cars", 1, t0, &builds);
@@ -289,13 +359,13 @@ mod tests {
             &builds,
         );
         get(&c, "bikes", 1, t0 + HOUR, &builds);
-        assert_eq!(locked(&c).held.len(), 1, "cars went on the hit's sweep");
+        assert_eq!(c.len(), 1, "cars went on the hit's sweep");
         assert_eq!(builds.load(Ordering::SeqCst), 2);
     }
 
     #[test]
     fn a_changed_view_is_rebuilt_and_a_request_never_gets_the_old_one() {
-        let c = Mutex::new(ViewCache::default());
+        let c = ViewCache::default();
         let builds = AtomicUsize::new(0);
         let t0 = Instant::now();
         assert_eq!(get(&c, "cars", 1, t0, &builds), Some(1));
@@ -305,34 +375,32 @@ mod tests {
     }
 
     #[test]
-    fn a_removed_view_goes_on_the_next_build() {
-        let c = Mutex::new(ViewCache::default());
+    fn a_removed_view_goes_on_the_next_sweep() {
+        let c = ViewCache::default();
         let t0 = Instant::now();
         for id in ["cars", "bikes"] {
-            ViewCache::get_or_build(&c, id, |_| true, |_| true, t0, HOUR, || Some(1_u32));
+            c.get_or_build(id, |_| true, |_| true, t0, HOUR, || Some(1_u32));
         }
-        let (_, gone) = ViewCache::get_or_build(
-            &c,
+        let (_, gone) = c.get_or_build(
             "buses",
             |_| true,
             |id| id != "cars",
-            t0,
+            t0 + SWEEP_EVERY,
             HOUR,
             || Some(2),
         );
-        assert_eq!(locked(&c).held.len(), 2);
+        assert_eq!(c.len(), 2);
         assert_eq!(gone, vec![1], "the removed handle is handed back to free");
     }
 
     #[test]
     fn a_failed_build_is_not_cached_and_is_retried() {
-        let c = Mutex::new(ViewCache::<u32>::default());
+        let c = ViewCache::<u32>::default();
         let t0 = Instant::now();
-        let (none, _) = ViewCache::get_or_build(&c, "cars", |_| true, |_| true, t0, HOUR, || None);
+        let (none, _) = c.get_or_build("cars", |_| true, |_| true, t0, HOUR, || None);
         assert_eq!(none, None);
-        assert_eq!(locked(&c).held.len(), 0);
-        let (some, _) =
-            ViewCache::get_or_build(&c, "cars", |_| true, |_| true, t0, HOUR, || Some(3));
+        assert_eq!(c.len(), 0);
+        let (some, _) = c.get_or_build("cars", |_| true, |_| true, t0, HOUR, || Some(3));
         assert_eq!(some, Some(3));
     }
 
