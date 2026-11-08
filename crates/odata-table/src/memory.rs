@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: EUPL-1.2
+// SPDX-License-Identifier: MIT
 //! [`MemoryTable`]: rows held in memory, evaluated by the reference semantics.
 
 use std::collections::HashSet;

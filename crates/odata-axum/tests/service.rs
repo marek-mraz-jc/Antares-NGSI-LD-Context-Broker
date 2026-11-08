@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: EUPL-1.2
+// SPDX-License-Identifier: MIT
 //! One `Service` definition serving a `MemoryTable` and a `GitTable` (T-6642 owner addition):
 //! `$metadata`, OpenAPI 3.1 with the same fields, `$export` and `$allowed` agreeing with the
 //! real call.

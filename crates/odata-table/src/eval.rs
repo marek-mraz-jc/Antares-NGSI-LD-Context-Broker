@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: EUPL-1.2
+// SPDX-License-Identifier: MIT
 //! The reference semantics: a [`Cond`] and a sort order evaluated over one JSON row. Every
 //! other source is tested to answer what this answers.
 

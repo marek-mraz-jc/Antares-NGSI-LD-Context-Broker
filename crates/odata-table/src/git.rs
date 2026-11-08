@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: EUPL-1.2
+// SPDX-License-Identifier: MIT
 //! [`GitTable`]: the YAML and JSON files of a repository at one commit, one file one row.
 //!
 //! The files are read from the object store (`git ls-tree`, `git cat-file`), never from a

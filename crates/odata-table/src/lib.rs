@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: EUPL-1.2
+// SPDX-License-Identifier: MIT
 //! OData 4.01 entity sets over any row source (T-6642): one [`Table`] interface, one query
 //! [`Plan`], and three sources behind it.
 //!

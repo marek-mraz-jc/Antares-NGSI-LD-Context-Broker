@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: EUPL-1.2
+// SPDX-License-Identifier: MIT
 //! What validation and the writers answer instead of a document.
 
 use std::fmt;

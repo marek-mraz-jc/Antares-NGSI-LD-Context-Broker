@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: EUPL-1.2
+// SPDX-License-Identifier: MIT
 //! Two entity sets from one `Service` definition, served by `table_router` on
 //! `127.0.0.1:<port>/odata/`: `Things` from memory, or `Files` from a Git repository at one
 //! commit when one is given (one set per run: the .NET check reads a service's first set). For the conformance suites (joinedcontext-conformance tests/odata) and the

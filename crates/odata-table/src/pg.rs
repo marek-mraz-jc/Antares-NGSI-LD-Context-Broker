@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: EUPL-1.2
+// SPDX-License-Identifier: MIT
 //! [`PgTable`]: a plan pushed down to PostgreSQL.
 //!
 //! Every value of the request reaches the database as a bound parameter, property names

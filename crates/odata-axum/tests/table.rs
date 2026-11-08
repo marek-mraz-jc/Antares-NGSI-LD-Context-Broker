@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: EUPL-1.2
+// SPDX-License-Identifier: MIT
 //! `table_router` serving a `MemoryTable` (T-6642): pages, count, key, refusals, scope.
 
 use std::sync::Arc;

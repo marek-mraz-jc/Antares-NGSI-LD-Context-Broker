@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: EUPL-1.2
+// SPDX-License-Identifier: MIT
 //! `commonExpr` and `boolCommonExpr` (ABNF section 4) for `$filter` and `$orderby`.
 //!
 //! The ABNF lists operators without precedence; the tree follows URL Conventions 5.1.1.16:

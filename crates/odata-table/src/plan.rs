@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: EUPL-1.2
+// SPDX-License-Identifier: MIT
 //! Query options to one [`Plan`] every source executes: what is supported is decided here.
 
 use odata_url::{CompareOp, EdmModel, Expr, Literal, Member, Method, Model as _, SelectItem};

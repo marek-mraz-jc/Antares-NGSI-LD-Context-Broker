@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: EUPL-1.2
+// SPDX-License-Identifier: MIT
 //! One definition per entity set, written once (owner 2026-11-07): its fields, the operations it
 //! offers and the permission each needs. From it come the CSDL model (`$metadata` and URL
 //! parsing), the OpenAPI 3.1 document, the [`TableInfo`] a source serves, and [`allowed`], the

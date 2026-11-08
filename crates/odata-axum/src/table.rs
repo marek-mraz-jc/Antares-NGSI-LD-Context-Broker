@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: EUPL-1.2
+// SPDX-License-Identifier: MIT
 //! [`table_router`]: any [`Table`] served read-only, with the service and metadata documents.
 
 use std::sync::Arc;

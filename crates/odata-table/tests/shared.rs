@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: EUPL-1.2
+// SPDX-License-Identifier: MIT
 //! One query table answered by `MemoryTable`, `GitTable` and `PgTable` over the same rows (T-6642):
 //! same rows, same order, same count, same next page, same refusal on every source.
 //!
