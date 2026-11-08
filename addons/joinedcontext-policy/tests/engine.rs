@@ -790,12 +790,15 @@ async fn coordinates_outside_the_granted_area_are_refused() -> Res {
     assert_eq!(code, StatusCode::FORBIDDEN);
     // F-08: a partial update of the location itself is judged on the new
     // location too, not on the bare instance the request carries
-    let mut zone = with(
-        writer(json!([{"entities": [{"type": "Car"}]}])),
-        "geoQ",
-        json!(AREA),
+    let zone = with(
+        with(
+            writer(json!([{"entities": [{"type": "Car"}]}])),
+            "geoQ",
+            json!(AREA),
+        ),
+        "operations",
+        json!(["5.6.1", "5.6.4"]),
     );
-    zone["operations"] = json!(["5.6.1", "5.6.4"]);
     let (st, _) = broker(doc(&[zone])).await?;
     seed(&st, &[at(23, 0.5)]).await?;
     let to = |x: f64| json!({"value": {"type": "Point", "coordinates": [x, 0.5]}});
@@ -860,19 +863,28 @@ async fn a_replace_or_delete_keeps_unlisted_stored_attributes_refused() -> Res {
 /// slice and a replace that drops the stored scope out of `scopeQ` are refused.
 #[tokio::test]
 async fn a_write_may_not_move_the_entity_out_of_its_condition() -> Res {
-    let mut slow = with(
-        writer(json!([{"entities": [{"type": "Car"}]}])),
-        "q",
-        json!("speed<50"),
+    let slow = with(
+        with(
+            writer(json!([{"entities": [{"type": "Car"}]}])),
+            "q",
+            json!("speed<50"),
+        ),
+        "operations",
+        json!(["5.6.2"]),
     );
-    slow["operations"] = json!(["5.6.2"]);
-    let mut here = with(
-        writer(json!([{"entities": [{"type": "Car"}]}])),
-        "scopeQ",
-        json!("/geo/SK/BB"),
+    let here = with(
+        with(
+            with(
+                writer(json!([{"entities": [{"type": "Car"}]}])),
+                "scopeQ",
+                json!("/geo/SK/BB"),
+            ),
+            "id",
+            json!("s"),
+        ),
+        "operations",
+        json!(["5.6.18"]),
     );
-    here["id"] = json!("s");
-    here["operations"] = json!(["5.6.18"]);
     let (st, _) = broker(doc(&[slow, here])).await?;
     fleet(&st).await?;
     let one = "/ngsi-ld/v1/entities/urn:ngsi-ld:Car:1";
@@ -880,7 +892,11 @@ async fn a_write_may_not_move_the_entity_out_of_its_condition() -> Res {
     let (code, _) = send(&st, "PATCH", &format!("{one}/attrs"), &ANA, Some(&fast)).await?;
     assert_eq!(code, StatusCode::FORBIDDEN);
     let (code, body) = send(&st, "GET", one, &ADMIN, None).await?;
-    assert_eq!(body["speed"]["value"], json!(10), "{code} {body}");
+    assert_eq!(
+        body.pointer("/speed/value"),
+        Some(&json!(10)),
+        "{code} {body}"
+    );
     let unscoped = json!({"id": "urn:ngsi-ld:Car:1", "type": "Car", "speed": prop(json!(10))});
     let (code, _) = send(&st, "PUT", one, &ANA, Some(&unscoped)).await?;
     assert_eq!(code, StatusCode::FORBIDDEN);

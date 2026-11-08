@@ -17,7 +17,7 @@
 //! `@context` (its Link header, or the one a surface's in-process call
 //! carries), the one the answer was compacted with, and compared with the
 //! engine's IRIs. A POST query's body `q`, `orderBy` and `temporalQ` are
-//! refused inside its handler ([`Metadata::refuse_body`]), with the body's
+//! refused inside its handler (`Metadata::refuse_body`), with the body's
 //! `@context`.
 
 use crate::policy::Denied;
