@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: EUPL-1.2
+// SPDX-License-Identifier: MIT
 //! What a parse answers when it does not answer an [`ODataUri`](crate::ODataUri).
 
 use std::fmt;
