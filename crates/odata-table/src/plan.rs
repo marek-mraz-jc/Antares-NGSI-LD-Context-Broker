@@ -34,20 +34,35 @@ pub enum Cond {
         /// The property path.
         path: Vec<String>,
     },
-    /// The string at `path` contains, starts or ends with `needle`; `false` for a non-string.
+    /// The string at `path`, folded by `case` first when set (`tolower`, `toupper`), equals,
+    /// contains, starts or ends with `needle`; `false` for a non-string.
     Text {
         /// The property path.
         path: Vec<String>,
         /// Which test.
         op: TextOp,
-        /// The text looked for.
+        /// The text looked for, as given: a case-blind test passes it already folded.
         needle: String,
+        /// The case the row's string is folded to before the test; `None` compares it as stored.
+        case: Option<Case>,
     },
+}
+
+/// The case fold of [`Cond::Text`]: `tolower` or `toupper` around the property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Case {
+    /// `tolower`.
+    Lower,
+    /// `toupper`.
+    Upper,
 }
 
 /// The string tests of [`Cond::Text`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextOp {
+    /// `eq`: only on a folded string (`tolower(name) eq 'x'`); a plain `eq` is a
+    /// [`Cond::Compare`].
+    Equals,
     /// `contains`.
     Contains,
     /// `startswith`.
@@ -173,7 +188,23 @@ impl Planner<'_> {
             Expr::Or(a, b) => Cond::Or(Box::new(self.cond(a)?), Box::new(self.cond(b)?)),
             Expr::Not(a) => Cond::Not(Box::new(self.cond(a)?)),
             Expr::Literal(Literal::Bool(b)) => Cond::Const(*b),
-            Expr::Compare(left, op, right) => self.compare(left, *op, right)?,
+            Expr::Compare(left, op, right) => match (folded(left), folded(right)) {
+                (Some((case, member)), _) => self.folded_eq(case, member, *op, right)?,
+                (_, Some((case, member))) => self.folded_eq(case, member, flipped(*op), left)?,
+                _ => self.compare(left, *op, right)?,
+            },
+            Expr::In(left, list) if folded(left).is_some() => {
+                let Some((case, member)) = folded(left) else {
+                    return Err(TableError::NotImplemented("this expression".into()));
+                };
+                let mut out = Cond::Const(false);
+                for literal in list {
+                    let literal = Expr::Literal(literal.clone());
+                    let one = self.folded_eq(case, member, CompareOp::Eq, &literal)?;
+                    out = Cond::Or(Box::new(out), Box::new(one));
+                }
+                out
+            }
             Expr::In(left, list) => {
                 let path = self.member(left)?;
                 let mut out = Cond::Const(false);
@@ -193,9 +224,18 @@ impl Planner<'_> {
                 let [haystack, needle] = args.as_slice() else {
                     return Err(TableError::NotImplemented(method.name().to_owned()));
                 };
+                let (case, haystack) = match folded(haystack) {
+                    Some((case, member)) => (Some(case), member),
+                    None => (None, haystack),
+                };
                 let path = self.member(haystack)?;
                 match self.literal(needle)? {
-                    Some(Value::String(needle)) => Cond::Text { path, op, needle },
+                    Some(Value::String(needle)) => Cond::Text {
+                        path,
+                        op,
+                        needle,
+                        case,
+                    },
                     // contains(x, null) is null: no row
                     None => Cond::Const(false),
                     Some(_) => {
@@ -231,6 +271,40 @@ impl Planner<'_> {
             (Some(value), CompareOp::Ne) => Cond::Not(Box::new(equal(path, value))),
             (Some(value), op) => Cond::Compare { path, op, value },
         })
+    }
+
+    /// `tolower(path) eq 'x'` (or `ne`, or the literal first): a string test on the folded
+    /// value; any other comparison of a folded value is not supported.
+    fn folded_eq(
+        &self,
+        case: Case,
+        member: &Expr,
+        op: CompareOp,
+        literal: &Expr,
+    ) -> Result<Cond, TableError> {
+        let path = self.member(member)?;
+        let equals = match self.literal(literal)? {
+            Some(Value::String(needle)) => Cond::Text {
+                path,
+                op: TextOp::Equals,
+                needle,
+                case: Some(case),
+            },
+            // tolower(null) is null: equal to null exactly when the value is
+            None => Cond::IsNull { path },
+            Some(_) => {
+                return Err(TableError::BadRequest(
+                    "tolower and toupper compare with a string".into(),
+                ))
+            }
+        };
+        match op {
+            CompareOp::Eq => Ok(equals),
+            CompareOp::Ne => Ok(Cond::Not(Box::new(equals))),
+            _ => Err(TableError::NotImplemented(
+                "ordering by tolower or toupper (eq and ne are served)".into(),
+            )),
+        }
     }
 
     fn member(&self, expr: &Expr) -> Result<Vec<String>, TableError> {
@@ -357,6 +431,22 @@ fn value(literal: &Literal) -> Result<Value, TableError> {
         }
         Literal::Binary(_) => return Err(TableError::NotImplemented("binary literals".into())),
     })
+}
+
+/// `tolower(member)` or `toupper(member)`: the case and the member inside.
+fn folded(expr: &Expr) -> Option<(Case, &Expr)> {
+    let Expr::Call(method, args) = expr else {
+        return None;
+    };
+    let case = match method {
+        Method::ToLower => Case::Lower,
+        Method::ToUpper => Case::Upper,
+        _ => return None,
+    };
+    match args.as_slice() {
+        [member @ Expr::Member(_)] => Some((case, member)),
+        _ => None,
+    }
 }
 
 /// `path eq value`, with `null` in an `in` list meaning "is null".

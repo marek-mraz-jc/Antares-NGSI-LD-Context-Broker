@@ -18,8 +18,9 @@
 //! changes nothing, and the source applies the [`Batch`] all or nothing.
 //!
 //! The supported subset: `$filter` with `eq ne gt ge lt le and or not in`, `contains`,
-//! `startswith`, `endswith`, null comparisons and nested complex property paths; `$orderby` on
-//! primitive paths (nulls first ascending, last descending, the key breaking ties); `$select` of
+//! `startswith`, `endswith`, `tolower`/`toupper` around a property in `eq`, `ne`, `in` and
+//! those three (the case-blind search, T-6663), null comparisons and nested complex property
+//! paths; `$orderby` on primitive paths (nulls first ascending, last descending, the key breaking ties); `$select` of
 //! top-level properties; `$top`, `$skip`, `$count` and server-driven paging by `$skiptoken`.
 //!
 //! ```
@@ -78,7 +79,7 @@ pub use memory::MemoryTable;
 pub use odata_url::QueryOptions;
 #[cfg(feature = "postgres")]
 pub use pg::PgTable;
-pub use plan::{plan, Cond, Plan, SortKey, TextOp};
+pub use plan::{plan, Case, Cond, Plan, SortKey, TextOp};
 pub use serde_json::Value;
 pub use write::{may_change, write, Batch, Change, Written};
 
@@ -238,23 +239,34 @@ impl Scope {
     }
 }
 
-/// Every restriction met, as one [`Cond`]; none: every row.
+/// Every restriction met, as one [`Cond`]; none: every row. The trees are balanced, so a
+/// scope of thousands of keys nests a few dozen levels deep, not thousands.
 fn restricted(restrictions: &[Restriction]) -> Cond {
-    restrictions
-        .iter()
-        .map(|r| {
-            r.any_of
-                .iter()
-                .map(|v| Cond::Compare {
-                    path: r.path.clone(),
-                    op: odata_url::CompareOp::Eq,
-                    value: v.clone(),
-                })
-                .reduce(|a, b| Cond::Or(Box::new(a), Box::new(b)))
-                .unwrap_or(Cond::Const(false))
-        })
-        .reduce(|a, b| Cond::And(Box::new(a), Box::new(b)))
-        .unwrap_or(Cond::Const(true))
+    let each = restrictions.iter().map(|r| {
+        let one_of = r.any_of.iter().map(|v| Cond::Compare {
+            path: r.path.clone(),
+            op: odata_url::CompareOp::Eq,
+            value: v.clone(),
+        });
+        balanced(one_of.collect(), Cond::Or, false)
+    });
+    balanced(each.collect(), Cond::And, true)
+}
+
+/// `parts` joined pairwise, level by level; `empty` when there are none.
+fn balanced(mut parts: Vec<Cond>, join: fn(Box<Cond>, Box<Cond>) -> Cond, empty: bool) -> Cond {
+    while parts.len() > 1 {
+        let mut level = parts.into_iter();
+        let mut next = Vec::new();
+        while let Some(a) = level.next() {
+            next.push(match level.next() {
+                Some(b) => join(Box::new(a), Box::new(b)),
+                None => a,
+            });
+        }
+        parts = next;
+    }
+    parts.pop().unwrap_or(Cond::Const(empty))
 }
 
 /// What a source fetched for a plan: at most [`Plan::fetch`] rows from [`Plan::offset`], in
@@ -451,4 +463,43 @@ fn project(row: &Value, names: &[String]) -> Value {
             .map(|n| (n.clone(), row.get(n).cloned().unwrap_or(Value::Null)))
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn depth(cond: &Cond) -> usize {
+        match cond {
+            Cond::And(a, b) | Cond::Or(a, b) => 1_usize.saturating_add(depth(a).max(depth(b))),
+            Cond::Not(a) => 1_usize.saturating_add(depth(a)),
+            _ => 1,
+        }
+    }
+
+    #[test]
+    fn a_scope_of_many_keys_nests_shallow_and_admits_each_key() {
+        let keys: Vec<Value> = (0..5000).map(|i| Value::String(format!("k{i}"))).collect();
+        let scope = Scope::all()
+            .and(&["id"], keys)
+            .and(&["org"], vec![Value::from("a")]);
+        let cond = scope.cond();
+        assert!(depth(&cond) <= 15, "depth {}", depth(&cond));
+        for id in ["k0", "k2500", "k4999"] {
+            assert!(
+                matches(&serde_json::json!({"id": id, "org": "a"}), &cond),
+                "{id}"
+            );
+        }
+        assert!(!matches(
+            &serde_json::json!({"id": "k5000", "org": "a"}),
+            &cond
+        ));
+        assert!(!matches(
+            &serde_json::json!({"id": "k1", "org": "b"}),
+            &cond
+        ));
+        assert_eq!(Scope::all().cond(), Cond::Const(true));
+        assert_eq!(Scope::all().and(&["id"], vec![]).cond(), Cond::Const(false));
+    }
 }

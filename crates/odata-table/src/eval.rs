@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use odata_url::CompareOp;
 use serde_json::Value;
 
-use crate::plan::{Cond, SortKey, TextOp};
+use crate::plan::{Case, Cond, SortKey, TextOp};
 
 /// The value at `path` in `row`; `None` when a step is missing or not an object.
 fn at<'r>(row: &'r Value, path: &[String]) -> Option<&'r Value> {
@@ -19,7 +19,7 @@ fn at<'r>(row: &'r Value, path: &[String]) -> Option<&'r Value> {
 /// ```
 /// use odata_table::{matches, Cond, TextOp};
 /// let row = serde_json::json!({"name": "Main Square", "address": {"city": "Ruzomberok"}});
-/// let city = Cond::Text { path: vec!["address".into(), "city".into()], op: TextOp::StartsWith, needle: "Ruz".into() };
+/// let city = Cond::Text { path: vec!["address".into(), "city".into()], op: TextOp::StartsWith, needle: "Ruz".into(), case: None };
 /// assert!(matches(&row, &city));
 /// assert!(!matches(&row, &Cond::Not(Box::new(city))));
 /// ```
@@ -44,12 +44,25 @@ pub fn matches(row: &Value, cond: &Cond) -> bool {
                     CompareOp::Le => ordering != Ordering::Greater,
                 }
             }),
-        Cond::Text { path, op, needle } => match at(row, path) {
-            Some(Value::String(s)) => match op {
-                TextOp::Contains => s.contains(needle.as_str()),
-                TextOp::StartsWith => s.starts_with(needle.as_str()),
-                TextOp::EndsWith => s.ends_with(needle.as_str()),
-            },
+        Cond::Text {
+            path,
+            op,
+            needle,
+            case,
+        } => match at(row, path) {
+            Some(Value::String(s)) => {
+                let s = match case {
+                    None => std::borrow::Cow::Borrowed(s.as_str()),
+                    Some(Case::Lower) => std::borrow::Cow::Owned(s.to_lowercase()),
+                    Some(Case::Upper) => std::borrow::Cow::Owned(s.to_uppercase()),
+                };
+                match op {
+                    TextOp::Equals => *s == **needle,
+                    TextOp::Contains => s.contains(needle.as_str()),
+                    TextOp::StartsWith => s.starts_with(needle.as_str()),
+                    TextOp::EndsWith => s.ends_with(needle.as_str()),
+                }
+            }
             _ => false,
         },
     }

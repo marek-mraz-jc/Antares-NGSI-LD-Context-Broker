@@ -134,6 +134,22 @@ const TABLE: &[(&str, &[&str])] = &[
     ("$filter=address/zip eq null", &["t2", "t3", "t4", "t5"]),
     ("$filter=startswith(address/city,'%C5%BD')", &["t7"]),
     ("$filter=name eq 10", &[]),
+    ("$filter=contains(tolower(name),'alpha')", &["t1", "t6"]),
+    ("$filter=startswith(toupper(name),'GAMMA')", &["t3"]),
+    ("$filter=endswith(tolower(name),'RAY')", &[]),
+    ("$filter=tolower(name) eq 'beta'", &["t2"]),
+    ("$filter='beta' eq tolower(name)", &["t2"]),
+    (
+        "$filter=tolower(name) ne 'beta'",
+        &["t1", "t3", "t4", "t5", "t6", "t7"],
+    ),
+    ("$filter=tolower(name) eq null", &["t5"]),
+    (
+        "$filter=tolower(name) in ('alpha','gamma%20ray')",
+        &["t1", "t3"],
+    ),
+    ("$filter=tolower(address/city) eq '%C5%BEilina'", &["t7"]),
+    ("$filter=contains(tolower(name),'_50%25')", &["t4"]),
     ("$filter=name eq 'x''%20OR%201%3D1%20--'", &[]),
     ("$orderby=size", &["t2", "t6", "t3", "t7", "t1", "t4", "t5"]),
     (
@@ -421,7 +437,8 @@ async fn an_unsupported_construct_is_501_and_an_unknown_property_400_on_every_so
         for q in [
             "$filter=length(name) eq 5",
             "$filter=size add 1 eq 11",
-            "$filter=tolower(name) eq 'beta'",
+            "$filter=tolower(name) gt 'beta'",
+            "$filter=tolower(tolower(name)) eq 'beta'",
             "$search=alpha",
             "$orderby=length(name)",
             "$filter=address eq null",

@@ -14,7 +14,7 @@ use serde_json::Value;
 use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, QueryBuilder};
 
-use crate::plan::{Cond, SortKey, TextOp};
+use crate::plan::{Case, Cond, SortKey, TextOp};
 use crate::{
     Applying, Batch, Change, Fetched, Fetching, Plan, Scope, Table, TableError, TableInfo,
 };
@@ -93,9 +93,27 @@ impl PgTable {
         ty: &str,
         body: impl FnOnce(&mut QueryBuilder<Postgres>) -> Result<(), TableError>,
     ) -> Result<(), TableError> {
+        self.folded(qb, path, ty, None, body)
+    }
+
+    /// [`Self::typed`] with the value folded by `case` first (`lower`, `upper`), in the
+    /// database's default collation so a non-ASCII letter folds as the reference does.
+    fn folded(
+        &self,
+        qb: &mut QueryBuilder<Postgres>,
+        path: &[String],
+        ty: &str,
+        case: Option<Case>,
+        body: impl FnOnce(&mut QueryBuilder<Postgres>) -> Result<(), TableError>,
+    ) -> Result<(), TableError> {
         qb.push("(CASE WHEN jsonb_typeof(");
         self.json(qb, path)?;
-        qb.push(") = ").push_bind(ty.to_owned()).push(" THEN (");
+        qb.push(") = ").push_bind(ty.to_owned()).push(" THEN ");
+        qb.push(match case {
+            None => "(",
+            Some(Case::Lower) => "lower(",
+            Some(Case::Upper) => "upper(",
+        });
         self.json(qb, path)?;
         qb.push(" #>> '{}')");
         body(qb)?;
@@ -164,7 +182,21 @@ impl PgTable {
                     }
                 }
             }
-            Cond::Text { path, op, needle } => self.typed(qb, path, "string", |qb| {
+            Cond::Text {
+                path,
+                op: TextOp::Equals,
+                needle,
+                case,
+            } => self.folded(qb, path, "string", *case, |qb| {
+                qb.push(" COLLATE \"C\" = ").push_bind(needle.clone());
+                Ok(())
+            })?,
+            Cond::Text {
+                path,
+                op,
+                needle,
+                case,
+            } => self.folded(qb, path, "string", *case, |qb| {
                 qb.push(if *op == TextOp::StartsWith {
                     " COLLATE \"C\" LIKE "
                 } else {
