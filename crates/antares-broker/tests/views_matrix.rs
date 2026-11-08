@@ -1614,7 +1614,10 @@ async fn a_write_through_a_writer_view_notifies_a_public_view_socket() {
         let mut socket = Socket::open(
             port,
             "/x/views/transport/ws",
-            &[("x-jc-roles".to_owned(), String::new())],
+            &[
+                ("l5d-client-id".to_owned(), GATEWAY.to_owned()),
+                ("x-jc-roles".to_owned(), String::new()),
+            ],
             Duration::from_millis(1500),
         )
         .expect("the socket");
@@ -1713,6 +1716,7 @@ async fn the_gateway_subscribes_on_a_public_view_only_where_it_is_listed() {
                 port,
                 "/x/views/transport/ws",
                 &[
+                    ("l5d-client-id".to_owned(), GATEWAY.to_owned()),
                     ("x-jc-client".to_owned(), "context-gateway".to_owned()),
                     ("x-jc-roles".to_owned(), String::new()),
                 ],
