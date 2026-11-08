@@ -544,15 +544,18 @@ fn operations_and_imports_are_written_in_both_representations(
     ] {
         assert!(xml.contains(expected), "{expected} missing from\n{xml}");
     }
+    // The pretty-printed layout is pinned by `every_branch`; here only the members.
+    let json: String = json.split_whitespace().collect();
     for expected in [
-        "\"Access\": [\n      {\n        \"$Kind\": \"Function\",\n        \"$ReturnType\": {\n          \"$Type\": \"o.Decision\"\n        }\n      }\n    ]",
-        "\"$Name\": \"subject\",\n            \"$Type\": \"Edm.Untyped\",\n            \"$Nullable\": true",
-        "\"Forget\": [\n      {\n        \"$Kind\": \"Action\"\n      }\n    ]",
-        "\"Access\": {\n        \"$Function\": \"o.Access\",\n        \"$IncludeInServiceDocument\": true\n      }",
-        "\"Hidden\": {\n        \"$Function\": \"o.Attributes\"\n      }",
-        "\"Check\": {\n        \"$Action\": \"o.Check\"\n      }",
+        r#""Access":[{"$Kind":"Function","$ReturnType":{"$Type":"o.Decision"}}]"#,
+        r#"{"$Name":"subject","$Type":"Edm.Untyped","$Nullable":true}"#,
+        r#""$ReturnType":{"$Type":"o.Decision","$Collection":true,"$Nullable":true}"#,
+        r#""Forget":[{"$Kind":"Action"}]"#,
+        r#""Access":{"$Function":"o.Access","$IncludeInServiceDocument":true}"#,
+        r#""Hidden":{"$Function":"o.Attributes"}"#,
+        r#""Check":{"$Action":"o.Check"}"#,
     ] {
-        assert!(json.contains(expected), "{expected} missing from\n{json}");
+        assert!(json.contains(expected), "{expected} missing from {json}");
     }
     Ok(())
 }
