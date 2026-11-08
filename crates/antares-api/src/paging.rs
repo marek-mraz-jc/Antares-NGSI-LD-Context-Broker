@@ -1628,4 +1628,46 @@ mod tests {
         assert_eq!(query_value("a+b"), "a%2Bb");
         assert_eq!(query_value("é"), "%C3%A9");
     }
+
+    /// 4.23: an ordering the broker cannot read is BadRequestData, never an
+    /// unordered page: an unclosed bracket, a key with no attribute, a
+    /// distance ordering without or with an unreadable reference geometry,
+    /// and a collation ICU does not know.
+    #[test]
+    fn an_unreadable_ordering_is_bad_request_data() {
+        let ctx = Loader::new().core();
+        let mut docs = vec![ent("urn:a", "x", json!(1))];
+        let cases: [(&str, &[(&str, &str)]); 5] = [
+            ("x[y", &[]),
+            (";desc", &[]),
+            ("location;dist-asc", &[("orderFrom", "[1,")]),
+            ("location;dist-desc", &[]),
+            ("x", &[("collation", "zz-Qqqq-u-ks-level9")]),
+        ];
+        for (spec, p) in cases {
+            let e = order_entities(&mut docs, spec, &params(p), &ctx)
+                .expect_err(&format!("{spec} {p:?} must be refused"));
+            assert_eq!(e.kind(), "BadRequestData", "{spec} {p:?}: {e}");
+        }
+    }
+
+    /// The POST query documents (5.2.43 ordering, 5.2.44 aggrParams, 5.2.21
+    /// temporalQ) refuse members of the wrong JSON type as BadRequestData
+    /// instead of reading them as absent.
+    #[test]
+    fn a_query_document_member_of_the_wrong_type_is_bad_request_data() {
+        let cases: [(bool, Value); 4] = [
+            (false, json!({"ordering": {"orderBy": "x"}})),
+            (false, json!({"ordering": {"orderBy": [1]}})),
+            (true, json!({"aggrParams": {"aggrMethods": [1]}})),
+            (true, json!({"temporalQ": {"timerel": "after", "timeAt": "2020-01-01T00:00:00Z",
+                "aggrMethods": [1]}})),
+        ];
+        for (temporal, q) in cases {
+            let mut vp = HashMap::new();
+            let e = query_doc_params(q.as_object().expect("object"), temporal, &mut vp)
+                .expect_err(&format!("{q} must be refused"));
+            assert_eq!(e.kind(), "BadRequestData", "{q}: {e}");
+        }
+    }
 }
