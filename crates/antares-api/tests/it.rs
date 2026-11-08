@@ -25,6 +25,7 @@ mod core_member_iris_5_5_7;
 mod cross_org_write_5_6;
 mod csf_forwarding_5_7;
 mod csource_concurrency_5_9_2;
+mod csource_refusals_5_9_2;
 mod csource_subscription_ignored_members;
 mod csource_tenant_in_csi_9_5_1;
 mod csource_tenant_stall_5_9_2;
