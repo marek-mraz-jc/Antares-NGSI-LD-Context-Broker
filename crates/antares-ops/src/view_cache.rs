@@ -129,20 +129,16 @@ impl<T: Clone> ViewCache<T> {
         }
         let slot = {
             let mut map = write(&self.held);
-            match map
-                .get(id)
-                .filter(|s| s.made.get().is_none_or(|h| current(h)))
-            {
-                Some(s) => s.clone(),
-                None => {
-                    let s = Arc::new(Slot {
-                        made: OnceLock::new(),
-                        building: Mutex::new(()),
-                        used: AtomicU64::new(at),
-                    });
-                    map.insert(id.to_owned(), s.clone());
-                    s
-                }
+            if let Some(s) = map.get(id).filter(|s| s.made.get().is_none_or(&current)) {
+                s.clone()
+            } else {
+                let s = Arc::new(Slot {
+                    made: OnceLock::new(),
+                    building: Mutex::new(()),
+                    used: AtomicU64::new(at),
+                });
+                map.insert(id.to_owned(), s.clone());
+                s
             }
         };
         let guard = slot.building.lock().unwrap_or_else(PoisonError::into_inner);
@@ -292,10 +288,20 @@ mod tests {
             let cache = cache.clone();
             std::thread::spawn(move || {
                 cache
-                    .get_or_build("cold", |_| true, |_| true, now, HOUR, || {
-                        let _ = building_tx.send(());
-                        warm_rx.recv_timeout(Duration::from_secs(5)).ok().map(|()| 2)
-                    })
+                    .get_or_build(
+                        "cold",
+                        |_| true,
+                        |_| true,
+                        now,
+                        HOUR,
+                        || {
+                            let _ = building_tx.send(());
+                            warm_rx
+                                .recv_timeout(Duration::from_secs(5))
+                                .ok()
+                                .map(|()| 2)
+                        },
+                    )
                     .0
             })
         };
@@ -311,8 +317,16 @@ mod tests {
                 hit
             })
         };
-        assert_eq!(warm.join().ok().flatten(), Some(1), "the warm hit was answered");
-        assert_eq!(cold.join().ok().flatten(), Some(2), "and the cold build finished after it");
+        assert_eq!(
+            warm.join().ok().flatten(),
+            Some(1),
+            "the warm hit was answered"
+        );
+        assert_eq!(
+            cold.join().ok().flatten(),
+            Some(2),
+            "and the cold build finished after it"
+        );
     }
 
     #[test]
@@ -324,10 +338,7 @@ mod tests {
         assert_eq!(get(&c, "cars", 1, t0 + HOUR / 2, &builds), Some(1));
         assert_eq!(builds.load(Ordering::SeqCst), 1);
         // a request on another view an hour after the last use of `cars` sweeps it
-        assert_eq!(
-            get(&c, "bikes", 1, t0 + HOUR / 2 + HOUR, &builds),
-            Some(1)
-        );
+        assert_eq!(get(&c, "bikes", 1, t0 + HOUR / 2 + HOUR, &builds), Some(1));
         assert_eq!(c.len(), 1);
         // the view changed while evicted: the reload builds the table's version, not the old one
         assert_eq!(get(&c, "cars", 2, t0 + 2 * HOUR, &builds), Some(2));

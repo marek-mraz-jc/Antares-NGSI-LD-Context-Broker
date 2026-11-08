@@ -68,7 +68,7 @@ use axum::response::Response;
 use axum::Router;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 /// The policy seam's public types (ADR-0020), so a surface names no
 /// `antares-api` item.

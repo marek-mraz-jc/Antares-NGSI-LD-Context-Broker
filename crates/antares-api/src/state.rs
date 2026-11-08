@@ -2223,7 +2223,8 @@ mod shared_view_router {
     async fn seeded() -> AppState {
         let st = AppState::new("antares-test".into());
         for (id, t) in [("urn:ngsi-ld:Car:1", "Car"), ("urn:ngsi-ld:Bike:1", "Bike")] {
-            let body = serde_json::json!({"id": id, "type": t, "speed": {"type": "Property", "value": 1}});
+            let body =
+                serde_json::json!({"id": id, "type": t, "speed": {"type": "Property", "value": 1}});
             let body = body.to_string();
             let req = Request::post("/ngsi-ld/v1/entities")
                 .header("content-type", "application/json")
@@ -2242,13 +2243,21 @@ mod shared_view_router {
         let (cars, bikes) = (st.with_view(view_of("Car")), st.with_view(view_of("Bike")));
         let runs: Vec<_> = (0..32)
             .map(|i| {
-                let st = if i % 2 == 0 { cars.clone() } else { bikes.clone() };
+                let st = if i % 2 == 0 {
+                    cars.clone()
+                } else {
+                    bikes.clone()
+                };
                 tokio::spawn(async move { (i % 2, ids(&st).await) })
             })
             .collect();
         for run in runs {
             let (odd, got) = run.await.expect("joined");
-            let want = if odd == 0 { "urn:ngsi-ld:Car:1" } else { "urn:ngsi-ld:Bike:1" };
+            let want = if odd == 0 {
+                "urn:ngsi-ld:Car:1"
+            } else {
+                "urn:ngsi-ld:Bike:1"
+            };
             assert_eq!(got, vec![want.to_owned()]);
         }
         assert!(Arc::ptr_eq(&cars.viewed, &bikes.viewed), "one router cell");
