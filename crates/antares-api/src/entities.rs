@@ -2844,6 +2844,7 @@ async fn merge_entity_inner(
             raw.apply(doc, &mut frag)?;
             apply_common_lang(doc, &mut frag, lang);
             merge_into(doc, &frag, &ts);
+            crate::policy::Condition::post(cond.as_ref(), doc)?;
             #[cfg(feature = "views")]
             if let Some(g) = &guard {
                 g.post(doc)?;
@@ -2852,6 +2853,7 @@ async fn merge_entity_inner(
         })
         .await?;
     crate::history::settle(id, matches!(res, Some(Ok(()))));
+    crate::policy::Condition::verdict(cond.as_ref())?;
     #[cfg(feature = "views")]
     if let Some(g) = &guard {
         g.settled()?;
@@ -3398,6 +3400,7 @@ pub async fn replace_entity(
                         o.insert("createdAt".into(), created);
                     }
                     *doc = expanded.clone();
+                    crate::policy::Condition::post(cond.as_ref(), doc)?;
                     #[cfg(feature = "views")]
                     if let Some(g) = &guard {
                         g.post(doc)?;
@@ -3405,6 +3408,7 @@ pub async fn replace_entity(
                     Ok::<(), NgsiError>(())
                 })
                 .await?;
+            crate::policy::Condition::verdict(cond.as_ref())?;
             #[cfg(feature = "views")]
             if let Some(g) = &guard {
                 g.settled()?;

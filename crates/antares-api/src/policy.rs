@@ -1827,6 +1827,10 @@ fn record_image(doc: &Value) -> Value {
 /// judged synchronously on one document.
 pub(crate) type Condition = crate::repr::PolicyReach;
 
+/// Why [`Condition::post`] refuses a write.
+const LEFT_THE_GRANT: &str =
+    "the write would leave the Entity outside what the policy grants (its q, scopeQ or area)";
+
 impl Condition {
     /// The selection `f` makes, whatever it projects.
     pub(crate) fn new(f: &Filter) -> Self {
@@ -1835,6 +1839,7 @@ impl Condition {
             scope_q: f.scope_q.clone(),
             areas: f.areas().cloned().collect(),
             rules: crate::repr::type_rules(f),
+            refused: std::sync::OnceLock::new(),
         }
     }
 
@@ -1885,6 +1890,32 @@ impl Condition {
             Err(antares_model::NgsiError::ResourceNotFound(format!(
                 "entity {id} not found"
             )))
+        }
+    }
+
+    /// Inside the store closure, on the document as the write leaves it: a
+    /// grant bound by `q`, `scopeQ` or an area admits a write only when the
+    /// Entity stays inside it (F-08), so a PATCH cannot move an Entity out
+    /// of the slice and a replace cannot drop the stored scope. The refusal
+    /// is recorded for [`Condition::verdict`] and aborts the commit.
+    pub(crate) fn post(cond: Option<&Self>, doc: &Value) -> Result<(), antares_model::NgsiError> {
+        match cond {
+            Some(c) if !c.holds(doc) => {
+                let _ = c.refused.set(LEFT_THE_GRANT);
+                Err(antares_model::NgsiError::InternalError(
+                    LEFT_THE_GRANT.into(),
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The refusal [`Condition::post`] recorded, as the 403 the handler
+    /// answers.
+    pub(crate) fn verdict(cond: Option<&Self>) -> Result<(), Denied> {
+        match cond.and_then(|c| c.refused.get()) {
+            Some(why) => Err(Denied((*why).to_owned())),
+            None => Ok(()),
         }
     }
 

@@ -161,8 +161,7 @@ pub(super) async fn deliver_as(
     // A binding that opens no socket has no destination for the policy or
     // the breaker to judge, nor has a delivery the forward transport makes
     // in process; every other network binding is policed below.
-    let policed =
-        in_process(st, uri).is_none() && st.sinks.sink_for_uri(uri).is_some_and(|s| s.network());
+    let policed = network_policed(st, uri);
     if policed && st.egress.is_open(tenant.as_str(), uri) {
         tracing::debug!(
             "notification to {} short-circuited (breaker open)",
@@ -571,6 +570,13 @@ pub(super) fn in_process<'a>(
 /// takes the endpoint (ADR-0025 rule 7), on every attempt, retries and
 /// replays included. `Err((timed_out, why))`: only a timeout-class failure
 /// feeds the breaker — an endpoint that answers is alive.
+/// Whether a delivery to `uri` opens a socket the egress policy and the
+/// breaker judge: not one the forward transport makes in process, nor a
+/// binding that opens none.
+pub(super) fn network_policed(st: &AppState, uri: &str) -> bool {
+    in_process(st, uri).is_none() && st.sinks.sink_for_uri(uri).is_some_and(|s| s.network())
+}
+
 pub(super) async fn send_outbound(
     st: &AppState,
     tenant: &TenantId,
