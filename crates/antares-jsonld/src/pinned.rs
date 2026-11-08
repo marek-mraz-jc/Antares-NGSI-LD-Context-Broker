@@ -109,7 +109,9 @@ pub(crate) fn pinned(url: &str) -> Option<Value> {
     PARSED.iter().find(|(u, _)| *u == url)?.1.clone()
 }
 
-/// Is `url` one of the compiled-in documents? A name lookup, no parse.
+/// Is `url` one of the compiled-in documents? A name lookup, no parse. Only the
+/// `fetch` loader asks it.
+#[cfg(any(test, feature = "fetch"))]
 pub(crate) fn is_pinned(url: &str) -> bool {
     PINNED.iter().any(|(u, _)| *u == url)
 }
