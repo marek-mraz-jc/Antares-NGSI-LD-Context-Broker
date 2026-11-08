@@ -111,6 +111,7 @@ async fn main() -> Result<(), String> {
         url_limits: odata_url::Limits::strict(),
         csdl_limits,
         max_header_len: 1024,
+        metadata: Arc::default(),
         custom_options: vec![],
     };
     let app = axum::Router::new()

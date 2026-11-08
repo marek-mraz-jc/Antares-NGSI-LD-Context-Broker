@@ -137,6 +137,7 @@ fn app(scope: Scope) -> Result<Router, String> {
         csdl_limits: odata_csdl::Limits::strict(),
         max_header_len: 1024,
         metadata_etag: None,
+        metadata: Arc::default(),
         custom_options: vec![],
     };
     let tables: Vec<Arc<dyn Table>> = vec![Arc::new(things), Arc::new(files)];

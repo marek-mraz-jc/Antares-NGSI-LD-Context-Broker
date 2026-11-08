@@ -352,7 +352,7 @@ fn value(literal: &Literal) -> Result<Value, TableError> {
         | Literal::TimeOfDay(s)
         | Literal::Guid(s)
         | Literal::Duration(s) => Value::String(s.clone()),
-        Literal::Geography(_) => {
+        Literal::Geography(_) | Literal::Geometry(_) => {
             return Err(TableError::NotImplemented("geography literals".into()))
         }
         Literal::Binary(_) => return Err(TableError::NotImplemented("binary literals".into())),
