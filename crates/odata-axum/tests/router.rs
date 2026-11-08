@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: EUPL-1.2
+// SPDX-License-Identifier: MIT
 //! The service document and `$metadata` over HTTP (T-3506, ADR-0024 decisions 4 and 5): content
 //! negotiation, version negotiation, the caller's limits, and the refusals of T-3441 row Q27.
 

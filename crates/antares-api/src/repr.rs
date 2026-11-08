@@ -438,6 +438,9 @@ pub struct PolicyReach {
     /// The narrowing's expanded rules: an Entity none of them holds for is
     /// not admitted (ADR-0023 rule 11).
     pub rules: Option<std::sync::Arc<crate::policy::Filter>>,
+    /// A write's post-image refusal, recorded inside the store closure for
+    /// the handler's 403 (`Condition::post`, `Condition::verdict`).
+    pub refused: std::sync::OnceLock<&'static str>,
 }
 
 /// Whether the narrowing admits the INTERNAL document `doc`; no narrowing

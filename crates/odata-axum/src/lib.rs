@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: EUPL-1.2
+// SPDX-License-Identifier: MIT
 //! OData 4.01 over axum: HTTP to the library types and back (ADR-0024 decision 1, row
 //! `odata-axum`).
 //!
@@ -31,6 +31,10 @@
 //! ```
 
 #![forbid(unsafe_code)]
+
+mod table;
+
+pub use table::table_router;
 
 use std::sync::Arc;
 
