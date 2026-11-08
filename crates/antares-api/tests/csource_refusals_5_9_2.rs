@@ -26,7 +26,10 @@ async fn send(st: &AppState, method: &str, uri: &str, body: &str) -> (StatusCode
         .expect("response");
     let status = resp.status();
     let bytes = resp.into_body().collect().await.expect("body").to_bytes();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 fn valid() -> Value {
@@ -44,9 +47,21 @@ async fn every_refused_member_is_bad_request_data_and_stores_nothing() {
     let cases: Vec<(&str, &str, Value)> = vec![
         ("information", "not an array", json!("x")),
         ("information", "entry not an object", json!(["x"])),
-        ("information", "entity not an object", json!([{"entities": ["x"]}])),
-        ("information", "empty type", json!([{"entities": [{"type": ""}]}])),
-        ("information", "id not a string", json!([{"entities": [{"type": "T", "id": 5}]}])),
+        (
+            "information",
+            "entity not an object",
+            json!([{"entities": ["x"]}]),
+        ),
+        (
+            "information",
+            "empty type",
+            json!([{"entities": [{"type": ""}]}]),
+        ),
+        (
+            "information",
+            "id not a string",
+            json!([{"entities": [{"type": "T", "id": 5}]}]),
+        ),
         (
             "information",
             "idPattern not a string",
@@ -64,8 +79,13 @@ async fn every_refused_member_is_bad_request_data_and_stores_nothing() {
     for (member, why, value) in cases {
         let mut body = valid();
         body[member] = value;
-        let (code, problem) =
-            send(&st, "POST", "/ngsi-ld/v1/csourceRegistrations", &body.to_string()).await;
+        let (code, problem) = send(
+            &st,
+            "POST",
+            "/ngsi-ld/v1/csourceRegistrations",
+            &body.to_string(),
+        )
+        .await;
         assert_eq!(code, StatusCode::BAD_REQUEST, "{member} {why}: {problem}");
         assert!(
             problem["type"]
@@ -74,7 +94,13 @@ async fn every_refused_member_is_bad_request_data_and_stores_nothing() {
             "{member} {why}: {problem}"
         );
     }
-    let (code, listed) = send(&st, "GET", "/ngsi-ld/v1/csourceRegistrations?type=Vehicle", "").await;
+    let (code, listed) = send(
+        &st,
+        "GET",
+        "/ngsi-ld/v1/csourceRegistrations?type=Vehicle",
+        "",
+    )
+    .await;
     assert_eq!(code, StatusCode::OK, "{listed}");
     assert_eq!(listed, json!([]), "a refused registration is never stored");
 }

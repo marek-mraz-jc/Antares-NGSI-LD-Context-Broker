@@ -31,7 +31,10 @@ fn refused(envs: &[(&str, &str)]) -> String {
 fn an_unknown_store_backend_is_a_failed_start_that_lists_the_built_ones() {
     let log = refused(&[("ANTARES_STORE", "mongo")]);
     assert!(log.contains("unknown ANTARES_STORE"), "{log}");
-    assert!(log.contains("memory"), "the message lists what was built: {log}");
+    assert!(
+        log.contains("memory"),
+        "the message lists what was built: {log}"
+    );
 }
 
 /// The collector URL may carry a credential (RFC 3986 3.2.1): a URL the
@@ -43,7 +46,10 @@ fn an_unusable_collector_url_fails_the_start_without_its_credential() {
         ("ANTARES_TELEMETRY", "1"),
         ("ANTARES_OTLP_ENDPOINT", "http://user:s3cret@[::1/v1/traces"),
     ]);
-    assert!(!log.contains("s3cret"), "the collector password in the log: {log}");
+    assert!(
+        !log.contains("s3cret"),
+        "the collector password in the log: {log}"
+    );
 }
 
 /// ANTARES_REQUIRE_RLS turns a database role that bypasses row-level

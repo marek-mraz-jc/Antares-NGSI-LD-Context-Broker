@@ -1156,12 +1156,15 @@ mod tests {
         let sink = MqttSink::new(2, Duration::from_millis(300));
         let acking = format!("mqtt://127.0.0.1:{}/t", stub_broker(true).await);
         let qos1 = [("MQTT-QoS", "1"), ("MQTT-Version", "mqtt3.1.1")];
-        sink.parse_endpoint(&acking, &qos1).expect("a valid endpoint");
+        sink.parse_endpoint(&acking, &qos1)
+            .expect("a valid endpoint");
         assert!(sink.parse_endpoint("http://host/t", &qos1).is_err());
         assert!(sink.parse_endpoint(&acking, &[("MQTT-QoS", "7")]).is_err());
         let out = outbound(&qos1);
         let timeout = Duration::from_secs(1);
-        sink.deliver(&acking, &out, timeout).await.expect("PUBACK delivers");
+        sink.deliver(&acking, &out, timeout)
+            .await
+            .expect("PUBACK delivers");
 
         let e = sink
             .deliver("mqtt://u:hunter2@", &out, timeout)
@@ -1253,7 +1256,9 @@ mod tests {
         let ep = MqttEndpoint::parse(&format!("{url}/{topic}")).expect("parse");
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let timeout = Duration::from_secs(5);
-        let task = listen(&ep, "notifier-test", tx, timeout).await.expect("listen");
+        let task = listen(&ep, "notifier-test", tx, timeout)
+            .await
+            .expect("listen");
         let sink = MqttSink::new(2, timeout);
         let params = MqttParams { qos: 1, v5: true };
         let got = tokio::time::timeout(Duration::from_secs(10), async {

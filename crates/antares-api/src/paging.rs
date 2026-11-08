@@ -1660,8 +1660,11 @@ mod tests {
             (false, json!({"ordering": {"orderBy": "x"}})),
             (false, json!({"ordering": {"orderBy": [1]}})),
             (true, json!({"aggrParams": {"aggrMethods": [1]}})),
-            (true, json!({"temporalQ": {"timerel": "after", "timeAt": "2020-01-01T00:00:00Z",
-                "aggrMethods": [1]}})),
+            (
+                true,
+                json!({"temporalQ": {"timerel": "after", "timeAt": "2020-01-01T00:00:00Z",
+                "aggrMethods": [1]}}),
+            ),
         ];
         for (temporal, q) in cases {
             let mut vp = HashMap::new();

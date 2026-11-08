@@ -46,7 +46,10 @@ fn http(port: u16, method: &str, path: &str, body: Option<&str>) -> String {
 fn json(answer: &str) -> serde_json::Value {
     let (head, mut rest) = answer.split_once("\r\n\r\n").unwrap_or((answer, ""));
     let mut body = String::new();
-    if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+    if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
         // each chunk: hex size line, the bytes, CRLF; a zero size ends it
         while let Some((size, tail)) = rest.split_once("\r\n") {
             let n = usize::from_str_radix(size.trim(), 16).unwrap_or(0);
@@ -79,7 +82,9 @@ fn spawn(envs: &[(&str, &str)]) -> (Broker, u16) {
 }
 
 fn entity(n: usize) -> String {
-    format!(r#"{{"id":"urn:ngsi-ld:Knob:{n}","type":"Knob","p":{{"type":"Property","value":{n}}}}}"#)
+    format!(
+        r#"{{"id":"urn:ngsi-ld:Knob:{n}","type":"Knob","p":{{"type":"Property","value":{n}}}}}"#
+    )
 }
 
 #[test]
@@ -102,11 +107,24 @@ fn the_bound_knobs_set_in_the_environment_are_published_and_enforced() {
 
     // a batch over the ceiling is refused whole, one at the ceiling passes
     let three = format!("[{},{},{}]", entity(1), entity(2), entity(3));
-    let over = http(port, "POST", "/ngsi-ld/v1/entityOperations/create", Some(&three));
-    assert!(over.starts_with("HTTP/1.1 400"), "batch of 3 over 2: {over}");
+    let over = http(
+        port,
+        "POST",
+        "/ngsi-ld/v1/entityOperations/create",
+        Some(&three),
+    );
+    assert!(
+        over.starts_with("HTTP/1.1 400"),
+        "batch of 3 over 2: {over}"
+    );
     for pair in [[1, 2], [3, 4]] {
         let two = format!("[{},{}]", entity(pair[0]), entity(pair[1]));
-        let ok = http(port, "POST", "/ngsi-ld/v1/entityOperations/create", Some(&two));
+        let ok = http(
+            port,
+            "POST",
+            "/ngsi-ld/v1/entityOperations/create",
+            Some(&two),
+        );
         assert!(ok.starts_with("HTTP/1.1 201"), "batch of 2: {ok}");
     }
 
@@ -115,7 +133,10 @@ fn the_bound_knobs_set_in_the_environment_are_published_and_enforced() {
     assert!(page.starts_with("HTTP/1.1 200"), "{page}");
     assert_eq!(json(&page).as_array().map(Vec::len), Some(3), "{page}");
     let too_many = http(port, "GET", "/ngsi-ld/v1/entities?type=Knob&limit=6", None);
-    assert!(too_many.starts_with("HTTP/1.1 403"), "limit 6 over 5: {too_many}");
+    assert!(
+        too_many.starts_with("HTTP/1.1 403"),
+        "limit 6 over 5: {too_many}"
+    );
 }
 
 #[test]

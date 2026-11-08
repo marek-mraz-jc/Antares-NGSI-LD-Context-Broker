@@ -1962,10 +1962,34 @@ mod tests {
             tx.commit().expect("commit");
         };
         let cases: [(&str, Table, &[u8], &[u8], &str); 4] = [
-            ("badkey", T_ENTITIES, b"no-separator", b"{}", "undecodable key"),
-            ("badvalue", T_ENTITIES, b"t\0urn:e:1", b"not json", "undecodable value"),
-            ("badctxid", T_JSONLD_CONTEXTS, &[0xff, 0xfe], b"{}", "undecodable context id"),
-            ("badctx", T_JSONLD_CONTEXTS, b"ctx-1", b"not json", "undecodable context ctx-1"),
+            (
+                "badkey",
+                T_ENTITIES,
+                b"no-separator",
+                b"{}",
+                "undecodable key",
+            ),
+            (
+                "badvalue",
+                T_ENTITIES,
+                b"t\0urn:e:1",
+                b"not json",
+                "undecodable value",
+            ),
+            (
+                "badctxid",
+                T_JSONLD_CONTEXTS,
+                &[0xff, 0xfe],
+                b"{}",
+                "undecodable context id",
+            ),
+            (
+                "badctx",
+                T_JSONLD_CONTEXTS,
+                b"ctx-1",
+                b"not json",
+                "undecodable context ctx-1",
+            ),
         ];
         for (name, table, key, value, says) in cases {
             let dir = tempdir(name);

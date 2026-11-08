@@ -155,12 +155,28 @@ async fn the_admin_documents_and_sweeps_report_the_pool_wall() {
     wall(st.delete_view_doc("v").await.expect_err("delete view"));
     wall(st.grant_docs().await.expect_err("grants"));
     wall(st.grant_doc("g").await.expect_err("grant"));
-    wall(st.put_grant_doc("g", json!({})).await.expect_err("put grant"));
+    wall(
+        st.put_grant_doc("g", json!({}))
+            .await
+            .expect_err("put grant"),
+    );
     wall(st.delete_grant_doc("g").await.expect_err("delete grant"));
     wall(st.policy_docs().await.expect_err("policies"));
     wall(st.policy_doc("acme").await.expect_err("policy"));
-    wall(st.put_policy_doc("acme", json!({})).await.expect_err("put policy"));
-    wall(st.delete_policy_doc("acme").await.expect_err("delete policy"));
+    wall(
+        st.put_policy_doc("acme", json!({}))
+            .await
+            .expect_err("put policy"),
+    );
+    wall(
+        st.delete_policy_doc("acme")
+            .await
+            .expect_err("delete policy"),
+    );
     wall(st.stored_type_names(&t).await.expect_err("type names"));
-    wall(st.scan_entities(&t, &[], &[], 0, 10).await.expect_err("scan"));
+    wall(
+        st.scan_entities(&t, &[], &[], 0, 10)
+            .await
+            .expect_err("scan"),
+    );
 }

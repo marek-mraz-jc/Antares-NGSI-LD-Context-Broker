@@ -1814,7 +1814,9 @@ mod tests {
         let segs = d.entity_id_segments(&t, "urn:", ':', 10).await;
         assert!(segs.expect("segments").is_none());
         assert_eq!(d.sweep_expired().await, 0);
-        let kept = d.retain_current(&t, "T", "2026-01-01T00:00:00Z", 10, true).await;
+        let kept = d
+            .retain_current(&t, "T", "2026-01-01T00:00:00Z", 10, true)
+            .await;
         assert_eq!(kept.expect("retain"), 0);
         assert!(d.history_overrides(10).await.expect("overrides").is_empty());
         let unsupported = |r: Result<(), NgsiError>| {
@@ -1827,12 +1829,21 @@ mod tests {
         unsupported(d.purge_tenant(&t).await.map(drop));
         // the failure bookkeeping default goes through `mutate`
         let failed = d
-            .record_failure(&t, Kind::Subscription, "urn:a", None, "2026-01-02T00:00:00Z")
+            .record_failure(
+                &t,
+                Kind::Subscription,
+                "urn:a",
+                None,
+                "2026-01-02T00:00:00Z",
+            )
             .await
             .expect("record")
             .expect("row present");
         assert_eq!(failed["notification"]["timesFailed"], 3, "{failed}");
-        assert_eq!(failed["notification"]["lastFailure"], "2026-01-02T00:00:00Z");
+        assert_eq!(
+            failed["notification"]["lastFailure"],
+            "2026-01-02T00:00:00Z"
+        );
     }
 
     /// The remaining defaults: no commit queue, never wedged, no
@@ -1855,7 +1866,11 @@ mod tests {
             .await
             .expect("record")
             .expect("row present");
-        assert_eq!(booked.doc["notification"]["timesSent"], 2, "{:?}", booked.doc);
+        assert_eq!(
+            booked.doc["notification"]["timesSent"], 2,
+            "{:?}",
+            booked.doc
+        );
         assert!(booked.prev_success.is_none(), "never succeeded before");
         let many = d
             .record_deliveries(&t, Kind::Subscription, &[("urn:a", now, 3)])
@@ -1885,7 +1900,10 @@ mod tests {
     #[test]
     fn a_stored_document_that_is_no_object_is_an_internal_error() {
         let mut v = serde_json::json!([1]);
-        assert_eq!(stored_object(&mut v).expect_err("array").kind(), "InternalError");
+        assert_eq!(
+            stored_object(&mut v).expect_err("array").kind(),
+            "InternalError"
+        );
         let mut o = serde_json::json!({"a": 1});
         assert!(stored_object(&mut o).expect("object").contains_key("a"));
     }
@@ -2194,16 +2212,36 @@ mod tests {
         let d: std::sync::Arc<dyn TemporalDriver> = std::sync::Arc::new(NoTemporal);
         let bound = std::time::Duration::from_millis(1);
         assert_eq!(d.attr_instance_count(&t).await.expect("count"), 0);
-        assert_eq!(d.attr_instance_count_within(&t, bound).await.expect("count"), 0);
+        assert_eq!(
+            d.attr_instance_count_within(&t, bound)
+                .await
+                .expect("count"),
+            0
+        );
         assert_eq!(d.attr_instance_bytes(&t).await.expect("bytes"), 0);
-        assert_eq!(d.attr_instance_usage(&t, bound).await.expect("usage"), (0, 0));
-        let e = d.attr_instance_estimate(&t).await.expect_err("no statistics");
+        assert_eq!(
+            d.attr_instance_usage(&t, bound).await.expect("usage"),
+            (0, 0)
+        );
+        let e = d
+            .attr_instance_estimate(&t)
+            .await
+            .expect_err("no statistics");
         assert_eq!(e.kind(), "OperationNotSupported");
         let scope = HistoryScope::Entity("urn:a");
         let before = "2026-01-01T00:00:00Z";
-        assert_eq!(d.retain_history(&t, scope, before, 10, false).await.expect("retain"), 0);
+        assert_eq!(
+            d.retain_history(&t, scope, before, 10, false)
+                .await
+                .expect("retain"),
+            0
+        );
         let floors = [("t".to_string(), before.to_string())];
-        assert!(d.drop_retained_history(&floors).await.expect("drop").is_empty());
+        assert!(d
+            .drop_retained_history(&floors)
+            .await
+            .expect("drop")
+            .is_empty());
         assert_eq!(d.retain_audit(before, 10).await.expect("audit"), 0);
         d.set_short_history(ShortHistory::default());
         assert!(d.versions(&t, "urn:a").await.expect("versions").is_empty());
