@@ -212,18 +212,43 @@ impl HistoryRules {
 /// write can create a Tenant at any moment, so a "does not exist" is never
 /// kept. A purge on this process forgets the name at once; a purge on
 /// another process sharing the store is seen once the entry ages out.
+///
+/// The names sit in [`KnownTenants::SHARDS`] maps by hash (T-6611, R1-007):
+/// every request asks, and one process-wide lock made every worker thread
+/// queue on it; a shard's lock covers one hash lookup.
 #[derive(Debug, Default)]
-pub struct KnownTenants(std::sync::Mutex<std::collections::HashMap<String, Instant>>);
+pub struct KnownTenants(
+    [std::sync::Mutex<std::collections::HashMap<String, Instant>>; KNOWN_SHARDS],
+);
+
+/// [`KnownTenants::SHARDS`].
+const KNOWN_SHARDS: usize = 16;
 
 impl KnownTenants {
     /// How long a remembered "exists" stands in for the store's answer.
     pub const TTL: std::time::Duration = std::time::Duration::from_secs(30);
     /// The most names held at once (ADR-0001's 10 000-tenant target): a
-    /// full map takes no new name until its old entries age out.
+    /// full shard takes no new name until its old entries age out.
     pub const CAP: usize = 10_000;
+    /// Maps the names are spread over.
+    pub const SHARDS: usize = KNOWN_SHARDS;
 
-    fn map(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, Instant>> {
+    fn map(
+        &self,
+        tenant: &str,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, Instant>> {
+        use std::hash::BuildHasher as _;
+        let hash =
+            std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default()
+                .hash_one(tenant);
+        let shard = hash
+            .checked_rem(Self::SHARDS as u64)
+            .and_then(|i| usize::try_from(i).ok())
+            .unwrap_or_default();
+        let [first, ..] = &self.0;
         self.0
+            .get(shard)
+            .unwrap_or(first)
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -231,17 +256,18 @@ impl KnownTenants {
     /// Did the store say this Tenant exists within the last [`Self::TTL`]?
     #[must_use]
     pub fn holds(&self, tenant: &antares_model::TenantId) -> bool {
-        self.map()
+        self.map(tenant.as_str())
             .get(tenant.as_str())
             .is_some_and(|at| at.elapsed() < Self::TTL)
     }
 
     /// The store just said this Tenant exists.
     pub fn remember(&self, tenant: &antares_model::TenantId) {
-        let mut map = self.map();
-        if map.len() >= Self::CAP && !map.contains_key(tenant.as_str()) {
+        let mut map = self.map(tenant.as_str());
+        let cap = Self::CAP.div_ceil(Self::SHARDS);
+        if map.len() >= cap && !map.contains_key(tenant.as_str()) {
             map.retain(|_, at| at.elapsed() < Self::TTL);
-            if map.len() >= Self::CAP {
+            if map.len() >= cap {
                 return;
             }
         }
@@ -250,7 +276,57 @@ impl KnownTenants {
 
     /// The Tenant was purged: the next request asks the store again.
     pub fn forget(&self, tenant: &antares_model::TenantId) {
-        self.map().remove(tenant.as_str());
+        self.map(tenant.as_str()).remove(tenant.as_str());
+    }
+}
+
+#[cfg(test)]
+mod known_tenants_tests {
+    use super::KnownTenants;
+    use antares_model::TenantId;
+
+    fn tenant(name: &str) -> TenantId {
+        TenantId::try_from(name.to_owned()).unwrap()
+    }
+
+    /// A lookup of one Tenant does not wait while another Tenant's entry is
+    /// locked (T-6611, R1-007): on dev b683bfc3 one mutex held every name.
+    #[test]
+    fn a_lookup_does_not_wait_for_another_tenants_lock() {
+        let known = std::sync::Arc::new(KnownTenants::default());
+        let held = tenant("t6611-held");
+        known.remember(&held);
+        let guard = known.map(held.as_str());
+        let other = (0..32)
+            .map(|i| tenant(&format!("t6611-other-{i}")))
+            .find(|t| {
+                let probe = known.clone();
+                let t = t.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(probe.holds(&t));
+                });
+                rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok()
+            });
+        drop(guard);
+        assert!(
+            other.is_some(),
+            "every other Tenant waited for one held lock"
+        );
+        assert!(known.holds(&held));
+    }
+
+    /// The cap still bounds the whole memory, spread over the shards.
+    #[test]
+    fn the_cap_bounds_every_shard() {
+        let known = KnownTenants::default();
+        for i in 0..KnownTenants::CAP * 2 {
+            known.remember(&tenant(&format!("t{i}")));
+        }
+        let held: usize = known.0.iter().map(|m| m.lock().unwrap().len()).sum();
+        assert!(held <= KnownTenants::CAP.div_ceil(KnownTenants::SHARDS) * KnownTenants::SHARDS);
+        known.forget(&tenant("t0"));
+        assert!(!known.holds(&tenant("t0")));
     }
 }
 
