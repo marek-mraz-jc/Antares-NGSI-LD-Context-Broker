@@ -1686,7 +1686,7 @@ mod tests {
             unimplemented!()
         }
         async fn list(&self, _t: &TenantId, _k: Kind) -> Result<Vec<Value>, NgsiError> {
-            unimplemented!()
+            Ok(self.0.lock().expect("lock").iter().cloned().collect())
         }
         async fn matching_registrations(
             &self,
@@ -1698,10 +1698,15 @@ mod tests {
         }
         async fn query_entities(
             &self,
-            _t: &TenantId,
+            t: &TenantId,
             _f: &filter::EntityFilter<'_>,
         ) -> Result<filter::QueryOutcome, NgsiError> {
-            unimplemented!()
+            Ok(filter::QueryOutcome {
+                rows: self.list(t, Kind::Entity).await?,
+                decided: false,
+                paged: false,
+                total: None,
+            })
         }
         async fn mutate_boxed<'a>(
             &self,
@@ -1772,6 +1777,60 @@ mod tests {
         async fn context_list_meta(&self, _t: Option<&TenantId>) -> Result<Vec<Value>, NgsiError> {
             Ok(Vec::new())
         }
+    }
+
+    /// What a driver that overrides none of the optional reads answers: an
+    /// empty health block, no outbox, no type or id-segment index (the
+    /// caller folds instead), nothing to sweep or retain, and the tenant
+    /// inventory as OperationNotSupported, never a panic. The digest, the
+    /// candidate and the text reads fall back to `list` / `query_entities`.
+    #[tokio::test]
+    async fn a_driver_without_overrides_answers_the_documented_defaults() {
+        let t = TenantId::new("t").expect("tenant");
+        let doc = serde_json::json!({"id": "urn:a", "notification": {"timesFailed": 2}});
+        let d: std::sync::Arc<dyn CurrentStateDriver> =
+            std::sync::Arc::new(OneDoc(std::sync::Mutex::new(Some(doc.clone()))));
+        assert_eq!(d.version_info(), serde_json::json!({}));
+        d.set_outbox(true);
+        assert!(d.outbox_peek(10).await.expect("peek").is_empty());
+        assert_eq!(d.outbox_ack(&[1]).await.expect("ack"), 0);
+        assert_eq!(d.outbox_retain(&t, &[1]).await.expect("retain"), 0);
+        assert!(d.outbox_event(1, &t).await.expect("event").is_none());
+        assert_eq!(
+            d.list_digests(&t, Kind::Entity).await.expect("digests"),
+            digests(vec![doc.clone()])
+        );
+        let f = filter::EntityFilter::default();
+        let c = d.query_candidates(&t, &f).await.expect("candidates");
+        assert_eq!(c.rows, vec![doc.clone()]);
+        let text = d.query_entities_text(&t, &f).await.expect("text");
+        assert_eq!(text.rows.len(), 1);
+        assert_eq!(text.rows[0].get(), doc.to_string());
+        assert!(d.entity_type_names(&t).await.expect("types").is_none());
+        let beside = d.entity_types_beside(&t, &["T".into()]).await;
+        assert!(beside.expect("beside").is_none());
+        let segs = d.entity_id_segments(&t, "urn:", ':', 10).await;
+        assert!(segs.expect("segments").is_none());
+        assert_eq!(d.sweep_expired().await, 0);
+        let kept = d.retain_current(&t, "T", "2026-01-01T00:00:00Z", 10, true).await;
+        assert_eq!(kept.expect("retain"), 0);
+        assert!(d.history_overrides(10).await.expect("overrides").is_empty());
+        let unsupported = |r: Result<(), NgsiError>| {
+            assert_eq!(r.expect_err("unsupported").kind(), "OperationNotSupported");
+        };
+        unsupported(d.tenant_ids().await.map(drop));
+        unsupported(d.tenant_stats_one(&t).await.map(drop));
+        unsupported(d.tenant_bytes(&t).await.map(drop));
+        unsupported(d.tenant_bytes_estimate(&t, 1).await.map(drop));
+        unsupported(d.purge_tenant(&t).await.map(drop));
+        // the failure bookkeeping default goes through `mutate`
+        let failed = d
+            .record_failure(&t, Kind::Subscription, "urn:a", None, "2026-01-02T00:00:00Z")
+            .await
+            .expect("record")
+            .expect("row present");
+        assert_eq!(failed["notification"]["timesFailed"], 3, "{failed}");
+        assert_eq!(failed["notification"]["lastFailure"], "2026-01-02T00:00:00Z");
     }
 
     #[tokio::test]
@@ -2046,5 +2105,40 @@ mod tests {
             .await
             .expect("ok")
             .is_none());
+    }
+
+    /// A deployment without history answers every inventory, retention and
+    /// erasure call with "nothing here" and the one statistics guess it
+    /// cannot make with OperationNotSupported, so `/q/tenants`, `/q/retention`
+    /// and erasure work on it instead of failing.
+    #[tokio::test]
+    async fn no_temporal_holds_nothing_to_count_retain_or_erase() {
+        let t = TenantId::new("t").expect("tenant");
+        let d: std::sync::Arc<dyn TemporalDriver> = std::sync::Arc::new(NoTemporal);
+        let bound = std::time::Duration::from_millis(1);
+        assert_eq!(d.attr_instance_count(&t).await.expect("count"), 0);
+        assert_eq!(d.attr_instance_count_within(&t, bound).await.expect("count"), 0);
+        assert_eq!(d.attr_instance_bytes(&t).await.expect("bytes"), 0);
+        assert_eq!(d.attr_instance_usage(&t, bound).await.expect("usage"), (0, 0));
+        let e = d.attr_instance_estimate(&t).await.expect_err("no statistics");
+        assert_eq!(e.kind(), "OperationNotSupported");
+        let scope = HistoryScope::Entity("urn:a");
+        let before = "2026-01-01T00:00:00Z";
+        assert_eq!(d.retain_history(&t, scope, before, 10, false).await.expect("retain"), 0);
+        let floors = [("t".to_string(), before.to_string())];
+        assert!(d.drop_retained_history(&floors).await.expect("drop").is_empty());
+        assert_eq!(d.retain_audit(before, 10).await.expect("audit"), 0);
+        d.set_short_history(ShortHistory::default());
+        assert!(d.versions(&t, "urn:a").await.expect("versions").is_empty());
+        assert_eq!(d.erase(&t, "urn:a", None, None).await.expect("erase"), 0);
+        d.purge_tenant(&t).await.expect("purge");
+        d.ping().await.expect("always ready");
+        assert_eq!(d.version_info(), serde_json::json!({}));
+        d.close().await;
+        let q = antares_ql::parse_q("speed>1").expect("q");
+        assert!(!d.q_pushdown_exact(&q, None, &|s| s.to_string()));
+        assert!(d.get(&t, "urn:a").await.expect("get").is_none());
+        assert!(!d.create(&t, "urn:a", Value::Null).await.expect("create"));
+        assert!(!d.upsert(&t, "urn:a", Value::Null).await.expect("upsert"));
     }
 }
