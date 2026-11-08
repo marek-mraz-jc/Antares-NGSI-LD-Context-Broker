@@ -444,8 +444,16 @@ async fn reads_across_views_hold_their_pages_in_the_answer_pool() -> Result<(), 
     let one = union(&f.app, "views=car0&type=Car&limit=1000").await;
     assert_eq!(one.status, StatusCode::OK, "{}", one.text);
     let full = union(&f.app, "views=car0,car1&type=Car&limit=1000").await;
-    assert_eq!(full.status, StatusCode::SERVICE_UNAVAILABLE, "{}", full.text);
-    assert!(full.header("retry-after").is_some(), "503 without Retry-After");
+    assert_eq!(
+        full.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        full.text
+    );
+    assert!(
+        full.header("retry-after").is_some(),
+        "503 without Retry-After"
+    );
     assert_eq!(pool.held(), 0, "a refused read gives its share back");
     Ok(())
 }
