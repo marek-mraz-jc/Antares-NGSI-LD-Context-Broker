@@ -673,6 +673,16 @@ mod tests {
     use antares_model::EntityId;
     use serde_json::json;
 
+    /// The mirror-sync ladder doubles from 0.2 s and stops at 3.2 s, so five
+    /// attempts outlive a bus reconnect and a long outage never overflows
+    /// the shift.
+    #[test]
+    fn the_mirror_sync_backoff_doubles_to_its_ceiling() {
+        let ms: Vec<u128> = (0..7).map(|a| mirror_sync_backoff(a).as_millis()).collect();
+        assert_eq!(ms, [200, 400, 800, 1600, 3200, 3200, 3200]);
+        assert_eq!(mirror_sync_backoff(u32::MAX).as_millis(), 3200);
+    }
+
     #[test]
     fn roles_parse_accepts_the_role_set_and_refuses_anything_else() {
         assert!(Roles::parse("all").expect("all").all());

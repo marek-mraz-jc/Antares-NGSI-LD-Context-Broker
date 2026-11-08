@@ -138,3 +138,29 @@ async fn a_batch_that_wrote_nothing_answers_503_for_the_whole_array() {
         String::from_utf8_lossy(&body)
     );
 }
+
+/// The admin-document and maintenance helpers behind `/q/views`, `/q/grants`,
+/// `/q/policy` and the view sweeps hand a store at its pool wall back as the
+/// store's error, never as an empty list or a missing document: a sweep that
+/// read "nothing stored" would delete what it could not see.
+#[cfg(feature = "views")]
+#[tokio::test]
+async fn the_admin_documents_and_sweeps_report_the_pool_wall() {
+    let st = overloaded_state();
+    let wall = |e: String| assert!(e.contains(antares_model::error::DB_OVERLOADED), "{e}");
+    let t = antares_model::TenantId::new("acme").expect("tenant");
+    wall(st.view_digests().await.expect_err("digests"));
+    wall(st.view_doc("v").await.expect_err("view"));
+    wall(st.put_view_doc("v", json!({})).await.expect_err("put view"));
+    wall(st.delete_view_doc("v").await.expect_err("delete view"));
+    wall(st.grant_docs().await.expect_err("grants"));
+    wall(st.grant_doc("g").await.expect_err("grant"));
+    wall(st.put_grant_doc("g", json!({})).await.expect_err("put grant"));
+    wall(st.delete_grant_doc("g").await.expect_err("delete grant"));
+    wall(st.policy_docs().await.expect_err("policies"));
+    wall(st.policy_doc("acme").await.expect_err("policy"));
+    wall(st.put_policy_doc("acme", json!({})).await.expect_err("put policy"));
+    wall(st.delete_policy_doc("acme").await.expect_err("delete policy"));
+    wall(st.stored_type_names(&t).await.expect_err("type names"));
+    wall(st.scan_entities(&t, &[], &[], 0, 10).await.expect_err("scan"));
+}
