@@ -1941,10 +1941,11 @@ fn projected<'s>(
 
 /// URL 5.1.5 puts null first ascending and last descending; the store puts
 /// an Entity lacking an `orderBy` key last ascending and first descending.
-/// One count of the Entities lacking a key decides: none, and the store's
-/// order is the standard's; any, and the read is sorted on the surface
-/// (T-3853). A key the `$filter` holds on every Entity it admits needs no
-/// count, a second scan of the match set (T-4919).
+/// One Entity lacking a key decides: none, and the store's order is the
+/// standard's; any, and the read is sorted on the surface (T-3853). The
+/// probe reads at most one Entity and asks no count, which walked every match
+/// (R3-001/R3-002). A key the `$filter` holds on every Entity it admits needs
+/// no probe at all (T-4919).
 // ponytail: a sparse key over RESIDUAL_SCAN Entities is 400 TooManyResults;
 // split a single-key sort into "lacks it" and "holds it" reads if that matters
 async fn nulls_first(
@@ -1982,11 +1983,8 @@ async fn nulls_first(
         q: Some(q),
         ..filter.probe()
     };
-    let target = format!(
-        "/ngsi-ld/v1/entities?{}&limit=0&count=true",
-        query(set, None, &[], &probe)
-    );
-    let (_, lacking) = run(
+    let target = lacking_target(set, &probe);
+    let (lacking, _) = run(
         reads,
         caller,
         OperationId::QueryEntities,
@@ -1995,12 +1993,20 @@ async fn nulls_first(
         version,
     )
     .await?;
-    if lacking > 0 {
+    if !lacking.is_empty() {
         filter.sort_reads = terms.iter().map(|t| (*t).to_owned()).collect();
         filter.sort = Some(std::mem::take(&mut filter.pushed_keys));
         filter.order = None;
     }
     Ok(())
+}
+
+/// The [`nulls_first`] probe: one Entity of the match set lacking a key, no count.
+fn lacking_target(set: &Set, probe: &Translated) -> String {
+    format!(
+        "/ngsi-ld/v1/entities?{}&limit=1",
+        query(set, None, &[], probe)
+    )
 }
 
 /// The request's residual as a program, `now` read once (ADR-0028 rule 2).
@@ -2372,6 +2378,19 @@ mod tests {
         // a broken member ends them, as a whole parse of a broken answer held none
         assert_eq!(read("[{\"id\":\"a\"},{\"id\":]"), vec![json!({"id": "a"})]);
         assert_eq!(counted("[{\"id\":\"a\"},{\"id\":]"), 1);
+    }
+
+    /// R3-002: the probe of a sort key reads one Entity and asks the store for no count,
+    /// which walked the whole match set before every sorted page.
+    #[test]
+    fn the_lacking_key_probe_reads_one_entity_and_counts_nothing() {
+        let probe = Translated {
+            q: Some("!speed".into()),
+            ..Translated::default()
+        };
+        let target = lacking_target(&set(), &probe);
+        assert!(target.ends_with("&limit=1"), "{target}");
+        assert!(!target.contains("count=true"), "{target}");
     }
 
     fn set() -> Set {
