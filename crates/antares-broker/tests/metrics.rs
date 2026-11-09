@@ -158,15 +158,18 @@ fn metrics_port_serves_metrics_only_and_api_port_none() {
             .expect("spawn antares"),
     );
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !http(metrics_port, "GET", "/q/metrics", None).starts_with("HTTP/1.1 200") {
-        assert!(Instant::now() < deadline, "metrics listener never answered");
+    // The limit gauges appear with the sampler's first tick, which can still be
+    // running when the listener first answers: wait for them, not for the 200.
+    let mut metrics = String::new();
+    while !metrics.contains("# TYPE antares_limit_rejections_total") {
+        assert!(
+            Instant::now() < deadline,
+            "metrics listener serves no Prometheus text:\n{metrics}"
+        );
         std::thread::sleep(Duration::from_millis(200));
+        metrics = http(metrics_port, "GET", "/q/metrics", None);
     }
-    let metrics = http(metrics_port, "GET", "/q/metrics", None);
-    assert!(
-        metrics.contains("# TYPE antares_limit_rejections_total"),
-        "metrics listener serves no Prometheus text:\n{metrics}"
-    );
+    assert!(metrics.starts_with("HTTP/1.1 200"), "{metrics}");
     for path in [
         "/q/health",
         "/q/tenants",
