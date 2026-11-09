@@ -1505,6 +1505,30 @@ pub(crate) struct ReadMembers {
 }
 
 impl ReadMembers {
+    /// The gate of a POST Query (5.7.2, 5.7.4): the engine is shown every member of the
+    /// Query body (ADR-0020), and a body asking for metadata the Policy withholds is refused.
+    pub(crate) async fn gate_query(
+        st: &AppState,
+        tenant: &TenantId,
+        headers: &HeaderMap,
+        clause: &'static str,
+        vp: &HashMap<String, String>,
+        ctx: &antares_jsonld::Context,
+    ) -> ApiResult<std::sync::Arc<crate::policy::Filter>> {
+        let named = Self::with_ctx(st, vp, ctx);
+        let filter = gate!(
+            st, tenant, headers, clause,
+            q: named.q.as_ref(),
+            scope_q: vp.get("scopeQ").map(String::as_str),
+            types: &named.types,
+            attrs: &named.attrs,
+            geo: named.geo.as_ref(),
+        )
+        .await?;
+        crate::policy::Metadata::refuse_body(&filter, vp, ctx)?;
+        Ok(filter)
+    }
+
     pub(crate) fn with_ctx(
         st: &AppState,
         params: &HashMap<String, String>,
@@ -2844,20 +2868,12 @@ async fn merge_entity_inner(
             raw.apply(doc, &mut frag)?;
             apply_common_lang(doc, &mut frag, lang);
             merge_into(doc, &frag, &ts);
-            crate::policy::Condition::post(cond.as_ref(), doc)?;
-            #[cfg(feature = "views")]
-            if let Some(g) = &guard {
-                g.post(doc)?;
-            }
+            write_checks!(post cond, guard, doc);
             Ok::<(), NgsiError>(())
         })
         .await?;
     crate::history::settle(id, matches!(res, Some(Ok(()))));
-    crate::policy::Condition::verdict(cond.as_ref())?;
-    #[cfg(feature = "views")]
-    if let Some(g) = &guard {
-        g.settled()?;
-    }
+    write_checks!(settled cond, guard);
     match res {
         None => Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into()),
         Some(Err(e)) => Err(e.into()),
@@ -3400,19 +3416,11 @@ pub async fn replace_entity(
                         o.insert("createdAt".into(), created);
                     }
                     *doc = expanded.clone();
-                    crate::policy::Condition::post(cond.as_ref(), doc)?;
-                    #[cfg(feature = "views")]
-                    if let Some(g) = &guard {
-                        g.post(doc)?;
-                    }
+                    write_checks!(post cond, guard, doc);
                     Ok::<(), NgsiError>(())
                 })
                 .await?;
-            crate::policy::Condition::verdict(cond.as_ref())?;
-            #[cfg(feature = "views")]
-            if let Some(g) = &guard {
-                g.settled()?;
-            }
+            write_checks!(settled cond, guard);
             return match res {
                 None => Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into()),
                 Some(Err(e)) => Err(e.into()),

@@ -68,6 +68,34 @@ macro_rules! gate {
     };
 }
 
+/// The two judges of a write inside `store.mutate`: the Policy's conditions
+/// ([`policy::Condition`]) and, in a state served through an endpoint view, the
+/// view's write guard (ADR-0023).
+///
+/// ```ignore
+/// write_checks!(post cond, guard, doc);   // in the closure, on the changed document
+/// write_checks!(settled cond, guard);     // after the store call: either refusal as a 403/412
+/// ```
+///
+/// A macro because `guard` exists only with the `views` feature: the check on it
+/// compiles away with the feature, and so does the name.
+macro_rules! write_checks {
+    (post $cond:ident, $guard:ident, $doc:expr) => {
+        $crate::policy::Condition::post($cond.as_ref(), $doc)?;
+        #[cfg(feature = "views")]
+        if let Some(g) = &$guard {
+            g.post($doc)?;
+        }
+    };
+    (settled $cond:ident, $guard:ident) => {
+        $crate::policy::Condition::verdict($cond.as_ref())?;
+        #[cfg(feature = "views")]
+        if let Some(g) = &$guard {
+            g.settled()?;
+        }
+    };
+}
+
 pub mod admin_auth;
 // Inbound bridge Channels (ADR-0031): `/x/channels`, off in the vanilla build.
 pub(crate) mod attrs;

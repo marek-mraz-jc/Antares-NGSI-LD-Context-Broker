@@ -1156,18 +1156,15 @@ pub async fn batch_temporal_query(
         // and aggrParams (5.2.44).
         let mut vp: HashMap<String, String> = params.clone();
         crate::paging::query_doc_params(q, true, &mut vp)?;
-        // ADR-0020: the engine is shown every member of the Query body
-        let named = crate::entities::ReadMembers::with_ctx(&st, &vp, &parsed.ctx);
-        let filter = gate!(
-            st, &tenant, &headers, "5.7.4",
-            q: named.q.as_ref(),
-            scope_q: vp.get("scopeQ").map(String::as_str),
-            types: &named.types,
-            attrs: &named.attrs,
-            geo: named.geo.as_ref(),
+        let filter = crate::entities::ReadMembers::gate_query(
+            &st,
+            &tenant,
+            &headers,
+            "5.7.4",
+            &vp,
+            &parsed.ctx,
         )
         .await?;
-        crate::policy::Metadata::refuse_body(&filter, &vp, &parsed.ctx)?;
         query_temporal_inner(&st, &vp, &headers, &filter).await
     };
     go.await.unwrap_or_else(|e| e.into_response())

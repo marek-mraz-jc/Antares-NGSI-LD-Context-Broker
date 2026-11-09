@@ -261,11 +261,7 @@ async fn write_attrs(
             return Err(Unwritten::Untouched);
         }
         target.insert("modifiedAt".into(), Value::String(ts.clone()));
-        Condition::post(cond.as_ref(), doc)?;
-        #[cfg(feature = "views")]
-        if let Some(g) = &guard {
-            g.post(doc)?;
-        }
+        write_checks!(post cond, guard, doc);
         Ok::<(), Unwritten>(())
     };
     // An inbound bridge Channel's bind probe and relay samples (ADR-0031):
@@ -291,11 +287,7 @@ async fn write_attrs(
             Err(Unwritten::Failed(e)) => return Err(e.into()),
             Err(Unwritten::Untouched) => {}
             Ok(()) => {
-                Condition::verdict(cond.as_ref())?;
-                #[cfg(feature = "views")]
-                if let Some(g) = &guard {
-                    g.settled()?;
-                }
+                write_checks!(settled cond, guard);
                 relay(st, &tenant, before, after);
             }
         }
@@ -306,11 +298,7 @@ async fn write_attrs(
     } else {
         let res = st.store.mutate(&tenant, Kind::Entity, id, apply).await?;
         crate::history::settle(id, matches!(res, Some(Ok(()))));
-        Condition::verdict(cond.as_ref())?;
-        #[cfg(feature = "views")]
-        if let Some(g) = &guard {
-            g.settled()?;
-        }
+        write_checks!(settled cond, guard);
         Some(match res {
             None => Err(NgsiError::ResourceNotFound(format!("entity {id} not found")).into()),
             Some(Err(Unwritten::Failed(e))) => Err(e.into()),
@@ -1061,19 +1049,11 @@ async fn partial_update_inner(
                 if found {
                     target.insert("modifiedAt".into(), Value::String(ts.clone()));
                 }
-                Condition::post(cond.as_ref(), doc)?;
-                #[cfg(feature = "views")]
-                if let Some(g) = &guard {
-                    g.post(doc)?;
-                }
+                write_checks!(post cond, guard, doc);
                 Ok::<(), NgsiError>(())
             })
             .await?;
-        Condition::verdict(cond.as_ref())?;
-        #[cfg(feature = "views")]
-        if let Some(g) = &guard {
-            g.settled()?;
-        }
+        write_checks!(settled cond, guard);
         Some(single_attr_local(res, found, id, attr, &tenant))
     };
     if regs.is_empty() {
@@ -1241,19 +1221,11 @@ pub async fn replace_attr(
                     if found {
                         target.insert("modifiedAt".into(), Value::String(ts.clone()));
                     }
-                    Condition::post(cond.as_ref(), doc)?;
-                    #[cfg(feature = "views")]
-                    if let Some(g) = &guard {
-                        g.post(doc)?;
-                    }
+                    write_checks!(post cond, guard, doc);
                     Ok::<(), NgsiError>(())
                 })
                 .await?;
-            Condition::verdict(cond.as_ref())?;
-            #[cfg(feature = "views")]
-            if let Some(g) = &guard {
-                g.settled()?;
-            }
+            write_checks!(settled cond, guard);
             Some(single_attr_local(res, found, &id, &attr, &tenant))
         };
         if regs.is_empty() {
@@ -1432,19 +1404,11 @@ async fn set_attr_value_inner(
                 *slot = ni;
                 found = true;
                 target.insert("modifiedAt".into(), Value::String(ts.clone()));
-                Condition::post(cond.as_ref(), doc)?;
-                #[cfg(feature = "views")]
-                if let Some(g) = &guard {
-                    g.post(doc)?;
-                }
+                write_checks!(post cond, guard, doc);
                 Ok::<(), NgsiError>(())
             })
             .await?;
-        Condition::verdict(cond.as_ref())?;
-        #[cfg(feature = "views")]
-        if let Some(g) = &guard {
-            g.settled()?;
-        }
+        write_checks!(settled cond, guard);
         Some(single_attr_local(res, found, id, attr, &tenant))
     };
     if regs.is_empty() {
@@ -1655,11 +1619,7 @@ async fn delete_attr_inner(
                     if found {
                         target.insert("modifiedAt".into(), Value::String(ts.clone()));
                     }
-                    Condition::post(cond.as_ref(), doc)?;
-                    #[cfg(feature = "views")]
-                    if let Some(g) = &guard {
-                        g.post(doc)?;
-                    }
+                    write_checks!(post cond, guard, doc);
                     return Ok(());
                 }
                 let target = antares_store::stored_object(doc)?;
@@ -1683,19 +1643,11 @@ async fn delete_attr_inner(
                 if found {
                     target.insert("modifiedAt".into(), Value::String(ts.clone()));
                 }
-                Condition::post(cond.as_ref(), doc)?;
-                #[cfg(feature = "views")]
-                if let Some(g) = &guard {
-                    g.post(doc)?;
-                }
+                write_checks!(post cond, guard, doc);
                 Ok::<(), NgsiError>(())
             })
             .await?;
-        Condition::verdict(cond.as_ref())?;
-        #[cfg(feature = "views")]
-        if let Some(g) = &guard {
-            g.settled()?;
-        }
+        write_checks!(settled cond, guard);
         // The store's change hook records the deletion (4.8 deletedAt,
         // notify::record_temporal_change). Only what the Entity held is
         // deleted (5.6.5.4: "If the target Entity does not contain the target
