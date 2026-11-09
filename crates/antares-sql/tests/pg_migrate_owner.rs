@@ -54,7 +54,9 @@ async fn the_migrations_backfill_scoped_entities_as_a_non_superuser_owner() {
     let as_owner = base.username(OWNER).password("owner").database(&name);
     // The extensions are no owner's to create (postgis is untrusted); dev's
     // operator creates them the same way, before the broker connects.
-    let ext = sqlx::PgPool::connect_with(as_admin).await.expect("admin on own db");
+    let ext = sqlx::PgPool::connect_with(as_admin)
+        .await
+        .expect("admin on own db");
     for stmt in [
         "CREATE EXTENSION IF NOT EXISTS postgis",
         "CREATE EXTENSION IF NOT EXISTS btree_gin",
@@ -73,7 +75,10 @@ async fn the_migrations_backfill_scoped_entities_as_a_non_superuser_owner() {
             .fetch_one(&owner)
             .await
             .expect("role flags");
-    assert!(!bypass, "the owner must wear RLS or this test proves nothing");
+    assert!(
+        !bypass,
+        "the owner must wear RLS or this test proves nothing"
+    );
     let before = sqlx::migrate::Migrator::with_migrations(
         pg::MIGRATOR
             .iter()
@@ -83,7 +88,10 @@ async fn the_migrations_backfill_scoped_entities_as_a_non_superuser_owner() {
     );
     before.run(&owner).await.expect("migrations up to 0031");
     let tenants = [
-        (TenantId::new("t6610-a").expect("tenant"), r#"["/A//B/", "C"]"#),
+        (
+            TenantId::new("t6610-a").expect("tenant"),
+            r#"["/A//B/", "C"]"#,
+        ),
         (TenantId::new("t6610-b").expect("tenant"), r#"["/D"]"#),
     ];
     for (tenant, scopes) in &tenants {
@@ -115,17 +123,18 @@ async fn the_migrations_backfill_scoped_entities_as_a_non_superuser_owner() {
     ] {
         let mut tx = pool.begin().await.expect("tx");
         pg::set_tenant(&mut tx, tenant).await.expect("set_tenant");
-        let got: Vec<String> = sqlx::query_scalar(
-            "SELECT txt FROM entity_values WHERE attr = 'scope' ORDER BY txt",
-        )
-        .fetch_all(&mut *tx)
-        .await
-        .expect("scope rows");
+        let got: Vec<String> =
+            sqlx::query_scalar("SELECT txt FROM entity_values WHERE attr = 'scope' ORDER BY txt")
+                .fetch_all(&mut *tx)
+                .await
+                .expect("scope rows");
         assert_eq!(got, want, "{} keeps its own scope rows", tenant.as_str());
     }
     pool.close().await;
-    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {name} WITH (FORCE)")))
-        .execute(&admin)
-        .await
-        .expect("drop own database");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE {name} WITH (FORCE)"
+    )))
+    .execute(&admin)
+    .await
+    .expect("drop own database");
 }
