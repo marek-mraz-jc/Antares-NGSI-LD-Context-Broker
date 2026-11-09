@@ -115,6 +115,13 @@ if [ "${UNIT_TESTS:-0}" = 1 ]; then
     [ "$name" = antares-wasm ] && continue
     API_PKGS+=(-p "$name")
   done
+  # A test target with `required-features` makes `--test '*'` refuse the whole
+  # invocation (odata-table's `shared` needs git + postgres: run 42698563830),
+  # so each one runs with its features, read from the manifests.
+  mapfile -t REQ_FEATS < <(cargo metadata --no-deps --format-version 1 | jq -r '
+    .packages[] | .name as $p | .targets[] | select(.kind == ["test"])
+    | (.["required-features"] // [])[] | "--features=\($p)/\(.)"' | sort -u)
+  API_PKGS+=("${REQ_FEATS[@]}")
   # Built first and without `|| true`: an unknown package or a test that no
   # longer compiles must fail the run, never measure an empty api pass.
   cargo test "${API_PKGS[@]}" --test '*' -j 2 --no-run

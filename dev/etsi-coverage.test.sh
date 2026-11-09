@@ -3,10 +3,12 @@
 # dev/etsi-coverage.sh measures every test binary even when some are red, and a
 # cell without a database skips the pg tests (T-6499: run 41519646110 lost 2.6
 # points when one red binary per cell cut each pass short). A stub cargo fails
-# every test run and stops the script at the broker build.
+# every test run and stops the script at the broker build. A test target with
+# required-features must get them, or cargo refuses the api pass (run 42698563830).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+real_cargo=$(command -v cargo)
 tmp=$(mktemp -d)
 trap 'rm -rf "${tmp:?}"' EXIT
 mkdir "$tmp/target"
@@ -15,6 +17,7 @@ cat > "$tmp/cargo" <<STUB
 case "\$1 \$2" in
   "llvm-cov show-env") echo "export CARGO_LLVM_COV_TARGET_DIR=$tmp/target" ;;
   "llvm-cov clean") ;;
+  metadata\ *) exec "$real_cargo" "\$@" ;;
   test\ *) [[ " \$* " == *" --no-run "* ]] && exit 0
     echo "\$* url=\${ANTARES_TEST_DATABASE_URL-unset}" >> "$tmp/runs"; exit 101 ;;
   *) exit 1 ;;
@@ -36,5 +39,10 @@ fi
 if grep -v 'url=unset$' "$tmp/runs"; then
   echo "^ an empty ANTARES_TEST_DATABASE_URL reached the tests: pg tests panic instead of skipping"; bad=1
 fi
+while read -r feat; do
+  grep -- "--test " "$tmp/runs" | grep -qF -- "--features=$feat " || {
+    echo "the api pass lacks --features=$feat: cargo refuses a test target without its required-features"; bad=1; }
+done < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | .name as $p | .targets[]
+  | select(.kind == ["test"]) | (.["required-features"] // [])[] | "\($p)/\(.)"')
 [ "$bad" = 0 ] && echo "etsi-coverage passes: OK"
 exit "$bad"
