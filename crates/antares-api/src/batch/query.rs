@@ -44,18 +44,9 @@ async fn batch_query_inner(
     if let Some(l) = params.get("local") {
         vp.insert("local".into(), l.clone());
     }
-    // ADR-0020: the engine is shown every member of the Query body
-    let named = crate::entities::ReadMembers::with_ctx(st, &vp, &parsed.ctx);
-    let filter = gate!(
-        st, &tenant, headers, "5.7.2",
-        q: named.q.as_ref(),
-        scope_q: vp.get("scopeQ").map(String::as_str),
-        types: &named.types,
-        attrs: &named.attrs,
-        geo: named.geo.as_ref(),
-    )
-    .await?;
-    crate::policy::Metadata::refuse_body(&filter, &vp, &parsed.ctx)?;
+    let filter =
+        crate::entities::ReadMembers::gate_query(st, &tenant, headers, "5.7.2", &vp, &parsed.ctx)
+            .await?;
     refuse_too_wide(&vp)?;
     // ADR-0020: the engine's narrowing joins the Query's own filters here,
     // after the "too wide" judgement — which is about what the client asked

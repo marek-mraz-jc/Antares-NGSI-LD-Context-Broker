@@ -667,6 +667,23 @@ fn ids_of(e: &Expr, aliases: &[(String, Literal)]) -> Result<Option<Vec<String>>
 }
 
 /// The literal an operand is, through an alias.
+/// A WKT position as the `GeoJSON` coordinate array NGSI-LD geo queries take; 400 for a
+/// number that is not finite.
+fn coordinates(position: &odata_url::Position) -> Result<Value, Refused> {
+    position
+        .0
+        .iter()
+        .map(|n| {
+            n.parse::<f64>()
+                .ok()
+                .filter(|n| n.is_finite())
+                .map(Value::from)
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(Value::from)
+        .ok_or(Refused::Bad)
+}
+
 fn literal<'a>(e: &'a Expr, aliases: &'a [(String, Literal)]) -> Result<&'a Literal, Refused> {
     match e {
         Expr::Literal(l) => Ok(l),
@@ -873,6 +890,17 @@ impl<'a> Terms<'a> {
             Ok(Literal::Geometry(_)) => return Err(Refused::Bad),
             _ => return Err(Refused::Later),
         };
+        let term = self.geo_term(member)?;
+        let polygon = rings
+            .iter()
+            .map(|ring| ring.iter().map(coordinates).collect::<Result<Vec<_>, _>>())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some((term, Value::from(polygon))))
+    }
+
+    /// The term of the GeoProperty a geo function's first argument names: 501 for anything
+    /// but a plain member path, 400 for a member that is no GeoProperty.
+    fn geo_term(&mut self, member: &Expr) -> Result<String, Refused> {
         let Expr::Member(MemberPath {
             variable: None,
             path,
@@ -886,27 +914,7 @@ impl<'a> Terms<'a> {
         if !matches!(m.shape, Shape::Geo) {
             return Err(Refused::Bad);
         }
-        let mut polygon = Vec::with_capacity(rings.len());
-        for ring in rings {
-            let mut points = Vec::with_capacity(ring.len());
-            for position in ring {
-                let point = position
-                    .0
-                    .iter()
-                    .map(|n| {
-                        n.parse::<f64>()
-                            .ok()
-                            .filter(|n| n.is_finite())
-                            .map(Value::from)
-                    })
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or(Refused::Bad)?;
-                points.push(Value::from(point));
-            }
-            polygon.push(Value::from(points));
-        }
-        let term = self.term_of(&m.iri);
-        Ok(Some((term, Value::from(polygon))))
+        Ok(self.term_of(&m.iri))
     }
 
     /// F30: `geo.distance(p, geography'SRID=4326;Point(x y)') lt m` (or `le`, `gt`, `ge`,
@@ -948,34 +956,11 @@ impl<'a> Terms<'a> {
             Literal::Geography(Geography {
                 srid: 4326,
                 shape: odata_url::Shape::Point(position),
-            }) => position
-                .0
-                .iter()
-                .map(|n| {
-                    n.parse::<f64>()
-                        .ok()
-                        .filter(|n| n.is_finite())
-                        .map(Value::from)
-                })
-                .collect::<Option<Vec<_>>>()
-                .ok_or(Refused::Bad)?,
+            }) => coordinates(position)?,
             Literal::Geography(_) => return Err(Refused::Later),
             _ => return Err(Refused::Bad),
         };
-        let Expr::Member(MemberPath {
-            variable: None,
-            path,
-        }) = member
-        else {
-            return Err(Refused::Later);
-        };
-        let Some((None, m)) = self.leaf(path) else {
-            return Err(Refused::Later);
-        };
-        if !matches!(m.shape, Shape::Geo) {
-            return Err(Refused::Bad);
-        }
-        Ok(Some((self.term_of(&m.iri), Value::from(point), georel)))
+        Ok(Some((self.geo_term(member)?, point, georel)))
     }
 
     /// F1 to F6, F2/F4 on `null`, F25 refused.
