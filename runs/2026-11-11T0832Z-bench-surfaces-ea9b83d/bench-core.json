@@ -1,0 +1,49 @@
+{
+  "cases": {
+    "calibrate": {
+      "calibrate_p50_ns": 1880.0,
+      "p50_ns": 1880.0,
+      "p99_ns": 1985.0
+    },
+    "jsonld_compact_page_100": {
+      "calibrate_p50_ns": 1880.0,
+      "p50_ns": 208689.0,
+      "p99_ns": 233659.0
+    },
+    "ql_check_type_selection": {
+      "calibrate_p50_ns": 1880.0,
+      "p50_ns": 94.0,
+      "p99_ns": 101.0
+    },
+    "ql_geo_from_params": {
+      "calibrate_p50_ns": 1880.0,
+      "p50_ns": 455.0,
+      "p99_ns": 491.0
+    },
+    "ql_parse_q": {
+      "calibrate_p50_ns": 1880.0,
+      "p50_ns": 1330.0,
+      "p99_ns": 1406.0
+    },
+    "sql_compile_geo_near": {
+      "calibrate_p50_ns": 1880.0,
+      "p50_ns": 9923.0,
+      "p99_ns": 10871.0
+    },
+    "sql_compile_geo_within": {
+      "calibrate_p50_ns": 1880.0,
+      "p50_ns": 23253.0,
+      "p99_ns": 31788.0
+    },
+    "sql_compile_q": {
+      "calibrate_p50_ns": 1880.0,
+      "p50_ns": 8932.0,
+      "p99_ns": 9493.0
+    },
+    "sql_compile_scope_q": {
+      "calibrate_p50_ns": 1880.0,
+      "p50_ns": 920.0,
+      "p99_ns": 1733.0
+    }
+  }
+}
