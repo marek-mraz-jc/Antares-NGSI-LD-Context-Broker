@@ -2737,6 +2737,7 @@ dependencies = [
  "odata-table",
  "odata-url",
  "serde_json",
+ "sqlx",
  "tokio",
  "tower",
 ]
