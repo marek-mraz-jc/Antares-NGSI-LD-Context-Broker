@@ -260,9 +260,12 @@ jobs:
       - &mosquitto
         name: Start mosquitto for the MQTT e2e
         run: |
-          sudo apt-get install -y -qq mosquitto
-          printf 'allow_anonymous true\nlistener 1883\n' | sudo tee /etc/mosquitto/conf.d/antares-e2e.conf
-          sudo systemctl restart mosquitto
+          # A container like NATS below, never apt: the Ubuntu mirror's DNS outage
+          # failed every shard of full run 43040015976 while Docker Hub pulls worked.
+          docker run -d --name mosquitto --network host \
+            eclipse-mosquitto:2.0.22@sha256:81a6193ae693942a3231cd3ac52875b02b7e3a19da671b2fb4b55cc874c5b279 \
+            sh -c 'printf "listener 1883\nallow_anonymous true\n" > /mosquitto/config/e2e.conf && exec mosquitto -c /mosquitto/config/e2e.conf'
+          timeout 30 bash -c 'until (exec 3<>/dev/tcp/127.0.0.1/1883) 2>/dev/null; do sleep 1; done' || { docker logs mosquitto; exit 1; }
           echo "ANTARES_TEST_MQTT_URL=mqtt://127.0.0.1:1883" >> "$GITHUB_ENV"
       # Live NATS (JetStream) for the bus tests + the 2-instance roles e2e.
       # A `docker run` step, not a service: services cannot pass the `-js`
@@ -734,8 +737,12 @@ jobs:
           key: odata-csdl-conformance
       - name: xmllint
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq libxml2-utils
+          # apt only when the runner image lacks it, with retries: a mirror DNS
+          # outage failed this step in full run 43040015976.
+          command -v xmllint || {
+            sudo apt-get -o Acquire::Retries=5 update -qq
+            sudo apt-get -o Acquire::Retries=5 install -y -qq libxml2-utils
+          }
       - name: Schemas, converter and vocabulary terms
         run: python3 dev/odata-csdl-conformance.py
 
