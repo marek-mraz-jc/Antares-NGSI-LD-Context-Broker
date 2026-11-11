@@ -570,7 +570,10 @@ async fn a_pg_table_keeps_forced_row_level_security() -> Result<(), String> {
     let Some(admin) = admin().await? else {
         return Ok(());
     };
-    let name = relation(&admin, "rls", &rows()).await?;
+    let plain = relation(&admin, "rls", &rows()).await?;
+    // The policy table lives outside `public`: antares-sql's probe list reads every RLS table in
+    // `public` of the same database, and would count this one while both suites run.
+    let name = format!("odata_table_rls.{plain}");
     let url = std::env::var("ANTARES_TEST_DATABASE_URL").must()?;
     // Role DDL is cluster-global: the advisory lock other suites take queues the setups.
     let mut tx = admin.begin().await.must()?;
@@ -579,7 +582,10 @@ async fn a_pg_table_keeps_forced_row_level_security() -> Result<(), String> {
         "DO $$ BEGIN CREATE ROLE odata_table_app LOGIN PASSWORD 'app' NOSUPERUSER NOBYPASSRLS; \
          EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$"
             .to_owned(),
-        "GRANT USAGE ON SCHEMA public TO odata_table_app".to_owned(),
+        "CREATE SCHEMA IF NOT EXISTS odata_table_rls".to_owned(),
+        format!("DROP TABLE IF EXISTS {name}"),
+        format!("ALTER TABLE {plain} SET SCHEMA odata_table_rls"),
+        "GRANT USAGE ON SCHEMA odata_table_rls TO odata_table_app".to_owned(),
         format!("GRANT SELECT ON {name} TO odata_table_app"),
         format!("ALTER TABLE {name} ENABLE ROW LEVEL SECURITY"),
         format!("ALTER TABLE {name} FORCE ROW LEVEL SECURITY"),
