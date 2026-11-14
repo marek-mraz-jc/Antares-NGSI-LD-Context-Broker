@@ -136,3 +136,7 @@ note = "drops the unused tenant_update policy on attr_versions; an older release
 [0032]
 rollback = "compatible"
 note = "entity_value_rows also gives each Entity's scopes as attr scope rows; an older release never probes attr scope, refuses attrs= naming scope before it reads entity_values, and its triggers keep the rows through the same function"
+
+[0033]
+rollback = "compatible"
+note = "the history_retention flag is kept by a trigger, so an older release's writes keep it current; its retention sweep asks entity ? historyRetention, which no index serves after 0033, and reads entities once a minute until the roll-forward"

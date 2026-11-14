@@ -440,3 +440,23 @@ async fn a_conditioned_write_is_not_forwarded() {
         assert_eq!(stored(&st, IN_A).await, before, "{method} {uri}");
     }
 }
+
+/// R1-005 (T-6607): Set Attribute Value under an engine reads the Entity
+/// once before its store operation. It read it a second time for the gate's
+/// pre-image, a pool round trip that returned the document it already held.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_attribute_value_reads_the_entity_once_before_its_write() {
+    let mut st = state(Arc::new(Conditioned(zone_a()))).await;
+    let double = Arc::new(Double::flaky_list(st.store.clone(), 0));
+    st.store = double.clone();
+    let (status, out) = send(
+        &st,
+        "PUT",
+        &format!("/ngsi-ld/v1/entities/{IN_A}/attrs/speed/value"),
+        Some(json!(5)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{out}");
+    assert_eq!(double.gets(), 1, "reads before the write");
+    assert_eq!(stored(&st, IN_A).await["speed"]["value"], 5);
+}

@@ -32,6 +32,7 @@ pub struct Double {
     unpaged_queries: AtomicUsize,
     geo_paged: AtomicUsize,
     rows_read: AtomicUsize,
+    gets: AtomicUsize,
     registration_reads: AtomicUsize,
     tenant_probes: AtomicUsize,
     wedged: AtomicBool,
@@ -56,6 +57,7 @@ impl Double {
             unpaged_queries: AtomicUsize::new(0),
             geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
+            gets: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
             wedged: AtomicBool::new(false),
@@ -81,6 +83,7 @@ impl Double {
             unpaged_queries: AtomicUsize::new(0),
             geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
+            gets: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
             wedged: AtomicBool::new(false),
@@ -106,6 +109,7 @@ impl Double {
             unpaged_queries: AtomicUsize::new(0),
             geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
+            gets: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
             wedged: AtomicBool::new(false),
@@ -133,6 +137,7 @@ impl Double {
             unpaged_queries: AtomicUsize::new(0),
             geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
+            gets: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
             wedged: AtomicBool::new(false),
@@ -172,6 +177,7 @@ impl Double {
             unpaged_queries: AtomicUsize::new(0),
             geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
+            gets: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
             wedged: AtomicBool::new(false),
@@ -197,6 +203,7 @@ impl Double {
             unpaged_queries: AtomicUsize::new(0),
             geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
+            gets: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
             wedged: AtomicBool::new(false),
@@ -222,6 +229,7 @@ impl Double {
             unpaged_queries: AtomicUsize::new(0),
             geo_paged: AtomicUsize::new(0),
             rows_read: AtomicUsize::new(0),
+            gets: AtomicUsize::new(0),
             registration_reads: AtomicUsize::new(0),
             tenant_probes: AtomicUsize::new(0),
             wedged: AtomicBool::new(false),
@@ -255,6 +263,11 @@ impl Double {
 
     /// Entity documents `query_entities` has handed out, whatever the double
     /// was built for: what a read costs the store (T-4610).
+    /// How many `get` calls reached this store.
+    pub fn gets(&self) -> usize {
+        self.gets.load(Ordering::SeqCst)
+    }
+
     pub fn rows_read(&self) -> usize {
         self.rows_read.load(Ordering::SeqCst)
     }
@@ -421,6 +434,7 @@ impl CurrentStateDriver for Double {
         kind: Kind,
         id: &str,
     ) -> Result<Option<Value>, NgsiError> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
         self.pool_wall()?;
         self.refused(kind, id)?;
         let doc = self.inner.get(tenant, kind, id).await?;

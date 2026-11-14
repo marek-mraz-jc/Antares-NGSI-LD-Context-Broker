@@ -10,6 +10,7 @@ use antares_model::TenantId;
 use antares_sql::store::pg;
 use antares_sql::store::pg::entity::PgEntityStore;
 use serde_json::json;
+use sqlx::Row;
 
 macro_rules! require_db {
     () => {
@@ -1688,4 +1689,68 @@ async fn a_slice_of_a_tenant_past_the_ceiling_is_served() {
             .map(|i| format!("urn:ngsi-ld:Test:{i:06}"))
             .collect::<Vec<_>>()
     );
+}
+
+/// R2-004 (T-6607): an update that changes only attribute values is HOT, so
+/// it writes no index entry and keeps the row on its page. Before 0033 the
+/// predicate of 0010's partial index read `entity`, which every write sets,
+/// so no Entity update could be HOT. The SET list is the store's update
+/// (store/pg/entity.rs), every extracted column written with its old value.
+/// The counters are this transaction's own, so no other test moves them.
+#[tokio::test]
+async fn a_value_update_is_hot_and_the_retention_flag_follows_the_key() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("connect");
+    const KEY: &str = "https://uri.etsi.org/ngsi-ld/default-context/historyRetention";
+    let mut tx = pool.begin().await.expect("tx");
+    let id = "urn:ngsi-ld:Test:hot1";
+    sqlx::query(
+        "INSERT INTO entities (tenant_id, id, entity, types, created_at, modified_at)
+         VALUES ('pghot', $1, $2, ARRAY['https://uri.etsi.org/ngsi-ld/default-context/Test'],
+                 now(), now())",
+    )
+    .bind(id)
+    .bind(doc(id, 1))
+    .execute(&mut *tx)
+    .await
+    .expect("insert");
+    let update = |entity: serde_json::Value| {
+        sqlx::query(
+            "UPDATE entities SET entity = $2, types = types, scopes = scopes,
+               modified_at = now(), expires_at = expires_at, location = location,
+               location_ambiguous = location_ambiguous, attrs_expire_at = attrs_expire_at,
+               version = version + 1
+             WHERE tenant_id = 'pghot' AND id = $1
+             RETURNING history_retention",
+        )
+        .bind(id)
+        .bind(entity)
+    };
+    let hot = "SELECT pg_stat_get_xact_tuples_hot_updated('entities'::regclass)";
+    let flag: bool = update(doc(id, 2))
+        .fetch_one(&mut *tx)
+        .await
+        .expect("update")
+        .get(0);
+    let n: i64 = sqlx::query_scalar(hot)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("hot");
+    assert_eq!((n, flag), (1, false), "a value update must be HOT");
+
+    let mut own = doc(id, 3);
+    own[KEY] = json!([{"type": "Property", "value": "P7D"}]);
+    let flag: bool = update(own)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("update")
+        .get(0);
+    assert!(flag, "the trigger sets the flag when the key arrives");
+    let flag: bool = update(doc(id, 4))
+        .fetch_one(&mut *tx)
+        .await
+        .expect("update")
+        .get(0);
+    assert!(!flag, "the trigger clears the flag when the key leaves");
+    tx.rollback().await.expect("rollback");
 }
