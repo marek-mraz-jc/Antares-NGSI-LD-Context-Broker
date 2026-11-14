@@ -163,24 +163,30 @@ fn an_upsert_through_a_view_opens_three_transactions_however_many_targets_and_me
         assert!(Instant::now() < settle, "the broker never went idle");
         idle = now;
     }
-    let before = begun(port);
-    let one = upsert(port, &vehicle(1, 2));
-    assert!(one.starts_with("HTTP/1.1 204"), "{one}");
-    let after = begun(port);
+    // The fewest transactions any of three upserts opened: on CI's shared
+    // database a background job's transaction can land inside one window
+    // (dev ci 42547144688 and 43115773188 counted 4 without any branch),
+    // while a transaction the upsert itself adds shows in every attempt.
+    let fewest = |members: &dyn Fn(u32) -> String| {
+        (0..3)
+            .map(|round| {
+                let before = begun(port);
+                let answer = upsert(port, &members(round));
+                assert!(answer.starts_with("HTTP/1.1 204"), "{answer}");
+                begun(port) - before
+            })
+            .min()
+            .unwrap_or(u64::MAX)
+    };
+    let one = fewest(&|round| vehicle(1, 10 + round));
     assert!(
-        after - before <= 3,
-        "one Vehicle with two Relationships opened {} transactions",
-        after - before
+        one <= 3,
+        "one Vehicle with two Relationships opened {one} transactions",
     );
-
-    let before = begun(port);
-    let five = upsert(port, &all(3));
-    assert!(five.starts_with("HTTP/1.1 204"), "{five}");
-    let after = begun(port);
+    let five = fewest(&|round| all(20 + round));
     assert!(
-        after - before <= 3,
-        "five Vehicles opened {} transactions: the history is one, the reads one",
-        after - before
+        five <= 3,
+        "five Vehicles opened {five} transactions: the history is one, the reads one",
     );
 
     // A target the view does not show still refuses the member (T-3786).

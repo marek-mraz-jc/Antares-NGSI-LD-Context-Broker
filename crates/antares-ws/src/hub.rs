@@ -500,9 +500,40 @@ pub trait Relay: Send + Sync {
 /// The connections of this process.
 pub struct Hub {
     pub(crate) limits: Limits,
-    conns: Mutex<HashMap<String, Arc<Conn>>>,
+    conns: Mutex<Table>,
     relay: Mutex<Option<Arc<dyn Relay>>>,
     overflows: std::sync::atomic::AtomicU64,
+}
+
+/// The connections by id, and how many each Tenant holds, kept together under
+/// one lock so an upgrade's per-Tenant check is a lookup, not a walk of every
+/// connection of the process (R2-030).
+#[derive(Default)]
+struct Table {
+    by_id: HashMap<String, Arc<Conn>>,
+    per_tenant: TenantCounts,
+}
+
+/// Connections per Tenant; a Tenant with none has no entry.
+#[derive(Default)]
+struct TenantCounts(HashMap<String, usize>);
+
+impl TenantCounts {
+    fn of(&self, tenant: &str) -> usize {
+        self.0.get(tenant).copied().unwrap_or(0)
+    }
+    fn add(&mut self, tenant: &str) {
+        let n = self.0.entry(tenant.to_owned()).or_default();
+        *n = n.saturating_add(1);
+    }
+    fn sub(&mut self, tenant: &str) {
+        if let Some(n) = self.0.get_mut(tenant) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.0.remove(tenant);
+            }
+        }
+    }
 }
 
 /// Why an upgrade was not admitted.
@@ -534,7 +565,7 @@ impl Hub {
     /// The live connections and those within their grace period.
     #[must_use]
     pub fn connections(&self) -> usize {
-        lock(&self.conns).len()
+        lock(&self.conns).by_id.len()
     }
 
     /// The connections a socket holds now: [`Hub::connections`] less those
@@ -546,7 +577,7 @@ impl Hub {
     /// ```
     #[must_use]
     pub fn attached(&self) -> usize {
-        let conns: Vec<Arc<Conn>> = lock(&self.conns).values().cloned().collect();
+        let conns: Vec<Arc<Conn>> = lock(&self.conns).by_id.values().cloned().collect();
         conns
             .iter()
             .filter(|c| lock(&c.state).attached.is_some())
@@ -569,7 +600,7 @@ impl Hub {
     /// ```
     #[must_use]
     pub fn queued(&self) -> u64 {
-        let conns: Vec<Arc<Conn>> = lock(&self.conns).values().cloned().collect();
+        let conns: Vec<Arc<Conn>> = lock(&self.conns).by_id.values().cloned().collect();
         conns
             .iter()
             .flat_map(|c| {
@@ -593,7 +624,7 @@ impl Hub {
     }
 
     pub(crate) fn get(&self, id: &str) -> Option<Arc<Conn>> {
-        lock(&self.conns).get(id).cloned()
+        lock(&self.conns).by_id.get(id).cloned()
     }
 
     /// Admit and register a new connection (rule 10, W2).
@@ -606,16 +637,14 @@ impl Hub {
         runner: Runner,
     ) -> Result<Arc<Conn>, Refused> {
         let mut conns = lock(&self.conns);
-        if conns.len() >= self.limits.max_connections {
+        if conns.by_id.len() >= self.limits.max_connections {
             return Err(Refused::Process);
         }
-        if conns.values().filter(|c| c.tenant == tenant).count()
-            >= self.limits.max_connections_per_tenant
-        {
+        if conns.per_tenant.of(&tenant) >= self.limits.max_connections_per_tenant {
             return Err(Refused::Tenant);
         }
         let mut id = crate::random::id();
-        while conns.contains_key(&id) {
+        while conns.by_id.contains_key(&id) {
             id = crate::random::id();
         }
         let conn = Arc::new(Conn {
@@ -632,7 +661,8 @@ impl Hub {
             }),
             wake: Notify::new(),
         });
-        conns.insert(id.clone(), conn.clone());
+        conns.per_tenant.add(&conn.tenant);
+        conns.by_id.insert(id.clone(), conn.clone());
         drop(conns);
         if let Some(relay) = self.relay() {
             relay.listen(Arc::downgrade(self), &id);
@@ -647,7 +677,11 @@ impl Hub {
 
     /// Remove a connection from the table.
     pub(crate) fn close(&self, id: &str) {
-        lock(&self.conns).remove(id);
+        let mut conns = lock(&self.conns);
+        if let Some(gone) = conns.by_id.remove(id) {
+            conns.per_tenant.sub(&gone.tenant);
+        }
+        drop(conns);
         if let Some(relay) = self.relay() {
             relay.unlisten(id);
         }
@@ -767,6 +801,25 @@ mod tests {
             Some(Next::Send(texts)) => texts,
             _ => Vec::new(),
         }
+    }
+
+    /// R2-030: the per-Tenant count an upgrade reads follows every open and
+    /// close, and a Tenant that closed its last connection leaves no entry.
+    #[test]
+    fn the_tenant_counts_follow_open_and_close() {
+        let mut counts = TenantCounts::default();
+        for _ in 0..3 {
+            counts.add("a");
+        }
+        counts.add("b");
+        assert_eq!((counts.of("a"), counts.of("b"), counts.of("c")), (3, 1, 0));
+        counts.sub("b");
+        counts.sub("c");
+        assert_eq!((counts.of("a"), counts.of("b")), (3, 0));
+        assert!(
+            !counts.0.contains_key("b"),
+            "an empty Tenant keeps no entry"
+        );
     }
 
     fn ring_bytes(st: &State) -> usize {

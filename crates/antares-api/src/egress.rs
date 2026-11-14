@@ -206,11 +206,14 @@ impl Egress {
     /// Is this destination currently open-circuit FOR THIS TENANT? A tripped
     /// destination admits ONE probe per cooldown window (half-open).
     pub(crate) fn is_open(&self, tenant: &str, url: &str) -> bool {
+        // parsed before the lock: every egress check of the process takes it
+        // (R1-024)
+        let k = Self::key(tenant, url);
         let mut map = self
             .breakers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(b) = map.get_mut(&Self::key(tenant, url)) else {
+        let Some(b) = map.get_mut(&k) else {
             return false;
         };
         match b.tripped_at {
@@ -224,18 +227,19 @@ impl Egress {
     }
 
     pub(crate) fn record_success(&self, tenant: &str, url: &str) {
+        let k = Self::key(tenant, url);
         self.breakers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&Self::key(tenant, url));
+            .remove(&k);
     }
 
     pub(crate) fn record_failure(&self, tenant: &str, url: &str) {
+        let k = Self::key(tenant, url);
         let mut map = self
             .breakers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let k = Self::key(tenant, url);
         if !map.contains_key(&k) {
             evict_oldest(&mut map, &k, |b: &Breaker| b.touched_at);
         }

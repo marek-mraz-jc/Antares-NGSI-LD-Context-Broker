@@ -367,7 +367,7 @@ fn delete_outcome(
     for (id, _) in &remote.ok {
         out.succeed(id);
     }
-    let erred: Vec<String> = remote
+    let erred: std::collections::HashSet<String> = remote
         .err
         .iter()
         .filter_map(|e| e.get("entityId").and_then(Value::as_str).map(str::to_owned))

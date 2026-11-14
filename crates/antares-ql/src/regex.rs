@@ -92,26 +92,39 @@ type Outcome = Result<Arc<regex::Regex>, Box<str>>;
 /// is what the eviction below orders by, so every cache here stores one.
 type Entry<V> = (V, AtomicU64);
 
-/// Source of the use stamps. Wrapping after 2^64 hand-outs would mis-order
+/// Source of the use stamps. It moves only when an entry is inserted, a cache
+/// miss: a hit reads it, so the hits of every core no longer write one shared
+/// line (R1-006). The order it gives is coarse: the entries handed out since
+/// the last insert share a stamp. Wrapping after 2^64 inserts would mis-order
 /// one eviction; nothing else depends on it.
 static CLOCK: AtomicU64 = AtomicU64::new(0);
 
 fn stamp<V>(v: V) -> Entry<V> {
-    (v, AtomicU64::new(CLOCK.fetch_add(1, Ordering::Relaxed)))
+    (
+        v,
+        AtomicU64::new(CLOCK.fetch_add(1, Ordering::Relaxed).saturating_add(1)),
+    )
 }
 
 /// Record that an entry was just handed out. Done under the READ lock — the
 /// stamp is the only mutable part of an entry, and ordering evictions is the
 /// only thing that reads it, so a lost update costs one entry a place in the
-/// order and nothing else.
+/// order and nothing else. An entry already stamped since the last insert is
+/// not written again, so a hot pattern's hits write nothing.
 fn touch<V>(e: &Entry<V>) -> &V {
-    e.1.store(CLOCK.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+    let now = CLOCK.load(Ordering::Relaxed);
+    if e.1.load(Ordering::Relaxed) != now {
+        e.1.store(now, Ordering::Relaxed);
+    }
     &e.0
 }
 
-/// Drop the least recently used half. The entries a request in flight is
-/// using were stamped by that request, so they are on the surviving side:
-/// crossing a bound costs the pattern that crossed it, not the working set.
+/// Drop the least recently used half, exactly: `len / 2` entries survive.
+/// The entries a request in flight is using carry the newest stamp, so they
+/// are on the surviving side unless more than half the map shares it; then
+/// the tie on the boundary stamp is cut arbitrarily and costs a recompile,
+/// never a bound. Keeping exactly half is what lets the halving loop in
+/// [`compile`] end with coarse stamps, where most entries can tie.
 fn evict_lru_half<V>(map: &mut HashMap<Box<str>, Entry<V>>) {
     let keep = map.len() / 2;
     if keep == 0 {
@@ -120,12 +133,21 @@ fn evict_lru_half<V>(map: &mut HashMap<Box<str>, Entry<V>>) {
     }
     let mut stamps: Vec<u64> = map.values().map(|e| e.1.load(Ordering::Relaxed)).collect();
     stamps.sort_unstable();
-    // `keep` newest survive; a tie on the boundary stamp keeps both, which
-    // costs at most a few entries over the half and never a bound.
+    // `keep` newest survive: every stamp above the boundary one, and as many
+    // on it as the half has room for.
     let Some(&cut) = stamps.len().checked_sub(keep).and_then(|i| stamps.get(i)) else {
         return;
     };
-    map.retain(|_, e| e.1.load(Ordering::Relaxed) >= cut);
+    let above = stamps.iter().filter(|s| **s > cut).count();
+    let mut ties = keep.saturating_sub(above);
+    map.retain(|_, e| match e.1.load(Ordering::Relaxed) {
+        s if s > cut => true,
+        s if s == cut && ties > 0 => {
+            ties = ties.saturating_sub(1);
+            true
+        }
+        _ => false,
+    });
 }
 
 /// One bounded cache: client-supplied text to what it compiled or parsed
@@ -398,6 +420,41 @@ mod tests {
         for k in ["p1", "p2", "p4", "p5"] {
             assert!(!map.contains_key(k), "{k} was the oldest and must go");
         }
+    }
+
+    /// R1-006: a hit reads the clock and writes no shared line. A thousand
+    /// hits of one entry leave its stamp where the last insert put it; the
+    /// old touch advanced the process-wide clock on every hit, one distinct
+    /// stamp each. Inserts by tests running beside this one may move the
+    /// clock a few times, never per hit.
+    #[test]
+    fn a_hit_does_not_advance_the_clock() {
+        let e = stamp(0u32);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            touch(&e);
+            seen.insert(e.1.load(Ordering::Relaxed));
+        }
+        assert!(
+            seen.len() < 100,
+            "{} distinct stamps for one entry",
+            seen.len()
+        );
+    }
+
+    /// Coarse stamps tie: every entry handed out since the last insert holds
+    /// the same one. Eviction still keeps exactly half, or the halving loop
+    /// in `compile` would never end on a map that is all ties.
+    #[test]
+    fn eviction_keeps_exactly_half_when_every_stamp_ties() {
+        let mut map: HashMap<Box<str>, Entry<u32>> = HashMap::new();
+        for i in 0..9u32 {
+            map.insert(format!("p{i}").into(), (i, AtomicU64::new(7)));
+        }
+        evict_lru_half(&mut map);
+        assert_eq!(map.len(), 4, "half of nine, rounded down");
+        evict_lru_half(&mut map);
+        assert_eq!(map.len(), 2);
     }
 
     /// The bound holds whatever the map's size, so the halving has to be

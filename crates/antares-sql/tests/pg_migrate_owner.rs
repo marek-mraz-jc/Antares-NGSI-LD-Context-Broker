@@ -65,7 +65,8 @@ async fn the_migrations_backfill_scoped_entities_as_a_non_superuser_owner() {
     }
     ext.close().await;
 
-    // The schema dev held before 0032, then scoped Entities of two Tenants.
+    // The schema dev held before 0032, then scoped Entities of two Tenants
+    // that carry historyRetention, which 0033's backfill flags (T-6607).
     let owner = sqlx::PgPool::connect_with(as_owner.clone())
         .await
         .expect("owner on own db");
@@ -99,7 +100,8 @@ async fn the_migrations_backfill_scoped_entities_as_a_non_superuser_owner() {
         pg::set_tenant(&mut tx, tenant).await.expect("set_tenant");
         sqlx::query(
             "INSERT INTO entities (tenant_id, id, entity, types, scopes, created_at, modified_at)
-             VALUES ($1, 'urn:ngsi-ld:T:1', jsonb_build_object('scope', $2::jsonb), '{T}',
+             VALUES ($1, 'urn:ngsi-ld:T:1', jsonb_build_object('scope', $2::jsonb,
+                     'https://uri.etsi.org/ngsi-ld/default-context/historyRetention', 'P1D'), '{T}',
                      ARRAY(SELECT jsonb_array_elements_text($2::jsonb)), now(), now())",
         )
         .bind(tenant.as_str())
@@ -115,7 +117,7 @@ async fn the_migrations_backfill_scoped_entities_as_a_non_superuser_owner() {
     let url = as_owner.to_url_lossy().to_string();
     let pool = pg::connect(&url, 2)
         .await
-        .expect("0032 migrates as a non-superuser owner with scoped Entities");
+        .expect("0032 and 0033 migrate as a non-superuser owner with scoped Entities");
 
     for (tenant, want) in [
         (&tenants[0].0, vec!["/A/B", "/C"]),
@@ -129,6 +131,12 @@ async fn the_migrations_backfill_scoped_entities_as_a_non_superuser_owner() {
                 .await
                 .expect("scope rows");
         assert_eq!(got, want, "{} keeps its own scope rows", tenant.as_str());
+        let flagged: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM entities WHERE history_retention")
+                .fetch_one(&mut *tx)
+                .await
+                .expect("retention flags");
+        assert_eq!(flagged, 1, "{} has its Entity flagged", tenant.as_str());
     }
     pool.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!(

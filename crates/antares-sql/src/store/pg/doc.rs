@@ -1033,13 +1033,18 @@ impl PgDocStore {
                    OR x.entity_id = ANY(${n}))"
             ));
         }
-        // literals from this function plus `$n` placeholders — no caller text
+        // literals from this function plus `$n` placeholders — no caller text.
+        // A semi-join, not `SELECT DISTINCT r.id, r.registration` over the
+        // join (R2-042): DISTINCT sorted or hashed every candidate's whole
+        // jsonb document once per index row; EXISTS keeps each registration
+        // once and lets the LIMIT stop the id-ordered walk.
         let sql = format!(
-            "SELECT DISTINCT r.id, r.registration
+            "SELECT r.id, r.registration
                FROM csource_registrations r
-               JOIN csource_index x
-                 ON x.tenant_id = r.tenant_id AND x.registration_id = r.id
-              WHERE r.tenant_id = $1{wheres}
+              WHERE r.tenant_id = $1
+                AND EXISTS (SELECT 1 FROM csource_index x
+                             WHERE x.tenant_id = r.tenant_id
+                               AND x.registration_id = r.id{wheres})
               ORDER BY r.id LIMIT ${}",
             n.saturating_add(1)
         );

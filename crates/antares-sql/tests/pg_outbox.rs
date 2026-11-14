@@ -292,3 +292,49 @@ async fn retain_and_read_back_hold_under_the_non_superuser_role() {
     );
     outbox::reap_published(&app, 0).await.expect("reap");
 }
+
+/// R2-029 (T-6607): a batch replace-upsert finds each row's document by id
+/// in a map, no longer by a scan of the batch per row; every event still
+/// carries the document of its own id.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_upsert_event_carries_the_document_of_its_own_id() {
+    let url = require_db!();
+    let pool = pg::connect(&url, 5).await.expect("pool");
+    let t = TenantId::new("pgoutboxbatch").expect("tenant");
+    pg::ensure_tenant(&pool, &t).await.expect("tenant row");
+    let store = pg::entity::PgEntityStore::new(pool.clone());
+    store.set_outbox(true);
+    let items: Vec<(String, serde_json::Value)> = (0..3)
+        .map(|n| {
+            let id = format!("urn:ngsi-ld:T:batch{n}");
+            let doc = serde_json::json!({"id": id, "type": "T",
+                "n": [{"type": "Property", "value": n}]});
+            (id, doc)
+        })
+        .collect();
+    for (id, _) in &items {
+        let _ = store.delete(&t, id).await;
+    }
+    store
+        .batch_upsert_replace(&t, &items)
+        .await
+        .expect("upsert");
+    let page = outbox::peek(&pool, 10_000).await.expect("peek");
+    let mut seen: Vec<(String, i64)> = page
+        .iter()
+        .filter(|(_, tn, e)| tn == "pgoutboxbatch" && e["op"] != "delete")
+        .map(|(_, _, e)| {
+            assert_eq!(e["payload"]["id"], e["entity_id"], "{e}");
+            (
+                e["entity_id"].as_str().unwrap_or_default().to_owned(),
+                e["payload"]["n"][0]["value"].as_i64().unwrap_or(-1),
+            )
+        })
+        .collect();
+    seen.sort();
+    seen.dedup();
+    let want: Vec<(String, i64)> = (0..3)
+        .map(|n| (format!("urn:ngsi-ld:T:batch{n}"), n))
+        .collect();
+    assert!(want.iter().all(|w| seen.contains(w)), "{seen:?}");
+}

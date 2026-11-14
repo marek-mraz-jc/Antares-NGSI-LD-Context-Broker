@@ -256,7 +256,8 @@ impl JoinScope<'_> {
             )
             .await;
         }
-        let page_ids: Vec<&str> = page.iter().filter_map(|d| d["id"].as_str()).collect();
+        let page_ids: std::collections::HashSet<&str> =
+            page.iter().filter_map(|d| d["id"].as_str()).collect();
         linked
             .into_iter()
             .filter(|(id, _)| !page_ids.contains(&id.as_str()))
