@@ -7,6 +7,7 @@
 //! in the answer multiplies it by the page size, and the request the ceiling
 //! exists to bound is exactly a page of densely linked Entities.
 
+use crate::common;
 use antares_api::AppState;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -282,4 +283,69 @@ async fn join_expands_an_entity_at_its_shallowest_depth() {
         ],
         "{flat}"
     );
+}
+
+/// R1-009: a page of 50 Linking Entities, each naming two Linked Entities
+/// that each name one more, read with `joinLevel=2` in both forms. The walk
+/// reads each depth of each Linking Entity in one store call, never one read
+/// per target: 150 targets cost no single Entity read and at most two
+/// several-Entity reads per Linking Entity.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_reads_each_depth_in_one_store_call_not_one_read_per_target() {
+    let mut st = AppState::new("antares-join-batched".into());
+    for i in 0..100 {
+        create(
+            &st,
+            json!({"id": format!("urn:ngsi-ld:T:{i}"), "type": "T",
+                "next": {"type": "Relationship", "object": format!("urn:ngsi-ld:L:{i}")}}),
+        )
+        .await;
+        create(
+            &st,
+            json!({"id": format!("urn:ngsi-ld:L:{i}"), "type": "L"}),
+        )
+        .await;
+    }
+    for r in 0..50 {
+        create(
+            &st,
+            json!({"id": format!("urn:ngsi-ld:Root:{r}"), "type": "Root",
+                "a": {"type": "Relationship", "object": format!("urn:ngsi-ld:T:{}", 2 * r)},
+                "b": {"type": "Relationship", "object": format!("urn:ngsi-ld:T:{}", 2 * r + 1)}}),
+        )
+        .await;
+    }
+    let spy = std::sync::Arc::new(common::Double::passthrough(st.store.clone()));
+    st.store = spy.clone();
+    for (form, members) in [("inline", 50), ("flat", 250)] {
+        let before = spy.entity_reads();
+        let (status, headers, body) = send(
+            &st,
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/ngsi-ld/v1/entities?type=Root&limit=50&join={form}&joinLevel=2"
+                ))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!warned(&headers), "{headers:?}");
+        assert_eq!(
+            body.as_array().map(Vec::len),
+            Some(members),
+            "{form}: {body}"
+        );
+        let after = spy.entity_reads();
+        assert_eq!(
+            after.0, before.0,
+            "{form}: a join read its Linked Entities one at a time"
+        );
+        assert!(
+            after.1 - before.1 <= 100,
+            "{form}: {} several-Entity reads for 50 Linking Entities of depth 2",
+            after.1 - before.1
+        );
+    }
 }

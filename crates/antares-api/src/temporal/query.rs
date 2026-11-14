@@ -312,27 +312,41 @@ pub(super) async fn member_now(
     if !reach_reads_state(filter) {
         return Ok(true);
     }
+    let now = st
+        .store
+        .get(tenant, antares_store::Kind::Entity, id)
+        .await?;
+    Ok(member_given(st, tenant, ctx, filter, now.as_ref(), held).await)
+}
+
+/// [`member_now`] on the Entity's state `now` read already: a page of
+/// histories reads the states of all its Entities in one store call
+/// (R2-032).
+async fn member_given(
+    st: &AppState,
+    tenant: &TenantId,
+    ctx: &Context,
+    filter: &crate::policy::Filter,
+    now: Option<&Value>,
+    held: Option<&Value>,
+) -> bool {
     let Some(reach) = crate::repr::narrowing(filter).policy_reach else {
-        return Ok(true);
+        return true;
     };
     let reach = crate::repr::PolicyReach {
         rules: None,
         ..(*reach).clone()
     };
-    match st
-        .store
-        .get(tenant, antares_store::Kind::Entity, id)
-        .await?
-    {
-        Some(doc) => Ok(crate::repr::policy_admits(st, tenant, ctx, Some(&reach), &doc).await),
-        None => Ok(held.is_none_or(|h| {
+    match now {
+        Some(doc) => crate::repr::policy_admits(st, tenant, ctx, Some(&reach), doc).await,
+        None => held.is_none_or(|h| {
             let areas: Vec<&antares_ql::geo::GeoQuery> = reach.areas.iter().collect();
             window_conditions_match(h, None, reach.q.as_ref(), &areas, ctx)
                 && reach
                     .scope_q
                     .as_deref()
                     .is_none_or(|sq| scope_window_retain(&mut h.clone(), sq, None, "observedAt"))
-        })),
+        }),
     }
 }
 
@@ -407,18 +421,26 @@ pub(crate) async fn query_temporal_collected(
     let (all, pre_paged, pre_total) = (outcome.rows, outcome.paged, outcome.total);
     let mut warnings: Vec<String> = Vec::new();
     let all = federate_temporal(&req, &qry.timeprop, all, &mut warnings).await?;
+    let qualified: Vec<Value> = all
+        .into_iter()
+        .filter_map(|doc| qualifies(doc, &qry, &geos, &shown_geos, &ctx))
+        .collect();
+    // ADR-0023 rule 8: the states of the page's Entities in one store call,
+    // not one read per history (R2-032)
+    let now = if plan.narrowed_now && reach_reads_state(filter) {
+        let ids: Vec<&str> = qualified
+            .iter()
+            .filter_map(|d| d.get("id").and_then(Value::as_str))
+            .collect();
+        Some(st.store.get_entities(&tenant, &ids).await?)
+    } else {
+        None
+    };
     let mut matches = Vec::new();
-    for doc in all {
-        let Some(doc) = qualifies(doc, &qry, &geos, &shown_geos, &ctx) else {
-            continue;
-        };
-        if plan.narrowed_now {
-            let id = doc
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            if !member_now(st, &tenant, &ctx, filter, &id, None).await? {
+    for doc in qualified {
+        if let Some(now) = &now {
+            let id = doc.get("id").and_then(Value::as_str).unwrap_or_default();
+            if !member_given(st, &tenant, &ctx, filter, now.get(id), None).await {
                 continue;
             }
         }
