@@ -816,7 +816,10 @@ mod tests {
         counts.sub("b");
         counts.sub("c");
         assert_eq!((counts.of("a"), counts.of("b")), (3, 0));
-        assert!(!counts.0.contains_key("b"), "an empty Tenant keeps no entry");
+        assert!(
+            !counts.0.contains_key("b"),
+            "an empty Tenant keeps no entry"
+        );
     }
 
     fn ring_bytes(st: &State) -> usize {

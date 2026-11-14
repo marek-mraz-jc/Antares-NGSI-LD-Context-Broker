@@ -256,7 +256,6 @@ impl Egress {
 mod tests {
     use super::*;
 
-
     /// The reason string is interpolated into a caller's log line next to a
     /// URI that caller redacted (`notify.rs`, `federation.rs`), so it may not
     /// smuggle back what the redaction removed: 5.2.9 allows any URI as a

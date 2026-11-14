@@ -100,7 +100,10 @@ type Entry<V> = (V, AtomicU64);
 static CLOCK: AtomicU64 = AtomicU64::new(0);
 
 fn stamp<V>(v: V) -> Entry<V> {
-    (v, AtomicU64::new(CLOCK.fetch_add(1, Ordering::Relaxed).saturating_add(1)))
+    (
+        v,
+        AtomicU64::new(CLOCK.fetch_add(1, Ordering::Relaxed).saturating_add(1)),
+    )
 }
 
 /// Record that an entry was just handed out. Done under the READ lock — the
@@ -432,7 +435,11 @@ mod tests {
             touch(&e);
             seen.insert(e.1.load(Ordering::Relaxed));
         }
-        assert!(seen.len() < 100, "{} distinct stamps for one entry", seen.len());
+        assert!(
+            seen.len() < 100,
+            "{} distinct stamps for one entry",
+            seen.len()
+        );
     }
 
     /// Coarse stamps tie: every entry handed out since the last insert holds
