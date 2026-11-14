@@ -27,9 +27,24 @@ END $$;
 CREATE TRIGGER history_retention_on_write BEFORE INSERT OR UPDATE OF entity ON entities
   FOR EACH ROW EXECUTE FUNCTION note_history_retention();
 
+-- The broker migrates as a NOSUPERUSER owner under FORCE RLS: entities'
+-- WITH CHECK and the 0025 statement trigger's entity_attrs insert both want
+-- antares.tenant, and the service escape alone reads rows but writes none
+-- (T-6610 in 0032). So each Tenant's rows are flagged under that Tenant's
+-- own scope, transaction local like set_tenant.
 SELECT set_config('antares.service', 'on', true);
-UPDATE entities SET history_retention = true
-  WHERE entity ? 'https://uri.etsi.org/ngsi-ld/default-context/historyRetention';
+DO $$
+DECLARE t text;
+BEGIN
+  FOR t IN SELECT DISTINCT tenant_id FROM entities
+            WHERE entity ? 'https://uri.etsi.org/ngsi-ld/default-context/historyRetention' LOOP
+    PERFORM set_config('antares.tenant', t, true);
+    UPDATE entities SET history_retention = true
+     WHERE tenant_id = t
+       AND entity ? 'https://uri.etsi.org/ngsi-ld/default-context/historyRetention';
+  END LOOP;
+  PERFORM set_config('antares.tenant', '', true);
+END $$;
 SELECT set_config('antares.service', '', true);
 
 -- The retention sweep's set (store/pg/maintenance.rs `history_overrides`),
