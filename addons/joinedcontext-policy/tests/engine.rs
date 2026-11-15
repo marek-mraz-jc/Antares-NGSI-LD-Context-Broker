@@ -2067,8 +2067,11 @@ async fn a_notification_carries_only_the_members_the_subscriber_may_read() -> Re
     )
     .await?;
     assert_eq!(code, StatusCode::NO_CONTENT, "{body}");
-    while let Ok(Some(n)) =
-        tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await
+    while let Ok(Some(n)) = tokio::time::timeout(
+        std::time::Duration::from_secs(10 * antares_jsonld::slow_factor()),
+        rx.recv(),
+    )
+    .await
     {
         let entity = &at(&n, "/data/0");
         if at(entity, "/pm10/value") == 50 {
