@@ -450,8 +450,11 @@ async fn notification_previous_value_projected_per_type() {
     .await;
     assert_eq!(code, StatusCode::NO_CONTENT, "{body}");
     let mut seen = Vec::new();
-    while let Ok(Some(n)) =
-        tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await
+    while let Ok(Some(n)) = tokio::time::timeout(
+        std::time::Duration::from_secs(10 * antares_jsonld::slow_factor()),
+        rx.recv(),
+    )
+    .await
     {
         let text = n.to_string();
         seen.push(n);
@@ -1116,8 +1119,11 @@ async fn notification_after_zone_exit_has_no_hidden_previous_value() {
     .await;
     assert_eq!(code, StatusCode::NO_CONTENT, "{body}");
     let mut seen = Vec::new();
-    while let Ok(Some(n)) =
-        tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await
+    while let Ok(Some(n)) = tokio::time::timeout(
+        std::time::Duration::from_secs(10 * antares_jsonld::slow_factor()),
+        rx.recv(),
+    )
+    .await
     {
         let text = n.to_string();
         seen.push(n);
