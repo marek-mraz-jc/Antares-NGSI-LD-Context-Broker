@@ -134,39 +134,21 @@ async fn read(
 ) -> Result<Response, ODataErrorResponse> {
     let version = request.version;
     let fail = |e: ODataErrorResponse| e.with_version(version);
-    let Some(scope) = extensions.get::<Scope>() else {
-        return Err(fail(ODataErrorResponse::new(
-            StatusCode::FORBIDDEN,
-            "Forbidden",
-            "this request carries no read scope",
-        )));
-    };
-    let ODataUri::Resource { path, options } = &request.uri else {
-        return Err(fail(unsupported("this resource")));
-    };
-    let Some((Segment::EntitySet(set), rest)) = path.split_first() else {
-        return Err(fail(unsupported("this resource path")));
-    };
-    let Some(table) = served.sets.iter().find(|t| t.info().set == *set) else {
-        return Err(fail(ODataErrorResponse::new(
-            StatusCode::NOT_FOUND,
-            "NotFound",
-            "the resource does not exist",
-        )));
-    };
+    let (table, scope, options, rest) = resolved(served, &request.uri, extensions).map_err(fail)?;
+    let set = &table.info().set;
     let mut response = match rest {
         [] => {
-            decided(table.as_ref(), scope, Operation::Read, None)
+            decided(table, scope, Operation::Read, None)
                 .await
                 .map_err(fail)?;
-            let answer = run(table.as_ref(), options, scope, served.max_page)
+            let answer = run(table, options, scope, served.max_page)
                 .await
                 .map_err(fail)?;
             let next = answer.next.map(|token| {
                 let mut options = options.clone();
                 options.skiptoken = Some(token.to_string());
                 let uri = ODataUri::Resource {
-                    path: path.clone(),
+                    path: vec![Segment::EntitySet(set.clone())],
                     options,
                 };
                 format!("{}{uri}", served.state.service_root)
@@ -183,7 +165,7 @@ async fn read(
             )?
         }
         [Segment::Count] => {
-            decided(table.as_ref(), scope, Operation::Read, None)
+            decided(table, scope, Operation::Read, None)
                 .await
                 .map_err(fail)?;
             let counted = QueryOptions {
@@ -194,19 +176,19 @@ async fn read(
                 count: Some(true),
                 ..QueryOptions::default()
             };
-            let answer = run(table.as_ref(), &counted, scope, served.max_page)
+            let answer = run(table, &counted, scope, served.max_page)
                 .await
                 .map_err(fail)?;
             counted_response(version, answer.count.unwrap_or(0))
         }
         [Segment::Key(Key::Single(KeyValue::Literal(key)))] => {
             let key = key_value(key).map_err(fail)?;
-            decided(table.as_ref(), scope, Operation::Read, Some(&key))
+            decided(table, scope, Operation::Read, Some(&key))
                 .await
                 .map_err(fail)?;
             let by_key = key_options(table.info(), &key, options.select.clone())
                 .map_err(|e| fail(refused(e)))?;
-            let answer = run(table.as_ref(), &by_key, scope, served.max_page)
+            let answer = run(table, &by_key, scope, served.max_page)
                 .await
                 .map_err(fail)?;
             if answer.rows.is_empty() {
@@ -316,19 +298,41 @@ fn key_value(key: &Literal) -> Result<Value, ODataErrorResponse> {
     }
 }
 
+/// The read scope the authorizing layer put on the request.
+fn scope_of(extensions: &Extensions) -> Result<&Scope, ODataErrorResponse> {
+    extensions.get::<Scope>().ok_or_else(|| {
+        ODataErrorResponse::new(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            "this request carries no read scope",
+        )
+    })
+}
+
+/// The served set, the scope, the options and the path after the set of an OData resource URL.
+fn resolved<'s>(
+    served: &'s Tables,
+    uri: &'s ODataUri,
+    extensions: &'s Extensions,
+) -> Result<(&'s dyn Table, &'s Scope, &'s QueryOptions, &'s [Segment]), ODataErrorResponse> {
+    scope_of(extensions)?;
+    let ODataUri::Resource { path, options } = uri else {
+        return Err(unsupported("this resource"));
+    };
+    let Some((Segment::EntitySet(set), rest)) = path.split_first() else {
+        return Err(unsupported("this resource path"));
+    };
+    let (table, scope) = scoped(served, set, extensions)?;
+    Ok((table, scope, options, rest))
+}
+
 /// The scope and the served set of a request outside the OData URL grammar.
 fn scoped<'s>(
     served: &'s Tables,
     set: &str,
     extensions: &'s Extensions,
 ) -> Result<(&'s dyn Table, &'s Scope), ODataErrorResponse> {
-    let scope = extensions.get::<Scope>().ok_or_else(|| {
-        ODataErrorResponse::new(
-            StatusCode::FORBIDDEN,
-            "Forbidden",
-            "this request carries no read scope",
-        )
-    })?;
+    let scope = scope_of(extensions)?;
     let table = served
         .sets
         .iter()
@@ -419,30 +423,16 @@ async fn change(
     let request = ODataRequest::from_request_parts(&mut parts, &served).await?;
     let version = request.version;
     let fail = |e: ODataErrorResponse| e.with_version(version);
-    let Some(scope) = parts.extensions.get::<Scope>() else {
-        return Err(fail(ODataErrorResponse::new(
-            StatusCode::FORBIDDEN,
-            "Forbidden",
-            "this request carries no read scope",
-        )));
-    };
-    let ODataUri::Resource { path, options } = &request.uri else {
-        return Err(fail(unsupported("this resource")));
-    };
-    let Some((Segment::EntitySet(set), rest)) = path.split_first() else {
-        return Err(fail(unsupported("this resource path")));
-    };
-    let Some(table) = served.sets.iter().find(|t| t.info().set == *set) else {
-        return Err(fail(not_found()));
-    };
-    let (options, key) = target(table.as_ref(), options, rest).map_err(fail)?;
+    let (table, scope, options, rest) =
+        resolved(&served, &request.uri, &parts.extensions).map_err(fail)?;
+    let (options, key) = target(table, options, rest).map_err(fail)?;
     let operation = if parts.method == Method::DELETE {
         Operation::Delete
     } else {
         Operation::Update
     };
     // the decision before the body: a caller without the right learns that first
-    decided(table.as_ref(), scope, operation, key.as_ref())
+    decided(table, scope, operation, key.as_ref())
         .await
         .map_err(fail)?;
     let change = if operation == Operation::Delete {
@@ -451,7 +441,7 @@ async fn change(
         patched(body).await.map_err(fail)?
     };
     let max_rows = usize::try_from(served.max_page.saturating_mul(100)).unwrap_or(usize::MAX);
-    let done = written_rows(table.as_ref(), &options, scope, change, dry_run, max_rows)
+    let done = written_rows(table, &options, scope, change, dry_run, max_rows)
         .await
         .map_err(|e| fail(refused(e)))?;
     if key.is_some() && done.keys.is_empty() {
