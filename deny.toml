@@ -31,6 +31,11 @@ ignore = [
     # `cargo tree -i libsqlite3-sys --all-features --target all` is empty: no build compiles it.
     # No fix reachable: sqlx-sqlite 0.9.0 (newest) caps it at <0.38. Drops with that cap.
     { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys via sqlx's weak sqlite features; in Cargo.lock and cargo metadata only, never compiled" },
+    # chrono and humantime: "unmaintained" (2026-09-14), no vulnerability and no
+    # patched release. Owner 2026-11-18: dated ignore plus migration to jiff, as on
+    # jc (T-7232, T-7233); dev/advisory-ignores.py turns each red after its date.
+    { id = "RUSTSEC-2026-0543", reason = "chrono 0.4 unmaintained, no vulnerability, no safe upgrade: timestamps, RFC 3339 wire formats and sqlx timestamptz across the workspace. Owner 2026-11-18 dated ignore; remove by 2027-02-18 or when the jiff migration lands, whichever is first" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime 2.4 unmaintained, no vulnerability, no patched release: only via console-subscriber 0.5 (newest) behind antares-broker's opt-in `console` dev feature, never in a release image; in Cargo.lock only. Remove by 2027-02-18 or when console-subscriber drops it" },
 ]
 
 [bans]
