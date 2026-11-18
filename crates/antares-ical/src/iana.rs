@@ -227,11 +227,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn default_zone_is_bratislava() {
-        assert_eq!(crate::mapping::default_zone().name(), "Europe/Bratislava");
-    }
-
     /// DST in both test zones: the spring gap, the autumn fold, the offsets on either side.
     #[test]
     fn dst_crossings_in_bratislava_and_helsinki() -> Result<(), String> {

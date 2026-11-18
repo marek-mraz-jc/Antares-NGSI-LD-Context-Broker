@@ -58,6 +58,14 @@ fn has(l: &[String], line: &str) -> bool {
 }
 
 #[test]
+fn default_zone_is_bratislava() {
+    assert_eq!(
+        antares_ical::mapping::default_zone().name(),
+        "Europe/Bratislava"
+    );
+}
+
+#[test]
 fn a_line_of_multibyte_letters_folds_at_75_octets_between_characters() {
     let mut out = String::new();
     fold(&format!("SUMMARY:{}", "ž".repeat(60)), &mut out);
