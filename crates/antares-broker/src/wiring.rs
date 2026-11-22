@@ -13,7 +13,8 @@
 //!                 registration CUD → `ANTARES_REGISTRY`, and the
 //!                 per-instance registration mirror its federation path reads.
 //!   matcher /     one shared DURABLE ("matcher"): decode → process_change →
-//!   notifier      ack AFTER processing; the KV-watched subscription mirror;
+//!   notifier      ack AFTER processing, also on shutdown (the drain waits
+//!                 for it); the KV-watched subscription mirror;
 //!                 the interval loop (single-winner by row-lock claim).
 //!   temporal      no bus consumer — auto-recording is synchronous in the
 //!                 write path; the role only carries the
@@ -29,6 +30,7 @@ use antares_bus::ChangeEvent;
 use antares_model::TenantId;
 use antares_sql::store::Kind;
 use futures_util::StreamExt;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]
@@ -487,8 +489,11 @@ pub async fn wire_nats(
         durables.push("matcher");
         let consumer = bus.consume_balanced("matcher").await?;
         let st = state.clone();
+        let bus_for_matcher = bus.clone();
+        let running = Pending::new(state.pending_changes.clone());
         tokio::spawn(async move {
-            loop {
+            let _running = running;
+            while !st.draining.load(Ordering::Relaxed) {
                 let mut msgs = match consumer.messages().await {
                     Ok(m) => m,
                     Err(e) => {
@@ -497,7 +502,15 @@ pub async fn wire_nats(
                         continue;
                     }
                 };
-                while let Some(Ok(first)) = msgs.next().await {
+                loop {
+                    let first = tokio::select! {
+                        biased;
+                        () = drain_begun(&st.draining) => break,
+                        next = msgs.next() => match next {
+                            Some(Ok(first)) => first,
+                            Some(Err(_)) | None => break,
+                        },
+                    };
                     // What the consumer already holds rides the same pass, as
                     // on the local bus (T-6608): one pass matches up to
                     // MATCH_WIDTH changes at once and folds a subscription's
@@ -530,10 +543,11 @@ pub async fn wire_nats(
                         }
                         if let Some(ev) = nats::decode(msg) {
                             let (before, after) = resolve_payloads(&st, &ev).await;
-                            changes.push((ev.tenant.as_str().to_owned(), before, after));
+                            let change = (ev.tenant.as_str().to_owned(), before, after);
+                            changes.push((ev.written_at, change));
                         }
                     }
-                    antares_api::notify::process_changes(&st, changes).await;
+                    antares_api::notify::process_events(&st, changes).await;
                     for msg in batch {
                         let _ = msg.ack().await;
                     }
@@ -541,6 +555,19 @@ pub async fn wire_nats(
                         break;
                     }
                 }
+                if st.draining.load(Ordering::Relaxed) {
+                    // prefetched and untouched: another pod's work now
+                    while let Some(Some(Ok(msg))) =
+                        futures_util::FutureExt::now_or_never(msgs.next())
+                    {
+                        if let Err(e) = nats::hand_back(&msg).await {
+                            tracing::warn!("matcher could not hand a change back: {e}");
+                        }
+                    }
+                }
+            }
+            if let Err(e) = bus_for_matcher.flush().await {
+                tracing::warn!("matcher acks not flushed on shutdown: {e}");
             }
         });
 
@@ -565,6 +592,35 @@ pub async fn wire_nats(
     tracing::info!(?roles, "bus=nats wired");
     Ok(bus)
 }
+
+/// The matcher consumer's unit of the count `shutdown::drain` waits on, held
+/// until the consumer has acked what it took: a pod that left earlier matched
+/// against a closed pool, or left a change to be redelivered and notified
+/// twice (T-7259).
+struct Pending(Arc<AtomicUsize>);
+
+impl Pending {
+    fn new(count: Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Resolves once `shutdown::begin` has run.
+async fn drain_begun(draining: &AtomicBool) {
+    while !draining.load(Ordering::Relaxed) {
+        tokio::time::sleep(DRAIN_POLL).await;
+    }
+}
+
+/// How often an idle consumer looks at the drain flag.
+const DRAIN_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Hydrate a mirror from the system of record (Postgres) at startup.
 /// Attempts a mirror write gets before the divergence is logged as an error.
@@ -834,6 +890,7 @@ mod tests {
             prev_payload: None,
             version: 1,
             incarnation: String::new(),
+            written_at: None,
             seq: 0,
             payload_ref: r#ref,
             prev_payload_ref: None,
@@ -933,6 +990,7 @@ mod tests {
             prev_payload: Some(before_doc.clone()),
             version: 2,
             incarnation: String::new(),
+            written_at: None,
             seq: 0,
             payload_ref: None,
             prev_payload_ref: None,

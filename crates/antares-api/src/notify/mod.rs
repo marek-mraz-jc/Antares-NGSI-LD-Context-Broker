@@ -257,13 +257,16 @@ pub(crate) async fn wire_matcher(state: &mut AppState) {
     let pending = state.pending_changes.clone();
     crate::spawn_loop(async move {
         while let Some((queued, first)) = rx.recv().await {
-            let mut batch: Vec<(u64, Change)> = first.into_iter().map(|c| (queued, c)).collect();
+            let mut batch: Vec<(Written, Change)> = first
+                .into_iter()
+                .map(|c| (Written::Queued(queued), c))
+                .collect();
             let mut taken: usize = 1;
             // everything already queued behind it rides the same pass
             while batch.len() < CHANGE_BATCH {
                 match rx.try_recv() {
                     Ok((queued, c)) => {
-                        batch.extend(c.into_iter().map(|c| (queued, c)));
+                        batch.extend(c.into_iter().map(|c| (Written::Queued(queued), c)));
                         taken = taken.saturating_add(1);
                     }
                     Err(_) => break,
