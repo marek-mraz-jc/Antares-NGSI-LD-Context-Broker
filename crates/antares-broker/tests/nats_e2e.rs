@@ -87,6 +87,11 @@ fn http(port: u16, method: &str, path: &str, tenant: Option<&str>, body: Option<
 
 /// Notification receiver: records every POSTed body, answers 200.
 fn receiver() -> (u16, Arc<Mutex<Vec<String>>>) {
+    receiver_answering_after(Duration::ZERO)
+}
+
+/// [`receiver`], holding each answer back for `delay` once it has the body.
+fn receiver_answering_after(delay: Duration) -> (u16, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind receiver");
     let port = listener.local_addr().expect("addr").port();
     let seen: Arc<Mutex<Vec<String>>> = Arc::default();
@@ -131,6 +136,7 @@ fn receiver() -> (u16, Arc<Mutex<Vec<String>>>) {
                 // can assert WHICH endpoint/path was dialed, not only payloads
                 let body = String::from_utf8_lossy(&buf[..]).to_string();
                 sink.lock().expect("sink").push(body);
+                std::thread::sleep(delay);
                 let _ = stream.write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 );
@@ -264,6 +270,7 @@ fn roles_split_across_two_instances_notifies_and_records() {
             prev_payload: None,
             version,
             incarnation: "2026-08-05T00:00:00Z".into(),
+            written_at: None,
             seq: 9_000_000 + version,
             payload_ref: None,
             prev_payload_ref: None,
@@ -445,6 +452,159 @@ fn api_pods_interchangeable_and_worker_group_survives_a_kill() {
     wait_for("notification with one worker dead", 60, || {
         seen.lock().expect("seen").iter().any(|b| b.contains(&e2))
     });
+}
+
+/// 5.8.6, T-7259: a change the bus delivers late (here: no matcher was up
+/// when it was written; in ETSI 586_01_02: redelivered 30 s after a roll) is
+/// not notified to a Subscription made after it.
+#[test]
+fn a_late_change_does_not_reach_a_subscription_made_after_it() {
+    let _serial = serial();
+    let (Ok(db), Ok(nats)) = (
+        std::env::var("ANTARES_TEST_DATABASE_URL"),
+        std::env::var("ANTARES_TEST_NATS_URL"),
+    ) else {
+        eprintln!("SKIP: ANTARES_TEST_DATABASE_URL / ANTARES_TEST_NATS_URL not set");
+        return;
+    };
+    let run = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let tenant = format!("late{run}");
+    let (api_port, worker_port) = (free_port(), free_port());
+    let _api = start(api_port, "api", &db, &nats);
+    let mut worker = start(worker_port, "matcher,notifier", &db, &nats);
+    wait_healthy(api_port);
+    wait_healthy(worker_port);
+    // the durable outlives its last consumer, so the change waits in the stream
+    worker.0.kill().expect("SIGKILL worker");
+    worker.0.wait().expect("reap worker");
+
+    let create = |id: &str| {
+        let body = format!(r#"{{"id":"{id}","type":"Late","n":{{"type":"Property","value":1}}}}"#);
+        let resp = http(
+            api_port,
+            "POST",
+            "/ngsi-ld/v1/entities",
+            Some(&tenant),
+            Some(&body),
+        );
+        assert!(resp.starts_with("HTTP/1.1 201"), "entity create: {resp}");
+    };
+    let earlier = format!("urn:ngsi-ld:Late:{run}:earlier");
+    create(&earlier);
+    // further back than the clock skew the matcher allows between hosts
+    std::thread::sleep(Duration::from_secs(6));
+    let (rx_port, seen) = receiver();
+    let sub = format!(
+        r#"{{"id":"urn:ngsi-ld:Subscription:late:{run}","type":"Subscription",
+            "entities":[{{"type":"Late"}}],
+            "notification":{{"endpoint":{{"uri":"http://127.0.0.1:{rx_port}/notify"}}}}}}"#
+    );
+    let resp = http(
+        api_port,
+        "POST",
+        "/ngsi-ld/v1/subscriptions",
+        Some(&tenant),
+        Some(&sub),
+    );
+    assert!(resp.starts_with("HTTP/1.1 201"), "sub create: {resp}");
+    let later = format!("urn:ngsi-ld:Late:{run}:later");
+    create(&later);
+
+    let port = free_port();
+    let _worker = start(port, "matcher,notifier", &db, &nats);
+    wait_healthy(port);
+    // the stream keeps write order: once the later change is out, so is the earlier
+    wait_for("the change made after the subscription", 30, || {
+        seen.lock()
+            .expect("seen")
+            .iter()
+            .any(|b| b.contains(&later))
+    });
+    assert!(
+        !seen
+            .lock()
+            .expect("seen")
+            .iter()
+            .any(|b| b.contains(&earlier)),
+        "a change older than the subscription was notified to it"
+    );
+}
+
+/// 5.8.6, T-7259: a matcher pod told to stop finishes and acks the change it
+/// holds. Left unacked, JetStream redelivers it after its 30 s ack wait and
+/// one change becomes two notifications.
+#[test]
+fn a_rolled_matcher_notifies_the_change_it_held_once() {
+    let _serial = serial();
+    let (Ok(db), Ok(nats)) = (
+        std::env::var("ANTARES_TEST_DATABASE_URL"),
+        std::env::var("ANTARES_TEST_NATS_URL"),
+    ) else {
+        eprintln!("SKIP: ANTARES_TEST_DATABASE_URL / ANTARES_TEST_NATS_URL not set");
+        return;
+    };
+    let run = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let tenant = format!("roll{run}");
+    let (api_port, old_port) = (free_port(), free_port());
+    let _api = start(api_port, "api", &db, &nats);
+    let mut old = start(old_port, "matcher,notifier", &db, &nats);
+    wait_healthy(api_port);
+    wait_healthy(old_port);
+
+    // slower than the 2 s drain delay, so SIGTERM lands inside the delivery
+    let (rx_port, seen) = receiver_answering_after(Duration::from_secs(4));
+    let sub = format!(
+        r#"{{"id":"urn:ngsi-ld:Subscription:roll:{run}","type":"Subscription",
+            "entities":[{{"type":"Rolled"}}],
+            "notification":{{"endpoint":{{"uri":"http://127.0.0.1:{rx_port}/notify"}}}}}}"#
+    );
+    let resp = http(
+        api_port,
+        "POST",
+        "/ngsi-ld/v1/subscriptions",
+        Some(&tenant),
+        Some(&sub),
+    );
+    assert!(resp.starts_with("HTTP/1.1 201"), "sub create: {resp}");
+    // the subscription reaches the matcher pod's mirror through the KV
+    std::thread::sleep(stretch(2));
+    let eid = format!("urn:ngsi-ld:Rolled:{run}");
+    let body = format!(r#"{{"id":"{eid}","type":"Rolled","n":{{"type":"Property","value":1}}}}"#);
+    let resp = http(
+        api_port,
+        "POST",
+        "/ngsi-ld/v1/entities",
+        Some(&tenant),
+        Some(&body),
+    );
+    assert!(resp.starts_with("HTTP/1.1 201"), "entity create: {resp}");
+    let posts = || {
+        seen.lock()
+            .expect("seen")
+            .iter()
+            .filter(|b| b.contains(&eid))
+            .count()
+    };
+    wait_for("the notification in flight", 30, || posts() == 1);
+
+    let term = Command::new("kill")
+        .args(["-TERM", &old.0.id().to_string()])
+        .status()
+        .expect("run kill");
+    assert!(term.success(), "SIGTERM worker");
+    old.0.wait().expect("reap worker");
+    let port = free_port();
+    let _new = start(port, "matcher,notifier", &db, &nats);
+    wait_healthy(port);
+    // past the durable's 30 s ack wait, which is when an unacked change returns
+    std::thread::sleep(stretch(35));
+    assert_eq!(posts(), 1, "one change, one notification across a roll");
 }
 
 /// Postgres arm: a change committed but not yet published survives a

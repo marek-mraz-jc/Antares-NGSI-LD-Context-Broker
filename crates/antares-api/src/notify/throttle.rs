@@ -48,14 +48,27 @@ pub async fn process_change(
 pub async fn process_changes(st: &AppState, changes: Vec<Change>) {
     process_queued(
         st,
-        changes.into_iter().map(|c| (u64::MAX, c)).collect(),
+        changes.into_iter().map(|c| (Written::Unknown, c)).collect(),
         None,
     )
     .await;
 }
 
-/// [`process_changes`] of changes each stamped with the [`crate::mirror::tick`]
-/// they were queued at.
+/// [`process_changes`] of bus events, each with its `written_at`: one
+/// delivered late does not reach a Subscription made after it (5.8.6).
+pub async fn process_events(st: &AppState, events: Vec<(Option<String>, Change)>) {
+    process_queued(
+        st,
+        events
+            .into_iter()
+            .map(|(at, c)| (Written::parse(at.as_deref()), c))
+            .collect(),
+        None,
+    )
+    .await;
+}
+
+/// [`process_changes`] of changes each stamped with when they were made.
 ///
 /// With `done` (the matcher queue's drain), each group is handed to its
 /// subscription's lane and the drain goes on to the next batch: a slow or
@@ -65,7 +78,7 @@ pub async fn process_changes(st: &AppState, changes: Vec<Change>) {
 /// this returns.
 pub(super) async fn process_queued(
     st: &AppState,
-    changes: Vec<(u64, Change)>,
+    changes: Vec<(Written, Change)>,
     done: Option<Arc<BatchDone>>,
 ) {
     let mut groups: Vec<Matched> = Vec::new();
@@ -186,16 +199,16 @@ pub(super) static MATCH_WIDTH: std::sync::LazyLock<usize> =
 #[cfg(not(target_arch = "wasm32"))]
 fn matched_in_order(
     st: &AppState,
-    changes: Vec<(u64, Change)>,
+    changes: Vec<(Written, Change)>,
 ) -> impl futures_util::Stream<Item = Vec<Matched>> + Unpin {
     use futures_util::StreamExt as _;
     let st = st.clone();
     futures_util::stream::iter(changes)
-        .map(move |(queued, (tenant_str, before, after))| {
+        .map(move |(written, (tenant_str, before, after))| {
             let st = st.clone();
             tokio::spawn(async move {
                 let mut ctx_memo = CtxMemo::new();
-                let matched = matches_for(&st, &tenant_str, before, after, queued, &mut ctx_memo);
+                let matched = matches_for(&st, &tenant_str, before, after, written, &mut ctx_memo);
                 match tokio::time::timeout(STEP_DEADLINE, matched).await {
                     Ok(m) => m,
                     Err(_) => {
@@ -218,13 +231,13 @@ fn matched_in_order(
 #[cfg(target_arch = "wasm32")]
 fn matched_in_order<'a>(
     st: &'a AppState,
-    changes: Vec<(u64, Change)>,
+    changes: Vec<(Written, Change)>,
 ) -> impl futures_util::Stream<Item = Vec<Matched>> + Unpin + 'a {
     use futures_util::StreamExt as _;
     Box::pin(futures_util::stream::iter(changes).then(
-        move |(queued, (tenant_str, before, after))| async move {
+        move |(written, (tenant_str, before, after))| async move {
             let mut ctx_memo = CtxMemo::new();
-            matches_for(st, &tenant_str, before, after, queued, &mut ctx_memo).await
+            matches_for(st, &tenant_str, before, after, written, &mut ctx_memo).await
         },
     ))
 }

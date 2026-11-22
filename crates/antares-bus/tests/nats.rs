@@ -40,6 +40,7 @@ fn event(tenant: &TenantId, id: &str, seq: i64) -> ChangeEvent {
         prev_payload: None,
         version: 1,
         incarnation: "2026-08-05T00:00:00Z".into(),
+        written_at: None,
         seq,
         payload_ref: None,
         prev_payload_ref: None,

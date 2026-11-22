@@ -205,6 +205,7 @@ fn change_event(
         "prev_payload": prev,
         "version": version,
         "incarnation": incarnation,
+        "written_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
     })
 }
 
@@ -2669,6 +2670,7 @@ mod tests {
                 "tenant",
                 "types",
                 "version",
+                "written_at",
             ]
         );
         assert_eq!(ev["op"], "create");

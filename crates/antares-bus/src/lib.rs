@@ -69,6 +69,12 @@ pub struct ChangeEvent {
     /// The row's created_at — the incarnation half of the ordering key.
     #[serde(default)]
     pub incarnation: String,
+    /// When the write was made, RFC 3339 on the writing pod's clock. A
+    /// delivery can be late (redelivery, backlog) and a Subscription made
+    /// after this instant is not notified of the change. Absent on events of
+    /// a pod older than the member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_at: Option<String>,
     /// Outbox row id — the `Nats-Msg-Id` dedup key. 0 = local bus.
     #[serde(default)]
     pub seq: i64,
@@ -146,6 +152,7 @@ mod tests {
             prev_payload: None,
             version,
             incarnation: "2026-08-05T00:00:00Z".into(),
+            written_at: None,
             seq: 0,
             payload_ref: None,
             prev_payload_ref: None,

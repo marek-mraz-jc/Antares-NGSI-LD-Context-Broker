@@ -3,6 +3,43 @@
 
 use super::*;
 
+/// How far the clocks of two api pods may stand apart: a change reads as
+/// older than a Subscription only past this, so skew never costs a
+/// notification.
+// ponytail: a change delivered late to a Subscription made under 5 s after
+// it still notifies; closing that needs one clock for both (the database's).
+const WRITE_CLOCK_SKEW: chrono::TimeDelta = chrono::TimeDelta::seconds(5);
+
+/// When a change was made, as far as its bus can say.
+#[derive(Clone, Copy)]
+pub(super) enum Written {
+    /// The [`crate::mirror::tick`] it was queued at on the local bus.
+    Queued(u64),
+    /// The writing pod's clock, off the change event.
+    At(chrono::DateTime<chrono::Utc>),
+    /// Nothing is known: it reaches every Subscription.
+    Unknown,
+}
+
+impl Written {
+    /// The member of a change event.
+    pub(super) fn parse(written_at: Option<&str>) -> Self {
+        written_at
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map_or(Self::Unknown, |t| Self::At(t.to_utc()))
+    }
+
+    /// Whether `sub` was created after the change. Read off the stored
+    /// `createdAt`, which a restarted pod's mirror still holds; its ticks do
+    /// not survive the restart that causes a redelivery.
+    fn predates(self, sub: &Value) -> bool {
+        let Self::At(at) = self else { return false };
+        sub_str(sub, "createdAt")
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .is_some_and(|born| born.to_utc().signed_duration_since(at) > WRITE_CLOCK_SKEW)
+    }
+}
+
 /// Where the matcher reads candidates from: the indexed mirror (both bus
 /// modes wire one), with the store scan only as the never-wired
 /// fallback so a missing mirror degrades to correct-but-slow.
@@ -11,9 +48,13 @@ pub(super) async fn subs_for(
     tenant: &TenantId,
     types: &[&str],
     changed: &[&str],
-    queued: u64,
+    written: Written,
 ) -> Vec<Arc<Value>> {
-    match &st.sub_mirror {
+    let queued = match written {
+        Written::Queued(tick) => tick,
+        Written::At(_) | Written::Unknown => u64::MAX,
+    };
+    let mut subs = match &st.sub_mirror {
         Some(m) => m.candidates_before(tenant.as_str(), types, changed, queued),
         // ponytail: the scan reads subscriptions as they are now, so a change
         // drained late may reach one made after it; only the never-wired path.
@@ -30,7 +71,9 @@ pub(super) async fn subs_for(
                 Vec::new()
             }
         },
-    }
+    };
+    subs.retain(|sub| !written.predates(sub));
+    subs
 }
 
 /// Whether two attribute instances are the same once the volatile members
@@ -513,7 +556,7 @@ pub(super) async fn matches_for(
     tenant_str: &str,
     before: Option<Value>,
     after: Option<Value>,
-    queued: u64,
+    written: Written,
     ctx_memo: &mut CtxMemo,
 ) -> Vec<Matched> {
     let mut out = Vec::new();
@@ -538,7 +581,7 @@ pub(super) async fn matches_for(
         .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
     let changed_keys: Vec<&str> = changes.iter().map(|(k, _)| k.as_str()).collect();
-    let subs = subs_for(st, &tenant, &types, &changed_keys, queued).await;
+    let subs = subs_for(st, &tenant, &types, &changed_keys, written).await;
     // one instant for the change, so equal shapes render one payload
     let now = now_iso();
     let mut built: HashMap<String, Vec<Value>> = HashMap::new();
@@ -727,4 +770,29 @@ pub(super) fn read_or_warn<T>(res: Result<Vec<T>, antares_model::NgsiError>, wha
         tracing::warn!("notification path: reading {what} failed: {e}");
         Vec::new()
     })
+}
+
+#[cfg(test)]
+mod written {
+    use super::Written;
+    use serde_json::json;
+
+    /// T-7259: only a change that is older for certain is withheld; skew, an
+    /// older pod's event and an unreadable instant all still notify.
+    #[test]
+    fn a_change_is_withheld_only_when_it_surely_predates_the_subscription() {
+        let sub = json!({"createdAt": "2026-11-21T18:43:03.900Z"});
+        let predates = |at: Option<&str>| Written::parse(at).predates(&sub);
+        assert!(predates(Some("2026-11-21T18:42:44.300Z")));
+        assert!(predates(Some("2026-11-21T18:42:58.899Z")));
+        assert!(!predates(Some("2026-11-21T18:42:58.900Z")), "within skew");
+        assert!(!predates(Some("2026-11-21T18:43:13.990Z")));
+        assert!(!predates(None), "an event without the member");
+        assert!(!predates(Some("yesterday")));
+        assert!(!Written::parse(Some("2026-11-21T18:42:44Z")).predates(&json!({})));
+        assert!(
+            !Written::Queued(1).predates(&sub),
+            "the local bus has ticks"
+        );
+    }
 }

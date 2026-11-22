@@ -100,6 +100,12 @@ impl NatsBus {
         Ok(bus)
     }
 
+    /// Put what is buffered on the wire. An ack is only queued in the client:
+    /// a process that exits before this loses it, and the stream redelivers.
+    pub async fn flush(&self) -> Result<(), BusError> {
+        self.client.flush().await.map_err(err)
+    }
+
     /// Live connection state for /q/health.
     pub fn connected(&self) -> bool {
         self.client.connection_state() == async_nats::connection::State::Connected
@@ -425,6 +431,14 @@ pub async fn messages(
     consumer.messages().await.map_err(err)
 }
 
+/// Hand a message this consumer will not process back to the stream, which
+/// redelivers it at once. An unanswered one waits out the 30 s ack wait.
+pub async fn hand_back(msg: &async_nats::jetstream::Message) -> Result<(), BusError> {
+    msg.ack_with(jetstream::AckKind::Nak(None))
+        .await
+        .map_err(err)
+}
+
 /// One decoded registry delta from the broadcast consumer, acked in place.
 pub async fn next_delta(
     stream: &mut (impl futures_util::Stream<
@@ -483,6 +497,7 @@ mod tests {
             prev_payload: None,
             version: 1,
             incarnation: String::new(),
+            written_at: None,
             seq: 1,
             payload_ref: None,
             prev_payload_ref: None,
@@ -512,6 +527,7 @@ mod tests {
             prev_payload: None,
             version: 1,
             incarnation: String::new(),
+            written_at: None,
             seq: 1,
             payload_ref: None,
             prev_payload_ref: None,
