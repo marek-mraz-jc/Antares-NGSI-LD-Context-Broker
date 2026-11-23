@@ -152,7 +152,9 @@ jobs:
             docker tag antares-local:latest "$IMG:$tag"
             docker push -q "$IMG:$tag"
           done
-          DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMG:$SHA")
+          # the pushed name's digest: since the Debian-update unpack the image also carries an
+          # antares-local@sha256 RepoDigest, and index 0 was that one (ship red 2026-11-19..23)
+          DIGEST=$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMG:$SHA" | grep -m1 "^$IMG@sha256:")
           case "$DIGEST" in "$IMG@sha256:"*) ;; *) echo "no digest for $IMG:$SHA: $DIGEST"; exit 1 ;; esac
           cosign sign --yes "$DIGEST"
           cosign attest --yes --type spdxjson --predicate antares-broker-jc.sbom.spdx.json "$DIGEST"
